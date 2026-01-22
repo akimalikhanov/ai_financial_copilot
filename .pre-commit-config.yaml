@@ -1,0 +1,51 @@
+repos:
+  # --------------------
+  # Basic hygiene
+  # --------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-json
+  # --------------------
+  # Python: lint + format
+  # --------------------
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        entry: ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff (format)
+        entry: ruff format
+        language: system
+        types: [python]
+
+  # --------------------
+  # Type checking (fast)
+  # --------------------
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright (typecheck)
+        entry: pyright
+        language: system
+        types: [python]
+        args: ["--level", "error"]
+
+  # --------------------
+  # Secret scanning
+  # --------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+        args: ["--verbose", "--no-banner"]
+        description: "Detect hardcoded secrets and credentials"
