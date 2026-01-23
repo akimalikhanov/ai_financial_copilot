@@ -1,0 +1,15 @@
+# config.yaml
+
+model: "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+host: "0.0.0.0"
+port: 8002
+max_model_len: 4096
+max_num_seqs: 4
+max_num_batched_tokens: 16000 # ≤ max_num_seqs * max_model_len
+gpu_memory_utilization: 0.75
+# kv-cache-dtype: fp8
+quantization: awq_marlin
+dtype: half
+uvicorn_log_level: "info"
+enable_auto_tool_choice: true
+tool_call_parser: llama3_json

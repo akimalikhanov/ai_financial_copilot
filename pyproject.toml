@@ -15,6 +15,7 @@ dev = [
     "ruff>=0.14.13",
 ]
 llm-engine = [
+    "google-genai>=1.60.0",
     "openai>=2.15.0",
     "vllm>=0.14.0",
 ]

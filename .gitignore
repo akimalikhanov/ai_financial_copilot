@@ -26,3 +26,11 @@ wheels/
 
 # Pytest
 .pytest_cache/
+
+# docs
+.cursor/
+AGENTS.MD
+
+# misc
+experiments/
+docs/
