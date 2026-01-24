@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, AsyncIterator, Literal, Optional, Sequence
 
 Role = Literal["system", "developer", "user", "assistant"]
 
@@ -27,6 +27,13 @@ class LLMResponse:
     raw: Any = None  # provider-native response object (optional)
 
 
+@dataclass(frozen=True)
+class LLMStreamChunk:
+    text: str
+    raw: Any = None  # provider-native chunk object (optional)
+    is_final: bool = False
+
+
 class LLMAdapter(ABC):
     """Provider-agnostic non-streaming interface."""
 
@@ -49,6 +56,26 @@ class LLMAdapter(ABC):
         )
         return await self._complete(req)
 
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        req = ChatRequest(
+            messages=messages,
+            model=model or self.default_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return self._stream(req)
+
     @abstractmethod
     async def _complete(self, req: ChatRequest) -> LLMResponse:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
         raise NotImplementedError
