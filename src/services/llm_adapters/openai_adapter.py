@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import AsyncIterator, Literal, Optional, Sequence
 
 from .base_adapter import (
@@ -8,7 +8,15 @@ from .base_adapter import (
     ChatRequest,
     LLMAdapter,
     LLMResponse,
+    LLMResponseStats,
     LLMStreamChunk,
+)
+from src.utils.llm_adapter_utils import (
+    calc_cost_openai,
+    compute_tps,
+    elapsed_ms,
+    get_pricing_for_model,
+    now_ms,
 )
 
 
@@ -40,6 +48,49 @@ class OpenAIAdapter(LLMAdapter):
     def _is_gpt_5_model(model: str) -> bool:
         """Check if model is a GPT-5 model (supports reasoning_effort/verbosity, but not temperature)."""
         return model.startswith("gpt-5")
+
+    @staticmethod
+    def _build_stats_from_usage(
+        usage: object | None,
+        *,
+        model: str,
+        latency_ms: float,
+        ttft_ms: Optional[float] = None,
+    ) -> LLMResponseStats:
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
+
+        reasoning_tokens = None
+        cached_input_tokens = None
+        if usage is not None:
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            if completion_details is not None:
+                reasoning_tokens = getattr(completion_details, "reasoning_tokens", None)
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            if prompt_details is not None:
+                cached_input_tokens = getattr(prompt_details, "cached_tokens", None)
+
+        stats = LLMResponseStats(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            total_tokens=total_tokens,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
+            tps=compute_tps(
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
+            ),
+        )
+        pricing = get_pricing_for_model("openai", model)
+        if pricing is not None:
+            cost = calc_cost_openai(stats, pricing)
+            if cost is not None:
+                stats = replace(stats, cost_usd=cost)
+        return stats
 
     def _build_request(
         self,
@@ -131,23 +182,49 @@ class OpenAIAdapter(LLMAdapter):
     async def _complete(self, req: ChatRequest) -> LLMResponse:
         kwargs = self._build_kwargs(req)
 
+        start_ms = now_ms()
         resp = await self._client.chat.completions.create(**kwargs)
+        latency_ms = elapsed_ms(start_ms)
 
         text = (resp.choices[0].message.content or "").strip()
-        return LLMResponse(text=text, raw=resp)
+        stats = self._build_stats_from_usage(
+            getattr(resp, "usage", None),
+            model=req.model,
+            latency_ms=latency_ms,
+        )
+
+        return LLMResponse(text=text, raw=resp, stats=stats)
 
     async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
         kwargs = self._build_kwargs(req)
+        kwargs["stream_options"] = {"include_usage": True}
+
+        start_ms = now_ms()
+        first_token_ms: Optional[float] = None
 
         stream = await self._client.chat.completions.create(**kwargs, stream=True)
 
-        # parts: list[str] = []
         async for chunk in stream:
-            delta = chunk.choices[0].delta
+            delta = chunk.choices[0].delta if chunk.choices else None
             text = getattr(delta, "content", None) or ""
-            if text:
-                # parts.append(text)
-                yield LLMStreamChunk(text=text, raw=chunk)
+            usage = getattr(chunk, "usage", None)
 
-        # full_text = "".join(parts).strip()
-        # yield LLMStreamChunk(text=full_text, is_final=True)
+            # Track first token time
+            if text and first_token_ms is None:
+                first_token_ms = now_ms()
+
+            # If this is the final chunk with usage, compute stats
+            if usage:
+                latency_ms = elapsed_ms(start_ms)
+                ttft_ms = elapsed_ms(start_ms, first_token_ms) if first_token_ms else None
+                stats = self._build_stats_from_usage(
+                    usage,
+                    model=req.model,
+                    latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
+                )
+
+                yield LLMStreamChunk(text=text, raw=chunk, is_final=True, stats=stats)
+            elif text:
+                yield LLMStreamChunk(text=text, raw=chunk, is_final=False)
+

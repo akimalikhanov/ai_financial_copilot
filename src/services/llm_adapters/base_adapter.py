@@ -22,9 +22,23 @@ class ChatRequest:
 
 
 @dataclass(frozen=True)
+class LLMResponseStats:
+    input_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None
+    tps: Optional[float] = None
+    cost_usd: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class LLMResponse:
     text: str
     raw: Any = None  # provider-native response object (optional)
+    stats: Optional[LLMResponseStats] = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +46,7 @@ class LLMStreamChunk:
     text: str
     raw: Any = None  # provider-native chunk object (optional)
     is_final: bool = False
+    stats: Optional[LLMResponseStats] = None
 
 
 class LLMAdapter(ABC):

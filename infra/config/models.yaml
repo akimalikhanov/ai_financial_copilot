@@ -1,0 +1,182 @@
+defaults:
+  params:
+    temperature: 0.2
+    max_tokens: 2000
+    seed: null
+    reasoning_effort: null
+    verbosity: null
+  stream: true
+
+models:
+  # === Cloud adapters ===
+  - id: gpt-5.2
+    label: "OpenAI GPT-5.2"
+    provider: openai
+    model_name: "gpt-5.2"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GPT5_2_INPUT_PRICE:-0.00175}
+      output: ${GPT5_2_OUTPUT_PRICE:-0.01400}
+      cached_input: ${GPT5_2_CACHED_INPUT_PRICE:-0.000175}
+      cached_output: null
+      rounding: exact
+      effective: 2025-12-11
+      notes: "OpenAI standard pricing (per 1M: $1.75 in, $0.175 cached in, $14 out)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: low}
+
+  - id: gpt-5-mini
+    label: "OpenAI GPT-5-mini"
+    provider: openai
+    model_name: "gpt-5-mini"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GPT5_MINI_INPUT_PRICE:-0.00025}
+      output: ${GPT5_MINI_OUTPUT_PRICE:-0.00200}
+      cached_input: ${GPT5_MINI_CACHED_INPUT_PRICE:-0.000025}
+      cached_output: null
+      rounding: exact
+      effective: 2025-12-11
+      notes: "OpenAI standard pricing (per 1M: $0.25 in, $0.025 cached in, $2 out)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {temperature: 1.0, reasoning_effort: low, verbosity: low}
+
+  - id: gpt-5-nano
+    label: "OpenAI GPT-5-nano"
+    provider: openai
+    model_name: "gpt-5-nano"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GPT5_NANO_INPUT_PRICE:-0.00005}
+      output: ${GPT5_NANO_OUTPUT_PRICE:-0.00040}
+      cached_input: ${GPT5_NANO_CACHED_INPUT_PRICE:-0.000005}
+      cached_output: null
+      rounding: exact
+      effective: 2025-12-11
+      notes: "OpenAI standard pricing (per 1M: $0.05 in, $0.005 cached in, $0.40 out)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {temperature: 1.0, reasoning_effort: low, verbosity: low}
+
+  - id: gpt-4o-mini
+    label: "OpenAI GPT-4o-mini"
+    provider: openai
+    model_name: "gpt-4o-mini"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GPT4O_MINI_INPUT_PRICE:-0.00015}
+      output: ${GPT4O_MINI_OUTPUT_PRICE:-0.00060}
+      cached_input: ${GPT4O_MINI_CACHED_INPUT_PRICE:-0.000075}
+      cached_output: null
+      rounding: exact
+      effective: 2025-07-18
+      notes: "OpenAI standard pricing (per 1M: $0.15 in, $0.075 cached in, $0.60 out)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
+
+  # === Google Gemini adapters ===
+
+  - id: gemini-3-flash-preview
+    label: "Gemini 3 Flash Preview"
+    provider: google
+    model_name: "gemini-3-flash-preview"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GEMINI_3_FLASH_PREVIEW_INPUT_PRICE:-0.00050}
+      output: ${GEMINI_3_FLASH_PREVIEW_OUTPUT_PRICE:-0.00300}
+      cached_input: ${GEMINI_3_FLASH_PREVIEW_CACHE_PRICE:-null}
+      cached_output: null
+      rounding: exact
+      effective: 2025-12-17
+      notes: "Paid tier (per 1M: $0.50 in, $3.00 out, caching $0.05)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
+
+  - id: gemini-2.5-flash-lite
+    label: "Gemini 2.5 Flash Lite"
+    provider: google
+    model_name: "gemini-2.5-flash-lite"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GEMINI_FLASH_LITE_INPUT_PRICE:-0.00010}
+      output: ${GEMINI_FLASH_LITE_OUTPUT_PRICE:-0.00040}
+      cached_input: ${GEMINI_FLASH_LITE_CACHE_PRICE:-0.00001}
+      cached_output: null
+      rounding: exact
+      effective: 2025-12-17
+      notes: "Paid tier (per 1M: $0.10 in, $0.40 out, caching $0.01)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
+
+  - id: gemini-2.5-flash
+    label: "Gemini 2.5 Flash"
+    provider: google
+    model_name: "gemini-2.5-flash"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GEMINI_FLASH_INPUT_PRICE:-0.00030}
+      output: ${GEMINI_FLASH_OUTPUT_PRICE:-0.00250}
+      cached_input: ${GEMINI_FLASH_CACHE_PRICE:-0.00003}
+      cached_output: null
+      rounding: exact
+      effective: 2025-09-01
+      notes: "Paid tier (per 1M: $0.30 in, $2.50 out, caching $0.03)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
+
+  # === Local vLLM adapters ===
+  - id: llama
+    label: "Llama3.1-8B-Instruct-AWQ"
+    provider: vllm
+    model_path: "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+    server:
+      host: "${LLAMA_SERVER_HOST}"
+      port: "${LLAMA_SERVER_PORT:-8002}"
+      base_path: "/v1"
+    pricing:
+      currency: USD
+      unit: local
+      cost: 0.0
+      notes: "Running on self-hosted GPU with vLLM. No API billing."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
+
+  - id: qwen
+    label: "Qwen2.5-7B-Instruct-AWQ "
+    provider: vllm
+    model_path: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+    server:
+      host: "${QWEN_SERVER_HOST}"
+      port: "${QWEN_SERVER_PORT:-8001}"
+      base_path: "/v1"
+    pricing:
+      currency: USD
+      unit: local
+      cost: 0.0
+      notes: "Running on self-hosted GPU with vLLM. No API billing."
+    capabilities:
+      streaming: true
+      tool_calling: true
+    params_override: {}
