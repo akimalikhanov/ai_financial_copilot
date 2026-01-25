@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
-from typing import AsyncIterator, Literal, Optional, Sequence
+from typing import Any, Literal, cast
+
+from src.utils.llm_adapter_utils import (
+    calc_cost_openai,
+    compute_tps,
+    elapsed_ms,
+    get_pricing_for_model,
+    now_ms,
+)
 
 from .base_adapter import (
     ChatMessage,
@@ -11,21 +20,12 @@ from .base_adapter import (
     LLMResponseStats,
     LLMStreamChunk,
 )
-from src.utils.llm_adapter_utils import (
-    calc_cost_openai,
-    compute_tps,
-    elapsed_ms,
-    get_pricing_for_model,
-    now_ms,
-)
 
 
 @dataclass(frozen=True)
 class OpenAIChatRequest(ChatRequest):
-    reasoning_effort: Optional[
-        Literal["none", "minimal", "low", "medium", "high"]
-    ] = None
-    verbosity: Optional[Literal["high", "medium", "low"]] = None
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+    verbosity: Literal["high", "medium", "low"] | None = None
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -35,10 +35,12 @@ class OpenAIAdapter(LLMAdapter):
         self,
         *,
         default_model: str,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,  # useful for OpenAI-compatible servers
+        api_key: str | None = None,
+        base_url: str | None = None,  # useful for OpenAI-compatible servers
+        include_usage: bool = True,
     ):
         super().__init__(default_model=default_model)
+        self.include_usage = include_usage
 
         from openai import AsyncOpenAI
 
@@ -55,7 +57,7 @@ class OpenAIAdapter(LLMAdapter):
         *,
         model: str,
         latency_ms: float,
-        ttft_ms: Optional[float] = None,
+        ttft_ms: float | None = None,
     ) -> LLMResponseStats:
         input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
         output_tokens = getattr(usage, "completion_tokens", None) if usage else None
@@ -96,13 +98,12 @@ class OpenAIAdapter(LLMAdapter):
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[
-            Literal["none", "minimal", "low", "medium", "high"]
-        ] = None,
-        verbosity: Optional[Literal["high", "medium", "low"]] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None,
+        verbosity: Literal["high", "medium", "low"] | None = None,
+        **kwargs: Any,
     ) -> OpenAIChatRequest:
         return OpenAIChatRequest(
             messages=messages,
@@ -111,13 +112,14 @@ class OpenAIAdapter(LLMAdapter):
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
+            extra_params=kwargs,
         )
 
-    def _build_kwargs(self, req: ChatRequest) -> dict[str, object]:
+    def _build_kwargs(self, req: ChatRequest) -> dict[str, Any]:
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
         is_gpt_5 = self._is_gpt_5_model(req.model)
 
-        kwargs: dict[str, object] = {
+        kwargs: dict[str, Any] = {
             "model": req.model,
             "messages": messages,
         }
@@ -125,27 +127,34 @@ class OpenAIAdapter(LLMAdapter):
         if req.temperature is not None and not is_gpt_5:
             kwargs["temperature"] = req.temperature
         if req.max_tokens is not None:
-            kwargs["max_tokens"] = req.max_tokens
-        
+            if is_gpt_5:
+                kwargs["max_completion_tokens"] = req.max_tokens
+            else:
+                kwargs["max_tokens"] = req.max_tokens
+
         # reasoning_effort and verbosity are only supported by GPT-5 models
         if isinstance(req, OpenAIChatRequest) and is_gpt_5:
             if req.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = req.reasoning_effort
             if req.verbosity is not None:
                 kwargs["verbosity"] = req.verbosity
+
+        # Merge extra params from ChatRequest
+        if req.extra_params:
+            kwargs.update(req.extra_params)
+
         return kwargs
 
     async def complete(
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[
-            Literal["none", "minimal", "low", "medium", "high"]
-        ] = None,
-        verbosity: Optional[Literal["high", "medium", "low"]] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None,
+        verbosity: Literal["high", "medium", "low"] | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         req = self._build_request(
             messages,
@@ -154,6 +163,7 @@ class OpenAIAdapter(LLMAdapter):
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
+            **kwargs,
         )
         return await self._complete(req)
 
@@ -161,13 +171,12 @@ class OpenAIAdapter(LLMAdapter):
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        reasoning_effort: Optional[
-            Literal["none", "minimal", "low", "medium", "high"]
-        ] = None,
-        verbosity: Optional[Literal["high", "medium", "low"]] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None,
+        verbosity: Literal["high", "medium", "low"] | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[LLMStreamChunk]:
         req = self._build_request(
             messages,
@@ -176,6 +185,7 @@ class OpenAIAdapter(LLMAdapter):
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             verbosity=verbosity,
+            **kwargs,
         )
         return self._stream(req)
 
@@ -183,7 +193,7 @@ class OpenAIAdapter(LLMAdapter):
         kwargs = self._build_kwargs(req)
 
         start_ms = now_ms()
-        resp = await self._client.chat.completions.create(**kwargs)
+        resp = await self._client.chat.completions.create(**cast(Any, kwargs))
         latency_ms = elapsed_ms(start_ms)
 
         text = (resp.choices[0].message.content or "").strip()
@@ -197,12 +207,16 @@ class OpenAIAdapter(LLMAdapter):
 
     async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
         kwargs = self._build_kwargs(req)
-        kwargs["stream_options"] = {"include_usage": True}
+        if self.include_usage:
+            kwargs["stream_options"] = {"include_usage": True}
 
         start_ms = now_ms()
-        first_token_ms: Optional[float] = None
+        first_token_ms: float | None = None
 
-        stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        stream = await self._client.chat.completions.create(
+            **cast(Any, kwargs),
+            stream=True,
+        )
 
         async for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
@@ -227,4 +241,3 @@ class OpenAIAdapter(LLMAdapter):
                 yield LLMStreamChunk(text=text, raw=chunk, is_final=True, stats=stats)
             elif text:
                 yield LLMStreamChunk(text=text, raw=chunk, is_final=False)
-

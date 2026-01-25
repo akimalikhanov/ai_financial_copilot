@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Literal, Optional, Sequence
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 Role = Literal["system", "developer", "user", "assistant"]
 
@@ -17,28 +18,29 @@ class ChatMessage:
 class ChatRequest:
     messages: Sequence[ChatMessage]
     model: str
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    extra_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class LLMResponseStats:
-    input_tokens: Optional[int] = None
-    cached_input_tokens: Optional[int] = None
-    output_tokens: Optional[int] = None
-    reasoning_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
-    latency_ms: Optional[float] = None
-    ttft_ms: Optional[float] = None
-    tps: Optional[float] = None
-    cost_usd: Optional[float] = None
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+    latency_ms: float | None = None
+    ttft_ms: float | None = None
+    tps: float | None = None
+    cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
 class LLMResponse:
     text: str
     raw: Any = None  # provider-native response object (optional)
-    stats: Optional[LLMResponseStats] = None
+    stats: LLMResponseStats | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,7 @@ class LLMStreamChunk:
     text: str
     raw: Any = None  # provider-native chunk object (optional)
     is_final: bool = False
-    stats: Optional[LLMResponseStats] = None
+    stats: LLMResponseStats | None = None
 
 
 class LLMAdapter(ABC):
@@ -59,15 +61,17 @@ class LLMAdapter(ABC):
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        **kwargs: Any,
     ) -> LLMResponse:
         req = ChatRequest(
             messages=messages,
             model=model or self.default_model,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_params=kwargs,
         )
         return await self._complete(req)
 
@@ -75,15 +79,17 @@ class LLMAdapter(ABC):
         self,
         messages: Sequence[ChatMessage],
         *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        **kwargs: Any,
     ) -> AsyncIterator[LLMStreamChunk]:
         req = ChatRequest(
             messages=messages,
             model=model or self.default_model,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_params=kwargs,
         )
         return self._stream(req)
 
@@ -92,5 +98,5 @@ class LLMAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
+    def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
         raise NotImplementedError

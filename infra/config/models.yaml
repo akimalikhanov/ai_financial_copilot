@@ -2,9 +2,9 @@ defaults:
   params:
     temperature: 0.2
     max_tokens: 2000
-    seed: null
-    reasoning_effort: null
-    verbosity: null
+    # seed: null
+    # reasoning_effort: null
+    # verbosity: null
   stream: true
 
 models:
@@ -26,7 +26,7 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: low}
+    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: low, reasoning_effort: low}
 
   - id: gpt-5-mini
     label: "OpenAI GPT-5-mini"
@@ -150,7 +150,7 @@ models:
     provider: vllm
     model_path: "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
     server:
-      host: "${LLAMA_SERVER_HOST}"
+      host: "${LLAMA_SERVER_HOST:-localhost}"
       port: "${LLAMA_SERVER_PORT:-8002}"
       base_path: "/v1"
     pricing:
@@ -168,7 +168,7 @@ models:
     provider: vllm
     model_path: "Qwen/Qwen2.5-7B-Instruct-AWQ"
     server:
-      host: "${QWEN_SERVER_HOST}"
+      host: "${QWEN_SERVER_HOST:-localhost}"
       port: "${QWEN_SERVER_PORT:-8001}"
       base_path: "/v1"
     pricing:

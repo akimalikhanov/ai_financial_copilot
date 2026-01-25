@@ -4,18 +4,20 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 
-from src.services.llm_adapters.base_adapter import LLMResponseStats
+# Load environment variables from .env file (if present)
+load_dotenv()
 
 
 def now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
-def elapsed_ms(start_ms: float, end_ms: Optional[float] = None) -> float:
+def elapsed_ms(start_ms: float, end_ms: float | None = None) -> float:
     if end_ms is None:
         end_ms = now_ms()
     return max(0.0, end_ms - start_ms)
@@ -23,10 +25,10 @@ def elapsed_ms(start_ms: float, end_ms: Optional[float] = None) -> float:
 
 def compute_tps(
     *,
-    output_tokens: Optional[int],
-    latency_ms: Optional[float],
-    ttft_ms: Optional[float] = None,
-) -> Optional[float]:
+    output_tokens: int | None,
+    latency_ms: float | None,
+    ttft_ms: float | None = None,
+) -> float | None:
     if output_tokens is None or latency_ms is None:
         return None
     if output_tokens <= 0:
@@ -43,13 +45,13 @@ def _expand_env_vars(value: Any) -> Any:
     """Recursively expand ${VAR:-default} patterns in YAML values."""
     if isinstance(value, str):
         # Match ${VAR:-default} pattern
-        pattern = r'\$\{([^:}]+)(?::-([^}]*))?\}'
-        
+        pattern = r"\$\{([^:}]+)(?::-([^}]*))?\}"
+
         def replacer(match: re.Match[str]) -> str:
             var_name = match.group(1)
             default = match.group(2) if match.group(2) is not None else ""
             return os.getenv(var_name, default)
-        
+
         return re.sub(pattern, replacer, value)
     elif isinstance(value, dict):
         return {k: _expand_env_vars(v) for k, v in value.items()}
@@ -59,13 +61,13 @@ def _expand_env_vars(value: Any) -> Any:
         return value
 
 
-def load_models_config(config_path: Optional[str | Path] = None) -> dict[str, Any]:
+def load_models_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """
     Load models.yaml config file with environment variable expansion.
-    
+
     Args:
         config_path: Path to models.yaml. If None, uses infra/config/models.yaml relative to project root.
-    
+
     Returns:
         Parsed YAML dict with env vars expanded.
     """
@@ -75,10 +77,10 @@ def load_models_config(config_path: Optional[str | Path] = None) -> dict[str, An
         config_path = project_root / "infra" / "config" / "models.yaml"
     else:
         config_path = Path(config_path)
-    
-    with open(config_path, "r") as f:
+
+    with open(config_path) as f:
         raw_data = yaml.safe_load(f)
-    
+
     # Expand environment variables
     return _expand_env_vars(raw_data)
 
@@ -86,105 +88,129 @@ def load_models_config(config_path: Optional[str | Path] = None) -> dict[str, An
 def get_pricing_for_model(
     provider: str,
     model_name: str,
-    config_path: Optional[str | Path] = None,
-) -> Optional[dict[str, Any]]:
+    config_path: str | Path | None = None,
+) -> dict[str, Any] | None:
     """
     Get pricing information for a model by provider and model_name.
-    
+
     Args:
         provider: Provider name (e.g., "openai", "google", "vllm")
         model_name: Model name (e.g., "gpt-5.2", "gemini-3-flash-preview")
         config_path: Optional path to models.yaml
-    
+
     Returns:
         Pricing dict with keys: input, output, cached_input, cached_output, etc.
         Returns None if model not found or pricing not available.
     """
     config = load_models_config(config_path)
     models = config.get("models", [])
-    
+
     for model in models:
-        if (
-            model.get("provider") == provider
-            and model.get("model_name") == model_name
-        ):
+        if model.get("provider") == provider and model.get("model_name") == model_name:
             pricing = model.get("pricing")
             if pricing is None:
                 return None
             # Handle "null" string or None values
             pricing = {k: (None if v in ("null", None) else v) for k, v in pricing.items()}
             return pricing
-    
+
     return None
 
 
-def calc_cost_openai(stats: LLMResponseStats, pricing: dict[str, Any]) -> Optional[float]:
+def _calc_llm_cost_shared(
+    stats: Any,
+    pricing: dict[str, Any],
+    *,
+    reasoning_in_output: bool,
+    implicit_cache_discount: float | None = None,
+    tokens_per_unit: int = 1000,  # keep 1000 if your pricing is "per 1K tokens"
+) -> float | None:
     """
-    Calculate cost for OpenAI models.
-    
-    OpenAI rule:
-      - reasoning_tokens are INCLUDED in output_tokens (do NOT add them)
-      - cached_input_tokens (if any) are billed at cached_input price
-    
+    Shared token cost calculator.
+
     Args:
-        stats: LLMResponseStats with token counts
-        pricing: Pricing dict with keys: input, output, cached_input
-    
+        stats: object with fields: input_tokens, output_tokens, reasoning_tokens, cached_input_tokens
+        pricing: dict with keys: input, output, optional cached_input
+        reasoning_in_output:
+            - True  => reasoning already included in output_tokens (OpenAI)
+            - False => reasoning separate, must add (Gemini)
+        implicit_cache_discount:
+            - None => use pricing["cached_input"] if present, else treat cached_input cost as 0
+            - e.g. 0.10 => cached input billed at 10% of normal input price (Gemini implicit caching)
+        tokens_per_unit: 1000 for "per 1K tokens", 1_000_000 for "per 1M tokens"
+
     Returns:
-        Cost in USD, or None if pricing is incomplete
+        Total cost (float) or None if pricing is missing required keys.
     """
     if not pricing:
         return None
-    
-    in_tokens = int(stats.input_tokens or 0)
-    out_tokens = int(stats.output_tokens or 0)
-    cached_in = int(stats.cached_input_tokens or 0)
+
+    # Require at least input + output prices
+    if pricing.get("input") is None or pricing.get("output") is None:
+        return None
+
+    pin = float(pricing["input"])
+    pout = float(pricing["output"])
+
+    in_tokens = int(getattr(stats, "input_tokens", 0) or 0)
+    out_tokens = int(getattr(stats, "output_tokens", 0) or 0)
+    reasoning = int(getattr(stats, "reasoning_tokens", 0) or 0)
+    cached_in = int(getattr(stats, "cached_input_tokens", 0) or 0)
+
+    # Clamp cached input to sane range
+    cached_in = max(min(cached_in, in_tokens), 0)
 
     billable_in = max(in_tokens - cached_in, 0)
     billable_cached_in = cached_in
-    billable_out = out_tokens  # ✅ reasoning already included
 
-    pin = float(pricing.get("input") or 0.0)
-    pout = float(pricing.get("output") or 0.0)
-    pcached = float(pricing.get("cached_input") or 0.0)
+    billable_out = out_tokens if reasoning_in_output else (out_tokens + reasoning)
 
-    cost = (billable_in / 1000) * pin \
-         + (billable_cached_in / 1000) * pcached \
-         + (billable_out / 1000) * pout
+    # Cached input price logic:
+    # 1) if explicit cached_input price provided => use it
+    # 2) else if implicit discount exists => pin * discount
+    # 3) else => 0
+    if pricing.get("cached_input") is not None:
+        pcached = float(pricing["cached_input"])
+    elif implicit_cache_discount is not None:
+        pcached = pin * float(implicit_cache_discount)
+    else:
+        pcached = 0.0
 
+    denom = float(tokens_per_unit)
+
+    cost = (
+        (billable_in / denom) * pin
+        + (billable_cached_in / denom) * pcached
+        + (billable_out / denom) * pout
+    )
     return cost
 
 
-def calc_cost_google(stats: LLMResponseStats, pricing: dict[str, Any]) -> Optional[float]:
+def calc_cost_openai(stats: Any, pricing: dict[str, Any]) -> float | None:
     """
-    Calculate cost for Google (Gemini) models.
-    
-    Google (Gemini) rule (implicit caching only):
-      - reasoning_tokens are SEPARATE => add them to output_tokens
-      - cached_input_tokens are not charged separately for implicit caching
-        (treat cached_input_price as 0 unless you explicitly enable caching)
-    
-    Args:
-        stats: LLMResponseStats with token counts
-        pricing: Pricing dict with keys: input, output
-    
-    Returns:
-        Cost in USD, or None if pricing is incomplete
+    OpenAI rules:
+      - reasoning_tokens already included in output_tokens
+      - cached_input_tokens billed at cached_input price (if provided)
     """
-    if not pricing:
-        return None
-    
-    in_tokens = int(stats.input_tokens or 0)
-    out_tokens = int(stats.output_tokens or 0)
-    reasoning = int(stats.reasoning_tokens or 0)
+    return _calc_llm_cost_shared(
+        stats,
+        pricing,
+        reasoning_in_output=True,
+        implicit_cache_discount=None,
+        tokens_per_unit=1000,
+    )
 
-    billable_in = in_tokens
-    billable_out = out_tokens + reasoning  # ✅ must add thinking/reasoning
 
-    pin = float(pricing.get("input") or 0.0)
-    pout = float(pricing.get("output") or 0.0)
-
-    cost = (billable_in / 1000) * pin \
-         + (billable_out / 1000) * pout
-
-    return cost
+def calc_cost_google(stats: Any, pricing: dict[str, Any]) -> float | None:
+    """
+    Gemini rules (implicit caching default):
+      - reasoning_tokens are separate => add them to output_tokens
+      - cached input billed at ~10% of input if cached_input price not provided
+    """
+    return _calc_llm_cost_shared(
+        stats,
+        pricing,
+        reasoning_in_output=False,
+        implicit_cache_discount=0.10,
+        tokens_per_unit=1000,
+    )
