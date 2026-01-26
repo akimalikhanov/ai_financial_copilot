@@ -3,27 +3,36 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from enum import Enum
+from typing import Any
 
-Role = Literal["system", "developer", "user", "assistant"]
+
+class Role(str, Enum):
+    system = "system"
+    developer = "developer"
+    user = "user"
+    assistant = "assistant"
+    tool = "tool"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Role
     content: str
+    name: str | None = None  # tool name (or function name)
+    tool_call_id: str | None = None  # ties tool result to assistant tool call
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ChatRequest:
-    messages: Sequence[ChatMessage]
+    messages: tuple[ChatMessage, ...]
     model: str
     temperature: float | None = None
     max_tokens: int | None = None
     extra_params: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LLMResponseStats:
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
@@ -36,14 +45,14 @@ class LLMResponseStats:
     cost_usd: float | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LLMResponse:
     text: str
     raw: Any = None  # provider-native response object (optional)
     stats: LLMResponseStats | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LLMStreamChunk:
     text: str
     raw: Any = None  # provider-native chunk object (optional)
@@ -53,6 +62,9 @@ class LLMStreamChunk:
 
 class LLMAdapter(ABC):
     """Provider-agnostic non-streaming interface."""
+
+    # Subclasses should override this to identify the provider for error mapping
+    provider_name: str = "unknown"
 
     def __init__(self, *, default_model: str):
         self.default_model = default_model
@@ -67,7 +79,7 @@ class LLMAdapter(ABC):
         **kwargs: Any,
     ) -> LLMResponse:
         req = ChatRequest(
-            messages=messages,
+            messages=tuple(messages),
             model=model or self.default_model,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -85,7 +97,7 @@ class LLMAdapter(ABC):
         **kwargs: Any,
     ) -> AsyncIterator[LLMStreamChunk]:
         req = ChatRequest(
-            messages=messages,
+            messages=tuple(messages),
             model=model or self.default_model,
             temperature=temperature,
             max_tokens=max_tokens,

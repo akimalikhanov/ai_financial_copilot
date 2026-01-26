@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
+from src.services.llm_runtime.exception_mapper import map_openai_error
 from src.utils.llm_adapter_utils import (
     calc_cost_openai,
     compute_tps,
@@ -31,6 +32,8 @@ class OpenAIChatRequest(ChatRequest):
 class OpenAIAdapter(LLMAdapter):
     """Uses openai-python AsyncOpenAI + Chat Completions (non-streaming)."""
 
+    provider_name: str = "openai"
+
     def __init__(
         self,
         *,
@@ -38,9 +41,12 @@ class OpenAIAdapter(LLMAdapter):
         api_key: str | None = None,
         base_url: str | None = None,  # useful for OpenAI-compatible servers
         include_usage: bool = True,
+        provider_name: str | None = None,  # override for vLLM or other compatible servers
     ):
         super().__init__(default_model=default_model)
         self.include_usage = include_usage
+        if provider_name is not None:
+            self.provider_name = provider_name
 
         from openai import AsyncOpenAI
 
@@ -106,7 +112,7 @@ class OpenAIAdapter(LLMAdapter):
         **kwargs: Any,
     ) -> OpenAIChatRequest:
         return OpenAIChatRequest(
-            messages=messages,
+            messages=tuple(messages),
             model=model or self.default_model,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -193,7 +199,10 @@ class OpenAIAdapter(LLMAdapter):
         kwargs = self._build_kwargs(req)
 
         start_ms = now_ms()
-        resp = await self._client.chat.completions.create(**cast(Any, kwargs))
+        try:
+            resp = await self._client.chat.completions.create(**cast(Any, kwargs))
+        except Exception as e:
+            raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
         latency_ms = elapsed_ms(start_ms)
 
         text = (resp.choices[0].message.content or "").strip()
@@ -207,37 +216,43 @@ class OpenAIAdapter(LLMAdapter):
 
     async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
         kwargs = self._build_kwargs(req)
-        if self.include_usage:
+        if self.include_usage and "stream_options" not in kwargs:
             kwargs["stream_options"] = {"include_usage": True}
 
         start_ms = now_ms()
         first_token_ms: float | None = None
 
-        stream = await self._client.chat.completions.create(
-            **cast(Any, kwargs),
-            stream=True,
-        )
+        try:
+            stream = await self._client.chat.completions.create(
+                **cast(Any, kwargs),
+                stream=True,
+            )
+        except Exception as e:
+            raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            text = getattr(delta, "content", None) or ""
-            usage = getattr(chunk, "usage", None)
+        try:
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                text = getattr(delta, "content", None) or ""
+                usage = getattr(chunk, "usage", None)
 
-            # Track first token time
-            if text and first_token_ms is None:
-                first_token_ms = now_ms()
+                # Track first token time
+                if text and first_token_ms is None:
+                    first_token_ms = now_ms()
 
-            # If this is the final chunk with usage, compute stats
-            if usage:
-                latency_ms = elapsed_ms(start_ms)
-                ttft_ms = elapsed_ms(start_ms, first_token_ms) if first_token_ms else None
-                stats = self._build_stats_from_usage(
-                    usage,
-                    model=req.model,
-                    latency_ms=latency_ms,
-                    ttft_ms=ttft_ms,
-                )
+                # If this is the final chunk with usage, compute stats
+                if usage:
+                    latency_ms = elapsed_ms(start_ms)
+                    ttft_ms = elapsed_ms(start_ms, first_token_ms) if first_token_ms else None
+                    stats = self._build_stats_from_usage(
+                        usage,
+                        model=req.model,
+                        latency_ms=latency_ms,
+                        ttft_ms=ttft_ms,
+                    )
 
-                yield LLMStreamChunk(text=text, raw=chunk, is_final=True, stats=stats)
-            elif text:
-                yield LLMStreamChunk(text=text, raw=chunk, is_final=False)
+                    yield LLMStreamChunk(text=text, raw=chunk, is_final=True, stats=stats)
+                elif text:
+                    yield LLMStreamChunk(text=text, raw=chunk, is_final=False)
+        except Exception as e:
+            raise map_openai_error(e, provider=self.provider_name, model=req.model) from e

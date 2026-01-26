@@ -70,7 +70,10 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
         # We default to False unless explicitly enabled in config
         include_usage = bool(model_cfg.get("include_usage", False))
         return OpenAIAdapter(
-            default_model=model_path, base_url=base_url, include_usage=include_usage
+            default_model=model_path,
+            base_url=base_url,
+            include_usage=include_usage,
+            provider_name="vllm",
         )
 
     raise LLMRouterError(f"Unsupported provider: {provider!r}")

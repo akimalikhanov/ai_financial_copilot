@@ -1,7 +1,10 @@
 from __future__ import annotations
+
+from collections.abc import AsyncIterator
 from dataclasses import replace
-from typing import Any, AsyncIterator, Optional
-from .base_adapter import ChatRequest, LLMAdapter, LLMResponse, LLMResponseStats, LLMStreamChunk
+from typing import Any, cast
+
+from src.services.llm_runtime.exception_mapper import map_google_error
 from src.utils.llm_adapter_utils import (
     calc_cost_google,
     compute_tps,
@@ -10,15 +13,19 @@ from src.utils.llm_adapter_utils import (
     now_ms,
 )
 
+from .base_adapter import ChatRequest, LLMAdapter, LLMResponse, LLMResponseStats, LLMStreamChunk
+
 
 class GeminiAdapter(LLMAdapter):
     """Uses google-genai (Gemini Developer API)."""
+
+    provider_name: str = "google"
 
     def __init__(
         self,
         *,
         default_model: str,
-        api_key: Optional[str] = None,  # if None, google-genai reads GEMINI_API_KEY
+        api_key: str | None = None,  # if None, google-genai reads GEMINI_API_KEY
     ):
         super().__init__(default_model=default_model)
 
@@ -41,9 +48,7 @@ class GeminiAdapter(LLMAdapter):
 
             # Gemini uses "user" and "model" roles for chat history
             role = "user" if m.role == "user" else "model"
-            contents.append(
-                types.Content(role=role, parts=[types.Part.from_text(text=m.content)])
-            )
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m.content)]))
 
         config_kwargs: dict[str, Any] = {}
         if sys_parts:
@@ -66,13 +71,23 @@ class GeminiAdapter(LLMAdapter):
         *,
         model: str,
         latency_ms: float,
-        ttft_ms: Optional[float] = None,
+        ttft_ms: float | None = None,
     ) -> LLMResponseStats:
-        input_tokens = getattr(usage_metadata, "prompt_token_count", None) if usage_metadata else None
-        output_tokens = getattr(usage_metadata, "candidates_token_count", None) if usage_metadata else None
-        total_tokens = getattr(usage_metadata, "total_token_count", None) if usage_metadata else None
-        reasoning_tokens = getattr(usage_metadata, "thoughts_token_count", None) if usage_metadata else None
-        cached_input_tokens = getattr(usage_metadata, "cached_content_token_count", None) if usage_metadata else None
+        input_tokens = (
+            getattr(usage_metadata, "prompt_token_count", None) if usage_metadata else None
+        )
+        output_tokens = (
+            getattr(usage_metadata, "candidates_token_count", None) if usage_metadata else None
+        )
+        total_tokens = (
+            getattr(usage_metadata, "total_token_count", None) if usage_metadata else None
+        )
+        reasoning_tokens = (
+            getattr(usage_metadata, "thoughts_token_count", None) if usage_metadata else None
+        )
+        cached_input_tokens = (
+            getattr(usage_metadata, "cached_content_token_count", None) if usage_metadata else None
+        )
 
         stats = LLMResponseStats(
             input_tokens=input_tokens,
@@ -99,11 +114,14 @@ class GeminiAdapter(LLMAdapter):
         contents, config = self._build_contents_and_config(req)
 
         start_ms = now_ms()
-        resp = await self._client.aio.models.generate_content(
-            model=req.model,
-            contents=contents if contents else "Hello",
-            config=config,
-        )
+        try:
+            resp = await self._client.aio.models.generate_content(
+                model=req.model,
+                contents=cast(Any, contents),
+                config=config,
+            )
+        except Exception as e:
+            raise map_google_error(e, provider=self.provider_name, model=req.model) from e
         latency_ms = elapsed_ms(start_ms)
 
         text = (resp.text or "").strip()
@@ -122,30 +140,36 @@ class GeminiAdapter(LLMAdapter):
         contents, config = self._build_contents_and_config(req)
 
         start_ms = now_ms()
-        first_token_ms: Optional[float] = None
+        first_token_ms: float | None = None
         last_usage_metadata = None
         last_chunk = None
 
-        stream = self._client.aio.models.generate_content_stream(
-            model=req.model,
-            contents=contents if contents else "Hello",
-            config=config,
-        )
-        if isawaitable(stream):
-            stream = await stream
+        try:
+            stream = self._client.aio.models.generate_content_stream(
+                model=req.model,
+                contents=cast(Any, contents),
+                config=config,
+            )
+            if isawaitable(stream):
+                stream = await stream
+        except Exception as e:
+            raise map_google_error(e, provider=self.provider_name, model=req.model) from e
 
-        async for chunk in stream:
-            last_chunk = chunk
-            text = (getattr(chunk, "text", None) or "")
-            if text and first_token_ms is None:
-                first_token_ms = now_ms()
+        try:
+            async for chunk in stream:
+                last_chunk = chunk
+                text = getattr(chunk, "text", None) or ""
+                if text and first_token_ms is None:
+                    first_token_ms = now_ms()
 
-            usage_metadata = getattr(chunk, "usage_metadata", None)
-            if usage_metadata is not None:
-                last_usage_metadata = usage_metadata
+                usage_metadata = getattr(chunk, "usage_metadata", None)
+                if usage_metadata is not None:
+                    last_usage_metadata = usage_metadata
 
-            if text:
-                yield LLMStreamChunk(text=text, raw=chunk)
+                if text:
+                    yield LLMStreamChunk(text=text, raw=chunk)
+        except Exception as e:
+            raise map_google_error(e, provider=self.provider_name, model=req.model) from e
 
         if last_usage_metadata is not None:
             latency_ms = elapsed_ms(start_ms)
