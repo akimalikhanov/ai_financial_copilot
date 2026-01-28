@@ -1,0 +1,44 @@
+errors:
+  400:
+    user: "Something went wrong with your request. Please try again."
+    internal: "Bad Request: The request was malformed or contained invalid parameters."
+
+  401:
+    user: "You're not logged in or your session expired."
+    internal: "Authentication Error: API key is missing, invalid, or incorrect."
+
+  403:
+    user: "You don't have permission to perform this action."
+    internal: "Permission Denied: Your API key does not have access to this resource."
+
+  404:
+    user: "We couldn't find what you were looking for."
+    internal: "Not Found: The requested resource (e.g., model) does not exist."
+
+  408:
+    user: "The request took too long. Please try again."
+    internal: "Request Timeout: The server timed out waiting for the request."
+
+  422:
+    user: "Some input is invalid. Please check your data."
+    internal: "Unprocessable Entity: The JSON was valid, but the input was invalid."
+
+  429:
+    user: "Too many requests. Please wait a moment and try again."
+    internal: "Rate Limit Exceeded: Too many requests or quota exhausted."
+
+  500:
+    user: "Something went wrong on our side."
+    internal: "Internal Server Error: Something went wrong on the server side."
+
+  502:
+    user: "Service is temporarily unavailable."
+    internal: "Bad Gateway: An upstream server failed."
+
+  503:
+    user: "Service is currently unavailable. Please try again later."
+    internal: "Service Unavailable: The server is overloaded or under maintenance."
+
+  504:
+    user: "The server took too long to respond."
+    internal: "Gateway Timeout: The upstream server timed out."

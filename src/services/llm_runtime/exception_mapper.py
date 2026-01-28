@@ -39,6 +39,22 @@ def _extract_retry_after(error: Exception) -> float | None:
     return None
 
 
+def _extract_status_code(error: Exception) -> int | None:
+    """Extract HTTP status code from common error attributes."""
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        return code
+    code_value = getattr(code, "value", None)
+    if isinstance(code_value, int):
+        return code_value
+
+    return None
+
+
 def map_openai_error(
     error: Exception,
     *,
@@ -60,6 +76,7 @@ def map_openai_error(
 
     retry_after = _extract_retry_after(error)
     retry_info = RetryInfo(retry_after_seconds=retry_after) if retry_after else None
+    status_code = _extract_status_code(error)
 
     common_kwargs = {
         "provider": provider,
@@ -69,52 +86,96 @@ def map_openai_error(
     }
 
     if isinstance(error, RateLimitError):
-        return LLMRateLimitError(str(error), **common_kwargs)
+        return LLMRateLimitError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 429,
+        )
 
     if isinstance(error, AuthenticationError):
-        return LLMAuthenticationError(str(error), **common_kwargs)
+        return LLMAuthenticationError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 401,
+        )
 
     if isinstance(error, PermissionDeniedError):
-        return LLMPermissionError(str(error), **common_kwargs)
+        return LLMPermissionError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 403,
+        )
 
     if isinstance(error, NotFoundError):
-        return LLMNotFoundError(str(error), **common_kwargs)
+        return LLMNotFoundError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 404,
+        )
 
     if isinstance(error, BadRequestError):
         # Check for specific error types
         msg = str(error).lower()
         if "context_length" in msg or "maximum context" in msg or "too long" in msg:
-            return LLMContextLengthError(str(error), **common_kwargs)
+            return LLMContextLengthError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 400,
+            )
         if "content" in msg and ("filter" in msg or "policy" in msg or "blocked" in msg):
-            return LLMContentFilterError(str(error), **common_kwargs)
-        return LLMInvalidRequestError(str(error), **common_kwargs)
+            return LLMContentFilterError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 400,
+            )
+        return LLMInvalidRequestError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 400,
+        )
 
     if isinstance(error, InternalServerError):
         # Check status code for more specific mapping
         status_code = getattr(error, "status_code", 500)
         if status_code == 503:
-            return LLMServiceUnavailableError(str(error), **common_kwargs)
-        return LLMServerError(str(error), **common_kwargs)
+            return LLMServiceUnavailableError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 503,
+            )
+        return LLMServerError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 500,
+        )
 
     if isinstance(error, APITimeoutError):
-        return LLMTimeoutError(str(error), **common_kwargs)
+        return LLMTimeoutError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 408,
+        )
 
     if isinstance(error, APIConnectionError):
-        return LLMConnectionError(str(error), **common_kwargs)
+        return LLMConnectionError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code,
+        )
 
     if isinstance(error, APIStatusError):
         # Fallback for other status errors
         status_code = getattr(error, "status_code", None)
         if status_code == 429:
-            return LLMRateLimitError(str(error), **common_kwargs)
+            return LLMRateLimitError(str(error), **common_kwargs, status_code=429)
         if status_code in (500, 502):
-            return LLMServerError(str(error), **common_kwargs)
+            return LLMServerError(str(error), **common_kwargs, status_code=status_code)
         if status_code == 503:
-            return LLMServiceUnavailableError(str(error), **common_kwargs)
-        return LLMError(str(error), **common_kwargs)
+            return LLMServiceUnavailableError(str(error), **common_kwargs, status_code=503)
+        return LLMError(str(error), **common_kwargs, status_code=status_code)
 
     # Unknown error - wrap as generic LLMError
-    return LLMError(str(error), **common_kwargs)
+    return LLMError(str(error), **common_kwargs, status_code=status_code)
 
 
 def map_google_error(
@@ -127,6 +188,7 @@ def map_google_error(
     # google.genai uses google.api_core.exceptions
     from google.api_core import exceptions as google_exceptions
 
+    status_code = _extract_status_code(error)
     common_kwargs = {
         "provider": provider,
         "model": model,
@@ -134,34 +196,70 @@ def map_google_error(
     }
 
     if isinstance(error, google_exceptions.ResourceExhausted):
-        return LLMRateLimitError(str(error), **common_kwargs)
+        return LLMRateLimitError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 429,
+        )
 
     if isinstance(error, google_exceptions.Unauthenticated):
-        return LLMAuthenticationError(str(error), **common_kwargs)
+        return LLMAuthenticationError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 401,
+        )
 
     if isinstance(error, google_exceptions.PermissionDenied):
-        return LLMPermissionError(str(error), **common_kwargs)
+        return LLMPermissionError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 403,
+        )
 
     if isinstance(error, google_exceptions.NotFound):
-        return LLMNotFoundError(str(error), **common_kwargs)
+        return LLMNotFoundError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 404,
+        )
 
     if isinstance(error, google_exceptions.InvalidArgument):
         msg = str(error).lower()
         if "token" in msg and ("limit" in msg or "exceed" in msg):
-            return LLMContextLengthError(str(error), **common_kwargs)
-        return LLMInvalidRequestError(str(error), **common_kwargs)
+            return LLMContextLengthError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 400,
+            )
+        return LLMInvalidRequestError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 400,
+        )
 
     if isinstance(error, google_exceptions.DeadlineExceeded):
-        return LLMTimeoutError(str(error), **common_kwargs)
+        return LLMTimeoutError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 408,
+        )
 
     if isinstance(error, google_exceptions.ServiceUnavailable):
-        return LLMServiceUnavailableError(str(error), **common_kwargs)
+        return LLMServiceUnavailableError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 503,
+        )
 
     if isinstance(error, google_exceptions.InternalServerError):
-        return LLMServerError(str(error), **common_kwargs)
+        return LLMServerError(
+            str(error),
+            **common_kwargs,
+            status_code=status_code or 500,
+        )
 
     if isinstance(error, google_exceptions.GoogleAPIError):
-        return LLMError(str(error), **common_kwargs)
+        return LLMError(str(error), **common_kwargs, status_code=status_code)
 
     # Unknown error
-    return LLMError(str(error), **common_kwargs)
+    return LLMError(str(error), **common_kwargs, status_code=status_code)

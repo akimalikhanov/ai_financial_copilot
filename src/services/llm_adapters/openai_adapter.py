@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from src.services.llm_runtime.exception_mapper import map_openai_error
-from src.utils.llm_adapter_utils import (
+from src.utils.llm_utils import (
     calc_cost_openai,
     compute_tps,
     elapsed_ms,

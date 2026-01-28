@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import os
-import re
 import time
 from pathlib import Path
 from typing import Any
 
-import yaml
-from dotenv import load_dotenv
-
-# Load environment variables from .env file (if present)
-load_dotenv()
+from src.utils.config import load_models_config
 
 
 def now_ms() -> float:
@@ -39,50 +33,6 @@ def compute_tps(
     if effective_latency_ms <= 0.0:
         return None
     return output_tokens / (effective_latency_ms / 1000.0)
-
-
-def _expand_env_vars(value: Any) -> Any:
-    """Recursively expand ${VAR:-default} patterns in YAML values."""
-    if isinstance(value, str):
-        # Match ${VAR:-default} pattern
-        pattern = r"\$\{([^:}]+)(?::-([^}]*))?\}"
-
-        def replacer(match: re.Match[str]) -> str:
-            var_name = match.group(1)
-            default = match.group(2) if match.group(2) is not None else ""
-            return os.getenv(var_name, default)
-
-        return re.sub(pattern, replacer, value)
-    elif isinstance(value, dict):
-        return {k: _expand_env_vars(v) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [_expand_env_vars(item) for item in value]
-    else:
-        return value
-
-
-def load_models_config(config_path: str | Path | None = None) -> dict[str, Any]:
-    """
-    Load models.yaml config file with environment variable expansion.
-
-    Args:
-        config_path: Path to models.yaml. If None, uses infra/config/models.yaml relative to project root.
-
-    Returns:
-        Parsed YAML dict with env vars expanded.
-    """
-    if config_path is None:
-        # Assume we're in src/utils/, go up to project root
-        project_root = Path(__file__).parent.parent.parent
-        config_path = project_root / "infra" / "config" / "models.yaml"
-    else:
-        config_path = Path(config_path)
-
-    with open(config_path) as f:
-        raw_data = yaml.safe_load(f)
-
-    # Expand environment variables
-    return _expand_env_vars(raw_data)
 
 
 def get_pricing_for_model(

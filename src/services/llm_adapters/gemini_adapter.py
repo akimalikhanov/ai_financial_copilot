@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Any, cast
 
 from src.services.llm_runtime.exception_mapper import map_google_error
-from src.utils.llm_adapter_utils import (
+from src.utils.llm_utils import (
     calc_cost_google,
     compute_tps,
     elapsed_ms,

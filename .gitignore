@@ -29,7 +29,7 @@ wheels/
 
 # docs
 .cursor/
-AGENTS.MD
+AGENTS.md
 
 # misc
 experiments/

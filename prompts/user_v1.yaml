@@ -1,0 +1,15 @@
+version: "v1"
+name: "user"
+description: "User message with retrieved context and query"
+template: |
+  **Retrieved Document Chunks**:
+  {{ context }}
+
+  **Question**: {{ user_query }}
+variables:
+  - context
+  - user_query
+metadata:
+  author: "AI Financial Copilot Team"
+  created_at: "2025-01-01"
+  purpose: "Format user queries with retrieved document excerpts"

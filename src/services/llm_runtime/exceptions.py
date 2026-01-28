@@ -6,6 +6,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from src.utils.config import load_error_maps
+
+
+_ERROR_MAPS: dict[int, dict[str, str]] = load_error_maps()
+
 
 @dataclass(frozen=True)
 class RetryInfo:
@@ -54,7 +59,7 @@ class LLMError(Exception):
         Returns:
             Dictionary with error details if as_json=False, otherwise JSON string.
             Dict keys: error_type, message, provider, model, is_retryable,
-            error_code, status_code, details, retry_info, original_error_type
+            error_code, status_code, internal_message, user_message, details, retry_info, original_error_type
 
         Example:
             >>> error.to_dict()  # Returns dict
@@ -75,8 +80,14 @@ class LLMError(Exception):
         if self.error_code:
             result["error_code"] = self.error_code
 
-        if self.status_code:
+        if self.status_code is not None:
             result["status_code"] = self.status_code
+            error_map = _ERROR_MAPS.get(self.status_code)
+            if error_map:
+                if "internal" in error_map:
+                    result["internal_message"] = error_map["internal"]
+                if "user" in error_map:
+                    result["user_message"] = error_map["user"]
 
         if self.details:
             result["details"] = self.details

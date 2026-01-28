@@ -14,7 +14,7 @@ from src.services.llm_adapters.base_adapter import (
 )
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
-from src.utils.llm_adapter_utils import load_models_config
+from src.utils.config import load_models_config
 
 
 class LLMRouterError(ValueError):
