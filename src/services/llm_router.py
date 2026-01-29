@@ -14,11 +14,8 @@ from src.services.llm_adapters.base_adapter import (
 )
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
+from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
 from src.utils.config import load_models_config
-
-
-class LLMRouterError(ValueError):
-    pass
 
 
 def _merge_params(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -43,26 +40,42 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
     if provider == "openai":
         model_name = model_cfg.get("model_name")
         if not model_name:
-            raise LLMRouterError("OpenAI model is missing model_name")
+            raise LLMServerError(
+                "OpenAI model is missing model_name",
+                provider=provider,
+                status_code=500,
+            )
         return OpenAIAdapter(default_model=model_name)
 
     if provider == "google":
         model_name = model_cfg.get("model_name")
         if not model_name:
-            raise LLMRouterError("Google model is missing model_name")
+            raise LLMServerError(
+                "Google model is missing model_name",
+                provider=provider,
+                status_code=500,
+            )
         return GeminiAdapter(default_model=model_name)
 
     if provider == "vllm":
         model_path = model_cfg.get("model_path")
         server = model_cfg.get("server") or {}
         if not model_path:
-            raise LLMRouterError("vLLM model is missing model_path")
+            raise LLMServerError(
+                "vLLM model is missing model_path",
+                provider=provider,
+                status_code=500,
+            )
 
         host = server.get("host")
         port = server.get("port")
         base_path = server.get("base_path") or "/v1"
         if not host or not port:
-            raise LLMRouterError("vLLM server config missing host/port")
+            raise LLMServerError(
+                "vLLM server config missing host/port",
+                provider=provider,
+                status_code=500,
+            )
 
         base_url = _normalize_base_url(host, port, base_path)
 
@@ -76,7 +89,7 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             provider_name="vllm",
         )
 
-    raise LLMRouterError(f"Unsupported provider: {provider!r}")
+    raise LLMServerError(f"Unsupported provider: {provider!r}", provider=provider, status_code=500)
 
 
 @dataclass(frozen=True)
@@ -147,10 +160,19 @@ class LLMRouter:
         try:
             return self._models[model_id]
         except KeyError:
-            raise LLMRouterError(f"Unknown model_id: {model_id}") from None
+            raise LLMNotFoundError(
+                f"Unknown model_id: {model_id}",
+                model=model_id,
+                status_code=404,
+            ) from None
 
     def list_models(self) -> list[str]:
         return sorted(self._models.keys())
+
+    async def close(self) -> None:
+        """Close all adapter HTTP clients for graceful shutdown."""
+        for routed in self._models.values():
+            await routed.adapter.close()
 
 
 @lru_cache(maxsize=1)

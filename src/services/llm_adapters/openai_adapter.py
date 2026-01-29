@@ -52,6 +52,10 @@ class OpenAIAdapter(LLMAdapter):
 
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.close()
+
     @staticmethod
     def _is_gpt_5_model(model: str) -> bool:
         """Check if model is a GPT-5 model (supports reasoning_effort/verbosity, but not temperature)."""

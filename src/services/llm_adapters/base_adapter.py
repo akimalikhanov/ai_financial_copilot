@@ -69,6 +69,10 @@ class LLMAdapter(ABC):
     def __init__(self, *, default_model: str):
         self.default_model = default_model
 
+    async def close(self) -> None:
+        """Clean up resources (HTTP clients, connections). Override in subclasses."""
+        pass
+
     async def complete(
         self,
         messages: Sequence[ChatMessage],

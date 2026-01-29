@@ -34,6 +34,21 @@ class GeminiAdapter(LLMAdapter):
         # If api_key is None, genai.Client() will read GEMINI_API_KEY from env.
         self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        # google-genai Client uses httpx internally; close via _api_client if available
+        api_client = getattr(self._client, "_api_client", None)
+        if not api_client:
+            return
+
+        close = getattr(api_client, "close", None)
+        if not close:
+            return
+
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
     def _build_contents_and_config(self, req: ChatRequest):
         from google.genai import types
 

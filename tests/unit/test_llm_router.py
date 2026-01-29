@@ -26,12 +26,12 @@ import src.services.llm_router as llm_router_mod
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
 from src.services.llm_router import (
     LLMRouter,
-    LLMRouterError,
     RoutedLLM,
     _build_adapter,
     _merge_params,
     _normalize_base_url,
 )
+from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
 
 
 # -------------------------
@@ -206,26 +206,26 @@ class TestBuildAdapter:
         assert adapter.include_usage is False
 
     def test_openai_missing_model_name(self):
-        with pytest.raises(LLMRouterError, match="missing model_name"):
+        with pytest.raises(LLMServerError, match="missing model_name"):
             _build_adapter("openai", {})
 
     def test_google_missing_model_name(self):
-        with pytest.raises(LLMRouterError, match="missing model_name"):
+        with pytest.raises(LLMServerError, match="missing model_name"):
             _build_adapter("google", {})
 
     def test_vllm_missing_model_path(self):
-        with pytest.raises(LLMRouterError, match="missing model_path"):
+        with pytest.raises(LLMServerError, match="missing model_path"):
             _build_adapter("vllm", {"server": {"host": "localhost", "port": "8002"}})
 
     def test_vllm_missing_host_or_port(self):
-        with pytest.raises(LLMRouterError, match="missing host/port"):
+        with pytest.raises(LLMServerError, match="missing host/port"):
             _build_adapter("vllm", {"model_path": "llama-3", "server": {"port": "8000"}})
 
-        with pytest.raises(LLMRouterError, match="missing host/port"):
+        with pytest.raises(LLMServerError, match="missing host/port"):
             _build_adapter("vllm", {"model_path": "llama-3", "server": {"host": "localhost"}})
 
     def test_unsupported_provider(self):
-        with pytest.raises(LLMRouterError, match="Unsupported provider"):
+        with pytest.raises(LLMServerError, match="Unsupported provider"):
             _build_adapter("anthropic", {})
 
 
@@ -388,7 +388,7 @@ class TestLLMRouter:
 
     def test_router_get_unknown_model_raises(self, router_config):
         router = LLMRouter(router_config)
-        with pytest.raises(LLMRouterError, match="Unknown model_id"):
+        with pytest.raises(LLMNotFoundError, match="Unknown model_id"):
             router.get("unknown")
 
     def test_router_calls_build_adapter_for_each_valid_model(self, monkeypatch, router_config):
