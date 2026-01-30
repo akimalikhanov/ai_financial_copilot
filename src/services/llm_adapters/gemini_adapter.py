@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import replace
 from typing import Any, cast
 
@@ -149,7 +149,7 @@ class GeminiAdapter(LLMAdapter):
 
         return LLMResponse(text=text, raw=resp, stats=stats)
 
-    async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
+    async def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         from inspect import isawaitable
 
         contents, config = self._build_contents_and_config(req)

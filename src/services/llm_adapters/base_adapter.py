@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -69,6 +69,7 @@ class LLMAdapter(ABC):
     def __init__(self, *, default_model: str):
         self.default_model = default_model
 
+    @abstractmethod
     async def close(self) -> None:
         """Clean up resources (HTTP clients, connections). Override in subclasses."""
         pass
@@ -99,7 +100,7 @@ class LLMAdapter(ABC):
         temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
-    ) -> AsyncIterator[LLMStreamChunk]:
+    ) -> AsyncGenerator[LLMStreamChunk, None]:
         req = ChatRequest(
             messages=tuple(messages),
             model=model or self.default_model,
@@ -114,5 +115,5 @@ class LLMAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
+    def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         raise NotImplementedError

@@ -1,7 +1,7 @@
 # llm_router_runtime.py
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -107,7 +107,7 @@ class RoutedLLM:
 
     def stream(
         self, messages: Sequence[ChatMessage], **params: Any
-    ) -> AsyncIterator[LLMStreamChunk]:
+    ) -> AsyncGenerator[LLMStreamChunk, None]:
         merged = _merge_params(self.default_params, params)
         return self.adapter.stream(messages=messages, **merged)
 
@@ -116,7 +116,7 @@ class RoutedLLM:
         messages: Sequence[ChatMessage],
         stream: bool | None = None,
         **params: Any,
-    ) -> Coroutine[Any, Any, LLMResponse] | AsyncIterator[LLMStreamChunk]:
+    ) -> Coroutine[Any, Any, LLMResponse] | AsyncGenerator[LLMStreamChunk, None]:
         """
         Convenience method that delegates to stream() or complete() based on configuration.
         """

@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from src.api.logging import configure_logging
-from src.api.middleware import request_id_middleware
+from src.api.exceptions import llm_error_handler
+from src.api.logging import configure_logging, request_logging_middleware
 from src.api.routers import get_routers
 from src.services.llm_router import get_router
+from src.services.llm_runtime.exceptions import LLMError
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifecycle: startup and shutdown."""
     # Startup
     app.state.llm_router = get_router()
@@ -33,7 +34,10 @@ def create_app() -> FastAPI:
     configure_logging()
 
     app = FastAPI(title="AI Financial Copilot API", lifespan=lifespan)
-    app.middleware("http")(request_id_middleware)
+    app.middleware("http")(request_logging_middleware)
+
+    # Register global exception handler for LLM errors
+    app.add_exception_handler(LLMError, llm_error_handler)
 
     for router in get_routers():
         app.include_router(router)

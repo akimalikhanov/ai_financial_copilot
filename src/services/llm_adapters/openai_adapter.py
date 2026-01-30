@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
@@ -187,7 +187,7 @@ class OpenAIAdapter(LLMAdapter):
         reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None,
         verbosity: Literal["high", "medium", "low"] | None = None,
         **kwargs: Any,
-    ) -> AsyncIterator[LLMStreamChunk]:
+    ) -> AsyncGenerator[LLMStreamChunk, None]:
         req = self._build_request(
             messages,
             model=model,
@@ -218,7 +218,7 @@ class OpenAIAdapter(LLMAdapter):
 
         return LLMResponse(text=text, raw=resp, stats=stats)
 
-    async def _stream(self, req: ChatRequest) -> AsyncIterator[LLMStreamChunk]:
+    async def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         kwargs = self._build_kwargs(req)
         if self.include_usage and "stream_options" not in kwargs:
             kwargs["stream_options"] = {"include_usage": True}

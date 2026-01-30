@@ -94,8 +94,7 @@ class PromptLoader:
                     f"Available versions: {available}"
                 )
             raise PromptLoaderError(
-                f"Template '{name}' not found. "
-                f"Available templates: {self.list_templates()}"
+                f"Template '{name}' not found. Available templates: {self.list_templates()}"
             )
 
         try:

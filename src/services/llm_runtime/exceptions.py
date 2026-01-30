@@ -8,7 +8,6 @@ from typing import Any
 
 from src.utils.config import load_error_maps
 
-
 _ERROR_MAPS: dict[int, dict[str, str]] = load_error_maps()
 
 

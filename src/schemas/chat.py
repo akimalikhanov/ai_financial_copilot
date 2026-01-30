@@ -28,8 +28,8 @@ class ChatRequest(BaseModel):
 
     messages: list[ChatMessage]
     model: str
-    temperature: float | None = None
-    max_tokens: int | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
     extra_params: dict[str, Any] = Field(default_factory=dict)
 
 

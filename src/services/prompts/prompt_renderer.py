@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, UndefinedError
+from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, Undefined, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 
 from src.schemas.prompt import PromptTemplate
@@ -49,8 +49,8 @@ class PromptRenderer:
         # Create Jinja2 environment
         env_class = SandboxedEnvironment if sandboxed else Environment
         self._env = env_class(
-            # Use StrictUndefined to catch missing variables
-            undefined=StrictUndefined if strict else None,
+            # Use StrictUndefined to catch missing variables, or Undefined for lenient mode
+            undefined=StrictUndefined if strict else Undefined,
             # Keep whitespace handling predictable
             trim_blocks=True,
             lstrip_blocks=True,
@@ -91,7 +91,9 @@ class PromptRenderer:
         self._validate_variables(template, {"context": context, "user_query": user_query})
 
         # Render the template
-        return self._render_template(template.template, {"context": context, "user_query": user_query})
+        return self._render_template(
+            template.template, {"context": context, "user_query": user_query}
+        )
 
     def _render_template(self, template_string: str, variables: dict[str, Any]) -> str:
         """
@@ -117,9 +119,7 @@ class PromptRenderer:
         except Exception as e:
             raise PromptRendererError(f"Template rendering failed: {e}") from e
 
-    def _validate_variables(
-        self, template: PromptTemplate, variables: dict[str, Any]
-    ) -> None:
+    def _validate_variables(self, template: PromptTemplate, variables: dict[str, Any]) -> None:
         """
         Validate that all required variables are provided.
 
