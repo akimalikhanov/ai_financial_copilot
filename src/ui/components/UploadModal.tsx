@@ -57,11 +57,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm p-4">
-      <Card className="w-full max-w-lg overflow-hidden bg-zinc-900 border-zinc-800 shadow-2xl">
-        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
-          <h3 className="text-sm font-bold font-mono tracking-widest text-zinc-100 uppercase">
-            Upload Document <span className="text-zinc-600 ml-2">step {step}/3</span>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+      <Card className="w-full max-w-lg overflow-hidden shadow-xl" variant="elevated">
+        <div className="flex items-center justify-between p-4 border-b border-[var(--border)]">
+          <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wide">
+            Upload Document <span className="text-[var(--text-faint)] ml-2 font-normal">step {step}/3</span>
           </h3>
           <Button variant="ghost" size="icon" onClick={onClose}>
             <X size={18} />
@@ -71,7 +71,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
         <div className="p-6">
           {step === 1 && (
             <div 
-              className="border-2 border-dashed border-zinc-700 rounded-lg p-10 flex flex-col items-center justify-center text-center hover:bg-zinc-800/50 transition-colors cursor-pointer"
+              className="border-2 border-dashed border-[var(--border)] rounded-xl p-10 flex flex-col items-center justify-center text-center hover:bg-[var(--surface-2)] hover:border-[var(--accent)] transition-colors cursor-pointer"
               onDragOver={handleDragOver}
               onDrop={handleDrop}
               onClick={() => document.getElementById('file-upload')?.click()}
@@ -85,15 +85,15 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
               />
               {file ? (
                 <div className="flex flex-col items-center">
-                   <File size={48} className="text-accent-500 mb-4" />
-                   <p className="font-mono text-zinc-200">{file.name}</p>
-                   <p className="text-xs text-zinc-500 mt-1">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
+                   <File size={48} className="text-[var(--accent)] mb-4" />
+                   <p className="font-medium text-[var(--text)]">{file.name}</p>
+                   <p className="text-xs text-[var(--text-faint)] mt-1">{(file.size / 1024 / 1024).toFixed(2)} MB</p>
                 </div>
               ) : (
                 <>
-                   <UploadCloud size={48} className="text-zinc-600 mb-4" />
-                   <p className="text-zinc-300 font-medium">Drag PDF here or click to browse</p>
-                   <p className="text-xs text-zinc-500 mt-2">Max file size 50MB</p>
+                   <UploadCloud size={48} className="text-[var(--text-faint)] mb-4" />
+                   <p className="text-[var(--text)] font-medium">Drag PDF here or click to browse</p>
+                   <p className="text-xs text-[var(--text-faint)] mt-2">Max file size 50MB</p>
                 </>
               )}
             </div>
@@ -102,17 +102,17 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
           {step === 2 && (
             <div className="space-y-4">
                 <div>
-                    <label className="block text-xs font-mono text-zinc-500 mb-1">COMPANY</label>
+                    <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Company</label>
                     <Input placeholder="e.g. Acme Corp" defaultValue="Uploaded Corp" />
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                     <div>
-                        <label className="block text-xs font-mono text-zinc-500 mb-1">YEAR</label>
+                        <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Year</label>
                         <Input type="number" defaultValue="2024" />
                     </div>
                     <div>
-                        <label className="block text-xs font-mono text-zinc-500 mb-1">TYPE</label>
-                        <select className="flex h-10 w-full rounded-sm border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-sm text-zinc-100">
+                        <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Type</label>
+                        <select className="flex h-10 w-full rounded-md border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer">
                             <option>Annual Report</option>
                             <option>10-K</option>
                             <option>Earnings Call</option>
@@ -124,27 +124,27 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
 
           {step === 3 && (
             <div className="py-8">
-                 <div className="flex justify-between text-xs font-mono text-zinc-400 mb-2">
-                    <span>UPLOADING & PROCESSING</span>
-                    <span>{progress}%</span>
+                 <div className="flex justify-between text-xs font-medium text-[var(--text-muted)] mb-2 uppercase tracking-wide">
+                    <span>Uploading & Processing</span>
+                    <span className="font-mono">{progress}%</span>
                  </div>
-                 <div className="h-2 w-full bg-zinc-800 rounded-full overflow-hidden">
+                 <div className="h-2 w-full bg-[var(--surface-3)] rounded-full overflow-hidden">
                     <div 
-                        className="h-full bg-accent-500 transition-all duration-300 ease-out"
+                        className="h-full bg-[var(--accent)] transition-all duration-300 ease-out rounded-full"
                         style={{ width: `${progress}%` }}
                     />
                  </div>
                  {progress === 100 && (
-                    <div className="flex items-center justify-center mt-6 text-emerald-400 gap-2">
+                    <div className="flex items-center justify-center mt-6 text-[var(--success)] gap-2">
                         <Check size={16} />
-                        <span className="font-mono text-sm">COMPLETE</span>
+                        <span className="font-medium text-sm">Complete</span>
                     </div>
                  )}
             </div>
           )}
         </div>
 
-        <div className="p-4 border-t border-zinc-800 bg-zinc-900/50 flex justify-end gap-2">
+        <div className="p-4 border-t border-[var(--border)] bg-[var(--surface-1)] flex justify-end gap-2">
            {step === 1 && (
              <Button disabled={!file} onClick={() => setStep(2)}>Next: Metadata</Button>
            )}

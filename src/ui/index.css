@@ -1,0 +1,330 @@
+/**
+ * Global Styles - ChatGPT-inspired Design System
+ * 
+ * All design tokens are defined as CSS custom properties.
+ * Dark mode is default; light mode activates via .light class on html/body.
+ */
+
+/* ============================================
+   CSS CUSTOM PROPERTIES (Design Tokens)
+   ============================================ */
+
+:root,
+html.dark {
+  /* Backgrounds - ChatGPT style: darker sidebar, lighter main content */
+  --bg: #212121;              /* Main chat area - lighter gray */
+  --surface-1: #171717;       /* Sidebar - darker */
+  --surface-2: #2F2F2F;       /* Hover states, cards */
+  --surface-3: #3D3D3D;       /* Active states, highlights */
+  
+  /* Borders - Very subtle 1px dividers */
+  --border: #3D3D3D;
+  --border-subtle: #2F2F2F;
+  
+  /* Text - High contrast primary, muted secondary */
+  --text: #ECECEC;
+  --text-muted: #B4B4B4;
+  --text-faint: #8E8E8E;
+  --icon: #B4B4B4;
+  
+  /* Accent - OpenAI green */
+  --accent: #10A37F;
+  --accent-hover: #12B08A;
+  --accent-pressed: #0E8F6F;
+  --accent-subtle: rgba(16, 163, 127, 0.12);
+  --link: #10A37F;
+  --focus-ring: rgba(16, 163, 127, 0.35);
+  
+  /* Semantic colors */
+  --success: #22C55E;
+  --success-bg: rgba(34, 197, 94, 0.12);
+  --warning: #F59E0B;
+  --warning-bg: rgba(245, 158, 11, 0.12);
+  --danger: #EF4444;
+  --danger-bg: rgba(239, 68, 68, 0.12);
+  
+  /* Inputs */
+  --input-bg: #2F2F2F;
+  --input-border: #3D3D3D;
+  --input-border-focus: #10A37F;
+  --placeholder: #8E8E8E;
+  
+  /* Code blocks */
+  --code-bg: #171717;
+  --code-border: #3D3D3D;
+  
+  /* Chat bubbles */
+  --bubble-user-bg: #2F2F2F;
+  --bubble-assistant-bg: transparent;
+  
+  /* Scrollbar colors */
+  --scrollbar-track: #212121;
+  --scrollbar-thumb: #3D3D3D;
+  --scrollbar-thumb-hover: #4D4D4D;
+}
+
+html.light {
+  /* Backgrounds - ChatGPT style: gray sidebar, white main content */
+  --bg: #FFFFFF;              /* Main chat area - white */
+  --surface-1: #F7F7F8;       /* Sidebar - light gray */
+  --surface-2: #EFEFEF;       /* Hover states */
+  --surface-3: #E5E5E5;       /* Active states */
+  
+  /* Borders */
+  --border: #E5E5E5;
+  --border-subtle: #EFEFEF;
+  
+  /* Text */
+  --text: #0D0D0D;
+  --text-muted: #6E6E6E;
+  --text-faint: #8E8E8E;
+  --icon: #6E6E6E;
+  
+  /* Accent */
+  --accent: #10A37F;
+  --accent-hover: #0F946F;
+  --accent-pressed: #0D8562;
+  --accent-subtle: rgba(16, 163, 127, 0.08);
+  --link: #10A37F;
+  --focus-ring: rgba(16, 163, 127, 0.25);
+  
+  /* Semantic */
+  --success: #16A34A;
+  --success-bg: rgba(22, 163, 74, 0.1);
+  --warning: #D97706;
+  --warning-bg: rgba(217, 119, 6, 0.1);
+  --danger: #DC2626;
+  --danger-bg: rgba(220, 38, 38, 0.1);
+  
+  /* Inputs */
+  --input-bg: #FFFFFF;
+  --input-border: #E5E5E5;
+  --input-border-focus: #10A37F;
+  --placeholder: #8E8E8E;
+  
+  /* Code blocks */
+  --code-bg: #F7F7F8;
+  --code-border: #E5E5E5;
+  
+  /* Chat bubbles */
+  --bubble-user-bg: #F7F7F8;
+  --bubble-assistant-bg: transparent;
+  
+  /* Scrollbar colors */
+  --scrollbar-track: #FFFFFF;
+  --scrollbar-thumb: #D9D9D9;
+  --scrollbar-thumb-hover: #BFBFBF;
+}
+
+/* ============================================
+   BASE STYLES
+   ============================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Söhne', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  background-color: var(--bg);
+  color: var(--text);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* ============================================
+   TYPOGRAPHY
+   ============================================ */
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text);
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+code, pre, .font-mono {
+  font-family: 'Söhne Mono', 'JetBrains Mono', Menlo, Monaco, 'Courier New', monospace;
+}
+
+/* ============================================
+   SCROLLBAR STYLES
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+/* Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+/* ============================================
+   FOCUS STATES
+   ============================================ */
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ============================================
+   SELECTION
+   ============================================ */
+
+::selection {
+  background-color: var(--accent-subtle);
+  color: var(--text);
+}
+
+/* ============================================
+   UTILITY CLASSES
+   ============================================ */
+
+/* Text colors */
+.text-primary { color: var(--text); }
+.text-muted { color: var(--text-muted); }
+.text-faint { color: var(--text-faint); }
+.text-accent { color: var(--accent); }
+.text-success { color: var(--success); }
+.text-warning { color: var(--warning); }
+.text-danger { color: var(--danger); }
+
+/* Background colors */
+.bg-base { background-color: var(--bg); }
+.bg-surface-1 { background-color: var(--surface-1); }
+.bg-surface-2 { background-color: var(--surface-2); }
+.bg-surface-3 { background-color: var(--surface-3); }
+.bg-accent { background-color: var(--accent); }
+.bg-accent-subtle { background-color: var(--accent-subtle); }
+
+/* Border colors */
+.border-default { border-color: var(--border); }
+.border-subtle { border-color: var(--border-subtle); }
+.border-accent { border-color: var(--accent); }
+
+/* ============================================
+   ANIMATIONS
+   ============================================ */
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slideInUp {
+  from { 
+    opacity: 0;
+    transform: translateY(10px); 
+  }
+  to { 
+    opacity: 1;
+    transform: translateY(0); 
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s ease-out forwards;
+}
+
+.animate-slide-in-up {
+  animation: slideInUp 0.2s ease-out forwards;
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+.animate-bounce {
+  animation: bounce 0.6s ease-in-out infinite;
+}
+
+/* ============================================
+   TRANSITIONS
+   ============================================ */
+
+.transition-colors {
+  transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.transition-all {
+  transition: all 0.2s ease;
+}
+
+.transition-transform {
+  transition: transform 0.2s ease;
+}
+
+/* ============================================
+   NO SCROLLBAR UTILITY
+   ============================================ */
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

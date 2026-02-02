@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   MessageSquare, BookOpen, Plus, Send, Search, 
-  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot
+  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
 import { MOCK_DOCS, MOCK_CHATS, COMPANIES, YEARS } from './services/mockData';
@@ -14,7 +14,7 @@ import {
   ApiError,
   ModelInfo,
 } from './services/api';
-import { Button, Input, Badge, Card } from './components/ui';
+import { Button, Input, Badge, Card, ChatBubble, Toggle } from './components/ui';
 import { ScopeBar } from './components/ScopeBar';
 import { EvidencePanel } from './components/EvidencePanel';
 import { UploadModal } from './components/UploadModal';
@@ -68,6 +68,7 @@ export default function App() {
   // --- Global State ---
   const [view, setView] = useState<ViewMode>('ASK');
   const [mobileTab, setMobileTab] = useState<MobileTab>('CONVERSATION');
+  const [isDarkMode, setIsDarkMode] = useState(true);
   
   // Data
   const [docs, setDocs] = useState<Document[]>(MOCK_DOCS);
@@ -104,6 +105,12 @@ export default function App() {
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // --- Theme Toggle ---
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', isDarkMode);
+    document.documentElement.classList.toggle('light', !isDarkMode);
+  }, [isDarkMode]);
 
   // --- Derived State ---
   const activeChat = chats.find(c => c.id === activeChatId);
@@ -335,47 +342,52 @@ export default function App() {
 
   const renderSidebar = () => (
     <div className={`
-      fixed inset-y-0 left-0 z-30 w-64 bg-zinc-950 border-r border-zinc-800 transform transition-transform duration-200 ease-in-out flex flex-col
+      fixed inset-y-0 left-0 z-30 w-64 bg-[var(--surface-1)] border-r border-[var(--border)] transform transition-transform duration-200 ease-in-out flex flex-col
       md:relative md:translate-x-0
       ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
     `}>
-      <div className="h-14 flex items-center px-4 border-b border-zinc-800 shrink-0">
-         <div className="h-8 w-8 bg-accent-600 rounded-sm flex items-center justify-center mr-3 shadow-[0_0_15px_-3px_rgba(2,132,199,0.5)]">
-            <span className="font-bold text-white font-mono">AI</span>
+      {/* Logo */}
+      <div className="h-14 flex items-center px-4 border-b border-[var(--border)] shrink-0">
+         <div className="h-8 w-8 bg-[var(--accent)] rounded-lg flex items-center justify-center mr-3">
+            <span className="font-bold text-white font-mono text-sm">AI</span>
          </div>
-         <span className="font-bold text-zinc-100 font-mono tracking-tight">FIN.COPILOT</span>
+         <span className="font-semibold text-[var(--text)] tracking-tight">Financial Copilot</span>
       </div>
 
-      <div className="p-4 space-y-4 shrink-0">
+      {/* New Chat & Search */}
+      <div className="p-4 space-y-3 shrink-0">
         <Button className="w-full justify-start gap-2" onClick={handleNewChat}>
           <Plus size={16} /> New Chat
         </Button>
         <div className="relative">
-          <Search className="absolute left-3 top-2.5 text-zinc-500" size={14} />
+          <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
           <Input placeholder="Search chats..." className="pl-9" />
         </div>
       </div>
 
-      <div className="px-4 py-2 text-xs font-mono text-zinc-500 uppercase tracking-widest shrink-0">Recent Chats</div>
+      {/* Chat List */}
+      <div className="px-4 py-2 text-xs font-medium text-[var(--text-faint)] uppercase tracking-wider shrink-0">Recent Chats</div>
       <div className="flex-1 overflow-y-auto px-2 min-h-0">
         {chats.map(chat => (
           <div
             key={chat.id}
             onClick={() => { setActiveChatId(chat.id); if(window.innerWidth < 768) setIsSidebarOpen(false); }}
             className={`
-              group flex items-center justify-between p-3 rounded-sm mb-1 cursor-pointer transition-colors
-              ${activeChatId === chat.id ? 'bg-zinc-800/50 text-zinc-100 border border-zinc-700/50' : 'text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200 border border-transparent'}
+              group flex items-center justify-between p-3 rounded-lg mb-1 cursor-pointer transition-colors
+              ${activeChatId === chat.id 
+                ? 'bg-[var(--surface-3)] text-[var(--text)] border border-[var(--border)]' 
+                : 'text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] border border-transparent'}
             `}
           >
             <div className="truncate text-sm font-medium pr-2">
                 {chat.title}
-                <div className="text-[10px] opacity-60 font-mono mt-0.5">
+                <div className="text-[10px] text-[var(--text-faint)] font-mono mt-0.5">
                     {new Date(chat.createdAt).toLocaleDateString()}
                 </div>
             </div>
             <button 
                 onClick={(e) => handleDeleteRequest(e, chat.id)}
-                className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-400 transition-opacity"
+                className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--danger)] transition-opacity"
             >
                 <Trash2 size={12} />
             </button>
@@ -383,16 +395,17 @@ export default function App() {
         ))}
       </div>
 
-      <div className="p-4 border-t border-zinc-800 mt-auto shrink-0 bg-zinc-950">
+      {/* User Profile */}
+      <div className="p-4 border-t border-[var(--border)] mt-auto shrink-0 bg-[var(--surface-1)]">
         <div className="flex items-center gap-3">
-          <div className="h-8 w-8 rounded-full bg-zinc-800 flex items-center justify-center border border-zinc-700">
-            <User size={14} className="text-zinc-400" />
+          <div className="h-8 w-8 rounded-full bg-[var(--surface-2)] flex items-center justify-center border border-[var(--border)]">
+            <User size={14} className="text-[var(--text-muted)]" />
           </div>
           <div className="flex-1">
-             <div className="text-sm font-medium text-zinc-200">Analyst User</div>
-             <div className="text-xs text-zinc-500">Pro Plan</div>
+             <div className="text-sm font-medium text-[var(--text)]">Analyst User</div>
+             <div className="text-xs text-[var(--text-faint)]">Pro Plan</div>
           </div>
-          <Settings size={16} className="text-zinc-500 hover:text-zinc-300 cursor-pointer" />
+          <Settings size={16} className="text-[var(--icon)] hover:text-[var(--text)] cursor-pointer transition-colors" />
         </div>
       </div>
     </div>
@@ -403,11 +416,11 @@ export default function App() {
     if (!activeChatId) {
         return (
             <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
-                <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center mb-6 border border-zinc-800">
-                    <Bot className="text-zinc-600" size={32} />
+                <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-6 border border-[var(--border)]">
+                    <Bot className="text-[var(--text-faint)]" size={32} />
                 </div>
-                <h2 className="text-xl font-bold text-zinc-100 mb-2">AI Financial Copilot</h2>
-                <p className="text-zinc-500 max-w-md mb-8">
+                <h2 className="text-xl font-semibold text-[var(--text)] mb-2">AI Financial Copilot</h2>
+                <p className="text-[var(--text-muted)] max-w-md mb-8">
                    Select a conversation from the sidebar or start a new chat.
                 </p>
                 <Button onClick={handleNewChat}>
@@ -435,16 +448,16 @@ export default function App() {
         <div className="flex-1 overflow-y-auto p-4 md:p-8 pb-32 md:pb-8">
           {isChatEmpty ? (
             <div className="h-full flex flex-col items-center justify-center text-center animate-fade-in">
-                 <div className="w-16 h-16 bg-zinc-900 rounded-2xl flex items-center justify-center mb-6 border border-zinc-800">
-                    <Bot className="text-zinc-600" size={32} />
+                 <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-6 border border-[var(--border)]">
+                    <Bot className="text-[var(--text-faint)]" size={32} />
                 </div>
-                <h2 className="text-xl font-bold text-zinc-100 mb-2">AI Financial Copilot</h2>
-                <p className="text-zinc-500 max-w-md mb-8 leading-relaxed">
+                <h2 className="text-xl font-semibold text-[var(--text)] mb-2">AI Financial Copilot</h2>
+                <p className="text-[var(--text-muted)] max-w-md mb-8 leading-relaxed">
                    I can help you analyze financial documents, extract key metrics, and compare company performance.
                 </p>
             </div>
           ) : (
-            <div className="space-y-8">
+            <div className="space-y-6">
               {activeChat?.messages.map((msg) => {
                 // Skip rendering assistant messages with empty content (placeholder while typing)
                 if (msg.role === 'assistant' && !msg.content) return null;
@@ -452,13 +465,17 @@ export default function App() {
                 return (
                   <div key={msg.id} className={`flex gap-4 max-w-3xl mx-auto ${msg.role === 'user' ? 'justify-end' : ''}`}>
                     {msg.role === 'assistant' && (
-                      <div className="w-8 h-8 rounded-sm bg-accent-600/10 border border-accent-600/20 flex items-center justify-center flex-shrink-0 mt-1">
-                        <Bot size={18} className="text-accent-500" />
+                      <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0 mt-1">
+                        <Bot size={18} className="text-[var(--accent)]" />
                       </div>
                     )}
                     
                     <div className={`space-y-2 ${msg.role === 'user' ? 'text-right' : 'flex-1'}`}>
-                      <div className={`inline-block p-4 rounded-lg text-sm leading-relaxed ${msg.role === 'user' ? 'bg-zinc-800 text-zinc-100 rounded-br-none' : 'text-zinc-300'}`}>
+                      <div className={`inline-block p-4 rounded-2xl text-sm leading-relaxed ${
+                        msg.role === 'user' 
+                          ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md' 
+                          : 'bg-[var(--bubble-assistant-bg)] text-[var(--text)] rounded-bl-md'
+                      }`}>
                           <p className="whitespace-pre-wrap">{msg.content}</p>
                       </div>
                       
@@ -471,14 +488,14 @@ export default function App() {
                                       <button 
                                           key={i}
                                           onClick={() => handleCitationClick(c)}
-                                          className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 hover:border-accent-500/50 hover:bg-zinc-800 px-3 py-2 rounded-sm text-left transition-all group max-w-xs"
+                                          className="flex items-center gap-2 bg-[var(--surface-1)] border border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--surface-2)] px-3 py-2 rounded-lg text-left transition-all group max-w-xs"
                                       >
-                                          <div className="h-8 w-8 bg-zinc-950 flex items-center justify-center rounded-sm text-zinc-500 group-hover:text-accent-400 border border-zinc-800">
+                                          <div className="h-8 w-8 bg-[var(--bg)] flex items-center justify-center rounded-md text-[var(--text-faint)] group-hover:text-[var(--accent)] border border-[var(--border)]">
                                               <span className="font-mono text-xs font-bold">{i+1}</span>
                                           </div>
                                           <div className="min-w-0">
-                                              <div className="text-xs font-bold text-zinc-300 truncate">{doc?.company}</div>
-                                              <div className="text-[10px] text-zinc-500 font-mono truncate">Page {c.page} • {doc?.type}</div>
+                                              <div className="text-xs font-medium text-[var(--text)] truncate">{doc?.company}</div>
+                                              <div className="text-[10px] text-[var(--text-faint)] font-mono truncate">Page {c.page} • {doc?.type}</div>
                                           </div>
                                       </button>
                                   );
@@ -491,13 +508,13 @@ export default function App() {
               })}
               {isTyping && (
                 <div className="flex gap-4 max-w-3xl mx-auto">
-                    <div className="w-8 h-8 rounded-sm bg-accent-600/10 border border-accent-600/20 flex items-center justify-center flex-shrink-0">
-                        <Bot size={18} className="text-accent-500 animate-pulse" />
+                    <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0">
+                        <Bot size={18} className="text-[var(--accent)] animate-pulse" />
                     </div>
                     <div className="flex items-center gap-1 h-8">
-                        <span className="w-1.5 h-1.5 bg-zinc-600 rounded-full animate-bounce" style={{ animationDelay: '0s' }} />
-                        <span className="w-1.5 h-1.5 bg-zinc-600 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
-                        <span className="w-1.5 h-1.5 bg-zinc-600 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
+                        <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full animate-bounce" style={{ animationDelay: '0s' }} />
+                        <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
+                        <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
                     </div>
                 </div>
               )}
@@ -507,18 +524,18 @@ export default function App() {
         </div>
 
         {/* Composer */}
-        <div className="p-4 border-t border-zinc-800 bg-zinc-950">
+        <div className="p-4 border-t border-[var(--border)] bg-[var(--bg)]">
           <div className="max-w-3xl mx-auto relative">
              <div className="absolute -top-8 left-0 flex items-center gap-2">
                 <div className="relative">
                   <select 
                     value={activeModel}
                     onChange={(e) => setActiveModel(e.target.value)}
-                    className="appearance-none bg-zinc-900 border border-zinc-800 text-xs font-medium text-zinc-300 rounded-sm px-3 py-1 pr-8 outline-none focus:border-accent-500 hover:bg-zinc-800 cursor-pointer"
+                    className="appearance-none bg-[var(--surface-2)] border border-[var(--border)] text-xs font-medium text-[var(--text)] rounded-md px-3 py-1.5 pr-8 outline-none focus:border-[var(--accent)] hover:bg-[var(--surface-3)] cursor-pointer transition-colors"
                   >
                     {models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
                   </select>
-                  <ChevronDown className="absolute right-2 top-1.5 text-zinc-500 pointer-events-none" size={12} />
+                  <ChevronDown className="absolute right-2 top-1.5 text-[var(--text-faint)] pointer-events-none" size={12} />
                 </div>
              </div>
              <textarea
@@ -526,18 +543,22 @@ export default function App() {
                 onChange={(e) => setInputMessage(e.target.value)}
                 onKeyDown={(e) => { if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSendMessage(); } }}
                 placeholder="Ask me anything..."
-                className="w-full bg-zinc-900 border border-zinc-800 rounded-md p-4 pr-12 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-accent-600 focus:ring-1 focus:ring-accent-600 min-h-[60px] resize-none font-sans shadow-lg"
+                className="w-full bg-[var(--input-bg)] border border-[var(--input-border)] rounded-xl p-4 pr-14 text-sm text-[var(--text)] placeholder:text-[var(--placeholder)] focus:outline-none focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] min-h-[96px] resize-none font-sans shadow-sm transition-colors"
              />
              <Button 
                 size="icon" 
-                className={`absolute right-3 bottom-3 transition-all ${inputMessage.trim() ? 'bg-accent-600 text-white hover:bg-accent-500' : 'bg-zinc-800 text-zinc-500'}`}
+                className={`absolute right-3 bottom-3 transition-all ${
+                  inputMessage.trim() 
+                    ? 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]' 
+                    : 'bg-[var(--surface-3)] text-[var(--text-muted)]'
+                }`}
                 onClick={() => handleSendMessage()}
                 disabled={!inputMessage.trim() || isAwaitingResponse}
              >
                 <Send size={16} />
              </Button>
           </div>
-          <div className="text-center mt-2 text-[10px] text-zinc-600 font-mono">
+          <div className="text-center mt-2 text-[10px] text-[var(--text-faint)]">
             AI can make mistakes. Verify with citations.
           </div>
         </div>
@@ -546,14 +567,14 @@ export default function App() {
   };
 
   const renderLibrary = () => (
-    <div className="flex-1 overflow-auto bg-zinc-950 p-6 md:p-10 animate-fade-in pb-20 md:pb-10">
+    <div className="flex-1 overflow-auto bg-[var(--bg)] p-6 md:p-10 animate-fade-in pb-20 md:pb-10">
       <div className="max-w-6xl mx-auto">
         <div className="flex items-center justify-between mb-8">
             <div>
-                <h1 className="text-2xl font-bold text-zinc-100 font-mono mb-2">DOCUMENT LIBRARY</h1>
-                <p className="text-zinc-500 text-sm">Manage and analyze your financial repository.</p>
+                <h1 className="text-2xl font-semibold text-[var(--text)] mb-2">Document Library</h1>
+                <p className="text-[var(--text-muted)] text-sm">Manage and analyze your financial repository.</p>
             </div>
-            <Button onClick={() => setIsUploadOpen(true)} className="gap-2 bg-accent-600 hover:bg-accent-500 text-white border-0">
+            <Button onClick={() => setIsUploadOpen(true)} className="gap-2">
                 <Plus size={16} /> Upload PDFs
             </Button>
         </div>
@@ -561,36 +582,36 @@ export default function App() {
         {/* Filters */}
         <div className="flex gap-4 mb-6">
             <div className="relative flex-1 max-w-md">
-                <Search className="absolute left-3 top-2.5 text-zinc-500" size={14} />
-                <Input placeholder="Search documents..." className="pl-9 bg-zinc-900" />
+                <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
+                <Input placeholder="Search documents..." className="pl-9" />
             </div>
-            <select className="bg-zinc-900 border border-zinc-800 rounded-sm px-3 text-sm text-zinc-300">
+            <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
                 <option>All Companies</option>
                 {COMPANIES.map(c => <option key={c}>{c}</option>)}
             </select>
-             <select className="bg-zinc-900 border border-zinc-800 rounded-sm px-3 text-sm text-zinc-300">
+             <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
                 <option>All Years</option>
                 {YEARS.map(y => <option key={y}>{y}</option>)}
             </select>
         </div>
 
         {/* Table */}
-        <div className="border border-zinc-800 rounded-sm overflow-hidden bg-zinc-900/20">
+        <div className="border border-[var(--border)] rounded-lg overflow-hidden bg-[var(--surface-1)]">
             <table className="w-full text-left text-sm">
-                <thead className="bg-zinc-900 border-b border-zinc-800 text-zinc-500 font-mono text-xs uppercase tracking-wider">
+                <thead className="bg-[var(--surface-2)] border-b border-[var(--border)] text-[var(--text-muted)] text-xs uppercase tracking-wider">
                     <tr>
-                        <th className="px-6 py-4">Status</th>
-                        <th className="px-6 py-4">Document Name</th>
-                        <th className="px-6 py-4">Company</th>
-                        <th className="px-6 py-4">Year</th>
-                        <th className="px-6 py-4">Type</th>
-                        <th className="px-6 py-4">Pages</th>
-                        <th className="px-6 py-4 text-right">Actions</th>
+                        <th className="px-6 py-4 font-medium">Status</th>
+                        <th className="px-6 py-4 font-medium">Document Name</th>
+                        <th className="px-6 py-4 font-medium">Company</th>
+                        <th className="px-6 py-4 font-medium">Year</th>
+                        <th className="px-6 py-4 font-medium">Type</th>
+                        <th className="px-6 py-4 font-medium">Pages</th>
+                        <th className="px-6 py-4 font-medium text-right">Actions</th>
                     </tr>
                 </thead>
-                <tbody className="divide-y divide-zinc-800/50">
+                <tbody className="divide-y divide-[var(--border)]">
                     {docs.map(doc => (
-                        <tr key={doc.id} className="hover:bg-zinc-900/50 transition-colors group cursor-pointer" onClick={() => {
+                        <tr key={doc.id} className="hover:bg-[var(--surface-2)] transition-colors group cursor-pointer" onClick={() => {
                             // Open in side panel
                             setView('ASK');
                             handleCitationClick({ docId: doc.id, page: 1, excerpt: '' });
@@ -600,14 +621,14 @@ export default function App() {
                             <td className="px-6 py-4">
                                 <Badge variant={doc.status === 'Ready' ? 'success' : 'warning'}>{doc.status}</Badge>
                             </td>
-                            <td className="px-6 py-4 font-medium text-zinc-200 flex items-center gap-2">
-                                <FileText size={16} className="text-zinc-500" />
+                            <td className="px-6 py-4 font-medium text-[var(--text)] flex items-center gap-2">
+                                <FileText size={16} className="text-[var(--text-faint)]" />
                                 {doc.title}
                             </td>
-                            <td className="px-6 py-4 text-zinc-400">{doc.company}</td>
-                            <td className="px-6 py-4 font-mono text-zinc-500">{doc.year}</td>
-                            <td className="px-6 py-4 text-zinc-400">{doc.type}</td>
-                            <td className="px-6 py-4 font-mono text-zinc-500">{doc.pages}</td>
+                            <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company}</td>
+                            <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.year}</td>
+                            <td className="px-6 py-4 text-[var(--text-muted)]">{doc.type}</td>
+                            <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.pages}</td>
                             <td className="px-6 py-4 text-right">
                                 <Button variant="ghost" size="icon" className="opacity-0 group-hover:opacity-100">
                                     <MoreHorizontal size={16} />
@@ -623,7 +644,7 @@ export default function App() {
   );
 
   return (
-    <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 overflow-hidden font-sans">
+    <div className="flex flex-col h-screen bg-[var(--bg)] text-[var(--text)] overflow-hidden font-sans">
       {/* Upload Modal */}
       <UploadModal 
         isOpen={isUploadOpen} 
@@ -645,18 +666,18 @@ export default function App() {
 
       {/* Delete Confirmation Modal */}
       {chatToDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm p-4">
-          <Card className="w-full max-w-sm bg-zinc-900 border-zinc-800 p-6 shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <Card className="w-full max-w-sm p-6 shadow-xl" variant="elevated">
              <div className="flex flex-col items-center text-center gap-4">
-                <div className="w-12 h-12 bg-red-900/20 rounded-full flex items-center justify-center text-red-500">
+                <div className="w-12 h-12 bg-[var(--danger-bg)] rounded-full flex items-center justify-center text-[var(--danger)]">
                     <AlertTriangle size={24} />
                 </div>
                 <div>
-                    <h3 className="text-lg font-bold text-zinc-100">Delete Chat?</h3>
-                    <p className="text-sm text-zinc-500 mt-1">This action cannot be undone.</p>
+                    <h3 className="text-lg font-semibold text-[var(--text)]">Delete Chat?</h3>
+                    <p className="text-sm text-[var(--text-muted)] mt-1">This action cannot be undone.</p>
                 </div>
                 <div className="flex w-full gap-2 mt-2">
-                    <Button variant="ghost" className="flex-1" onClick={() => setChatToDelete(null)}>Cancel</Button>
+                    <Button variant="secondary" className="flex-1" onClick={() => setChatToDelete(null)}>Cancel</Button>
                     <Button variant="danger" className="flex-1" onClick={confirmDeleteChat}>Delete</Button>
                 </div>
              </div>
@@ -675,33 +696,49 @@ export default function App() {
         )}
 
         {/* Center Workspace */}
-        <div className="flex-1 flex flex-col min-w-0 bg-zinc-950 relative">
+        <div className="flex-1 flex flex-col min-w-0 bg-[var(--bg)] relative">
           
           {/* Header */}
-          <header className="h-14 border-b border-zinc-800 flex items-center justify-between px-4 bg-zinc-950/80 backdrop-blur-md z-10">
+          <header className="h-14 border-b border-[var(--border)] flex items-center justify-between px-4 bg-[var(--surface-1)] z-10">
             <div className="flex items-center gap-4">
                 <Button variant="ghost" size="icon" className="md:hidden" onClick={() => setIsSidebarOpen(!isSidebarOpen)}>
                     <Layers size={18} />
                 </Button>
                 {/* View Switcher */}
-                <div className="flex bg-zinc-900 p-0.5 rounded-sm border border-zinc-800">
+                <div className="flex bg-[var(--surface-2)] p-1 rounded-lg border border-[var(--border)]">
                     <button 
                         onClick={() => setView('ASK')} 
-                        className={`px-4 py-1.5 text-xs font-bold rounded-sm transition-all ${view === 'ASK' ? 'bg-zinc-800 text-zinc-100 shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
+                        className={`px-4 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                          view === 'ASK' 
+                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm' 
+                            : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+                        }`}
                     >
                         ASK
                     </button>
                     <button 
                         onClick={() => setView('LIBRARY')} 
-                        className={`px-4 py-1.5 text-xs font-bold rounded-sm transition-all ${view === 'LIBRARY' ? 'bg-zinc-800 text-zinc-100 shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}
+                        className={`px-4 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                          view === 'LIBRARY' 
+                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm' 
+                            : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+                        }`}
                     >
                         LIBRARY
                     </button>
                 </div>
             </div>
             
-            <div className="hidden md:flex items-center gap-2">
-                <Badge variant="outline" className="h-7 px-3 border-zinc-800 text-zinc-500">v2.4.0-stable</Badge>
+            <div className="flex items-center gap-3">
+                {/* Theme Toggle */}
+                <button
+                  onClick={() => setIsDarkMode(!isDarkMode)}
+                  className="p-2 rounded-lg text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+                  title={isDarkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+                >
+                  {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+                </button>
+                <Badge variant="outline" className="h-7 px-3">v2.4.0-stable</Badge>
             </div>
           </header>
 
@@ -736,20 +773,28 @@ export default function App() {
 
       {/* Mobile Bottom Nav (Only in ASK View, Always visible) */}
       {view === 'ASK' && (
-        <div className="md:hidden h-14 border-t border-zinc-800 bg-zinc-950 flex grid grid-cols-2 fixed bottom-0 left-0 right-0 z-50 shadow-lg">
+        <div className="md:hidden h-14 border-t border-[var(--border)] bg-[var(--surface-1)] flex grid grid-cols-2 fixed bottom-0 left-0 right-0 z-50 shadow-lg">
             <button 
                 onClick={() => { setMobileTab('CONVERSATION'); setIsEvidenceOpen(false); }}
-                className={`flex flex-col items-center justify-center gap-1 ${mobileTab === 'CONVERSATION' ? 'text-accent-500 bg-zinc-900/50' : 'text-zinc-500'}`}
+                className={`flex flex-col items-center justify-center gap-1 transition-colors ${
+                  mobileTab === 'CONVERSATION' 
+                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                    : 'text-[var(--text-muted)]'
+                }`}
             >
                 <MessageSquare size={18} />
-                <span className="text-[10px] font-bold">CHAT</span>
+                <span className="text-[10px] font-semibold">CHAT</span>
             </button>
             <button 
                 onClick={() => { setMobileTab('EVIDENCE'); setIsEvidenceOpen(true); }}
-                className={`flex flex-col items-center justify-center gap-1 ${mobileTab === 'EVIDENCE' ? 'text-accent-500 bg-zinc-900/50' : 'text-zinc-500'}`}
+                className={`flex flex-col items-center justify-center gap-1 transition-colors ${
+                  mobileTab === 'EVIDENCE' 
+                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                    : 'text-[var(--text-muted)]'
+                }`}
             >
                 <BookOpen size={18} />
-                <span className="text-[10px] font-bold">EVIDENCE</span>
+                <span className="text-[10px] font-semibold">EVIDENCE</span>
             </button>
         </div>
       )}
