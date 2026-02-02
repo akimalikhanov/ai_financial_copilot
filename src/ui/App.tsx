@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   MessageSquare, BookOpen, Plus, Send, Search, 
-  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon
+  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
 import { MOCK_DOCS, MOCK_CHATS, COMPANIES, YEARS } from './services/mockData';
@@ -13,12 +13,14 @@ import {
   ChatMessage as ApiChatMessage,
   ApiError,
   ModelInfo,
+  LLMStreamChunk,
 } from './services/api';
 import { Button, Input, Badge, Card, ChatBubble, Toggle } from './components/ui';
 import { ScopeBar } from './components/ScopeBar';
 import { EvidencePanel } from './components/EvidencePanel';
 import { UploadModal } from './components/UploadModal';
 import { DocPickerModal } from './components/DocPickerModal';
+import { ControlPane, ModelParams, RequestStats, ModelCapabilities } from './components/ControlPane';
 
 // Fallback models (used while loading or on error)
 const FALLBACK_MODELS: ModelInfo[] = [
@@ -101,6 +103,18 @@ export default function App() {
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
   
+  // Control Pane State
+  const [isControlPaneOpen, setIsControlPaneOpen] = useState(false);
+  const [modelParams, setModelParams] = useState<ModelParams>({
+    temperature: 0.2,
+    maxTokens: 2000,
+    reasoningEffort: null,
+    verbosity: null,
+  });
+  const [lastRequestStats, setLastRequestStats] = useState<RequestStats | null>(null);
+  const [statsHistory, setStatsHistory] = useState<RequestStats[]>([]);
+  const requestStartTimeRef = useRef<number>(0);
+  
   // Delete Confirmation State
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
 
@@ -164,6 +178,43 @@ export default function App() {
   // --- Streaming Mode Toggle ---
   const [useStreaming, setUseStreaming] = useState(true);
 
+  // --- Model Capabilities (derived from active model) ---
+  const modelCapabilities: ModelCapabilities = React.useMemo(() => {
+    // GPT-5 series and some newer models support reasoning_effort and verbosity
+    const supportsAdvanced = activeModel.startsWith('gpt-5') || activeModel.includes('o1') || activeModel.includes('o3');
+    return {
+      supportsTemperature: true, // Most models support temperature
+      supportsReasoningEffort: supportsAdvanced,
+      supportsVerbosity: supportsAdvanced,
+    };
+  }, [activeModel]);
+
+  // --- Helper to record stats from API response ---
+  const recordStats = useCallback((stats: LLMStreamChunk['stats'], model: string) => {
+    if (!stats) return;
+    
+    const reasoningTokens = stats.reasoning_tokens ?? 0;
+    const inputTokens = stats.input_tokens ?? 0;
+    const outputTokens = stats.output_tokens ?? 0;
+    const totalTokens = stats.total_tokens ?? (inputTokens + outputTokens + reasoningTokens);
+    
+    const newStats: RequestStats = {
+      inputTokens,
+      outputTokens,
+      reasoningTokens,
+      totalTokens,
+      cost: stats.cost_usd ?? 0,
+      latencyMs: stats.latency_ms ?? (Date.now() - requestStartTimeRef.current),
+      ttftMs: stats.ttft_ms ?? null,
+      tps: stats.tps ?? null,
+      model,
+      timestamp: Date.now(),
+    };
+    
+    setLastRequestStats(newStats);
+    setStatsHistory(prev => [...prev, newStats]);
+  }, []);
+
   // --- Handlers ---
 
   /** Update a message in the active chat by id */
@@ -215,13 +266,29 @@ export default function App() {
     setIsTyping(true);
     setIsAwaitingResponse(true);
 
-    // Build request
+    // Build request with model parameters
     const systemPrompt = buildScopeContext(scope, docs);
     const apiMessages = toApiMessages(messagesWithUser, systemPrompt);
+    
+    // Build extra_params for advanced features
+    const extraParams: Record<string, unknown> = {};
+    if (modelCapabilities.supportsReasoningEffort && modelParams.reasoningEffort) {
+      extraParams.reasoning_effort = modelParams.reasoningEffort;
+    }
+    if (modelCapabilities.supportsVerbosity && modelParams.verbosity) {
+      extraParams.verbosity = modelParams.verbosity;
+    }
+    
     const request: ChatRequest = {
       messages: apiMessages,
       model: activeModel,
+      temperature: modelParams.temperature,
+      max_tokens: modelParams.maxTokens,
+      ...(Object.keys(extraParams).length > 0 && { extra_params: extraParams }),
     };
+    
+    // Track request start time for latency calculation
+    requestStartTimeRef.current = Date.now();
 
     if (useStreaming) {
       // --- Streaming path ---
@@ -253,6 +320,10 @@ export default function App() {
               content: m.content + chunk.text,
             }));
           }
+          // Record stats from final chunk
+          if (chunk.stats) {
+            recordStats(chunk.stats, activeModel);
+          }
           setIsTyping(false);
           setIsAwaitingResponse(false);
         },
@@ -277,6 +348,10 @@ export default function App() {
           timestamp: Date.now(),
         };
         appendMessageToChat(assistantMsg);
+        // Record stats from response
+        if (response.stats) {
+          recordStats(response.stats, activeModel);
+        }
         setIsTyping(false);
       } catch (err) {
         const error = err as ApiError;
@@ -470,18 +545,18 @@ export default function App() {
                       </div>
                     )}
                     
-                    <div className={`space-y-2 ${msg.role === 'user' ? 'text-right' : 'flex-1'}`}>
-                      <div className={`inline-block p-4 rounded-2xl text-sm leading-relaxed ${
+                    <div className={`space-y-2 ${msg.role === 'user' ? 'flex flex-col items-end ml-[15%]' : 'flex-1'}`}>
+                      <div className={`p-4 rounded-2xl text-sm leading-relaxed ${
                         msg.role === 'user' 
-                          ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md' 
+                          ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md max-w-[85%]' 
                           : 'bg-[var(--bubble-assistant-bg)] text-[var(--text)] rounded-bl-md'
-                      }`}>
-                          <p className="whitespace-pre-wrap">{msg.content}</p>
+                      }`} style={{ width: 'fit-content', maxWidth: '100%' }}>
+                          <div className="whitespace-pre-wrap break-words">{msg.content}</div>
                       </div>
                       
                       {/* Citations Grid */}
                       {msg.citations && msg.citations.length > 0 && (
-                          <div className="flex flex-wrap gap-2 mt-2">
+                          <div className={`flex flex-wrap gap-2 mt-2 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                               {msg.citations.map((c, i) => {
                                   const doc = docs.find(d => d.id === c.docId);
                                   return (
@@ -730,6 +805,18 @@ export default function App() {
             </div>
             
             <div className="flex items-center gap-3">
+                {/* Control Pane Toggle */}
+                <button
+                  onClick={() => setIsControlPaneOpen(!isControlPaneOpen)}
+                  className={`p-2 rounded-lg transition-colors ${
+                    isControlPaneOpen 
+                      ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                      : 'text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]'
+                  }`}
+                  title="Control Pane"
+                >
+                  <Settings2 size={18} />
+                </button>
                 {/* Theme Toggle */}
                 <button
                   onClick={() => setIsDarkMode(!isDarkMode)}
@@ -765,6 +852,17 @@ export default function App() {
                         else if (activePdfDocId === id) setActivePdfDocId(newTabs[0].doc.id);
                     }}
                     highlight={activeHighlight}
+                />
+                
+                {/* Control Pane */}
+                <ControlPane
+                    isOpen={isControlPaneOpen}
+                    onToggle={() => setIsControlPaneOpen(!isControlPaneOpen)}
+                    params={modelParams}
+                    onParamsChange={(p) => setModelParams(prev => ({ ...prev, ...p }))}
+                    capabilities={modelCapabilities}
+                    stats={lastRequestStats}
+                    statsHistory={statsHistory}
                 />
              </div>
           )}
