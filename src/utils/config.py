@@ -123,3 +123,28 @@ def load_error_maps(config_path: Path | str | None = None) -> dict[int, dict[str
     errors = data.get("errors", {})
     # Convert string keys to int keys
     return {int(k): v for k, v in errors.items()}
+
+
+def get_cors_origins() -> list[str]:
+    """
+    Parse CORS_ALLOWED_ORIGINS from environment.
+
+    CORS_ALLOWED_ORIGINS: Comma-separated list of allowed origins (required).
+    Examples:
+      - Development: "http://localhost:3000,http://127.0.0.1:3000"
+      - Production:  "https://app.example.com,https://www.example.com"
+      - Allow all (NOT recommended for production): "*"
+
+    Raises:
+        RuntimeError: If CORS_ALLOWED_ORIGINS is not set.
+    """
+    raw = os.getenv("CORS_ALLOWED_ORIGINS")
+    if not raw:
+        raise RuntimeError(
+            "CORS_ALLOWED_ORIGINS environment variable is required. "
+            "Set it to a comma-separated list of allowed origins "
+            "(e.g., 'http://localhost:3000' for dev, or your production domain)."
+        )
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]

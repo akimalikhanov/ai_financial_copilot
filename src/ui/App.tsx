@@ -8,9 +8,11 @@ import { MOCK_DOCS, MOCK_CHATS, COMPANIES, YEARS } from './services/mockData';
 import {
   chat as apiChat,
   chatStream as apiChatStream,
+  fetchModels,
   ChatRequest,
   ChatMessage as ApiChatMessage,
   ApiError,
+  ModelInfo,
 } from './services/api';
 import { Button, Input, Badge, Card } from './components/ui';
 import { ScopeBar } from './components/ScopeBar';
@@ -18,12 +20,9 @@ import { EvidencePanel } from './components/EvidencePanel';
 import { UploadModal } from './components/UploadModal';
 import { DocPickerModal } from './components/DocPickerModal';
 
-// --- Types ---
-const MODELS = [
+// Fallback models (used while loading or on error)
+const FALLBACK_MODELS: ModelInfo[] = [
   { id: 'gpt-4o-mini', name: 'GPT-4o-mini' },
-  { id: 'gpt-4o', name: 'GPT-4o' },
-  { id: 'claude-3-opus', name: 'Claude 3 Opus' },
-  { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro' },
 ];
 
 // --- Helpers ---
@@ -74,9 +73,13 @@ export default function App() {
   const [docs, setDocs] = useState<Document[]>(MOCK_DOCS);
   const [chats, setChats] = useState<Chat[]>(MOCK_CHATS);
   
+  // Models (loaded from API)
+  const [models, setModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
+  const [modelsLoading, setModelsLoading] = useState(true);
+
   // Active Context
   const [activeChatId, setActiveChatId] = useState<string | null>(MOCK_CHATS[0].id);
-  const [activeModel, setActiveModel] = useState(MODELS[0].id);
+  const [activeModel, setActiveModel] = useState(FALLBACK_MODELS[0].id);
   const [scope, setScope] = useState<Scope>({
     mode: 'allDocs',
     docIds: [],
@@ -93,6 +96,7 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
   
@@ -118,6 +122,32 @@ export default function App() {
   }, [docs, scope]);
 
   // --- Effects ---
+
+  // Fetch available models on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const fetched = await fetchModels();
+        if (!cancelled && fetched.length > 0) {
+          setModels(fetched);
+          // Set default model to first in list if current isn't valid
+          setActiveModel((prev) => {
+            const isValid = fetched.some((m) => m.id === prev);
+            return isValid ? prev : fetched[0].id;
+          });
+        }
+      } catch (err) {
+        console.error('Failed to fetch models:', err);
+        // Keep fallback models on error
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Scroll to bottom when messages change
   useEffect(() => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -153,6 +183,11 @@ export default function App() {
     [activeChatId]
   );
 
+  const stopTypingForText = useCallback((text?: string) => {
+    if (!text || text.trim().length === 0) return;
+    setIsTyping(false);
+  }, []);
+
   const handleSendMessage = async (text: string = inputMessage) => {
     if (!text.trim() || !activeChatId) return;
 
@@ -171,6 +206,7 @@ export default function App() {
     );
     setInputMessage('');
     setIsTyping(true);
+    setIsAwaitingResponse(true);
 
     // Build request
     const systemPrompt = buildScopeContext(scope, docs);
@@ -199,6 +235,7 @@ export default function App() {
             ...m,
             content: m.content + chunk.text,
           }));
+          stopTypingForText(chunk.text);
         },
         // onFinal
         (chunk) => {
@@ -210,6 +247,7 @@ export default function App() {
             }));
           }
           setIsTyping(false);
+          setIsAwaitingResponse(false);
         },
         // onError
         (error: ApiError) => {
@@ -218,6 +256,7 @@ export default function App() {
             content: m.content || `Error: ${error.message}`,
           }));
           setIsTyping(false);
+          setIsAwaitingResponse(false);
         }
       );
     } else {
@@ -231,6 +270,7 @@ export default function App() {
           timestamp: Date.now(),
         };
         appendMessageToChat(assistantMsg);
+        setIsTyping(false);
       } catch (err) {
         const error = err as ApiError;
         const errorMsg: Message = {
@@ -240,8 +280,9 @@ export default function App() {
           timestamp: Date.now(),
         };
         appendMessageToChat(errorMsg);
-      } finally {
         setIsTyping(false);
+      } finally {
+        setIsAwaitingResponse(false);
       }
     }
   };
@@ -404,45 +445,50 @@ export default function App() {
             </div>
           ) : (
             <div className="space-y-8">
-              {activeChat?.messages.map((msg) => (
-                <div key={msg.id} className={`flex gap-4 max-w-3xl mx-auto ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                  {msg.role === 'assistant' && (
-                    <div className="w-8 h-8 rounded-sm bg-accent-600/10 border border-accent-600/20 flex items-center justify-center flex-shrink-0 mt-1">
-                      <Bot size={18} className="text-accent-500" />
-                    </div>
-                  )}
-                  
-                  <div className={`space-y-2 ${msg.role === 'user' ? 'text-right' : 'flex-1'}`}>
-                    <div className={`inline-block p-4 rounded-lg text-sm leading-relaxed ${msg.role === 'user' ? 'bg-zinc-800 text-zinc-100 rounded-br-none' : 'text-zinc-300'}`}>
-                        <p className="whitespace-pre-wrap">{msg.content}</p>
-                    </div>
-                    
-                    {/* Citations Grid */}
-                    {msg.citations && msg.citations.length > 0 && (
-                        <div className="flex flex-wrap gap-2 mt-2">
-                            {msg.citations.map((c, i) => {
-                                const doc = docs.find(d => d.id === c.docId);
-                                return (
-                                    <button 
-                                        key={i}
-                                        onClick={() => handleCitationClick(c)}
-                                        className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 hover:border-accent-500/50 hover:bg-zinc-800 px-3 py-2 rounded-sm text-left transition-all group max-w-xs"
-                                    >
-                                        <div className="h-8 w-8 bg-zinc-950 flex items-center justify-center rounded-sm text-zinc-500 group-hover:text-accent-400 border border-zinc-800">
-                                            <span className="font-mono text-xs font-bold">{i+1}</span>
-                                        </div>
-                                        <div className="min-w-0">
-                                            <div className="text-xs font-bold text-zinc-300 truncate">{doc?.company}</div>
-                                            <div className="text-[10px] text-zinc-500 font-mono truncate">Page {c.page} • {doc?.type}</div>
-                                        </div>
-                                    </button>
-                                );
-                            })}
-                        </div>
+              {activeChat?.messages.map((msg) => {
+                // Skip rendering assistant messages with empty content (placeholder while typing)
+                if (msg.role === 'assistant' && !msg.content) return null;
+                
+                return (
+                  <div key={msg.id} className={`flex gap-4 max-w-3xl mx-auto ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                    {msg.role === 'assistant' && (
+                      <div className="w-8 h-8 rounded-sm bg-accent-600/10 border border-accent-600/20 flex items-center justify-center flex-shrink-0 mt-1">
+                        <Bot size={18} className="text-accent-500" />
+                      </div>
                     )}
+                    
+                    <div className={`space-y-2 ${msg.role === 'user' ? 'text-right' : 'flex-1'}`}>
+                      <div className={`inline-block p-4 rounded-lg text-sm leading-relaxed ${msg.role === 'user' ? 'bg-zinc-800 text-zinc-100 rounded-br-none' : 'text-zinc-300'}`}>
+                          <p className="whitespace-pre-wrap">{msg.content}</p>
+                      </div>
+                      
+                      {/* Citations Grid */}
+                      {msg.citations && msg.citations.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mt-2">
+                              {msg.citations.map((c, i) => {
+                                  const doc = docs.find(d => d.id === c.docId);
+                                  return (
+                                      <button 
+                                          key={i}
+                                          onClick={() => handleCitationClick(c)}
+                                          className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 hover:border-accent-500/50 hover:bg-zinc-800 px-3 py-2 rounded-sm text-left transition-all group max-w-xs"
+                                      >
+                                          <div className="h-8 w-8 bg-zinc-950 flex items-center justify-center rounded-sm text-zinc-500 group-hover:text-accent-400 border border-zinc-800">
+                                              <span className="font-mono text-xs font-bold">{i+1}</span>
+                                          </div>
+                                          <div className="min-w-0">
+                                              <div className="text-xs font-bold text-zinc-300 truncate">{doc?.company}</div>
+                                              <div className="text-[10px] text-zinc-500 font-mono truncate">Page {c.page} • {doc?.type}</div>
+                                          </div>
+                                      </button>
+                                  );
+                              })}
+                          </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
               {isTyping && (
                 <div className="flex gap-4 max-w-3xl mx-auto">
                     <div className="w-8 h-8 rounded-sm bg-accent-600/10 border border-accent-600/20 flex items-center justify-center flex-shrink-0">
@@ -470,7 +516,7 @@ export default function App() {
                     onChange={(e) => setActiveModel(e.target.value)}
                     className="appearance-none bg-zinc-900 border border-zinc-800 text-xs font-medium text-zinc-300 rounded-sm px-3 py-1 pr-8 outline-none focus:border-accent-500 hover:bg-zinc-800 cursor-pointer"
                   >
-                    {MODELS.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                    {models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
                   </select>
                   <ChevronDown className="absolute right-2 top-1.5 text-zinc-500 pointer-events-none" size={12} />
                 </div>
@@ -486,7 +532,7 @@ export default function App() {
                 size="icon" 
                 className={`absolute right-3 bottom-3 transition-all ${inputMessage.trim() ? 'bg-accent-600 text-white hover:bg-accent-500' : 'bg-zinc-800 text-zinc-500'}`}
                 onClick={() => handleSendMessage()}
-                disabled={!inputMessage.trim() || isTyping}
+                disabled={!inputMessage.trim() || isAwaitingResponse}
              >
                 <Send size={16} />
              </Button>

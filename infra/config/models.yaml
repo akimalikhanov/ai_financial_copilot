@@ -153,6 +153,7 @@ models:
       host: "${LLAMA_SERVER_HOST:-localhost}"
       port: "${LLAMA_SERVER_PORT:-8002}"
       base_path: "/v1"
+    include_usage: true
     pricing:
       currency: USD
       unit: local
@@ -171,6 +172,7 @@ models:
       host: "${QWEN_SERVER_HOST:-localhost}"
       port: "${QWEN_SERVER_PORT:-8001}"
       base_path: "/v1"
+    include_usage: true
     pricing:
       currency: USD
       unit: local

@@ -120,6 +120,13 @@ const toApiErrorFromResponse = async (response: Response): Promise<ApiError> => 
 };
 
 const toApiErrorFromThrowable = (error: unknown): ApiError => {
+    if (error instanceof TypeError && error.message.includes('NetworkError')) {
+        return {
+            message: 'Unable to connect to the server. Check your internet connection and try again.',
+            errorType: 'NetworkError',
+            raw: error,
+        };
+        }
   if (error instanceof Error) {
     return { message: error.message, errorType: error.name, raw: error };
   }
@@ -178,6 +185,40 @@ export const chat = async (request: ChatRequest): Promise<LLMResponse> => {
 
   return (await response.json()) as LLMResponse;
 };
+
+// --- Models API ---
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+}
+
+export interface ModelsResponse {
+  models: ModelInfo[];
+}
+
+export const fetchModels = async (): Promise<ModelInfo[]> => {
+  let response: Response;
+  try {
+    response = await fetch(joinUrl(API_BASE_URL, '/v1/models'), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+
+  const data = (await response.json()) as ModelsResponse;
+  return data.models;
+};
+
+// --- Chat Stream API ---
 
 export const chatStream = async (
   request: ChatRequest,
