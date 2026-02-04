@@ -3,7 +3,7 @@ import { Loader2 } from 'lucide-react';
 
 /**
  * Design System Components
- * 
+ *
  * All components use CSS custom properties from index.css for theming.
  * Colors automatically adapt to dark/light mode.
  */
@@ -21,33 +21,33 @@ export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElemen
 export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className = '', variant = 'primary', size = 'md', loading, children, disabled, ...props }, ref) => {
     const isDisabled = disabled || loading;
-    
+
     const baseStyle = `
-      inline-flex items-center justify-center font-sans font-medium 
+      inline-flex items-center justify-center font-sans font-medium
       transition-all duration-150 ease-out
       focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg)]
       disabled:opacity-50 disabled:cursor-not-allowed
     `.trim().replace(/\s+/g, ' ');
-    
+
     const variants: Record<string, string> = {
       primary: `
-        bg-[var(--accent)] text-white 
-        hover:bg-[var(--accent-hover)] 
+        bg-[var(--accent)] text-white
+        hover:bg-[var(--accent-hover)]
         active:bg-[var(--accent-pressed)]
         border border-transparent
       `.trim().replace(/\s+/g, ' '),
       secondary: `
-        bg-[var(--surface-2)] text-[var(--text)] 
+        bg-[var(--surface-2)] text-[var(--text)]
         border border-[var(--border)]
         hover:bg-[var(--surface-3)] hover:border-[var(--border)]
       `.trim().replace(/\s+/g, ' '),
       ghost: `
-        bg-transparent text-[var(--text-muted)] 
+        bg-transparent text-[var(--text-muted)]
         hover:text-[var(--text)] hover:bg-[var(--surface-2)]
         border border-transparent
       `.trim().replace(/\s+/g, ' '),
       danger: `
-        bg-[var(--danger-bg)] text-[var(--danger)] 
+        bg-[var(--danger-bg)] text-[var(--danger)]
         border border-[var(--danger)]
         hover:bg-[var(--danger)] hover:text-white
       `.trim().replace(/\s+/g, ' '),
@@ -87,14 +87,14 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
       <input
         ref={ref}
         className={`
-          flex h-10 w-full rounded-md 
-          border border-[var(--input-border)] 
-          bg-[var(--input-bg)] 
-          px-3 py-2 text-sm text-[var(--text)] 
+          flex h-10 w-full rounded-md
+          border border-[var(--input-border)]
+          bg-[var(--input-bg)]
+          px-3 py-2 text-sm text-[var(--text)]
           placeholder:text-[var(--placeholder)]
           transition-colors duration-150
           focus:outline-none focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)]
-          disabled:cursor-not-allowed disabled:opacity-50 
+          disabled:cursor-not-allowed disabled:opacity-50
           font-sans
           ${className}
         `.trim().replace(/\s+/g, ' ')}
@@ -117,14 +117,14 @@ export const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
       <textarea
         ref={ref}
         className={`
-          flex w-full rounded-md 
-          border border-[var(--input-border)] 
-          bg-[var(--input-bg)] 
-          px-3 py-2 text-sm text-[var(--text)] 
+          flex w-full rounded-md
+          border border-[var(--input-border)]
+          bg-[var(--input-bg)]
+          px-3 py-2 text-sm text-[var(--text)]
           placeholder:text-[var(--placeholder)]
           transition-colors duration-150
           focus:outline-none focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)]
-          disabled:cursor-not-allowed disabled:opacity-50 
+          disabled:cursor-not-allowed disabled:opacity-50
           font-sans resize-none
           ${className}
         `.trim().replace(/\s+/g, ' ')}
@@ -147,13 +147,13 @@ export const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
       <select
         ref={ref}
         className={`
-          appearance-none h-10 rounded-md 
-          border border-[var(--input-border)] 
-          bg-[var(--input-bg)] 
+          appearance-none h-10 rounded-md
+          border border-[var(--input-border)]
+          bg-[var(--input-bg)]
           px-3 pr-8 text-sm text-[var(--text)]
           transition-colors duration-150
           focus:outline-none focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)]
-          disabled:cursor-not-allowed disabled:opacity-50 
+          disabled:cursor-not-allowed disabled:opacity-50
           font-sans cursor-pointer
           ${className}
         `.trim().replace(/\s+/g, ' ')}
@@ -176,10 +176,10 @@ export interface BadgeProps {
   className?: string;
 }
 
-export const Badge: React.FC<BadgeProps> = ({ 
-  children, 
-  variant = 'default', 
-  className = '' 
+export const Badge: React.FC<BadgeProps> = ({
+  children,
+  variant = 'default',
+  className = ''
 }) => {
   const variants: Record<string, string> = {
     default: 'bg-[var(--surface-2)] text-[var(--text-muted)] border-transparent',
@@ -191,12 +191,12 @@ export const Badge: React.FC<BadgeProps> = ({
   };
 
   return (
-    <span 
+    <span
       className={`
-        inline-flex items-center px-2.5 py-0.5 rounded-md 
+        inline-flex items-center px-2.5 py-0.5 rounded-md
         text-xs font-medium font-sans
         border
-        ${variants[variant]} 
+        ${variants[variant]}
         ${className}
       `.trim().replace(/\s+/g, ' ')}
     >
@@ -215,8 +215,8 @@ export interface CardProps {
   variant?: 'default' | 'elevated';
 }
 
-export const Card: React.FC<CardProps> = ({ 
-  children, 
+export const Card: React.FC<CardProps> = ({
+  children,
   className = '',
   variant = 'default'
 }) => {
@@ -226,7 +226,7 @@ export const Card: React.FC<CardProps> = ({
   };
 
   return (
-    <div 
+    <div
       className={`
         rounded-lg
         ${variants[variant]}
@@ -247,16 +247,16 @@ export interface SeparatorProps {
   orientation?: 'horizontal' | 'vertical';
 }
 
-export const Separator: React.FC<SeparatorProps> = ({ 
-  className = '', 
-  orientation = 'horizontal' 
+export const Separator: React.FC<SeparatorProps> = ({
+  className = '',
+  orientation = 'horizontal'
 }) => (
-  <div 
+  <div
     className={`
-      ${orientation === 'horizontal' ? 'h-[1px] w-full' : 'h-full w-[1px]'} 
+      ${orientation === 'horizontal' ? 'h-[1px] w-full' : 'h-full w-[1px]'}
       bg-[var(--border)]
       ${className}
-    `.trim().replace(/\s+/g, ' ')} 
+    `.trim().replace(/\s+/g, ' ')}
   />
 );
 
@@ -280,7 +280,7 @@ export const Toggle: React.FC<ToggleProps> = ({
   label,
 }) => {
   return (
-    <label 
+    <label
       className={`
         inline-flex items-center gap-2 cursor-pointer
         ${disabled ? 'opacity-50 cursor-not-allowed' : ''}
@@ -294,8 +294,8 @@ export const Toggle: React.FC<ToggleProps> = ({
         disabled={disabled}
         onClick={() => onChange?.(!checked)}
         className={`
-          relative inline-flex h-6 w-11 shrink-0 
-          cursor-pointer rounded-full border-2 border-transparent 
+          relative inline-flex h-6 w-11 shrink-0
+          cursor-pointer rounded-full border-2 border-transparent
           transition-colors duration-200 ease-in-out
           focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--focus-ring)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg)]
           ${checked ? 'bg-[var(--accent)]' : 'bg-[var(--surface-3)]'}
@@ -304,8 +304,8 @@ export const Toggle: React.FC<ToggleProps> = ({
       >
         <span
           className={`
-            pointer-events-none inline-block h-5 w-5 
-            transform rounded-full bg-white shadow-md ring-0 
+            pointer-events-none inline-block h-5 w-5
+            transform rounded-full bg-white shadow-md ring-0
             transition duration-200 ease-in-out
             ${checked ? 'translate-x-5' : 'translate-x-0'}
           `.trim().replace(/\s+/g, ' ')}
@@ -334,7 +334,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = ({
   className = '',
 }) => {
   return (
-    <div 
+    <div
       className={`
         rounded-lg overflow-hidden
         border border-[var(--code-border)]
@@ -377,7 +377,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   };
 
   return (
-    <div 
+    <div
       className={`
         px-4 py-3 text-sm leading-relaxed
         ${variants[variant]}
@@ -415,7 +415,7 @@ export const Avatar: React.FC<AvatarProps> = ({
   };
 
   return (
-    <div 
+    <div
       className={`
         rounded-full overflow-hidden flex items-center justify-center
         bg-[var(--surface-2)] border border-[var(--border)]
@@ -442,10 +442,10 @@ export interface SkeletonProps {
 }
 
 export const Skeleton: React.FC<SkeletonProps> = ({ className = '' }) => (
-  <div 
+  <div
     className={`
       animate-pulse rounded-md bg-[var(--surface-2)]
       ${className}
-    `.trim().replace(/\s+/g, ' ')} 
+    `.trim().replace(/\s+/g, ' ')}
   />
 );

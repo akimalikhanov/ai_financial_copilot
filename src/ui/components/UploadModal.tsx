@@ -70,17 +70,17 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
 
         <div className="p-6">
           {step === 1 && (
-            <div 
+            <div
               className="border-2 border-dashed border-[var(--border)] rounded-xl p-10 flex flex-col items-center justify-center text-center hover:bg-[var(--surface-2)] hover:border-[var(--accent)] transition-colors cursor-pointer"
               onDragOver={handleDragOver}
               onDrop={handleDrop}
               onClick={() => document.getElementById('file-upload')?.click()}
             >
-              <input 
-                id="file-upload" 
-                type="file" 
-                className="hidden" 
-                accept=".pdf" 
+              <input
+                id="file-upload"
+                type="file"
+                className="hidden"
+                accept=".pdf"
                 onChange={handleFileChange}
               />
               {file ? (
@@ -129,7 +129,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                     <span className="font-mono">{progress}%</span>
                  </div>
                  <div className="h-2 w-full bg-[var(--surface-3)] rounded-full overflow-hidden">
-                    <div 
+                    <div
                         className="h-full bg-[var(--accent)] transition-all duration-300 ease-out rounded-full"
                         style={{ width: `${progress}%` }}
                     />

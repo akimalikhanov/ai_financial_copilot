@@ -1,9 +1,9 @@
 /**
  * Theme Configuration - ChatGPT-inspired Design System
- * 
+ *
  * Single source of truth for all design tokens.
  * Inspired by ChatGPT.com's clean, neutral aesthetic with OpenAI's green accent.
- * 
+ *
  * To customize: modify the values below and everything updates automatically.
  */
 
@@ -14,17 +14,17 @@ export const theme = {
     'surface-1': '#171717',     // Sidebar - darker
     'surface-2': '#2F2F2F',     // Hover states, cards
     'surface-3': '#3D3D3D',     // Active states, highlights
-    
+
     // Borders - Very subtle 1px dividers
     border: '#3D3D3D',
     'border-subtle': '#2F2F2F',
-    
+
     // Text - High contrast primary, muted secondary
     text: '#ECECEC',
     'text-muted': '#B4B4B4',
     'text-faint': '#8E8E8E',
     icon: '#B4B4B4',
-    
+
     // Accent - OpenAI green
     accent: '#10A37F',
     'accent-hover': '#12B08A',
@@ -32,7 +32,7 @@ export const theme = {
     'accent-subtle': 'rgba(16, 163, 127, 0.12)',
     link: '#10A37F',
     'focus-ring': 'rgba(16, 163, 127, 0.35)',
-    
+
     // Semantic colors
     success: '#22C55E',
     'success-bg': 'rgba(34, 197, 94, 0.12)',
@@ -40,39 +40,39 @@ export const theme = {
     'warning-bg': 'rgba(245, 158, 11, 0.12)',
     danger: '#EF4444',
     'danger-bg': 'rgba(239, 68, 68, 0.12)',
-    
+
     // Inputs
     'input-bg': '#2F2F2F',
     'input-border': '#3D3D3D',
     'input-border-focus': '#10A37F',
     placeholder: '#8E8E8E',
-    
+
     // Code blocks
     'code-bg': '#171717',
     'code-border': '#3D3D3D',
-    
+
     // Chat bubbles
     'bubble-user-bg': '#2F2F2F',
     'bubble-assistant-bg': 'transparent',
   },
-  
+
   light: {
     // Backgrounds - ChatGPT style: gray sidebar, white main content
     bg: '#FFFFFF',              // Main chat area - white
     'surface-1': '#F7F7F8',     // Sidebar - light gray
     'surface-2': '#EFEFEF',     // Hover states
     'surface-3': '#E5E5E5',     // Active states
-    
+
     // Borders
     border: '#E5E5E5',
     'border-subtle': '#EFEFEF',
-    
+
     // Text
     text: '#0D0D0D',
     'text-muted': '#6E6E6E',
     'text-faint': '#8E8E8E',
     icon: '#6E6E6E',
-    
+
     // Accent
     accent: '#10A37F',
     'accent-hover': '#0F946F',
@@ -80,7 +80,7 @@ export const theme = {
     'accent-subtle': 'rgba(16, 163, 127, 0.08)',
     link: '#10A37F',
     'focus-ring': 'rgba(16, 163, 127, 0.25)',
-    
+
     // Semantic
     success: '#16A34A',
     'success-bg': 'rgba(22, 163, 74, 0.1)',
@@ -88,17 +88,17 @@ export const theme = {
     'warning-bg': 'rgba(217, 119, 6, 0.1)',
     danger: '#DC2626',
     'danger-bg': 'rgba(220, 38, 38, 0.1)',
-    
+
     // Inputs
     'input-bg': '#FFFFFF',
     'input-border': '#E5E5E5',
     'input-border-focus': '#10A37F',
     placeholder: '#8E8E8E',
-    
+
     // Code blocks
     'code-bg': '#F7F7F8',
     'code-border': '#E5E5E5',
-    
+
     // Chat bubbles
     'bubble-user-bg': '#F7F7F8',
     'bubble-assistant-bg': 'transparent',

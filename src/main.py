@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -14,6 +13,7 @@ from src.api.routers import get_routers
 from src.services.llm_router import get_router
 from src.services.llm_runtime.exceptions import LLMError
 from src.utils.config import get_cors_origins
+
 logger = logging.getLogger(__name__)
 
 

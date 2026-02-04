@@ -48,13 +48,13 @@ export const DocPickerModal: React.FC<DocPickerModalProps> = ({ isOpen, onClose,
             <X size={18} />
           </Button>
         </div>
-        
+
         <div className="p-4 border-b border-[var(--border)]">
           <div className="relative">
             <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
-            <Input 
-              placeholder="Search documents..." 
-              className="pl-9" 
+            <Input
+              placeholder="Search documents..."
+              className="pl-9"
               value={search}
               onChange={e => setSearch(e.target.value)}
               autoFocus
@@ -69,20 +69,20 @@ export const DocPickerModal: React.FC<DocPickerModalProps> = ({ isOpen, onClose,
            {filteredDocs.map(doc => {
              const isSelected = tempSelected.includes(doc.id);
              return (
-               <div 
+               <div
                  key={doc.id}
                  onClick={() => toggleId(doc.id)}
                  className={`
                    flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-colors border mb-1
-                   ${isSelected 
-                     ? 'bg-[var(--accent-subtle)] border-[var(--accent)]' 
+                   ${isSelected
+                     ? 'bg-[var(--accent-subtle)] border-[var(--accent)]'
                      : 'border-transparent hover:bg-[var(--surface-2)]'}
                  `}
                >
                  <div className={`
                    w-5 h-5 rounded-md border flex items-center justify-center mt-0.5 transition-colors
-                   ${isSelected 
-                     ? 'bg-[var(--accent)] border-[var(--accent)] text-white' 
+                   ${isSelected
+                     ? 'bg-[var(--accent)] border-[var(--accent)] text-white'
                      : 'border-[var(--border)] bg-[var(--input-bg)]'}
                  `}>
                     {isSelected && <Check size={12} />}

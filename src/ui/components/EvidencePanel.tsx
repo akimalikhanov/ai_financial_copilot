@@ -23,7 +23,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   highlight
 }) => {
   const [zoom, setZoom] = useState(100);
-  
+
   if (!isOpen) return null;
 
   const activeDocData = openDocs.find(d => d.doc.id === activeDocId);
@@ -32,7 +32,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
 
   return (
     <div className={`
-      fixed inset-0 z-40 flex flex-col bg-[var(--surface-1)] border-l border-[var(--border)] 
+      fixed inset-0 z-40 flex flex-col bg-[var(--surface-1)] border-l border-[var(--border)]
       transition-transform duration-300 ease-in-out
       md:relative md:inset-auto md:w-[600px] md:flex-shrink-0 md:transform-none
       ${isOpen ? 'translate-x-0' : 'translate-x-full md:hidden'}
@@ -47,13 +47,13 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
                 onClick={() => onSwitchDoc(doc.id)}
                 className={`
                   flex items-center gap-2 px-3 py-1.5 text-xs font-medium border rounded-md whitespace-nowrap transition-colors
-                  ${activeDocId === doc.id 
-                    ? 'bg-[var(--surface-3)] border-[var(--border)] text-[var(--text)]' 
+                  ${activeDocId === doc.id
+                    ? 'bg-[var(--surface-3)] border-[var(--border)] text-[var(--text)]'
                     : 'bg-[var(--bg)] border-[var(--border)] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)]'}
                 `}
             >
                 <span className="truncate max-w-[100px]">{doc.company}</span>
-                <span 
+                <span
                   className="ml-1 opacity-60 hover:opacity-100 p-0.5 rounded hover:bg-[var(--surface-3)]"
                   onClick={(e) => { e.stopPropagation(); onCloseDoc(doc.id); }}
                 >
@@ -95,10 +95,10 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
                 <p className="text-sm text-center max-w-[200px]">Select a citation to view evidence or open a document from Library.</p>
             </div>
         ) : (
-            <div 
+            <div
                 className="relative bg-white shadow-xl transition-all duration-300 rounded-sm"
-                style={{ 
-                    width: `${600 * (zoom / 100)}px`, 
+                style={{
+                    width: `${600 * (zoom / 100)}px`,
                     height: `${850 * (zoom / 100)}px`,
                 }}
             >
@@ -124,7 +124,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
 
                 {/* Highlight Overlay */}
                 {highlight && (
-                    <div 
+                    <div
                         className="absolute bg-[var(--accent)]/20 border-2 border-[var(--accent)]/50 rounded animate-pulse"
                         style={{
                             left: `${highlight.x}%`,

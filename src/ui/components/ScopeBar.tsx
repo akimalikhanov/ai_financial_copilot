@@ -28,8 +28,8 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
               onClick={() => onModeChange(mode.id as Scope['mode'])}
               className={`
                 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all
-                ${scope.mode === mode.id 
-                  ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm' 
+                ${scope.mode === mode.id
+                  ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm'
                   : 'text-[var(--text-muted)] hover:text-[var(--text)]'}
               `}
             >
@@ -38,7 +38,7 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
             </button>
           ))}
         </div>
-        
+
         {/* Active Doc Count Badge */}
         <div className="ml-auto flex items-center gap-2">
              <Badge variant="accent" className="h-7 px-3 font-mono">
@@ -50,7 +50,7 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
       {/* Filters (Only visible if 'filteredByMetadata') */}
       {scope.mode === 'filteredByMetadata' && (
         <div className="flex flex-wrap gap-2 animate-fade-in">
-          <select 
+          <select
             className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
             onChange={(e) => onFilterChange({ company: e.target.value ? [e.target.value] : undefined })}
           >
@@ -59,8 +59,8 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
             <option value="Tesla Inc">Tesla Inc</option>
             <option value="Apple Inc">Apple Inc</option>
           </select>
-          
-          <select 
+
+          <select
              className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
              onChange={(e) => onFilterChange({ year: e.target.value ? [parseInt(e.target.value)] : undefined })}
           >
@@ -69,7 +69,7 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
             <option value="2022">2022</option>
           </select>
 
-           <select 
+           <select
              className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
              onChange={(e) => onFilterChange({ type: e.target.value ? [e.target.value] : undefined })}
           >
@@ -83,17 +83,17 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
       {/* Selected Docs Actions */}
       {scope.mode === 'selectedDocs' && (
         <div className="flex items-center gap-2 animate-fade-in">
-            <Button 
-              size="sm" 
+            <Button
+              size="sm"
               variant="secondary"
-              onClick={onAddFiles} 
+              onClick={onAddFiles}
               className="h-7 gap-1 text-xs border-dashed"
             >
                 <Plus size={12} /> Add Files
             </Button>
             <span className="text-xs text-[var(--text-muted)] ml-2">
-                {scope.docIds.length === 0 
-                    ? "No documents selected. Add files to begin." 
+                {scope.docIds.length === 0
+                    ? "No documents selected. Add files to begin."
                     : `${scope.docIds.length} file(s) in scope.`}
             </span>
         </div>

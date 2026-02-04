@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
-  MessageSquare, BookOpen, Plus, Send, Search, 
+import {
+  MessageSquare, BookOpen, Plus, Send, Search,
   Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
@@ -71,11 +71,11 @@ export default function App() {
   const [view, setView] = useState<ViewMode>('ASK');
   const [mobileTab, setMobileTab] = useState<MobileTab>('CONVERSATION');
   const [isDarkMode, setIsDarkMode] = useState(true);
-  
+
   // Data
   const [docs, setDocs] = useState<Document[]>(MOCK_DOCS);
   const [chats, setChats] = useState<Chat[]>(MOCK_CHATS);
-  
+
   // Models (loaded from API)
   const [models, setModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -102,7 +102,7 @@ export default function App() {
   const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
-  
+
   // Control Pane State
   const [isControlPaneOpen, setIsControlPaneOpen] = useState(false);
   const [modelParams, setModelParams] = useState<ModelParams>({
@@ -114,7 +114,7 @@ export default function App() {
   const [lastRequestStats, setLastRequestStats] = useState<RequestStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<RequestStats[]>([]);
   const requestStartTimeRef = useRef<number>(0);
-  
+
   // Delete Confirmation State
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
 
@@ -183,7 +183,7 @@ export default function App() {
     // GPT-5 series and some newer models support reasoning_effort and verbosity
     const supportsAdvanced = activeModel.startsWith('gpt-5') || activeModel.includes('o1') || activeModel.includes('o3');
     return {
-      supportsTemperature: true, // Most models support temperature
+      supportsTemperature: !supportsAdvanced, // GPT-5 models don't support temperature
       supportsReasoningEffort: supportsAdvanced,
       supportsVerbosity: supportsAdvanced,
     };
@@ -192,12 +192,12 @@ export default function App() {
   // --- Helper to record stats from API response ---
   const recordStats = useCallback((stats: LLMStreamChunk['stats'], model: string) => {
     if (!stats) return;
-    
+
     const reasoningTokens = stats.reasoning_tokens ?? 0;
     const inputTokens = stats.input_tokens ?? 0;
     const outputTokens = stats.output_tokens ?? 0;
     const totalTokens = stats.total_tokens ?? (inputTokens + outputTokens + reasoningTokens);
-    
+
     const newStats: RequestStats = {
       inputTokens,
       outputTokens,
@@ -210,7 +210,7 @@ export default function App() {
       model,
       timestamp: Date.now(),
     };
-    
+
     setLastRequestStats(newStats);
     setStatsHistory(prev => [...prev, newStats]);
   }, []);
@@ -269,7 +269,7 @@ export default function App() {
     // Build request with model parameters
     const systemPrompt = buildScopeContext(scope, docs);
     const apiMessages = toApiMessages(messagesWithUser, systemPrompt);
-    
+
     // Build extra_params for advanced features
     const extraParams: Record<string, unknown> = {};
     if (modelCapabilities.supportsReasoningEffort && modelParams.reasoningEffort) {
@@ -278,7 +278,7 @@ export default function App() {
     if (modelCapabilities.supportsVerbosity && modelParams.verbosity) {
       extraParams.verbosity = modelParams.verbosity;
     }
-    
+
     const request: ChatRequest = {
       messages: apiMessages,
       model: activeModel,
@@ -286,7 +286,7 @@ export default function App() {
       max_tokens: modelParams.maxTokens,
       ...(Object.keys(extraParams).length > 0 && { extra_params: extraParams }),
     };
-    
+
     // Track request start time for latency calculation
     requestStartTimeRef.current = Date.now();
 
@@ -376,14 +376,14 @@ export default function App() {
     // Open Evidence Panel
     setIsEvidenceOpen(true);
     setMobileTab('EVIDENCE');
-    
+
     // Add tab if not exists
     setOpenPdfTabs(prev => {
         const exists = prev.find(p => p.doc.id === doc.id);
         if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page: citation.page } : p);
         return [...prev, { doc, page: citation.page }];
     });
-    
+
     setActivePdfDocId(doc.id);
     setActiveHighlight(citation.bboxHint);
   };
@@ -449,8 +449,8 @@ export default function App() {
             onClick={() => { setActiveChatId(chat.id); if(window.innerWidth < 768) setIsSidebarOpen(false); }}
             className={`
               group flex items-center justify-between p-3 rounded-lg mb-1 cursor-pointer transition-colors
-              ${activeChatId === chat.id 
-                ? 'bg-[var(--surface-3)] text-[var(--text)] border border-[var(--border)]' 
+              ${activeChatId === chat.id
+                ? 'bg-[var(--surface-3)] text-[var(--text)] border border-[var(--border)]'
                 : 'text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] border border-transparent'}
             `}
           >
@@ -460,7 +460,7 @@ export default function App() {
                     {new Date(chat.createdAt).toLocaleDateString()}
                 </div>
             </div>
-            <button 
+            <button
                 onClick={(e) => handleDeleteRequest(e, chat.id)}
                 className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--danger)] transition-opacity"
             >
@@ -511,10 +511,10 @@ export default function App() {
     return (
       <div className="flex-1 flex flex-col min-w-0 h-full">
         {/* Scope Bar */}
-        <ScopeBar 
-            scope={scope} 
+        <ScopeBar
+            scope={scope}
             docCount={activeDocsCount}
-            onModeChange={(m) => setScope(s => ({ ...s, mode: m }))} 
+            onModeChange={(m) => setScope(s => ({ ...s, mode: m }))}
             onFilterChange={(f) => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
             onAddFiles={() => setIsDocPickerOpen(true)}
         />
@@ -536,7 +536,7 @@ export default function App() {
               {activeChat?.messages.map((msg) => {
                 // Skip rendering assistant messages with empty content (placeholder while typing)
                 if (msg.role === 'assistant' && !msg.content) return null;
-                
+
                 return (
                   <div key={msg.id} className={`flex gap-4 max-w-3xl mx-auto ${msg.role === 'user' ? 'justify-end' : ''}`}>
                     {msg.role === 'assistant' && (
@@ -544,23 +544,23 @@ export default function App() {
                         <Bot size={18} className="text-[var(--accent)]" />
                       </div>
                     )}
-                    
+
                     <div className={`space-y-2 ${msg.role === 'user' ? 'flex flex-col items-end ml-[15%]' : 'flex-1'}`}>
                       <div className={`p-4 rounded-2xl text-sm leading-relaxed ${
-                        msg.role === 'user' 
-                          ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md max-w-[85%]' 
+                        msg.role === 'user'
+                          ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md max-w-[85%]'
                           : 'bg-[var(--bubble-assistant-bg)] text-[var(--text)] rounded-bl-md'
                       }`} style={{ width: 'fit-content', maxWidth: '100%' }}>
                           <div className="whitespace-pre-wrap break-words">{msg.content}</div>
                       </div>
-                      
+
                       {/* Citations Grid */}
                       {msg.citations && msg.citations.length > 0 && (
                           <div className={`flex flex-wrap gap-2 mt-2 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                               {msg.citations.map((c, i) => {
                                   const doc = docs.find(d => d.id === c.docId);
                                   return (
-                                      <button 
+                                      <button
                                           key={i}
                                           onClick={() => handleCitationClick(c)}
                                           className="flex items-center gap-2 bg-[var(--surface-1)] border border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--surface-2)] px-3 py-2 rounded-lg text-left transition-all group max-w-xs"
@@ -599,11 +599,11 @@ export default function App() {
         </div>
 
         {/* Composer */}
-        <div className="p-4 border-t border-[var(--border)] bg-[var(--bg)]">
+        <div className="p-4 bg-[var(--bg)]">
           <div className="max-w-3xl mx-auto relative">
              <div className="absolute -top-8 left-0 flex items-center gap-2">
                 <div className="relative">
-                  <select 
+                  <select
                     value={activeModel}
                     onChange={(e) => setActiveModel(e.target.value)}
                     className="appearance-none bg-[var(--surface-2)] border border-[var(--border)] text-xs font-medium text-[var(--text)] rounded-md px-3 py-1.5 pr-8 outline-none focus:border-[var(--accent)] hover:bg-[var(--surface-3)] cursor-pointer transition-colors"
@@ -620,11 +620,11 @@ export default function App() {
                 placeholder="Ask me anything..."
                 className="w-full bg-[var(--input-bg)] border border-[var(--input-border)] rounded-xl p-4 pr-14 text-sm text-[var(--text)] placeholder:text-[var(--placeholder)] focus:outline-none focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] min-h-[96px] resize-none font-sans shadow-sm transition-colors"
              />
-             <Button 
-                size="icon" 
+             <Button
+                size="icon"
                 className={`absolute right-3 bottom-3 transition-all ${
-                  inputMessage.trim() 
-                    ? 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]' 
+                  inputMessage.trim()
+                    ? 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]'
                     : 'bg-[var(--surface-3)] text-[var(--text-muted)]'
                 }`}
                 onClick={() => handleSendMessage()}
@@ -721,14 +721,14 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen bg-[var(--bg)] text-[var(--text)] overflow-hidden font-sans">
       {/* Upload Modal */}
-      <UploadModal 
-        isOpen={isUploadOpen} 
-        onClose={() => setIsUploadOpen(false)} 
+      <UploadModal
+        isOpen={isUploadOpen}
+        onClose={() => setIsUploadOpen(false)}
         onUpload={(meta) => setDocs(prev => [{ id: Date.now().toString(), pages: 0, status: 'Processing', tags: [], ...meta }, ...prev])}
       />
-      
+
       {/* Doc Picker Modal */}
-      <DocPickerModal 
+      <DocPickerModal
         isOpen={isDocPickerOpen}
         onClose={() => setIsDocPickerOpen(false)}
         docs={docs}
@@ -772,7 +772,7 @@ export default function App() {
 
         {/* Center Workspace */}
         <div className="flex-1 flex flex-col min-w-0 bg-[var(--bg)] relative">
-          
+
           {/* Header */}
           <header className="h-14 border-b border-[var(--border)] flex items-center justify-between px-4 bg-[var(--surface-1)] z-10">
             <div className="flex items-center gap-4">
@@ -781,21 +781,21 @@ export default function App() {
                 </Button>
                 {/* View Switcher */}
                 <div className="flex bg-[var(--surface-2)] p-1 rounded-lg border border-[var(--border)]">
-                    <button 
-                        onClick={() => setView('ASK')} 
+                    <button
+                        onClick={() => setView('ASK')}
                         className={`px-4 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                          view === 'ASK' 
-                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm' 
+                          view === 'ASK'
+                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm'
                             : 'text-[var(--text-muted)] hover:text-[var(--text)]'
                         }`}
                     >
                         ASK
                     </button>
-                    <button 
-                        onClick={() => setView('LIBRARY')} 
+                    <button
+                        onClick={() => setView('LIBRARY')}
                         className={`px-4 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                          view === 'LIBRARY' 
-                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm' 
+                          view === 'LIBRARY'
+                            ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm'
                             : 'text-[var(--text-muted)] hover:text-[var(--text)]'
                         }`}
                     >
@@ -803,14 +803,14 @@ export default function App() {
                     </button>
                 </div>
             </div>
-            
+
             <div className="flex items-center gap-3">
                 {/* Control Pane Toggle */}
                 <button
                   onClick={() => setIsControlPaneOpen(!isControlPaneOpen)}
                   className={`p-2 rounded-lg transition-colors ${
-                    isControlPaneOpen 
-                      ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                    isControlPaneOpen
+                      ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
                       : 'text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]'
                   }`}
                   title="Control Pane"
@@ -837,9 +837,9 @@ export default function App() {
                 <div className={`flex-1 flex flex-col ${window.innerWidth < 768 && mobileTab === 'EVIDENCE' ? 'hidden' : 'flex'}`}>
                     {renderChatArea()}
                 </div>
-                
+
                 {/* Evidence Panel (Desktop: Side, Mobile: Full via Tab) */}
-                <EvidencePanel 
+                <EvidencePanel
                     isOpen={isEvidenceOpen || (window.innerWidth < 768 && mobileTab === 'EVIDENCE')}
                     onClose={() => { setIsEvidenceOpen(false); setMobileTab('CONVERSATION'); }}
                     openDocs={openPdfTabs}
@@ -853,7 +853,7 @@ export default function App() {
                     }}
                     highlight={activeHighlight}
                 />
-                
+
                 {/* Control Pane */}
                 <ControlPane
                     isOpen={isControlPaneOpen}
@@ -872,22 +872,22 @@ export default function App() {
       {/* Mobile Bottom Nav (Only in ASK View, Always visible) */}
       {view === 'ASK' && (
         <div className="md:hidden h-14 border-t border-[var(--border)] bg-[var(--surface-1)] flex grid grid-cols-2 fixed bottom-0 left-0 right-0 z-50 shadow-lg">
-            <button 
+            <button
                 onClick={() => { setMobileTab('CONVERSATION'); setIsEvidenceOpen(false); }}
                 className={`flex flex-col items-center justify-center gap-1 transition-colors ${
-                  mobileTab === 'CONVERSATION' 
-                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                  mobileTab === 'CONVERSATION'
+                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
                     : 'text-[var(--text-muted)]'
                 }`}
             >
                 <MessageSquare size={18} />
                 <span className="text-[10px] font-semibold">CHAT</span>
             </button>
-            <button 
+            <button
                 onClick={() => { setMobileTab('EVIDENCE'); setIsEvidenceOpen(true); }}
                 className={`flex flex-col items-center justify-center gap-1 transition-colors ${
-                  mobileTab === 'EVIDENCE' 
-                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]' 
+                  mobileTab === 'EVIDENCE'
+                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
                     : 'text-[var(--text-muted)]'
                 }`}
             >

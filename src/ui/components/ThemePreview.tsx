@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { Sun, Moon, Check, AlertTriangle, Info, X, Send, Search, User, Bot, Code, FileText } from 'lucide-react';
-import { 
-  Button, 
-  Input, 
-  Badge, 
-  Card, 
-  Separator, 
-  Toggle, 
-  CodeBlock, 
+import {
+  Button,
+  Input,
+  Badge,
+  Card,
+  Separator,
+  Toggle,
+  CodeBlock,
   ChatBubble,
   Avatar,
   Skeleton,
@@ -16,7 +16,7 @@ import {
 
 /**
  * Theme Preview Component
- * 
+ *
  * A comprehensive showcase of all design tokens and components.
  * Use this to verify the theme looks correct in both dark and light modes.
  */
@@ -34,7 +34,7 @@ export const ThemePreview: React.FC = () => {
   return (
     <div className="min-h-screen bg-[var(--bg)] p-8 transition-colors">
       <div className="max-w-5xl mx-auto space-y-12">
-        
+
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
@@ -57,7 +57,7 @@ export const ThemePreview: React.FC = () => {
         {/* Color Palette */}
         <section>
           <h2 className="text-xl font-semibold text-[var(--text)] mb-6">Color Palette</h2>
-          
+
           {/* Backgrounds */}
           <div className="mb-8">
             <h3 className="text-sm font-medium text-[var(--text-muted)] mb-3 uppercase tracking-wide">Backgrounds</h3>
@@ -69,7 +69,7 @@ export const ThemePreview: React.FC = () => {
                 { name: 'surface-3', label: 'Surface 3' },
               ].map(({ name, label }) => (
                 <div key={name} className="space-y-2">
-                  <div 
+                  <div
                     className="h-20 rounded-lg border border-[var(--border)]"
                     style={{ backgroundColor: `var(--${name})` }}
                   />
@@ -105,7 +105,7 @@ export const ThemePreview: React.FC = () => {
                 { name: 'danger', label: 'Danger' },
               ].map(({ name, label }) => (
                 <div key={name} className="space-y-2">
-                  <div 
+                  <div
                     className="h-16 rounded-lg"
                     style={{ backgroundColor: `var(--${name})` }}
                   />
@@ -125,7 +125,7 @@ export const ThemePreview: React.FC = () => {
         <section>
           <h2 className="text-xl font-semibold text-[var(--text)] mb-6">Buttons</h2>
           <div className="space-y-6">
-            
+
             {/* Variants */}
             <div>
               <h3 className="text-sm font-medium text-[var(--text-muted)] mb-3 uppercase tracking-wide">Variants</h3>
@@ -166,7 +166,7 @@ export const ThemePreview: React.FC = () => {
         <section>
           <h2 className="text-xl font-semibold text-[var(--text)] mb-6">Form Elements</h2>
           <div className="grid grid-cols-2 gap-8">
-            
+
             {/* Inputs */}
             <div className="space-y-4">
               <h3 className="text-sm font-medium text-[var(--text-muted)] mb-3 uppercase tracking-wide">Inputs</h3>

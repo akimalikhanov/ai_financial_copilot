@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import pytest
 from fastapi.routing import APIRoute
@@ -73,8 +74,8 @@ def _chat_payload(model: str = "dummy-model") -> dict[str, object]:
     }
 
 
-def _collect_sse_events(raw: str) -> list[tuple[str, dict[str, object]]]:
-    events: list[tuple[str, dict[str, object]]] = []
+def _collect_sse_events(raw: str) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
     for block in raw.strip().split("\n\n"):
         if not block:
             continue

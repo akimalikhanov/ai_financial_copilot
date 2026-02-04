@@ -1,0 +1,110 @@
+version: "3.9"
+
+x-logging: &default-logging
+  logging:
+    driver: local
+    options:
+      mode: non-blocking
+      max-buffer-size: 12m
+
+networks:
+  backend:
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+
+services:
+  postgres:
+    image: postgres:16.11-alpine # pinned, stable :contentReference[oaicite:1]{index=1}
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      POSTGRES_DB: app
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    # Resource limits (use `docker compose --compatibility up -d` for deploy->runtime mapping)
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1g
+    cpus: "1.00"
+    mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]
+
+  redis:
+    image: redis:7.2.12-alpine # pinned, stable :contentReference[oaicite:2]{index=2}
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256m
+    cpus: "0.50"
+    mem_limit: 256m
+    <<: *default-logging
+    networks: [backend]
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.3
+    container_name: qdrant
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # Optional: you can keep a simple liveness check here or omit it entirely
+
+  qdrant-hc:
+    image: busybox:1.36
+    container_name: qdrant-hc
+    depends_on:
+      qdrant:
+        condition: service_started
+    networks: [backend]
+
+    mem_limit: 64m
+    mem_reservation: 16m
+    cpus: "0.10"
+    <<: *default-logging
+
+    command: ["sh", "-c", "sleep 9999999"]
+
+    # Choose ONE endpoint:
+    # - /healthz = “alive” style
+    # - /readyz = “ready” style (preferred if you want readiness gating)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://qdrant:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    restart: unless-stopped

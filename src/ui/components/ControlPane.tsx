@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { 
-  Settings2, ChevronRight, ChevronLeft, Thermometer, 
-  Hash, Brain, MessageSquareText, Zap, DollarSign, 
+import {
+  Settings2, ChevronRight, ChevronLeft, Thermometer,
+  Hash, Brain, MessageSquareText, Zap, DollarSign,
   Clock, BarChart3, Sparkles, Info, RotateCcw, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { Button, Badge } from './ui';
@@ -86,9 +86,14 @@ const Slider: React.FC<SliderProps> = ({
           {hint && (
             <div className="group relative">
               <Info size={12} className="text-[var(--text-faint)] cursor-help" />
-              <div className="absolute left-0 bottom-full mb-2 hidden group-hover:block z-50">
-                <div className="bg-[var(--surface-3)] text-[var(--text)] text-[10px] px-2 py-1 rounded-md shadow-lg whitespace-nowrap border border-[var(--border)]">
-                  {hint}
+              <div className="absolute left-0 top-full mt-2 hidden group-hover:block z-50">
+                <div className="bg-[var(--surface-3)] text-[var(--text)] text-[10px] px-2 py-1 rounded-md shadow-lg whitespace-pre-line border border-[var(--border)] max-w-[200px]">
+                  {hint.split(/<br\s*\/?>/i).map((part, i, arr) => (
+                    <React.Fragment key={i}>
+                      {part.trim()}
+                      {i < arr.length - 1 && <br />}
+                    </React.Fragment>
+                  ))}
                 </div>
               </div>
             </div>
@@ -100,7 +105,7 @@ const Slider: React.FC<SliderProps> = ({
       </div>
       <div className="relative h-2 group">
         <div className="absolute inset-0 bg-[var(--surface-3)] rounded-full overflow-hidden">
-          <div 
+          <div
             className="absolute inset-y-0 left-0 bg-gradient-to-r from-[var(--accent)] to-[var(--accent-hover)] rounded-full transition-all duration-150"
             style={{ width: `${percentage}%` }}
           />
@@ -115,7 +120,7 @@ const Slider: React.FC<SliderProps> = ({
           disabled={disabled}
           className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
         />
-        <div 
+        <div
           className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-md border-2 border-[var(--accent)] transition-all duration-150 group-hover:scale-110"
           style={{ left: `calc(${percentage}% - 8px)` }}
         />
@@ -155,9 +160,14 @@ const SegmentedControl: React.FC<SegmentedControlProps> = ({
         {hint && (
           <div className="group relative">
             <Info size={12} className="text-[var(--text-faint)] cursor-help" />
-            <div className="absolute left-0 bottom-full mb-2 hidden group-hover:block z-50">
-              <div className="bg-[var(--surface-3)] text-[var(--text)] text-[10px] px-2 py-1 rounded-md shadow-lg whitespace-nowrap border border-[var(--border)]">
-                {hint}
+            <div className="absolute left-0 top-full mt-2 hidden group-hover:block z-50">
+              <div className="bg-[var(--surface-3)] text-[var(--text)] text-[10px] px-2 py-1 rounded-md shadow-lg whitespace-pre-line border border-[var(--border)] max-w-[200px]">
+                {hint.split(/<br\s*\/?>/i).map((part, i, arr) => (
+                  <React.Fragment key={i}>
+                    {part.trim()}
+                    {i < arr.length - 1 && <br />}
+                  </React.Fragment>
+                ))}
               </div>
             </div>
           </div>
@@ -171,8 +181,8 @@ const SegmentedControl: React.FC<SegmentedControlProps> = ({
             disabled={disabled}
             className={`
               flex-1 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider rounded-md transition-all duration-150
-              ${value === opt.value 
-                ? 'bg-[var(--accent)] text-white shadow-sm' 
+              ${value === opt.value
+                ? 'bg-[var(--accent)] text-white shadow-sm'
                 : 'text-[var(--text-muted)] hover:text-[var(--text)] hover:bg-[var(--surface-3)]'
               }
               disabled:cursor-not-allowed
@@ -311,7 +321,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
   // Format TPS
   const formatTPS = (tps: number | null) => {
     if (tps === null || tps === undefined) return 'N/A';
-    return `${tps.toFixed(1)} t/s`;
+    return `${tps.toFixed(1)}`;
   };
 
   // Calculate session totals
@@ -377,8 +387,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
             onClick={() => setActiveTab('params')}
             className={`
               flex-1 px-4 py-3 text-xs font-semibold uppercase tracking-wider transition-colors relative
-              ${activeTab === 'params' 
-                ? 'text-[var(--accent)]' 
+              ${activeTab === 'params'
+                ? 'text-[var(--accent)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text)]'
               }
             `}
@@ -395,8 +405,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
             onClick={() => setActiveTab('stats')}
             className={`
               flex-1 px-4 py-3 text-xs font-semibold uppercase tracking-wider transition-colors relative
-              ${activeTab === 'stats' 
-                ? 'text-[var(--accent)]' 
+              ${activeTab === 'stats'
+                ? 'text-[var(--accent)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text)]'
               }
             `}
@@ -426,7 +436,9 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                 icon={<Thermometer size={14} />}
                 disabled={!capabilities.supportsTemperature}
                 formatValue={(v) => v.toFixed(1)}
-                hint="Controls randomness. Lower = more focused, higher = more creative"
+                hint="Controls randomness.
+                <br />
+                Lower = more focused, higher = more creative"
               />
 
               {/* Max Tokens */}
@@ -454,7 +466,9 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                 onChange={(v) => onParamsChange({ reasoningEffort: v as 'low' | 'medium' | 'high' | null })}
                 icon={<Brain size={14} />}
                 disabled={!capabilities.supportsReasoningEffort}
-                hint="How much the model should 'think' before responding"
+                hint="How much the model should 'think' before responding.
+                <br />
+                Low = less thinking, high = more thinking"
               />
 
               {/* Verbosity */}
@@ -482,7 +496,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
               </button>
 
               {/* Capability Notice */}
-              {(!capabilities.supportsReasoningEffort || !capabilities.supportsVerbosity) && (
+              {(!capabilities.supportsTemperature || !capabilities.supportsReasoningEffort || !capabilities.supportsVerbosity) && (
                 <div className="bg-[var(--warning-bg)] border border-[var(--warning)] rounded-lg p-3 text-xs text-[var(--warning)]">
                   <div className="flex items-start gap-2">
                     <Info size={14} className="shrink-0 mt-0.5" />
@@ -527,7 +541,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                             variant={stats.reasoningTokens > 0 ? 'default' : 'default'}
                           />
                         </div>
-                        
+
                         {/* Token Distribution Bar */}
                         <div className="bg-[var(--surface-1)] rounded-lg p-3 border border-[var(--border)]">
                           <div className="flex items-center justify-between mb-2">
@@ -536,23 +550,23 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                           </div>
                           <div className="h-2.5 bg-[var(--surface-3)] rounded-full overflow-hidden flex">
                             {stats.inputTokens > 0 && (
-                              <div 
+                              <div
                                 className="bg-[var(--accent)] transition-all duration-300"
                                 style={{ width: `${(stats.inputTokens / stats.totalTokens) * 100}%` }}
                                 title={`Input: ${stats.inputTokens}`}
                               />
                             )}
                             {stats.outputTokens > 0 && (
-                              <div 
+                              <div
                                 className="bg-[var(--warning)] transition-all duration-300"
                                 style={{ width: `${(stats.outputTokens / stats.totalTokens) * 100}%` }}
                                 title={`Output: ${stats.outputTokens}`}
                               />
                             )}
                             {stats.reasoningTokens > 0 && (
-                              <div 
+                              <div
                                 className="transition-all duration-300"
-                                style={{ 
+                                style={{
                                   width: `${(stats.reasoningTokens / stats.totalTokens) * 100}%`,
                                   backgroundColor: 'rgba(139, 92, 246, 0.7)' // Purple for reasoning
                                 }}
@@ -571,8 +585,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                             </div>
                             {stats.reasoningTokens > 0 && (
                               <div className="flex items-center gap-1">
-                                <div 
-                                  className="w-2 h-2 rounded-full" 
+                                <div
+                                  className="w-2 h-2 rounded-full"
                                   style={{ backgroundColor: 'rgba(139, 92, 246, 0.7)' }}
                                 />
                                 <span className="text-[var(--text-faint)]">Reasoning</span>
@@ -640,7 +654,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
               {statsHistory.length > 0 && (
                 <>
                   <div className="h-px bg-[var(--border)] my-4" />
-                  
+
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">Session Totals</span>
                     <span className="text-[10px] text-[var(--text-faint)]">{sessionTotals.requests} requests</span>
@@ -666,7 +680,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
               {statsHistory.length > 1 && (
                 <>
                   <div className="h-px bg-[var(--border)] my-4" />
-                  
+
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">Recent Requests</span>
                   </div>
@@ -675,8 +689,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                     {statsHistory.slice(-5).reverse().map((stat, idx) => {
                       const requestNumber = statsHistory.length - idx;
                       return (
-                        <div 
-                          key={stat.timestamp} 
+                        <div
+                          key={stat.timestamp}
                           className="flex items-center justify-between py-2.5 px-3 bg-[var(--surface-2)] rounded-lg border border-[var(--border)] text-xs hover:bg-[var(--surface-3)] transition-colors"
                         >
                           <div className="flex items-center gap-2 min-w-0">

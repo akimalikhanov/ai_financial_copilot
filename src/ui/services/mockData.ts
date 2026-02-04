@@ -21,9 +21,9 @@ export const MOCK_CHATS: Chat[] = [
     createdAt: Date.now() - 1000000,
     messages: [
       { id: 'm1', role: 'user', content: 'What was the growth in Data Center revenue for NVIDIA?', timestamp: Date.now() - 1000000 },
-      { 
-        id: 'm2', 
-        role: 'assistant', 
+      {
+        id: 'm2',
+        role: 'assistant',
         content: 'NVIDIA reported Data Center revenue of $15.01 billion for the fiscal year, up 41% from the previous year. This growth reflects strong demand for generative AI and large language models.',
         timestamp: Date.now() - 900000,
         citations: [
@@ -44,8 +44,8 @@ export const MOCK_CHATS: Chat[] = [
 
 // Helper to simulate an AI response with citations
 export const generateMockResponse = (
-    query: string, 
-    scope: Scope, 
+    query: string,
+    scope: Scope,
     allDocs: Document[]
 ): Promise<Message> => {
   return new Promise((resolve) => {
@@ -77,7 +77,7 @@ export const generateMockResponse = (
 
       // Pick 1-2 random docs from pool for citations
       const citedDocs = pool.sort(() => 0.5 - Math.random()).slice(0, Math.min(2, pool.length));
-      
+
       const citations: Citation[] = citedDocs.map(d => ({
         docId: d.id,
         page: Math.floor(Math.random() * d.pages) + 1,
