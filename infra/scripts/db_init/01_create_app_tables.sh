@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-echo ">> Initializing core DB schema (users, conversations, messages)..."
+echo ">> Initializing core DB schema (users, conversations, llm_requests, messages)..."
 
 # Use APP_DB environment variable (defaults to 'app' if not set)
 APP_DB="${APP_DB:-app}"
@@ -234,6 +234,108 @@ BEFORE UPDATE ON conversations
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ============================================================================
+-- Table: llm_requests
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS llm_requests (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Primary key UUID for the LLM request.
+
+  conversation_id    uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  -- Conversation this request belongs to. Cascades delete with the conversation.
+
+  user_id            uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- User who initiated this request. Denormalized for quick authorization checks.
+
+  provider           text NOT NULL,
+  -- LLM provider (openai/gemini/etc).
+
+  model              text NOT NULL,
+  -- Model id/name used for inference.
+
+  request_params     jsonb NOT NULL DEFAULT '{}'::jsonb,
+  -- Request parameters (temperature, max_tokens, etc.) stored as JSON.
+
+  prompt_tokens      integer,
+  -- Token usage accounting (prompt).
+
+  completion_tokens  integer,
+  -- Token usage accounting (completion).
+
+  reasoning_tokens   integer,
+  -- Token usage accounting (reasoning).
+
+  total_tokens       integer,
+  -- Total tokens (if provided/derived).
+
+  cost_usd           numeric(12,6),
+  -- Cost in USD for this request (numeric for precision).
+
+  latency_ms         integer,
+  -- End-to-end latency in milliseconds.
+
+  ttft_ms            integer,
+  -- Time to first token in milliseconds.
+
+  tps                integer,
+  -- Tokens per second.
+
+  error_code         text,
+  -- Optional error code for failed requests.
+
+  error_message      text,
+  -- Optional error details (keep non-sensitive).
+
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  -- Request creation timestamp.
+
+  updated_at         timestamptz NOT NULL DEFAULT now()
+  -- Last update timestamp (trigger managed).
+);
+
+COMMENT ON TABLE llm_requests IS
+  'LLM request tracking. Stores request-level statistics separate from message content.';
+
+COMMENT ON COLUMN llm_requests.id IS 'Primary key UUID.';
+COMMENT ON COLUMN llm_requests.conversation_id IS 'FK to conversations (cascade on delete).';
+COMMENT ON COLUMN llm_requests.user_id IS 'Denormalized FK to users for auth/audit.';
+COMMENT ON COLUMN llm_requests.provider IS 'LLM provider name.';
+COMMENT ON COLUMN llm_requests.model IS 'LLM model identifier.';
+COMMENT ON COLUMN llm_requests.request_params IS 'Request parameters JSON (temperature, max_tokens, etc.).';
+COMMENT ON COLUMN llm_requests.prompt_tokens IS 'Prompt token count.';
+COMMENT ON COLUMN llm_requests.completion_tokens IS 'Completion token count.';
+COMMENT ON COLUMN llm_requests.reasoning_tokens IS 'Reasoning token count.';
+COMMENT ON COLUMN llm_requests.total_tokens IS 'Total token count.';
+COMMENT ON COLUMN llm_requests.cost_usd IS 'Approximate cost in USD.';
+COMMENT ON COLUMN llm_requests.latency_ms IS 'Generation latency in ms.';
+COMMENT ON COLUMN llm_requests.ttft_ms IS 'Time to first token in ms.';
+COMMENT ON COLUMN llm_requests.tps IS 'Tokens per second.';
+COMMENT ON COLUMN llm_requests.error_code IS 'Error code if failed.';
+COMMENT ON COLUMN llm_requests.error_message IS 'Error message/details if failed.';
+COMMENT ON COLUMN llm_requests.created_at IS 'Row creation time.';
+COMMENT ON COLUMN llm_requests.updated_at IS 'Row last update time (trigger managed).';
+
+CREATE INDEX IF NOT EXISTS llm_requests_conv_idx
+  ON llm_requests (conversation_id);
+COMMENT ON INDEX llm_requests_conv_idx IS
+  'Fast lookup of LLM requests by conversation.';
+
+CREATE INDEX IF NOT EXISTS llm_requests_user_idx
+  ON llm_requests (user_id, created_at DESC);
+COMMENT ON INDEX llm_requests_user_idx IS
+  'Supports user-level analytics and cost tracking.';
+
+CREATE INDEX IF NOT EXISTS llm_requests_created_idx
+  ON llm_requests (created_at DESC);
+COMMENT ON INDEX llm_requests_created_idx IS
+  'Supports time-based queries and analytics.';
+
+DROP TRIGGER IF EXISTS trg_llm_requests_updated_at ON llm_requests;
+CREATE TRIGGER trg_llm_requests_updated_at
+BEFORE UPDATE ON llm_requests
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
 -- Table: messages
 -- ============================================================================
 
@@ -268,44 +370,8 @@ CREATE TABLE IF NOT EXISTS messages (
   client_msg_id      text,
   -- Optional idempotency key from client. Unique per conversation to prevent duplicates on retries.
 
-  request_id         text,
-  -- Trace id for the LLM request (useful across logs/observability).
-
-  provider           text,
-  -- LLM provider (openai/gemini/etc).
-
-  model              text,
-  -- Model id/name used for inference.
-
-  prompt_tokens      integer,
-  -- Token usage accounting (prompt).
-
-  completion_tokens  integer,
-  -- Token usage accounting (completion).
-
-  reasoning_tokens   integer,
-  -- Token usage accounting (reasoning).
-
-  total_tokens       integer,
-  -- Total tokens (if provided/derived).
-
-  cost_usd           numeric(12,6),
-  -- Cost in USD for this message generation (numeric for precision).
-
-  latency_ms         integer,
-  -- End-to-end latency in milliseconds.
-
-  ttft_ms           integer,
-  -- Time to first token in milliseconds.
-
-  tps                integer,
-  -- Tokens per second.
-
-  error_code         text,
-  -- Optional error code for failed generations.
-
-  error_message      text,
-  -- Optional error details (keep non-sensitive).
+  request_id         uuid REFERENCES llm_requests(id) ON DELETE SET NULL,
+  -- FK to llm_requests table. Links message to the LLM request that generated it.
 
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- Creation timestamp.
@@ -333,16 +399,7 @@ COMMENT ON COLUMN messages.content IS 'Message body (text).';
 COMMENT ON COLUMN messages.content_format IS 'Content format hint (e.g., text/markdown).';
 COMMENT ON COLUMN messages.metadata IS 'JSON metadata: citations, tool payloads, etc.';
 COMMENT ON COLUMN messages.client_msg_id IS 'Client idempotency id (unique per conversation).';
-COMMENT ON COLUMN messages.request_id IS 'Trace id for the LLM request.';
-COMMENT ON COLUMN messages.provider IS 'LLM provider name.';
-COMMENT ON COLUMN messages.model IS 'LLM model identifier.';
-COMMENT ON COLUMN messages.prompt_tokens IS 'Prompt token count.';
-COMMENT ON COLUMN messages.completion_tokens IS 'Completion token count.';
-COMMENT ON COLUMN messages.total_tokens IS 'Total token count.';
-COMMENT ON COLUMN messages.cost_usd IS 'Approximate cost in USD.';
-COMMENT ON COLUMN messages.latency_ms IS 'Generation latency in ms.';
-COMMENT ON COLUMN messages.error_code IS 'Error code if failed.';
-COMMENT ON COLUMN messages.error_message IS 'Error message/details if failed.';
+COMMENT ON COLUMN messages.request_id IS 'FK to llm_requests table. Links message to LLM request.';
 COMMENT ON COLUMN messages.created_at IS 'Row creation time.';
 COMMENT ON COLUMN messages.updated_at IS 'Row last update time (trigger managed).';
 
@@ -357,9 +414,10 @@ COMMENT ON INDEX messages_conv_created_idx IS
   'Secondary index for time-based queries / debugging.';
 
 CREATE INDEX IF NOT EXISTS messages_request_id_idx
-  ON messages (request_id);
+  ON messages (request_id)
+  WHERE request_id IS NOT NULL;
 COMMENT ON INDEX messages_request_id_idx IS
-  'Fast lookup of messages by a trace/request id for observability.';
+  'Fast lookup of messages by LLM request id.';
 
 CREATE INDEX IF NOT EXISTS messages_metadata_gin_idx
   ON messages USING gin (metadata);
@@ -370,6 +428,13 @@ DROP TRIGGER IF EXISTS trg_messages_updated_at ON messages;
 CREATE TRIGGER trg_messages_updated_at
 BEFORE UPDATE ON messages
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
+-- Add llm_requests table FK constraint (after llm_requests exists)
+-- ============================================================================
+
+-- Note: llm_requests table is created before messages, so the FK in messages
+-- references llm_requests correctly. No additional constraint needed here.
 
 -- ============================================================================
 -- Add conversations.last_message_id FK (after messages exists)

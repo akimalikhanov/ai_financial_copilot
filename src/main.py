@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.exceptions import llm_error_handler
 from src.api.logging import configure_logging, request_logging_middleware
 from src.api.routers import get_routers
+from src.db import init_db, shutdown_db
 from src.services.llm_router import get_router
 from src.services.llm_runtime.exceptions import LLMError
 from src.utils.config import get_cors_origins
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifecycle: startup and shutdown."""
     # Startup
+    await init_db()
     app.state.llm_router = get_router()
     logger.info("app.started")
 
@@ -29,6 +31,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Shutdown
     logger.info("app.shutting_down")
     await app.state.llm_router.close()
+    await shutdown_db()
+    logger.info("db.shutdown")
     logger.info("app.stopped")
 
 

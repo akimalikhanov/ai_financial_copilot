@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,6 +32,7 @@ class ChatRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
     extra_params: dict[str, Any] = Field(default_factory=dict)
+    conversation_id: UUID | None = None
 
 
 class LLMResponseStats(BaseModel):
@@ -77,3 +79,29 @@ class ErrorResponse(BaseModel):
     status_code: int | None = None
     error_code: str | None = None
     original_error_message: str | None = None
+
+
+class CreateConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: UUID | None = None
+    title: str | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateConversationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conversation_id: UUID
+
+
+class CreateMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conversation_id: UUID
+    role: Role
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateMessageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    message_id: UUID
+    seq: int

@@ -148,3 +148,36 @@ def get_cors_origins() -> list[str]:
     if raw == "*":
         return ["*"]
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def get_db_url() -> str:
+    """
+    Build database connection URL from environment variables.
+
+    Environment variables:
+      - APP_DB_HOST: Database host (default: localhost)
+      - APP_DB_PORT: Database port (default: 6432 for pgbouncer)
+      - APP_DB_NAME: Database name (default: app)
+      - APP_DB_USER: Database user (default: app)
+      - APP_DB_PASSWORD: Database password (required)
+
+    Returns:
+        PostgreSQL async connection URL string.
+
+    Raises:
+        RuntimeError: If APP_DB_PASSWORD is not set.
+    """
+    host = os.getenv("APP_DB_HOST", "localhost")
+    port = os.getenv("APP_DB_PORT", "6432")  # Default to pgbouncer port
+    db_name = os.getenv("APP_DB_NAME", "app")
+    db_user = os.getenv("APP_DB_USER", "app")
+    db_password = os.getenv("APP_DB_PASSWORD")
+
+    if not db_password:
+        raise RuntimeError(
+            "APP_DB_PASSWORD environment variable is required. "
+            "Set it to the database password for the application database."
+        )
+
+    # Use asyncpg driver for async PostgreSQL connections
+    return f"postgresql+asyncpg://{db_user}:{db_password}@{host}:{port}/{db_name}"
