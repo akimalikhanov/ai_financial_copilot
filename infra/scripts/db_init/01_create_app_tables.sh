@@ -155,8 +155,9 @@ CREATE TABLE IF NOT EXISTS conversations (
   id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   -- Primary key UUID for the conversation.
 
-  user_id            uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Owner of this conversation. Cascades delete when user is deleted.
+  user_id            uuid,
+  -- Owner of this conversation. Nullable for skip-auth approach.
+  -- ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
 
   title              text,
   -- Optional conversation title (UI sidebar). Can be generated.
@@ -244,8 +245,9 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   conversation_id    uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   -- Conversation this request belongs to. Cascades delete with the conversation.
 
-  user_id            uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- User who initiated this request. Denormalized for quick authorization checks.
+  user_id            uuid,
+  -- User who initiated this request. Denormalized for quick authorization checks. Nullable for skip-auth approach.
+  -- ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
 
   provider           text NOT NULL,
   -- LLM provider (openai/gemini/etc).
@@ -346,8 +348,9 @@ CREATE TABLE IF NOT EXISTS messages (
   conversation_id    uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   -- Conversation this message belongs to. Cascades delete with the conversation.
 
-  user_id            uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Denormalized user_id for quick authorization checks & auditing.
+  user_id            uuid,
+  -- Denormalized user_id for quick authorization checks & auditing. Nullable for skip-auth approach.
+  -- ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
 
   role               message_role NOT NULL,
   -- Message role: system/user/assistant/tool.
@@ -457,6 +460,24 @@ END $$;
 COMMENT ON CONSTRAINT conversations_last_message_fk ON conversations IS
   'Optional FK to last message for fast conversation preview. Deferrable for safe transactions.';
 
+SQL
+
+echo ">> Granting permissions to application user..."
+
+# Grant permissions to application user (using variable substitution)
+psql -v ON_ERROR_STOP=1 --username "${POSTGRES_USER}" --dbname "${APP_DB}" <<SQL
+-- Grant usage on schema (public is default)
+GRANT USAGE ON SCHEMA public TO ${APP_DB_USER};
+
+-- Grant all privileges on all tables
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${APP_DB_USER};
+
+-- Grant privileges on sequences (for SERIAL columns, though we use UUIDs)
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${APP_DB_USER};
+
+-- Grant privileges on future tables and sequences (for tables created later)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO ${APP_DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON SEQUENCES TO ${APP_DB_USER};
 SQL
 
 echo ">> Core schema init completed."

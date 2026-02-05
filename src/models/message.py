@@ -63,9 +63,9 @@ class Message(Base):
         index=True,
     )
     user_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
         nullable=True,  # Made nullable for skip-auth approach
         index=True,
+        # ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
     )
 
     # Message content
@@ -87,8 +87,9 @@ class Message(Base):
     )
 
     # Metadata
-    metadata: Mapped[dict] = mapped_column(  # type: ignore[assignment]
+    message_metadata: Mapped[dict] = mapped_column(
         JSON,
+        name="metadata",
         nullable=False,
         server_default=text("'{}'::jsonb"),
     )
@@ -115,6 +116,7 @@ class Message(Base):
     conversation: Mapped[Conversation] = relationship(
         "Conversation",
         back_populates="messages",
+        foreign_keys=[conversation_id],
     )
     llm_request: Mapped[LLMRequest | None] = relationship(
         "LLMRequest",

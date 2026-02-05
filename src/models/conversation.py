@@ -27,9 +27,9 @@ class Conversation(Base):
 
     # Foreign keys
     user_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
         nullable=True,  # Made nullable for skip-auth approach
         index=True,
+        # ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
     )
 
     # Conversation metadata
@@ -65,8 +65,9 @@ class Conversation(Base):
         nullable=False,
         server_default=text("'{}'::jsonb"),
     )
-    metadata: Mapped[dict] = mapped_column(  # type: ignore[assignment]
+    conversation_metadata: Mapped[dict] = mapped_column(
         JSON,
+        name="metadata",
         nullable=False,
         server_default=text("'{}'::jsonb"),
     )
@@ -85,6 +86,7 @@ class Conversation(Base):
     messages: Mapped[list[Message]] = relationship(
         "Message",
         back_populates="conversation",
+        foreign_keys="Message.conversation_id",
         order_by="Message.seq",
         cascade="all, delete-orphan",
     )

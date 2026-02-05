@@ -40,7 +40,7 @@ class MessageRepository:
             role=role,
             content=content,
             seq=next_seq,
-            metadata=metadata or {},
+            message_metadata=metadata or {},
             client_msg_id=client_msg_id,
             status=status,
             request_id=request_id,

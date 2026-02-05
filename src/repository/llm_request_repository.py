@@ -18,7 +18,7 @@ class LLMRequestRepository:
     async def create(
         self,
         conversation_id: UUID,
-        user_id: UUID,
+        user_id: UUID | None,
         provider: str,
         model: str,
         request_params: dict | None = None,

@@ -32,10 +32,10 @@ class LLMRequest(Base):
         nullable=False,
         index=True,
     )
-    user_id: Mapped[UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+    user_id: Mapped[UUID | None] = mapped_column(
+        nullable=True,  # Made nullable for skip-auth approach
         index=True,
+        # ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
     )
 
     # LLM provider/model info

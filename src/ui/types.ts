@@ -35,7 +35,7 @@ export interface Chat {
   id: string;
   title: string;
   createdAt: number;
-  messages: Message[];
+  conversationId: string; // Backend conversation UUID (required)
 }
 
 export interface ScopeFilters {

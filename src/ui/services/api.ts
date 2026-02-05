@@ -13,6 +13,7 @@ export interface ChatRequest {
   temperature?: number;
   max_tokens?: number;
   extra_params?: Record<string, unknown>;
+  conversation_id?: string;
 }
 
 export interface LLMResponseStats {
@@ -216,6 +217,157 @@ export const fetchModels = async (): Promise<ModelInfo[]> => {
 
   const data = (await response.json()) as ModelsResponse;
   return data.models;
+};
+
+// --- Conversations API ---
+
+export interface CreateConversationRequest {
+  user_id?: string | null;
+  title?: string | null;
+  settings?: Record<string, unknown>;
+}
+
+export interface CreateConversationResponse {
+  conversation_id: string;
+}
+
+export const createConversation = async (
+  request: CreateConversationRequest
+): Promise<CreateConversationResponse> => {
+  let response: Response;
+  try {
+    response = await fetch(joinUrl(API_BASE_URL, '/v1/conversations'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(request),
+    });
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+
+  return (await response.json()) as CreateConversationResponse;
+};
+
+export interface UpdateConversationRequest {
+  title: string | null;
+}
+
+export interface UpdateConversationResponse {
+  status: string;
+}
+
+export const updateConversation = async (
+  conversationId: string,
+  request: UpdateConversationRequest
+): Promise<UpdateConversationResponse> => {
+  let response: Response;
+  try {
+    response = await fetch(
+      joinUrl(API_BASE_URL, `/v1/conversations/${conversationId}`),
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(request),
+      }
+    );
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+
+  return (await response.json()) as UpdateConversationResponse;
+};
+
+// --- Messages API ---
+
+export interface CreateMessageRequest {
+  conversation_id: string;
+  role: Role;
+  content: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface CreateMessageResponse {
+  message_id: string;
+  seq: number;
+}
+
+export const createMessage = async (
+  request: CreateMessageRequest
+): Promise<CreateMessageResponse> => {
+  let response: Response;
+  try {
+    response = await fetch(
+      joinUrl(API_BASE_URL, `/v1/conversations/${request.conversation_id}/messages`),
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          role: request.role,
+          content: request.content,
+          metadata: request.metadata || {},
+        }),
+      }
+    );
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+
+  return (await response.json()) as CreateMessageResponse;
+};
+
+export interface MessageResponse {
+  id: string;
+  role: Role;
+  content: string;
+  seq: number;
+  created_at: string;
+  metadata?: Record<string, unknown>;
+}
+
+export const fetchMessages = async (
+  conversationId: string
+): Promise<MessageResponse[]> => {
+  let response: Response;
+  try {
+    response = await fetch(
+      joinUrl(API_BASE_URL, `/v1/conversations/${conversationId}/messages`),
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+        },
+      }
+    );
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+
+  return (await response.json()) as MessageResponse[];
 };
 
 // --- Chat Stream API ---

@@ -93,9 +93,23 @@ class CreateConversationResponse(BaseModel):
     conversation_id: UUID
 
 
+class UpdateConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = None
+
+
 class CreateMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     conversation_id: UUID
+    role: Role
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateMessageBody(BaseModel):
+    """Request body for creating a message (conversation_id comes from path)."""
+
+    model_config = ConfigDict(extra="forbid")
     role: Role
     content: str
     metadata: dict[str, Any] = Field(default_factory=dict)

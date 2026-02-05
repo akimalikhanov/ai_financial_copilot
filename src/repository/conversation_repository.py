@@ -27,7 +27,7 @@ class ConversationRepository:
             user_id=user_id,
             title=title,
             settings=settings or {},
-            metadata=metadata or {},
+            conversation_metadata=metadata or {},
         )
         self.session.add(conversation)
         await self.session.flush()
@@ -40,6 +40,19 @@ class ConversationRepository:
         )
         return result.scalar_one_or_none()
 
+    async def update(
+        self,
+        conversation_id: UUID,
+        title: str | None = None,
+    ) -> Conversation | None:
+        """Update conversation title."""
+        conversation = await self.get_by_id(conversation_id)
+        if conversation:
+            if title is not None:
+                conversation.title = title
+            await self.session.flush()
+        return conversation
+
     async def update_on_message(
         self,
         conversation_id: UUID,
@@ -49,7 +62,9 @@ class ConversationRepository:
         """Update conversation stats after message creation."""
         conversation = await self.get_by_id(conversation_id)
         if conversation:
-            conversation.last_message_at = datetime.now(UTC)
+            # Convert timezone-aware datetime to naive UTC for TIMESTAMP WITHOUT TIME ZONE
+            now_utc = datetime.now(UTC)
+            conversation.last_message_at = now_utc.replace(tzinfo=None)
             conversation.last_message_id = message_id
             conversation.message_count = message_count
             await self.session.flush()

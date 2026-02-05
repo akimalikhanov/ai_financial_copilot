@@ -45,6 +45,10 @@ async def init_db() -> None:
         db_url,
         poolclass=NullPool,  # pgbouncer handles pooling
         echo=False,  # Set to True for SQL query logging
+        connect_args={
+            # Important with PgBouncer transaction pooling + asyncpg
+            "statement_cache_size": 0,
+        },
     )
 
     # Create session factory
@@ -54,10 +58,6 @@ async def init_db() -> None:
         expire_on_commit=False,
         autoflush=False,
         autocommit=False,
-        connect_args={
-            # Important with PgBouncer transaction pooling + asyncpg
-            "statement_cache_size": 0,
-        },
     )
 
     logger.info("Database connection initialized")

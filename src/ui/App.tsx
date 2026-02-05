@@ -1,19 +1,24 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageSquare, BookOpen, Plus, Send, Search,
-  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2
+  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2, Pencil
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
-import { MOCK_DOCS, MOCK_CHATS, COMPANIES, YEARS } from './services/mockData';
+import { MOCK_DOCS, COMPANIES, YEARS } from './services/mockData';
 import {
   chat as apiChat,
   chatStream as apiChatStream,
   fetchModels,
+  createConversation,
+  createMessage,
+  fetchMessages,
+  updateConversation,
   ChatRequest,
   ChatMessage as ApiChatMessage,
   ApiError,
   ModelInfo,
   LLMStreamChunk,
+  MessageResponse,
 } from './services/api';
 import { Button, Input, Badge, Card, ChatBubble, Toggle } from './components/ui';
 import { ScopeBar } from './components/ScopeBar';
@@ -74,14 +79,18 @@ export default function App() {
 
   // Data
   const [docs, setDocs] = useState<Document[]>(MOCK_DOCS);
-  const [chats, setChats] = useState<Chat[]>(MOCK_CHATS);
+  const [chats, setChats] = useState<Chat[]>([]);
+
+  // Messages (fetched from backend, keyed by conversationId)
+  const [messagesByConversation, setMessagesByConversation] = useState<Record<string, Message[]>>({});
+  const [messagesLoading, setMessagesLoading] = useState<Record<string, boolean>>({});
 
   // Models (loaded from API)
   const [models, setModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
   const [modelsLoading, setModelsLoading] = useState(true);
 
   // Active Context
-  const [activeChatId, setActiveChatId] = useState<string | null>(MOCK_CHATS[0].id);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState(FALLBACK_MODELS[0].id);
   const [scope, setScope] = useState<Scope>({
     mode: 'allDocs',
@@ -118,6 +127,10 @@ export default function App() {
   // Delete Confirmation State
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
 
+  // Rename State
+  const [editingChatId, setEditingChatId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState<string>('');
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // --- Theme Toggle ---
@@ -128,6 +141,9 @@ export default function App() {
 
   // --- Derived State ---
   const activeChat = chats.find(c => c.id === activeChatId);
+  const activeMessages = activeChat?.conversationId
+    ? messagesByConversation[activeChat.conversationId] || []
+    : [];
   const activeDocsCount = React.useMemo(() => {
     if (scope.mode === 'allDocs') return docs.length;
     if (scope.mode === 'filteredByMetadata') {
@@ -168,12 +184,67 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
+  // Fetch messages when conversation is selected
+  useEffect(() => {
+    if (!activeChat?.conversationId) return;
+
+    const conversationId = activeChat.conversationId;
+
+    // Skip if already loading or already loaded
+    if (messagesLoading[conversationId] || messagesByConversation[conversationId]) {
+      return;
+    }
+
+    let cancelled = false;
+    setMessagesLoading(prev => ({ ...prev, [conversationId]: true }));
+
+    (async () => {
+      try {
+        const fetched = await fetchMessages(conversationId);
+        if (!cancelled) {
+          // Convert backend messages to UI format
+          const uiMessages: Message[] = fetched.map((msg) => ({
+            id: msg.id,
+            role: msg.role as 'user' | 'assistant',
+            content: msg.content,
+            timestamp: new Date(msg.created_at).getTime(),
+            citations: (msg.metadata?.citations as Citation[] | undefined),
+          }));
+          setMessagesByConversation(prev => ({
+            ...prev,
+            [conversationId]: uiMessages,
+          }));
+        }
+      } catch (error) {
+        console.error('Failed to fetch messages:', error);
+        if (!cancelled) {
+          setMessagesByConversation(prev => ({
+            ...prev,
+            [conversationId]: [],
+          }));
+        }
+      } finally {
+        if (!cancelled) {
+          setMessagesLoading(prev => {
+            const next = { ...prev };
+            delete next[conversationId];
+            return next;
+          });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeChat?.conversationId, messagesLoading, messagesByConversation]);
+
   // Scroll to bottom when messages change
   useEffect(() => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [activeChat?.messages, isTyping]);
+  }, [activeMessages, isTyping]);
 
   // --- Streaming Mode Toggle ---
   const [useStreaming, setUseStreaming] = useState(true);
@@ -217,28 +288,29 @@ export default function App() {
 
   // --- Handlers ---
 
-  /** Update a message in the active chat by id */
-  const updateMessageInChat = useCallback(
-    (msgId: string, updater: (msg: Message) => Message) => {
-      setChats((prev) =>
-        prev.map((c) =>
-          c.id === activeChatId
-            ? { ...c, messages: c.messages.map((m) => (m.id === msgId ? updater(m) : m)) }
-            : c
-        )
-      );
+  /** Update a message in the active conversation */
+  const updateMessage = useCallback(
+    (conversationId: string, msgId: string, updater: (msg: Message) => Message) => {
+      setMessagesByConversation((prev) => {
+        const messages = prev[conversationId] || [];
+        return {
+          ...prev,
+          [conversationId]: messages.map((m) => (m.id === msgId ? updater(m) : m)),
+        };
+      });
     },
-    [activeChatId]
+    []
   );
 
-  /** Append a message to the active chat */
-  const appendMessageToChat = useCallback(
-    (msg: Message) => {
-      setChats((prev) =>
-        prev.map((c) => (c.id === activeChatId ? { ...c, messages: [...c.messages, msg] } : c))
-      );
+  /** Append a message to the active conversation */
+  const appendMessage = useCallback(
+    (conversationId: string, msg: Message) => {
+      setMessagesByConversation((prev) => ({
+        ...prev,
+        [conversationId]: [...(prev[conversationId] || []), msg],
+      }));
     },
-    [activeChatId]
+    []
   );
 
   const stopTypingForText = useCallback((text?: string) => {
@@ -247,28 +319,48 @@ export default function App() {
   }, []);
 
   const handleSendMessage = async (text: string = inputMessage) => {
-    if (!text.trim() || !activeChatId) return;
+    if (!text.trim() || !activeChatId || !activeChat?.conversationId) return;
 
-    const userMsg: Message = {
-      id: generateId(),
-      role: 'user',
-      content: text,
-      timestamp: Date.now(),
-    };
-
-    // Optimistic update: add user message
-    const currentChat = chats.find((c) => c.id === activeChatId);
-    const messagesWithUser = currentChat ? [...currentChat.messages, userMsg] : [userMsg];
-    setChats((prev) =>
-      prev.map((c) => (c.id === activeChatId ? { ...c, messages: messagesWithUser } : c))
-    );
+    const conversationId = activeChat.conversationId;
     setInputMessage('');
     setIsTyping(true);
     setIsAwaitingResponse(true);
 
-    // Build request with model parameters
+    // Store user message in backend
+    try {
+      await createMessage({
+        conversation_id: conversationId,
+        role: 'user',
+        content: text,
+        metadata: {},
+      });
+      // Refresh messages from backend to get the new user message
+      const fetched = await fetchMessages(conversationId);
+      const uiMessages: Message[] = fetched.map((msg) => ({
+        id: msg.id,
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+        timestamp: new Date(msg.created_at).getTime(),
+        citations: (msg.metadata?.citations as Citation[] | undefined),
+      }));
+      setMessagesByConversation(prev => ({
+        ...prev,
+        [conversationId]: uiMessages,
+      }));
+    } catch (error) {
+      console.error('Failed to create message:', error);
+      setIsTyping(false);
+      setIsAwaitingResponse(false);
+      return;
+    }
+
+    // Build request - only send current user message, backend will reconstruct history
     const systemPrompt = buildScopeContext(scope, docs);
-    const apiMessages = toApiMessages(messagesWithUser, systemPrompt);
+    const apiMessages: ApiChatMessage[] = [];
+    if (systemPrompt) {
+      apiMessages.push({ role: 'system', content: systemPrompt });
+    }
+    apiMessages.push({ role: 'user', content: text });
 
     // Build extra_params for advanced features
     const extraParams: Record<string, unknown> = {};
@@ -284,6 +376,7 @@ export default function App() {
       model: activeModel,
       temperature: modelParams.temperature,
       max_tokens: modelParams.maxTokens,
+      conversation_id: conversationId,
       ...(Object.keys(extraParams).length > 0 && { extra_params: extraParams }),
     };
 
@@ -292,44 +385,70 @@ export default function App() {
 
     if (useStreaming) {
       // --- Streaming path ---
-      const assistantMsgId = generateId();
+      // Create temporary placeholder for streaming
+      const tempId = `temp-${Date.now()}`;
       const placeholderMsg: Message = {
-        id: assistantMsgId,
+        id: tempId,
         role: 'assistant',
         content: '',
         timestamp: Date.now(),
       };
-      appendMessageToChat(placeholderMsg);
+      appendMessage(conversationId, placeholderMsg);
 
       await apiChatStream(
         request,
         // onDelta
         (chunk) => {
-          updateMessageInChat(assistantMsgId, (m) => ({
+          updateMessage(conversationId, tempId, (m) => ({
             ...m,
             content: m.content + chunk.text,
           }));
           stopTypingForText(chunk.text);
         },
         // onFinal
-        (chunk) => {
-          // Append any remaining text from final chunk
+        async (chunk) => {
+          // First, ensure final chunk text is added to temporary message
           if (chunk.text) {
-            updateMessageInChat(assistantMsgId, (m) => ({
+            updateMessage(conversationId, tempId, (m) => ({
               ...m,
               content: m.content + chunk.text,
             }));
           }
+
           // Record stats from final chunk
           if (chunk.stats) {
             recordStats(chunk.stats, activeModel);
           }
+
           setIsTyping(false);
           setIsAwaitingResponse(false);
+
+          // Refresh messages from backend to get the persisted assistant message
+          // Add a small delay to ensure backend has committed the transaction
+          setTimeout(async () => {
+            try {
+              const fetched = await fetchMessages(conversationId);
+              const uiMessages: Message[] = fetched.map((msg) => ({
+                id: msg.id,
+                role: msg.role as 'user' | 'assistant',
+                content: msg.content,
+                timestamp: new Date(msg.created_at).getTime(),
+                citations: (msg.metadata?.citations as Citation[] | undefined),
+              }));
+              // Replace all messages with backend messages (includes the new assistant message)
+              setMessagesByConversation(prev => ({
+                ...prev,
+                [conversationId]: uiMessages,
+              }));
+            } catch (error) {
+              console.error('Failed to refresh messages:', error);
+              // Keep the temporary message - it's already updated with final content above
+            }
+          }, 200);
         },
         // onError
         (error: ApiError) => {
-          updateMessageInChat(assistantMsgId, (m) => ({
+          updateMessage(conversationId, tempId, (m) => ({
             ...m,
             content: m.content || `Error: ${error.message}`,
           }));
@@ -341,13 +460,19 @@ export default function App() {
       // --- Non-streaming path ---
       try {
         const response = await apiChat(request);
-        const assistantMsg: Message = {
-          id: generateId(),
-          role: 'assistant',
-          content: response.text,
-          timestamp: Date.now(),
-        };
-        appendMessageToChat(assistantMsg);
+        // Refresh messages from backend to get the persisted assistant message
+        const fetched = await fetchMessages(conversationId);
+        const uiMessages: Message[] = fetched.map((msg) => ({
+          id: msg.id,
+          role: msg.role as 'user' | 'assistant',
+          content: msg.content,
+          timestamp: new Date(msg.created_at).getTime(),
+          citations: (msg.metadata?.citations as Citation[] | undefined),
+        }));
+        setMessagesByConversation(prev => ({
+          ...prev,
+          [conversationId]: uiMessages,
+        }));
         // Record stats from response
         if (response.stats) {
           recordStats(response.stats, activeModel);
@@ -355,13 +480,14 @@ export default function App() {
         setIsTyping(false);
       } catch (err) {
         const error = err as ApiError;
+        // Add error message to UI
         const errorMsg: Message = {
-          id: generateId(),
+          id: `error-${Date.now()}`,
           role: 'assistant',
           content: `Error: ${error.message ?? 'Request failed'}`,
           timestamp: Date.now(),
         };
-        appendMessageToChat(errorMsg);
+        appendMessage(conversationId, errorMsg);
         setIsTyping(false);
       } finally {
         setIsAwaitingResponse(false);
@@ -388,16 +514,31 @@ export default function App() {
     setActiveHighlight(citation.bboxHint);
   };
 
-  const handleNewChat = () => {
-    const newChat: Chat = {
-      id: Date.now().toString(),
-      title: 'New Analysis',
-      createdAt: Date.now(),
-      messages: []
-    };
-    setChats([newChat, ...chats]);
-    setActiveChatId(newChat.id);
-    if (window.innerWidth < 768) setIsSidebarOpen(false);
+  const handleNewChat = async () => {
+    try {
+      const response = await createConversation({
+        title: 'New Analysis',
+        settings: {},
+      });
+      const newChat: Chat = {
+        id: Date.now().toString(),
+        title: 'New Analysis',
+        createdAt: Date.now(),
+        conversationId: response.conversation_id,
+      };
+      setChats([newChat, ...chats]);
+      setActiveChatId(newChat.id);
+      // Initialize empty messages for this conversation
+      setMessagesByConversation(prev => ({
+        ...prev,
+        [response.conversation_id]: [],
+      }));
+      if (window.innerWidth < 768) setIsSidebarOpen(false);
+    } catch (error) {
+      console.error('Failed to create conversation:', error);
+      // Show error to user
+      alert('Failed to create conversation. Please try again.');
+    }
   };
 
   const handleDeleteRequest = (e: React.MouseEvent, id: string) => {
@@ -407,9 +548,57 @@ export default function App() {
 
   const confirmDeleteChat = () => {
     if (chatToDelete) {
-        setChats(prev => prev.filter(c => c.id !== chatToDelete));
-        if (activeChatId === chatToDelete) setActiveChatId(null);
-        setChatToDelete(null);
+      const chat = chats.find(c => c.id === chatToDelete);
+      setChats(prev => prev.filter(c => c.id !== chatToDelete));
+      if (activeChatId === chatToDelete) setActiveChatId(null);
+      // Remove messages from state
+      if (chat?.conversationId) {
+        setMessagesByConversation(prev => {
+          const next = { ...prev };
+          delete next[chat.conversationId];
+          return next;
+        });
+      }
+      setChatToDelete(null);
+    }
+  };
+
+  const handleStartRename = (e: React.MouseEvent, chat: Chat) => {
+    e.stopPropagation();
+    setEditingChatId(chat.id);
+    setEditingTitle(chat.title);
+  };
+
+  const handleCancelRename = () => {
+    setEditingChatId(null);
+    setEditingTitle('');
+  };
+
+  const handleSaveRename = async (chat: Chat) => {
+    if (!chat.conversationId || !editingTitle.trim()) {
+      handleCancelRename();
+      return;
+    }
+
+    const newTitle = editingTitle.trim();
+    // Skip API call if title hasn't changed
+    if (newTitle === chat.title) {
+      handleCancelRename();
+      return;
+    }
+
+    try {
+      await updateConversation(chat.conversationId, { title: newTitle });
+      setChats(prev => prev.map(c =>
+        c.id === chat.id ? { ...c, title: newTitle } : c
+      ));
+      setEditingChatId(null);
+      setEditingTitle('');
+    } catch (error) {
+      console.error('Failed to rename conversation:', error);
+      alert('Failed to rename conversation. Please try again.');
+      // Reset to original title on error
+      setEditingTitle(chat.title);
     }
   };
 
@@ -446,7 +635,7 @@ export default function App() {
         {chats.map(chat => (
           <div
             key={chat.id}
-            onClick={() => { setActiveChatId(chat.id); if(window.innerWidth < 768) setIsSidebarOpen(false); }}
+            onClick={() => { if(editingChatId !== chat.id) { setActiveChatId(chat.id); if(window.innerWidth < 768) setIsSidebarOpen(false); } }}
             className={`
               group flex items-center justify-between p-3 rounded-lg mb-1 cursor-pointer transition-colors
               ${activeChatId === chat.id
@@ -454,18 +643,45 @@ export default function App() {
                 : 'text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] border border-transparent'}
             `}
           >
-            <div className="truncate text-sm font-medium pr-2">
-                {chat.title}
-                <div className="text-[10px] text-[var(--text-faint)] font-mono mt-0.5">
-                    {new Date(chat.createdAt).toLocaleDateString()}
-                </div>
+            {editingChatId === chat.id ? (
+              <input
+                type="text"
+                value={editingTitle}
+                onChange={(e) => setEditingTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    handleSaveRename(chat);
+                  } else if (e.key === 'Escape') {
+                    handleCancelRename();
+                  }
+                }}
+                onBlur={() => handleSaveRename(chat)}
+                autoFocus
+                className="flex-1 bg-[var(--input-bg)] border border-[var(--input-border)] rounded px-2 py-1 text-sm text-[var(--text)] focus:outline-none focus:border-[var(--input-border-focus)]"
+                onClick={(e) => e.stopPropagation()}
+              />
+            ) : (
+              <div className="truncate text-sm font-medium pr-2 flex-1">
+                  {chat.title}
+                  <div className="text-[10px] text-[var(--text-faint)] font-mono mt-0.5">
+                      {new Date(chat.createdAt).toLocaleDateString()}
+                  </div>
+              </div>
+            )}
+            <div className="flex items-center gap-1">
+              <button
+                  onClick={(e) => handleStartRename(e, chat)}
+                  className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--accent)] transition-opacity"
+              >
+                  <Pencil size={12} />
+              </button>
+              <button
+                  onClick={(e) => handleDeleteRequest(e, chat.id)}
+                  className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--danger)] transition-opacity"
+              >
+                  <Trash2 size={12} />
+              </button>
             </div>
-            <button
-                onClick={(e) => handleDeleteRequest(e, chat.id)}
-                className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--danger)] transition-opacity"
-            >
-                <Trash2 size={12} />
-            </button>
           </div>
         ))}
       </div>
@@ -506,7 +722,7 @@ export default function App() {
     }
 
     // 2. Chat selected
-    const isChatEmpty = activeChat && activeChat.messages.length === 0;
+    const isChatEmpty = activeMessages.length === 0;
 
     return (
       <div className="flex-1 flex flex-col min-w-0 h-full">
@@ -520,7 +736,7 @@ export default function App() {
         />
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 pb-32 md:pb-8">
+        <div className="flex-1 overflow-y-auto min-h-0 p-4 md:p-8 pb-32 md:pb-8">
           {isChatEmpty ? (
             <div className="h-full flex flex-col items-center justify-center text-center animate-fade-in">
                  <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-6 border border-[var(--border)]">
@@ -533,7 +749,7 @@ export default function App() {
             </div>
           ) : (
             <div className="space-y-6">
-              {activeChat?.messages.map((msg) => {
+              {activeMessages.map((msg) => {
                 // Skip rendering assistant messages with empty content (placeholder while typing)
                 if (msg.role === 'assistant' && !msg.content) return null;
 
