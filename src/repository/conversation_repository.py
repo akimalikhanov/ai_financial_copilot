@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.conversation import Conversation
@@ -57,14 +57,24 @@ class ConversationRepository:
         self,
         conversation_id: UUID,
         message_id: UUID,
-        message_count: int,
-    ) -> None:
-        """Update conversation stats after message creation."""
-        conversation = await self.get_by_id(conversation_id)
-        if conversation:
-            # Convert timezone-aware datetime to naive UTC for TIMESTAMP WITHOUT TIME ZONE
-            now_utc = datetime.now(UTC)
-            conversation.last_message_at = now_utc.replace(tzinfo=None)
-            conversation.last_message_id = message_id
-            conversation.message_count = message_count
-            await self.session.flush()
+        new_seq: int,
+    ) -> bool:
+        """Update conversation stats after message creation with WHERE guard to prevent hot-spot updates."""
+        # Convert timezone-aware datetime to naive UTC for TIMESTAMP WITHOUT TIME ZONE
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+
+        # Use WHERE guard to only update if new_seq > last_seq (prevents race conditions)
+        result = await self.session.execute(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                (Conversation.last_seq.is_(None)) | (Conversation.last_seq < new_seq),
+            )
+            .values(
+                last_message_at=now_utc,
+                last_message_id=message_id,
+                last_seq=new_seq,
+            )
+        )
+        await self.session.flush()
+        return result.rowcount > 0

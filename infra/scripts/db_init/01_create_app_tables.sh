@@ -174,8 +174,11 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_message_id    uuid,
   -- Denormalized last message id for fast preview fetch (FK added after messages table).
 
-  message_count      integer NOT NULL DEFAULT 0,
-  -- Denormalized count used for stable per-conversation sequence assignment.
+  message_count      integer,
+  -- Denormalized count (nullable, can be computed via COUNT(*) or async worker).
+
+  last_seq           bigint,
+  -- Last sequence number (guarded by WHERE new_seq > last_seq to prevent race conditions).
 
   pinned             boolean NOT NULL DEFAULT false,
   -- UI pin (keep at top).
@@ -209,7 +212,8 @@ COMMENT ON COLUMN conversations.created_at IS 'Creation timestamp.';
 COMMENT ON COLUMN conversations.updated_at IS 'Last update timestamp (trigger managed).';
 COMMENT ON COLUMN conversations.last_message_at IS 'Timestamp of last message for ordering.';
 COMMENT ON COLUMN conversations.last_message_id IS 'Last message id for preview (FK added later).';
-COMMENT ON COLUMN conversations.message_count IS 'Denormalized count for stable seq allocation.';
+COMMENT ON COLUMN conversations.message_count IS 'Denormalized count (nullable, computed via COUNT(*) or async worker).';
+COMMENT ON COLUMN conversations.last_seq IS 'Last sequence number (guarded updates prevent race conditions).';
 COMMENT ON COLUMN conversations.pinned IS 'Pinned conversations appear at top in UI.';
 COMMENT ON COLUMN conversations.archived_at IS 'Archive timestamp; NULL means active.';
 COMMENT ON COLUMN conversations.deleted_at IS 'Soft-delete timestamp; NULL means active.';
@@ -291,8 +295,26 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- Request creation timestamp.
 
-  updated_at         timestamptz NOT NULL DEFAULT now()
+  updated_at         timestamptz NOT NULL DEFAULT now(),
   -- Last update timestamp (trigger managed).
+
+  user_message_id    uuid,
+  -- Anchor point for the user message that triggered this request (FK added after messages exists).
+
+  snapshot_seq       bigint,
+  -- Sequence number snapshot when request started.
+
+  client_request_id  text,
+  -- Idempotency key from client (unique per conversation).
+
+  included_message_ids jsonb,
+  -- Array of message IDs included in LLM context.
+
+  status             text,
+  -- Request status: 'pending', 'streaming', 'completed', 'cancelled', 'failed'.
+
+  assistant_message_id uuid
+  -- Pre-created assistant message placeholder (FK added after messages exists).
 );
 
 COMMENT ON TABLE llm_requests IS
@@ -316,6 +338,12 @@ COMMENT ON COLUMN llm_requests.error_code IS 'Error code if failed.';
 COMMENT ON COLUMN llm_requests.error_message IS 'Error message/details if failed.';
 COMMENT ON COLUMN llm_requests.created_at IS 'Row creation time.';
 COMMENT ON COLUMN llm_requests.updated_at IS 'Row last update time (trigger managed).';
+COMMENT ON COLUMN llm_requests.user_message_id IS 'Anchor point for the user message that triggered this request.';
+COMMENT ON COLUMN llm_requests.snapshot_seq IS 'Sequence number snapshot when request started.';
+COMMENT ON COLUMN llm_requests.client_request_id IS 'Idempotency key from client (unique per conversation).';
+COMMENT ON COLUMN llm_requests.included_message_ids IS 'Array of message IDs included in LLM context.';
+COMMENT ON COLUMN llm_requests.status IS 'Request status: pending/streaming/completed/cancelled/failed.';
+COMMENT ON COLUMN llm_requests.assistant_message_id IS 'Pre-created assistant message placeholder.';
 
 CREATE INDEX IF NOT EXISTS llm_requests_conv_idx
   ON llm_requests (conversation_id);
@@ -331,6 +359,12 @@ CREATE INDEX IF NOT EXISTS llm_requests_created_idx
   ON llm_requests (created_at DESC);
 COMMENT ON INDEX llm_requests_created_idx IS
   'Supports time-based queries and analytics.';
+
+CREATE UNIQUE INDEX IF NOT EXISTS llm_requests_conv_client_req_idx
+  ON llm_requests (conversation_id, client_request_id)
+  WHERE client_request_id IS NOT NULL;
+COMMENT ON INDEX llm_requests_conv_client_req_idx IS
+  'Idempotency constraint: prevent duplicate requests with same client_request_id per conversation.';
 
 DROP TRIGGER IF EXISTS trg_llm_requests_updated_at ON llm_requests;
 CREATE TRIGGER trg_llm_requests_updated_at
@@ -459,6 +493,38 @@ END $$;
 
 COMMENT ON CONSTRAINT conversations_last_message_fk ON conversations IS
   'Optional FK to last message for fast conversation preview. Deferrable for safe transactions.';
+
+-- ============================================================================
+-- Add llm_requests FKs to messages (after messages exists)
+-- ============================================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'llm_requests_user_message_fk'
+  ) THEN
+    ALTER TABLE llm_requests
+      ADD CONSTRAINT llm_requests_user_message_fk
+      FOREIGN KEY (user_message_id) REFERENCES messages(id) ON DELETE SET NULL;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'llm_requests_assistant_message_fk'
+  ) THEN
+    ALTER TABLE llm_requests
+      ADD CONSTRAINT llm_requests_assistant_message_fk
+      FOREIGN KEY (assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+COMMENT ON CONSTRAINT llm_requests_user_message_fk ON llm_requests IS
+  'FK to user message that triggered this request.';
+COMMENT ON CONSTRAINT llm_requests_assistant_message_fk ON llm_requests IS
+  'FK to pre-created assistant message placeholder.';
 
 SQL
 

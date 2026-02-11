@@ -6,15 +6,12 @@ import {
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
 import { MOCK_DOCS, COMPANIES, YEARS } from './services/mockData';
 import {
-  chat as apiChat,
-  chatStream as apiChatStream,
+  chatEnqueue,
+  chatStreamSubscribe,
   fetchModels,
   createConversation,
-  createMessage,
   fetchMessages,
   updateConversation,
-  ChatRequest,
-  ChatMessage as ApiChatMessage,
   ApiError,
   ModelInfo,
   LLMStreamChunk,
@@ -35,42 +32,6 @@ const FALLBACK_MODELS: ModelInfo[] = [
 // --- Helpers ---
 const generateId = () => Math.random().toString(36).slice(2, 11);
 
-/** Build scope context string for system message */
-const buildScopeContext = (scope: Scope, docs: Document[]): string => {
-  let pool = docs;
-  if (scope.mode === 'filteredByMetadata') {
-    pool = docs.filter((d) => {
-      const f = scope.filters;
-      const matchCompany = !f.company?.length || f.company.includes(d.company);
-      const matchYear = !f.year?.length || f.year.includes(d.year);
-      const matchType = !f.type?.length || f.type.includes(d.type);
-      return matchCompany && matchYear && matchType;
-    });
-  } else if (scope.mode === 'selectedDocs' || scope.mode === 'thisDoc') {
-    pool = docs.filter((d) => scope.docIds.includes(d.id));
-  }
-  if (pool.length === 0) {
-    return 'No documents are currently in scope.';
-  }
-  const docList = pool.map((d) => `- ${d.title} (${d.company}, ${d.year}, ${d.type})`).join('\n');
-  return `The user has ${pool.length} document(s) in scope:\n${docList}`;
-};
-
-/** Convert UI messages to API messages, optionally prepending a system message */
-const toApiMessages = (
-  messages: Message[],
-  systemPrompt?: string
-): ApiChatMessage[] => {
-  const apiMessages: ApiChatMessage[] = [];
-  if (systemPrompt) {
-    apiMessages.push({ role: 'system', content: systemPrompt });
-  }
-  for (const m of messages) {
-    apiMessages.push({ role: m.role, content: m.content });
-  }
-  return apiMessages;
-};
-
 export default function App() {
   // --- Global State ---
   const [view, setView] = useState<ViewMode>('ASK');
@@ -84,6 +45,8 @@ export default function App() {
   // Messages (fetched from backend, keyed by conversationId)
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, Message[]>>({});
   const [messagesLoading, setMessagesLoading] = useState<Record<string, boolean>>({});
+  const [messagesHasMore, setMessagesHasMore] = useState<Record<string, boolean>>({});
+  const [messagesMinSeq, setMessagesMinSeq] = useState<Record<string, number>>({});
 
   // Models (loaded from API)
   const [models, setModels] = useState<ModelInfo[]>(FALLBACK_MODELS);
@@ -132,6 +95,7 @@ export default function App() {
   const [editingTitle, setEditingTitle] = useState<string>('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
 
   // --- Theme Toggle ---
   useEffect(() => {
@@ -200,10 +164,12 @@ export default function App() {
 
     (async () => {
       try {
-        const fetched = await fetchMessages(conversationId);
+        const response = await fetchMessages(conversationId, { limit: 50 });
         if (!cancelled) {
+          // Backend returns messages in reverse order (most recent first), reverse for display
+          const reversedMessages = [...response.messages].reverse();
           // Convert backend messages to UI format
-          const uiMessages: Message[] = fetched.map((msg) => ({
+          const uiMessages: Message[] = reversedMessages.map((msg) => ({
             id: msg.id,
             role: msg.role as 'user' | 'assistant',
             content: msg.content,
@@ -214,6 +180,17 @@ export default function App() {
             ...prev,
             [conversationId]: uiMessages,
           }));
+          setMessagesHasMore(prev => ({
+            ...prev,
+            [conversationId]: response.has_more,
+          }));
+          if (response.messages.length > 0) {
+            const minSeq = Math.min(...response.messages.map(m => m.seq));
+            setMessagesMinSeq(prev => ({
+              ...prev,
+              [conversationId]: minSeq,
+            }));
+          }
         }
       } catch (error) {
         console.error('Failed to fetch messages:', error);
@@ -246,8 +223,88 @@ export default function App() {
     }
   }, [activeMessages, isTyping]);
 
+  // Load older messages on scroll
+  useEffect(() => {
+    if (!activeChat?.conversationId || !messagesContainerRef.current) return;
+    const conversationId = activeChat.conversationId;
+
+    const container = messagesContainerRef.current;
+    let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
+    
+    const handleScroll = () => {
+      // Debounce scroll events
+      if (scrollTimeout) {
+        clearTimeout(scrollTimeout);
+      }
+      scrollTimeout = setTimeout(() => {
+        // Load more when scrolled to top (within 100px)
+        if (container.scrollTop < 100 && messagesHasMore[conversationId] && !messagesLoading[conversationId]) {
+          const minSeq = messagesMinSeq[conversationId];
+          if (minSeq !== undefined && minSeq > 0) {
+            setMessagesLoading(prev => ({ ...prev, [conversationId]: true }));
+            fetchMessages(conversationId, { limit: 50, before_seq: minSeq })
+              .then(response => {
+                // Backend returns messages in reverse order (most recent first), reverse for display
+                const reversedMessages = [...response.messages].reverse();
+                const uiMessages: Message[] = reversedMessages.map((msg) => ({
+                  id: msg.id,
+                  role: msg.role as 'user' | 'assistant',
+                  content: msg.content,
+                  timestamp: new Date(msg.created_at).getTime(),
+                  citations: (msg.metadata?.citations as Citation[] | undefined),
+                }));
+                setMessagesByConversation(prev => {
+                  const existing = prev[conversationId] || [];
+                  // Prepend older messages (they come before existing messages chronologically)
+                  const allMessages = [...uiMessages, ...existing];
+                  // Remove duplicates by id
+                  const uniqueMessages = Array.from(
+                    new Map(allMessages.map(m => [m.id, m])).values()
+                  );
+                  // Sort by timestamp (ascending)
+                  uniqueMessages.sort((a, b) => a.timestamp - b.timestamp);
+                  return {
+                    ...prev,
+                    [conversationId]: uniqueMessages,
+                  };
+                });
+                setMessagesHasMore(prev => ({
+                  ...prev,
+                  [conversationId]: response.has_more,
+                }));
+                if (response.messages.length > 0) {
+                  const newMinSeq = Math.min(...response.messages.map(m => m.seq));
+                  setMessagesMinSeq(prev => ({
+                    ...prev,
+                    [conversationId]: Math.min(prev[conversationId] ?? Infinity, newMinSeq),
+                  }));
+                }
+              })
+              .catch(error => {
+                console.error('Failed to load older messages:', error);
+              })
+              .finally(() => {
+                setMessagesLoading(prev => {
+                  const next = { ...prev };
+                  delete next[conversationId];
+                  return next;
+                });
+              });
+          }
+        }
+      }, 100);
+    };
+
+    container.addEventListener('scroll', handleScroll);
+    return () => {
+      container.removeEventListener('scroll', handleScroll);
+      if (scrollTimeout) {
+        clearTimeout(scrollTimeout);
+      }
+    };
+  }, [activeChat?.conversationId, messagesHasMore, messagesLoading, messagesMinSeq]);
+
   // --- Streaming Mode Toggle ---
-  const [useStreaming, setUseStreaming] = useState(true);
 
   // --- Model Capabilities (derived from active model) ---
   const modelCapabilities: ModelCapabilities = React.useMemo(() => {
@@ -326,43 +383,10 @@ export default function App() {
     setIsTyping(true);
     setIsAwaitingResponse(true);
 
-    // Store user message in backend
-    try {
-      await createMessage({
-        conversation_id: conversationId,
-        role: 'user',
-        content: text,
-        metadata: {},
-      });
-      // Refresh messages from backend to get the new user message
-      const fetched = await fetchMessages(conversationId);
-      const uiMessages: Message[] = fetched.map((msg) => ({
-        id: msg.id,
-        role: msg.role as 'user' | 'assistant',
-        content: msg.content,
-        timestamp: new Date(msg.created_at).getTime(),
-        citations: (msg.metadata?.citations as Citation[] | undefined),
-      }));
-      setMessagesByConversation(prev => ({
-        ...prev,
-        [conversationId]: uiMessages,
-      }));
-    } catch (error) {
-      console.error('Failed to create message:', error);
-      setIsTyping(false);
-      setIsAwaitingResponse(false);
-      return;
-    }
+    const clientMsgId = crypto.randomUUID();
+    const clientRequestId = crypto.randomUUID();
+    requestStartTimeRef.current = Date.now();
 
-    // Build request - only send current user message, backend will reconstruct history
-    const systemPrompt = buildScopeContext(scope, docs);
-    const apiMessages: ApiChatMessage[] = [];
-    if (systemPrompt) {
-      apiMessages.push({ role: 'system', content: systemPrompt });
-    }
-    apiMessages.push({ role: 'user', content: text });
-
-    // Build extra_params for advanced features
     const extraParams: Record<string, unknown> = {};
     if (modelCapabilities.supportsReasoningEffort && modelParams.reasoningEffort) {
       extraParams.reasoning_effort = modelParams.reasoningEffort;
@@ -371,84 +395,57 @@ export default function App() {
       extraParams.verbosity = modelParams.verbosity;
     }
 
-    const request: ChatRequest = {
-      messages: apiMessages,
-      model: activeModel,
-      temperature: modelParams.temperature,
-      max_tokens: modelParams.maxTokens,
-      conversation_id: conversationId,
-      ...(Object.keys(extraParams).length > 0 && { extra_params: extraParams }),
-    };
+    try {
+      const enqueueRes = await chatEnqueue({
+        conversation_id: conversationId,
+        content: text,
+        client_msg_id: clientMsgId,
+        client_request_id: clientRequestId,
+        model: activeModel,
+        params: {
+          temperature: modelParams.temperature,
+          max_tokens: modelParams.maxTokens,
+          ...extraParams,
+        },
+      });
 
-    // Track request start time for latency calculation
-    requestStartTimeRef.current = Date.now();
-
-    if (useStreaming) {
-      // --- Streaming path ---
-      // Create temporary placeholder for streaming
-      const tempId = `temp-${Date.now()}`;
-      const placeholderMsg: Message = {
-        id: tempId,
+      // Add user message to local state (from single persist+enqueue response)
+      const userMsg: Message = {
+        id: enqueueRes.user_message_id,
+        role: 'user',
+        content: text,
+        timestamp: Date.now(),
+      };
+      appendMessage(conversationId, userMsg);
+      const placeholderId = enqueueRes.assistant_message_id;
+      appendMessage(conversationId, {
+        id: placeholderId,
         role: 'assistant',
         content: '',
         timestamp: Date.now(),
-      };
-      appendMessage(conversationId, placeholderMsg);
-
-      await apiChatStream(
-        request,
-        // onDelta
+      });
+      await chatStreamSubscribe(
+        enqueueRes.request_id,
         (chunk) => {
-          updateMessage(conversationId, tempId, (m) => ({
+          updateMessage(conversationId, placeholderId, (m) => ({
             ...m,
             content: m.content + chunk.text,
           }));
           stopTypingForText(chunk.text);
         },
-        // onFinal
-        async (chunk) => {
-          // First, ensure final chunk text is added to temporary message
+        (chunk) => {
           if (chunk.text) {
-            updateMessage(conversationId, tempId, (m) => ({
+            updateMessage(conversationId, placeholderId, (m) => ({
               ...m,
               content: m.content + chunk.text,
             }));
           }
-
-          // Record stats from final chunk
-          if (chunk.stats) {
-            recordStats(chunk.stats, activeModel);
-          }
-
+          if (chunk.stats) recordStats(chunk.stats, activeModel);
           setIsTyping(false);
           setIsAwaitingResponse(false);
-
-          // Refresh messages from backend to get the persisted assistant message
-          // Add a small delay to ensure backend has committed the transaction
-          setTimeout(async () => {
-            try {
-              const fetched = await fetchMessages(conversationId);
-              const uiMessages: Message[] = fetched.map((msg) => ({
-                id: msg.id,
-                role: msg.role as 'user' | 'assistant',
-                content: msg.content,
-                timestamp: new Date(msg.created_at).getTime(),
-                citations: (msg.metadata?.citations as Citation[] | undefined),
-              }));
-              // Replace all messages with backend messages (includes the new assistant message)
-              setMessagesByConversation(prev => ({
-                ...prev,
-                [conversationId]: uiMessages,
-              }));
-            } catch (error) {
-              console.error('Failed to refresh messages:', error);
-              // Keep the temporary message - it's already updated with final content above
-            }
-          }, 200);
         },
-        // onError
-        (error: ApiError) => {
-          updateMessage(conversationId, tempId, (m) => ({
+        (error) => {
+          updateMessage(conversationId, placeholderId, (m) => ({
             ...m,
             content: m.content || `Error: ${error.message}`,
           }));
@@ -456,42 +453,23 @@ export default function App() {
           setIsAwaitingResponse(false);
         }
       );
-    } else {
-      // --- Non-streaming path ---
-      try {
-        const response = await apiChat(request);
-        // Refresh messages from backend to get the persisted assistant message
-        const fetched = await fetchMessages(conversationId);
-        const uiMessages: Message[] = fetched.map((msg) => ({
-          id: msg.id,
-          role: msg.role as 'user' | 'assistant',
-          content: msg.content,
-          timestamp: new Date(msg.created_at).getTime(),
-          citations: (msg.metadata?.citations as Citation[] | undefined),
-        }));
-        setMessagesByConversation(prev => ({
-          ...prev,
-          [conversationId]: uiMessages,
-        }));
-        // Record stats from response
-        if (response.stats) {
-          recordStats(response.stats, activeModel);
-        }
-        setIsTyping(false);
-      } catch (err) {
-        const error = err as ApiError;
-        // Add error message to UI
-        const errorMsg: Message = {
-          id: `error-${Date.now()}`,
-          role: 'assistant',
-          content: `Error: ${error.message ?? 'Request failed'}`,
-          timestamp: Date.now(),
-        };
-        appendMessage(conversationId, errorMsg);
-        setIsTyping(false);
-      } finally {
-        setIsAwaitingResponse(false);
-      }
+    } catch (err) {
+      const error = err as ApiError;
+      // Add user message (persistence failed, use temp id)
+      appendMessage(conversationId, {
+        id: `temp-${clientMsgId}`,
+        role: 'user',
+        content: text,
+        timestamp: Date.now(),
+      });
+      appendMessage(conversationId, {
+        id: `error-${Date.now()}`,
+        role: 'assistant',
+        content: `Error: ${error.message}`,
+        timestamp: Date.now(),
+      });
+      setIsTyping(false);
+      setIsAwaitingResponse(false);
     }
   };
 
@@ -736,7 +714,7 @@ export default function App() {
         />
 
         {/* Messages */}
-        <div className="flex-1 overflow-y-auto min-h-0 p-4 md:p-8 pb-32 md:pb-8">
+        <div ref={messagesContainerRef} className="flex-1 overflow-y-auto min-h-0 p-4 md:p-8 pb-32 md:pb-8">
           {isChatEmpty ? (
             <div className="h-full flex flex-col items-center justify-center text-center animate-fade-in">
                  <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-6 border border-[var(--border)]">
@@ -749,6 +727,11 @@ export default function App() {
             </div>
           ) : (
             <div className="space-y-6">
+              {messagesHasMore[activeChat.conversationId] && (
+                <div className="text-center text-sm text-[var(--text-faint)] py-2">
+                  {messagesLoading[activeChat.conversationId] ? 'Loading older messages...' : 'Scroll up to load more'}
+                </div>
+              )}
               {activeMessages.map((msg) => {
                 // Skip rendering assistant messages with empty content (placeholder while typing)
                 if (msg.role === 'assistant' && !msg.content) return null;

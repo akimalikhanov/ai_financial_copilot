@@ -121,6 +121,7 @@ class Message(Base):
     llm_request: Mapped[LLMRequest | None] = relationship(
         "LLMRequest",
         back_populates="messages",
+        foreign_keys=[request_id],
     )
 
     # Constraints

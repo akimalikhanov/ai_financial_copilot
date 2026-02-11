@@ -63,6 +63,13 @@ async def init_db() -> None:
     logger.info("Database connection initialized")
 
 
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Get the async session factory. Call init_db() first."""
+    if _async_session_factory is None:
+        raise RuntimeError("Database not initialized. Call init_db() first.")
+    return _async_session_factory
+
+
 async def shutdown_db() -> None:
     """
     Shutdown database connection pool.

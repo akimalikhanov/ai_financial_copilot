@@ -4,6 +4,7 @@ from src.db.base import Base
 from src.db.connection import (
     DbSessionDep,
     get_db_session,
+    get_session_factory,
     init_db,
     shutdown_db,
 )
@@ -12,6 +13,7 @@ __all__ = [
     "Base",
     "DbSessionDep",
     "get_db_session",
+    "get_session_factory",
     "init_db",
     "shutdown_db",
 ]

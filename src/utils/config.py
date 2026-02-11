@@ -181,3 +181,25 @@ def get_db_url() -> str:
 
     # Use asyncpg driver for async PostgreSQL connections
     return f"postgresql+asyncpg://{db_user}:{db_password}@{host}:{port}/{db_name}"
+
+
+def get_redis_url() -> str:
+    """
+    Build Redis connection URL from environment variables.
+
+    Environment variables:
+      - REDIS_HOST: Redis host (default: localhost)
+      - REDIS_PORT: Redis port (default: 6379)
+      - REDIS_DB: Redis DB index (default: 0)
+      - REDIS_PASSWORD: Redis password (optional)
+
+    Returns:
+        Redis connection URL string.
+    """
+    host = os.getenv("REDIS_HOST", "localhost")
+    port = os.getenv("REDIS_PORT", "6379")
+    db = os.getenv("REDIS_DB", "0")
+    password = os.getenv("REDIS_PASSWORD")
+    if password:
+        return f"redis://:{password}@{host}:{port}/{db}"
+    return f"redis://{host}:{port}/{db}"

@@ -7,15 +7,6 @@ export interface ChatMessage {
   tool_call_id?: string | null;
 }
 
-export interface ChatRequest {
-  messages: ChatMessage[];
-  model: string;
-  temperature?: number;
-  max_tokens?: number;
-  extra_params?: Record<string, unknown>;
-  conversation_id?: string;
-}
-
 export interface LLMResponseStats {
   input_tokens?: number | null;
   cached_input_tokens?: number | null;
@@ -28,17 +19,14 @@ export interface LLMResponseStats {
   cost_usd?: number | null;
 }
 
-export interface LLMResponse {
-  text: string;
-  stats?: LLMResponseStats | null;
-  raw?: Record<string, unknown> | null;
-}
-
 export interface LLMStreamChunk {
   text: string;
   is_final?: boolean;
   stats?: LLMResponseStats | null;
   raw?: Record<string, unknown> | null;
+  assistant_message_id?: string;
+  assistant_seq?: number;
+  persisted?: boolean;
 }
 
 export interface ErrorResponse {
@@ -165,28 +153,6 @@ const parseSseEvent = (rawEvent: string): SseEvent | null => {
   };
 };
 
-export const chat = async (request: ChatRequest): Promise<LLMResponse> => {
-  let response: Response;
-  try {
-    response = await fetch(joinUrl(API_BASE_URL, '/v1/chat'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(request),
-    });
-  } catch (error) {
-    throw toApiErrorFromThrowable(error);
-  }
-
-  if (!response.ok) {
-    throw await toApiErrorFromResponse(response);
-  }
-
-  return (await response.json()) as LLMResponse;
-};
-
 // --- Models API ---
 
 export interface ModelInfo {
@@ -293,49 +259,6 @@ export const updateConversation = async (
 
 // --- Messages API ---
 
-export interface CreateMessageRequest {
-  conversation_id: string;
-  role: Role;
-  content: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface CreateMessageResponse {
-  message_id: string;
-  seq: number;
-}
-
-export const createMessage = async (
-  request: CreateMessageRequest
-): Promise<CreateMessageResponse> => {
-  let response: Response;
-  try {
-    response = await fetch(
-      joinUrl(API_BASE_URL, `/v1/conversations/${request.conversation_id}/messages`),
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          role: request.role,
-          content: request.content,
-          metadata: request.metadata || {},
-        }),
-      }
-    );
-  } catch (error) {
-    throw toApiErrorFromThrowable(error);
-  }
-
-  if (!response.ok) {
-    throw await toApiErrorFromResponse(response);
-  }
-
-  return (await response.json()) as CreateMessageResponse;
-};
-
 export interface MessageResponse {
   id: string;
   role: Role;
@@ -345,20 +268,41 @@ export interface MessageResponse {
   metadata?: Record<string, unknown>;
 }
 
+export interface FetchMessagesResponse {
+  messages: MessageResponse[];
+  has_more: boolean;
+}
+
+export interface FetchMessagesParams {
+  limit?: number;
+  after_seq?: number;
+  before_seq?: number;
+}
+
 export const fetchMessages = async (
-  conversationId: string
-): Promise<MessageResponse[]> => {
+  conversationId: string,
+  params?: FetchMessagesParams
+): Promise<FetchMessagesResponse> => {
   let response: Response;
   try {
-    response = await fetch(
-      joinUrl(API_BASE_URL, `/v1/conversations/${conversationId}/messages`),
-      {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-        },
-      }
-    );
+    const searchParams = new URLSearchParams();
+    if (params?.limit !== undefined) {
+      searchParams.append('limit', params.limit.toString());
+    }
+    if (params?.after_seq !== undefined) {
+      searchParams.append('after_seq', params.after_seq.toString());
+    }
+    if (params?.before_seq !== undefined) {
+      searchParams.append('before_seq', params.before_seq.toString());
+    }
+    const queryString = searchParams.toString();
+    const url = `/v1/conversations/${conversationId}/messages${queryString ? `?${queryString}` : ''}`;
+    response = await fetch(joinUrl(API_BASE_URL, url), {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    });
   } catch (error) {
     throw toApiErrorFromThrowable(error);
   }
@@ -367,102 +311,116 @@ export const fetchMessages = async (
     throw await toApiErrorFromResponse(response);
   }
 
-  return (await response.json()) as MessageResponse[];
+  return (await response.json()) as FetchMessagesResponse;
 };
 
-// --- Chat Stream API ---
+// --- Queued Chat API (producer: persist + enqueue, subscriber: stream) ---
 
-export const chatStream = async (
-  request: ChatRequest,
+export interface ChatEnqueueRequest {
+  conversation_id: string;
+  content: string;
+  client_msg_id: string;
+  client_request_id: string;
+  model: string;
+  params: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ChatEnqueueResponse {
+  request_id: string;
+  user_message_id: string;
+  user_seq: number;
+  assistant_message_id: string;
+  assistant_seq: number;
+  status: string;
+}
+
+export const chatEnqueue = async (
+  request: ChatEnqueueRequest
+): Promise<ChatEnqueueResponse> => {
+  const response = await fetch(joinUrl(API_BASE_URL, '/v1/chat'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      ...request,
+      metadata: request.metadata ?? {},
+    }),
+  });
+  if (!response.ok) {
+    throw await toApiErrorFromResponse(response);
+  }
+  return (await response.json()) as ChatEnqueueResponse;
+};
+
+export const chatStreamSubscribe = async (
+  requestId: string,
   onDelta: (chunk: LLMStreamChunk) => void,
   onFinal: (chunk: LLMStreamChunk) => void,
-  onError: (error: ApiError) => void
+  onError: (error: ApiError) => void,
+  afterEventId?: string
 ): Promise<void> => {
+  const params = new URLSearchParams({ request_id: requestId });
+  if (afterEventId) {
+    params.set('after_event_id', afterEventId);
+  }
+  const url = `${joinUrl(API_BASE_URL, '/v1/chat/stream')}?${params}`;
   let response: Response;
   try {
-    response = await fetch(joinUrl(API_BASE_URL, '/v1/chat/stream'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify(request),
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
     });
   } catch (error) {
     onError(toApiErrorFromThrowable(error));
     return;
   }
-
   if (!response.ok) {
     onError(await toApiErrorFromResponse(response));
     return;
   }
-
   if (!response.body) {
-    onError({
-      message: 'Streaming response has no body.',
-      statusCode: response.status,
-    });
+    onError({ message: 'Stream response has no body', statusCode: response.status });
     return;
   }
-
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
       buffer = buffer.replace(/\r\n/g, '\n');
-
       let boundaryIndex = buffer.indexOf('\n\n');
       while (boundaryIndex !== -1) {
         const rawEvent = buffer.slice(0, boundaryIndex).trim();
         buffer = buffer.slice(boundaryIndex + 2);
         boundaryIndex = buffer.indexOf('\n\n');
-
         if (!rawEvent) continue;
         const parsed = parseSseEvent(rawEvent);
         if (!parsed) continue;
-
         if (parsed.event === 'error') {
           let payload: unknown = parsed.data;
           try {
             payload = JSON.parse(parsed.data);
           } catch {
-            // Keep raw string if parsing fails.
+            /* keep raw */
           }
-          onError(
-            toApiError(payload, {
-              fallbackMessage: 'Streaming error',
-              statusCode: response.status,
-            })
-          );
+          onError(toApiError(payload, { fallbackMessage: 'Streaming error', statusCode: response.status }));
           return;
         }
-
         let payload: LLMStreamChunk | null = null;
         try {
           payload = JSON.parse(parsed.data) as LLMStreamChunk;
         } catch {
-          onError(
-            toApiError(parsed.data, {
-              fallbackMessage: 'Failed to parse stream payload',
-              statusCode: response.status,
-            })
-          );
+          onError(toApiError(parsed.data, { fallbackMessage: 'Failed to parse stream payload', statusCode: response.status }));
           return;
         }
-
         const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
-        const safePayload: LLMStreamChunk = {
-          ...payload,
-          is_final: isFinal,
-        };
-
+        const safePayload: LLMStreamChunk = { ...payload, is_final: isFinal };
         if (isFinal) {
           onFinal(safePayload);
         } else {
@@ -470,23 +428,17 @@ export const chatStream = async (
         }
       }
     }
-
     if (buffer.trim().length > 0) {
       const parsed = parseSseEvent(buffer.trim());
       if (parsed?.data) {
         try {
           const payload = JSON.parse(parsed.data) as LLMStreamChunk;
           const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
-          const safePayload: LLMStreamChunk = { ...payload, is_final: isFinal };
+          const safePayload = { ...payload, is_final: isFinal };
           if (isFinal) onFinal(safePayload);
           else onDelta(safePayload);
         } catch {
-          onError(
-            toApiError(parsed.data, {
-              fallbackMessage: 'Failed to parse trailing stream payload',
-              statusCode: response.status,
-            })
-          );
+          onError(toApiError(buffer, { fallbackMessage: 'Failed to parse trailing payload', statusCode: response.status }));
         }
       }
     }

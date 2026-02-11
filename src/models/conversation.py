@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import JSON, ForeignKey, Integer, Text, text
+from sqlalchemy import BigInteger, JSON, ForeignKey, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base
@@ -41,10 +41,10 @@ class Conversation(Base):
         ForeignKey("messages.id", ondelete="SET NULL"),
         nullable=True,
     )
-    message_count: Mapped[int] = mapped_column(
+    last_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    message_count: Mapped[int | None] = mapped_column(
         Integer,
-        nullable=False,
-        server_default="0",
+        nullable=True,
     )
 
     # UI state

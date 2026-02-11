@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import JSON, ForeignKey, Integer, Numeric, Text, text
+from sqlalchemy import JSON, BigInteger, ForeignKey, Integer, Numeric, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base
@@ -37,6 +37,16 @@ class LLMRequest(Base):
         index=True,
         # ForeignKey("users.id", ondelete="CASCADE") - commented out until users table exists
     )
+    user_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    assistant_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # LLM provider/model info
     provider: Mapped[str] = mapped_column(Text, nullable=False)
@@ -48,6 +58,15 @@ class LLMRequest(Base):
         nullable=False,
         server_default=text("'{}'::jsonb"),
     )
+
+    # Flow optimization fields
+    snapshot_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    client_request_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    included_message_ids: Mapped[list[UUID] | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    status: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Token usage and stats
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -79,4 +98,15 @@ class LLMRequest(Base):
     messages: Mapped[list[Message]] = relationship(
         "Message",
         back_populates="llm_request",
+        foreign_keys="Message.request_id",
+    )
+    user_message: Mapped[Message | None] = relationship(
+        "Message",
+        foreign_keys=[user_message_id],
+        uselist=False,
+    )
+    assistant_message: Mapped[Message | None] = relationship(
+        "Message",
+        foreign_keys=[assistant_message_id],
+        uselist=False,
     )

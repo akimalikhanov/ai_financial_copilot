@@ -49,15 +49,55 @@ class MessageRepository:
         await self.session.flush()
         return message
 
-    async def get_by_conversation_id(
-        self,
-        conversation_id: UUID,
-    ) -> list[Message]:
-        """Get all messages for a conversation, ordered by seq."""
+    async def get_by_id(self, message_id: UUID) -> Message | None:
+        """Get a single message by ID."""
+        result = await self.session.execute(select(Message).where(Message.id == message_id))
+        return result.scalar_one_or_none()
+
+    async def get_by_client_msg_id(
+        self, conversation_id: UUID, client_msg_id: str
+    ) -> Message | None:
+        """Get message by client_msg_id for idempotency check."""
         result = await self.session.execute(
-            select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
+            select(Message).where(
+                Message.conversation_id == conversation_id,
+                Message.client_msg_id == client_msg_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_after_seq(
+        self, conversation_id: UUID, after_seq: int, limit: int
+    ) -> list[Message]:
+        """Get messages after a given sequence number (incremental fetch)."""
+        result = await self.session.execute(
+            select(Message)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.seq > after_seq,
+            )
+            .order_by(Message.seq)
+            .limit(limit)
         )
         return list(result.scalars().all())
+
+    async def get_recent(
+        self, conversation_id: UUID, limit: int, before_seq: int | None = None
+    ) -> list[Message]:
+        """Get recent messages (paginated, ordered by seq descending)."""
+        query = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.seq.desc())
+            .limit(limit)
+        )
+        if before_seq is not None:
+            query = query.where(Message.seq < before_seq)
+
+        result = await self.session.execute(query)
+        messages = list(result.scalars().all())
+        # Return in ascending order (oldest first)
+        return list(reversed(messages))
 
     async def update_on_final(
         self,

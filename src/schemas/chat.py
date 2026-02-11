@@ -24,17 +24,6 @@ class ChatMessage(BaseModel):
     tool_call_id: str | None = None
 
 
-class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    messages: list[ChatMessage]
-    model: str
-    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: int | None = Field(default=None, ge=1)
-    extra_params: dict[str, Any] = Field(default_factory=dict)
-    conversation_id: UUID | None = None
-
-
 class LLMResponseStats(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -49,14 +38,6 @@ class LLMResponseStats(BaseModel):
     cost_usd: float | None = None
 
 
-class LLMResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    text: str
-    stats: LLMResponseStats | None = None
-    raw: dict[str, Any] | None = None
-
-
 class LLMStreamChunk(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -64,6 +45,9 @@ class LLMStreamChunk(BaseModel):
     is_final: bool = False
     stats: LLMResponseStats | None = None
     raw: dict[str, Any] | None = None
+    assistant_message_id: UUID | None = None
+    assistant_seq: int | None = None
+    persisted: bool = False
 
 
 class ErrorResponse(BaseModel):
@@ -98,24 +82,39 @@ class UpdateConversationRequest(BaseModel):
     title: str | None = None
 
 
-class CreateMessageRequest(BaseModel):
+class StreamDoneEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    assistant_message_id: UUID
+    assistant_seq: int
+    persisted: bool = True
+
+
+# --- Queued chat (producer: persist message + enqueue) ---
+
+
+class ChatEnqueueRequest(BaseModel):
+    """Request body for POST /v1/chat. Persists user message and enqueues LLM request in one call."""
+
+    model_config = ConfigDict(extra="forbid")
+
     conversation_id: UUID
-    role: Role
     content: str
+    client_msg_id: str
+    client_request_id: str
+    model: str
+    params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class CreateMessageBody(BaseModel):
-    """Request body for creating a message (conversation_id comes from path)."""
+class ChatEnqueueResponse(BaseModel):
+    """Response from POST /v1/chat."""
 
     model_config = ConfigDict(extra="forbid")
-    role: Role
-    content: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
-
-class CreateMessageResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    message_id: UUID
-    seq: int
+    request_id: UUID
+    user_message_id: UUID
+    user_seq: int
+    assistant_message_id: UUID
+    assistant_seq: int
+    status: str = "queued"

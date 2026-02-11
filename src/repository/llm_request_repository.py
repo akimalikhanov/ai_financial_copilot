@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.llm_request import LLMRequest
+from src.models.message import Message, MessageRole, MessageStatus
 
 
 class LLMRequestRepository:
@@ -15,25 +16,102 @@ class LLMRequestRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def create(
+    async def get_by_id(self, request_id: UUID) -> LLMRequest | None:
+        """Get LLM request by id."""
+        result = await self.session.execute(
+            select(LLMRequest).where(LLMRequest.id == request_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_client_request_id(
+        self, conversation_id: UUID, client_request_id: str
+    ) -> LLMRequest | None:
+        """Get LLM request by client_request_id for idempotency check."""
+        result = await self.session.execute(
+            select(LLMRequest).where(
+                LLMRequest.conversation_id == conversation_id,
+                LLMRequest.client_request_id == client_request_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def update_status(self, request_id: UUID, status: str) -> LLMRequest | None:
+        """Update LLM request status."""
+        result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
+        llm_request = result.scalar_one_or_none()
+        if not llm_request:
+            return None
+
+        llm_request.status = status
+        await self.session.flush()
+        return llm_request
+
+    async def create_with_placeholder(
         self,
         conversation_id: UUID,
         user_id: UUID | None,
         provider: str,
         model: str,
+        user_message_id: UUID | None = None,
+        snapshot_seq: int | None = None,
+        client_request_id: str | None = None,
+        included_message_ids: list[UUID] | None = None,
         request_params: dict | None = None,
-    ) -> LLMRequest:
-        """Create a new LLM request record."""
+        initial_status: str = "pending",
+    ) -> tuple[LLMRequest, Message]:
+        """Atomically create LLM request with assistant message placeholder."""
+        from sqlalchemy import func
+
+        # Get next seq for assistant message
+        result = await self.session.execute(
+            select(func.coalesce(func.max(Message.seq), 0)).where(
+                Message.conversation_id == conversation_id
+            )
+        )
+        next_seq = result.scalar_one() + 1
+
+        # Use in_progress for placeholder; queued requests start as in_progress
+        # (message_status enum has no 'queued', avoiding DB migration)
+        placeholder_status = MessageStatus.in_progress
+
+        # Create assistant placeholder
+        assistant_message = Message(
+            conversation_id=conversation_id,
+            role=MessageRole.assistant,
+            content="",
+            seq=next_seq,
+            status=placeholder_status,
+            message_metadata={},
+        )
+        self.session.add(assistant_message)
+        await self.session.flush()
+
+        # Create LLM request linked to placeholder
+        # Convert UUID list to string list for JSON serialization
+        included_message_ids_json = (
+            [str(msg_id) for msg_id in included_message_ids] if included_message_ids else None
+        )
         llm_request = LLMRequest(
             conversation_id=conversation_id,
             user_id=user_id,
             provider=provider,
             model=model,
+            user_message_id=user_message_id,
+            snapshot_seq=snapshot_seq,
+            client_request_id=client_request_id,
+            included_message_ids=included_message_ids_json,
+            assistant_message_id=assistant_message.id,
+            status=initial_status,
             request_params=request_params or {},
         )
         self.session.add(llm_request)
         await self.session.flush()
-        return llm_request
+
+        # Link assistant message to request
+        assistant_message.request_id = llm_request.id
+        await self.session.flush()
+
+        return llm_request, assistant_message
 
     async def update_on_final(
         self,
