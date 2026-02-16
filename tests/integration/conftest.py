@@ -14,7 +14,7 @@ from src.api.routers import get_routers
 from src.db import init_db, shutdown_db
 from src.redis_client import close_redis_client, create_redis_client
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
-from src.services.llm_router import LLMRouter, RoutedLLM, get_router
+from src.services.llm_router import LLMRouter, RoutedLLM
 
 # Distinctive mock response to verify mock is used (avoids real LLM calls)
 MOCK_RESPONSE = "[INTEGRATION-TEST-MOCK-RESPONSE]"
@@ -31,7 +31,7 @@ class MockStreamingLLM:
     async def close(self) -> None:
         pass
 
-    def stream(self, *args: Any, **kwargs: Any) -> AsyncGenerator[LLMStreamChunk, None]:
+    def stream(self, *_args: Any, **_kwargs: Any) -> AsyncGenerator[LLMStreamChunk, None]:
         async def _gen() -> AsyncGenerator[LLMStreamChunk, None]:
             # Emit one delta, then final chunk (matches worker expectation)
             yield LLMStreamChunk(text=self._response_text, is_final=False)
@@ -85,7 +85,14 @@ def _integration_redis_stream(monkeypatch: pytest.MonkeyPatch) -> None:
 def _patch_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure get_router returns mock in integration tests (no real API calls)."""
     mock_router = _create_mock_router()
-    monkeypatch.setattr("src.services.llm_router.get_router", lambda *a, **kw: mock_router)
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_args, **_kwargs: mock_router)
+
+
+@pytest.fixture(autouse=True)
+def _jwt_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set JWT env for auth integration tests."""
+    monkeypatch.setenv("JWT_SECRET_KEY", "integration-test-secret-key-min-32-chars")
+    monkeypatch.setenv("JWT_ALGORITHM", "HS256")
 
 
 @pytest.fixture

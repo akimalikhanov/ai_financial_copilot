@@ -41,9 +41,7 @@ async def enqueue_chat_request(redis: Redis, request_id: str) -> None:
     logger.info("chat_request_enqueued", extra={"request_id": request_id})
 
 
-async def add_event(
-    redis: Redis, request_id: str, event_type: str, data: dict[str, Any]
-) -> str:
+async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[str, Any]) -> str:
     """Add an event to the request's events stream. Returns event id."""
     stream_key = events_stream_key(request_id)
     payload = json.dumps({"type": event_type, **data})

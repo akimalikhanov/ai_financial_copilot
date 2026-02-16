@@ -18,9 +18,7 @@ class LLMRequestRepository:
 
     async def get_by_id(self, request_id: UUID) -> LLMRequest | None:
         """Get LLM request by id."""
-        result = await self.session.execute(
-            select(LLMRequest).where(LLMRequest.id == request_id)
-        )
+        result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
         return result.scalar_one_or_none()
 
     async def get_by_client_request_id(

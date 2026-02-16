@@ -329,6 +329,16 @@ export const logout = async (): Promise<void> => {
   });
 };
 
+/** Fetch current user (requires valid access token). */
+export const getMe = async (): Promise<UserInfo> => {
+  const response = await fetchApi(joinUrl(API_BASE_URL, '/v1/auth/me'), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+  return (await response.json()) as UserInfo;
+};
+
 // --- Conversations API ---
 
 export interface CreateConversationRequest {
@@ -426,6 +436,16 @@ export const updateConversation = async (
   }
 
   return (await response.json()) as UpdateConversationResponse;
+};
+
+export const deleteConversation = async (
+  conversationId: string
+): Promise<void> => {
+  const response = await fetchApi(
+    joinUrl(API_BASE_URL, `/v1/conversations/${conversationId}`),
+    { method: 'DELETE', headers: { Accept: 'application/json' } }
+  );
+  if (!response.ok) throw await toApiErrorFromResponse(response);
 };
 
 // --- Messages API ---

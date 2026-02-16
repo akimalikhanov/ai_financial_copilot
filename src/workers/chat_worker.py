@@ -17,6 +17,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
+from src.api.logging import JsonFormatter
 from src.db import get_session_factory, init_db, shutdown_db
 from src.models.message import Message, MessageStatus
 from src.redis_client import CHAT_QUEUE_STREAM, events_stream_key
@@ -27,11 +28,10 @@ from src.repository import (
 )
 from src.schemas import chat as schemas
 from src.services.context import build_context
-from src.services.llm_adapters.base_adapter import Role as AdapterRole
 from src.services.llm_adapters.base_adapter import (
     ChatMessage as AdapterChatMessage,
 )
-from src.api.logging import JsonFormatter
+from src.services.llm_adapters.base_adapter import Role as AdapterRole
 from src.services.llm_router import get_router
 from src.utils.config import get_redis_url
 
@@ -57,6 +57,7 @@ def _configure_worker_logging() -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
+
 CONSUMER_GROUP = "chat-workers"
 WORKER_ID = os.getenv("CHAT_WORKER_ID", "worker-1")
 BLOCK_MS = int(os.getenv("CHAT_WORKER_BLOCK_MS", "15000"))
@@ -74,9 +75,7 @@ async def run_consume_loop(
     Does NOT init/shutdown DB or close redis (for integration test use).
     """
     try:
-        await redis.xgroup_create(
-            CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True
-        )
+        await redis.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
     except Exception as e:
         if "BUSYGROUP" not in str(e) and "already exists" not in str(e).lower():
             logger.warning("consumer_group_create", extra={"error": str(e)})
@@ -104,7 +103,7 @@ async def run_consume_loop(
             for msg_id, raw in messages:
                 payload_str = raw.get("payload") if isinstance(raw, dict) else ""
                 try:
-                    data = json.loads(payload_str)
+                    data = json.loads(payload_str or "")
                     rid = data.get("request_id")
                 except (json.JSONDecodeError, KeyError):
                     await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
@@ -132,9 +131,7 @@ def _to_adapter_messages(messages: list[schemas.ChatMessage]) -> list[AdapterCha
     ]
 
 
-async def add_event(
-    redis: Redis, request_id: str, event_type: str, data: dict
-) -> None:
+async def add_event(redis: Redis, request_id: str, event_type: str, data: dict) -> None:
     """Add event to request's event stream."""
     stream_key = events_stream_key(request_id)
     payload = json.dumps({"type": event_type, **data})
@@ -230,13 +227,9 @@ async def process_request(
                             else None
                         ),
                         ttft_ms=(
-                            int(chunk.stats.ttft_ms)
-                            if chunk.stats.ttft_ms is not None
-                            else None
+                            int(chunk.stats.ttft_ms) if chunk.stats.ttft_ms is not None else None
                         ),
-                        tps=(
-                            int(chunk.stats.tps) if chunk.stats.tps is not None else None
-                        ),
+                        tps=(int(chunk.stats.tps) if chunk.stats.tps is not None else None),
                     )
                 await llm_request_repo.update_status(UUID(request_id), "completed")
                 await conversation_repo.update_on_message(
@@ -294,9 +287,7 @@ async def run_worker() -> None:
     # Create consumer group (ignore error if already exists)
     # $ = only new messages from now; use "0" to process from start
     try:
-        await redis.xgroup_create(
-            CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True
-        )
+        await redis.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
         logger.info("consumer_group_created", extra={"group": CONSUMER_GROUP})
     except Exception as e:
         if "BUSYGROUP" in str(e) or "already exists" in str(e).lower():
@@ -337,11 +328,11 @@ async def run_worker() -> None:
             if not result:
                 continue
 
-            for stream_name, messages in result:
+            for _stream_name, messages in result:
                 for msg_id, raw in messages:
                     payload_str = raw.get("payload") if isinstance(raw, dict) else ""
                     try:
-                        data = json.loads(payload_str)
+                        data = json.loads(payload_str or "")
                         rid = data.get("request_id")
                     except (json.JSONDecodeError, KeyError):
                         logger.warning("invalid_queue_payload", extra={"msg_id": msg_id})

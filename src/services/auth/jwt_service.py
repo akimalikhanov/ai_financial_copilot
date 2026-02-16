@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from dotenv import load_dotenv
 import jwt
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -20,7 +20,7 @@ def _get_secret() -> str:
 
 
 def _get_algorithm() -> str:
-    return os.getenv("JWT_ALGORITHM")
+    return os.getenv("JWT_ALGORITHM") or "HS256"
 
 
 def _parse_expire(value: str, default_minutes: int) -> int:
@@ -61,14 +61,14 @@ def get_refresh_cookie_max_age() -> int:
 
 def create_access_token(user_id: UUID) -> str:
     """Create a short-lived access token."""
-    exp = datetime.now(timezone.utc) + timedelta(minutes=_access_expire_minutes())
+    exp = datetime.now(UTC) + timedelta(minutes=_access_expire_minutes())
     payload = {"sub": str(user_id), "exp": exp, "type": "access"}
     return jwt.encode(payload, _get_secret(), algorithm=_get_algorithm())
 
 
 def create_refresh_token(user_id: UUID, session_id: UUID) -> str:
     """Create a refresh token bound to a session (jti = session_id for revocation)."""
-    exp = datetime.now(timezone.utc) + timedelta(minutes=_refresh_expire_minutes())
+    exp = datetime.now(UTC) + timedelta(minutes=_refresh_expire_minutes())
     payload = {"sub": str(user_id), "jti": str(session_id), "exp": exp, "type": "refresh"}
     return jwt.encode(payload, _get_secret(), algorithm=_get_algorithm())
 

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageSquare, BookOpen, Plus, Send, Search,
-  Settings, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2, Pencil
+  LogOut, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2, Pencil, Loader2
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
 import { MOCK_DOCS, COMPANIES, YEARS } from './services/mockData';
@@ -9,14 +9,19 @@ import {
   chatEnqueue,
   chatStreamSubscribe,
   fetchModels,
+  getMe,
   createConversation,
   fetchMessages,
   updateConversation,
+  fetchConversations,
+  deleteConversation,
   ApiError,
   ModelInfo,
   LLMStreamChunk,
-  MessageResponse,
+  type UserInfo,
 } from './services/api';
+import { useAuth } from './context/AuthContext';
+import { LoginPage } from './components/LoginPage';
 import { Button, Input, Badge, Card, ChatBubble, Toggle } from './components/ui';
 import { ScopeBar } from './components/ScopeBar';
 import { EvidencePanel } from './components/EvidencePanel';
@@ -33,6 +38,8 @@ const FALLBACK_MODELS: ModelInfo[] = [
 const generateId = () => Math.random().toString(36).slice(2, 11);
 
 export default function App() {
+  const { authChecked, isAuthenticated, setAccessToken, logout } = useAuth();
+
   // --- Global State ---
   const [view, setView] = useState<ViewMode>('ASK');
   const [mobileTab, setMobileTab] = useState<MobileTab>('CONVERSATION');
@@ -87,6 +94,9 @@ export default function App() {
   const [statsHistory, setStatsHistory] = useState<RequestStats[]>([]);
   const requestStartTimeRef = useRef<number>(0);
 
+  // Current user (fetched when authenticated)
+  const [currentUser, setCurrentUser] = useState<UserInfo | null>(null);
+
   // Delete Confirmation State
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
 
@@ -102,6 +112,13 @@ export default function App() {
     document.documentElement.classList.toggle('dark', isDarkMode);
     document.documentElement.classList.toggle('light', !isDarkMode);
   }, [isDarkMode]);
+
+  // Reset request stats when auth state changes (login or logout) so the same tab doesn't show the previous user's stats
+  useEffect(() => {
+    if (!authChecked) return;
+    setLastRequestStats(null);
+    setStatsHistory([]);
+  }, [authChecked, isAuthenticated]);
 
   // --- Derived State ---
   const activeChat = chats.find(c => c.id === activeChatId);
@@ -123,6 +140,40 @@ export default function App() {
   }, [docs, scope]);
 
   // --- Effects ---
+
+  // Load current user when authenticated
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setCurrentUser(null);
+      return;
+    }
+    let cancelled = false;
+    getMe()
+      .then((user) => {
+        if (!cancelled) setCurrentUser(user);
+      })
+      .catch((err) => console.error('Failed to load current user:', err));
+    return () => { cancelled = true; };
+  }, [isAuthenticated]);
+
+  // Load conversations when authenticated (7.6)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    fetchConversations()
+      .then((res) => {
+        if (cancelled) return;
+        const mapped: Chat[] = res.conversations.map((c) => ({
+          id: c.id,
+          title: c.title ?? 'Untitled',
+          createdAt: new Date(c.created_at).getTime(),
+          conversationId: c.id,
+        }));
+        setChats(mapped);
+      })
+      .catch((err) => console.error('Failed to load conversations:', err));
+    return () => { cancelled = true; };
+  }, [isAuthenticated]);
 
   // Fetch available models on mount
   useEffect(() => {
@@ -154,39 +205,35 @@ export default function App() {
 
     const conversationId = activeChat.conversationId;
 
-    // Skip if already loading or already loaded
-    if (messagesLoading[conversationId] || messagesByConversation[conversationId]) {
-      return;
-    }
+    // Skip if already have messages (avoid re-fetch on tab reload when switching back)
+    if (messagesByConversation[conversationId]) return;
 
     let cancelled = false;
-    setMessagesLoading(prev => ({ ...prev, [conversationId]: true }));
+    setMessagesLoading((prev) => ({ ...prev, [conversationId]: true }));
 
     (async () => {
       try {
         const response = await fetchMessages(conversationId, { limit: 50 });
         if (!cancelled) {
-          // Backend returns messages in reverse order (most recent first), reverse for display
-          const reversedMessages = [...response.messages].reverse();
-          // Convert backend messages to UI format
-          const uiMessages: Message[] = reversedMessages.map((msg) => ({
+          // Backend returns oldest first (ascending by seq); use as-is for display
+          const uiMessages: Message[] = response.messages.map((msg) => ({
             id: msg.id,
             role: msg.role as 'user' | 'assistant',
             content: msg.content,
             timestamp: new Date(msg.created_at).getTime(),
             citations: (msg.metadata?.citations as Citation[] | undefined),
           }));
-          setMessagesByConversation(prev => ({
+          setMessagesByConversation((prev) => ({
             ...prev,
             [conversationId]: uiMessages,
           }));
-          setMessagesHasMore(prev => ({
+          setMessagesHasMore((prev) => ({
             ...prev,
             [conversationId]: response.has_more,
           }));
           if (response.messages.length > 0) {
-            const minSeq = Math.min(...response.messages.map(m => m.seq));
-            setMessagesMinSeq(prev => ({
+            const minSeq = Math.min(...response.messages.map((m) => m.seq));
+            setMessagesMinSeq((prev) => ({
               ...prev,
               [conversationId]: minSeq,
             }));
@@ -195,14 +242,14 @@ export default function App() {
       } catch (error) {
         console.error('Failed to fetch messages:', error);
         if (!cancelled) {
-          setMessagesByConversation(prev => ({
+          setMessagesByConversation((prev) => ({
             ...prev,
             [conversationId]: [],
           }));
         }
       } finally {
         if (!cancelled) {
-          setMessagesLoading(prev => {
+          setMessagesLoading((prev) => {
             const next = { ...prev };
             delete next[conversationId];
             return next;
@@ -214,7 +261,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeChat?.conversationId, messagesLoading, messagesByConversation]);
+  }, [activeChat?.conversationId, messagesByConversation]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
@@ -230,7 +277,7 @@ export default function App() {
 
     const container = messagesContainerRef.current;
     let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
-    
+
     const handleScroll = () => {
       // Debounce scroll events
       if (scrollTimeout) {
@@ -244,9 +291,8 @@ export default function App() {
             setMessagesLoading(prev => ({ ...prev, [conversationId]: true }));
             fetchMessages(conversationId, { limit: 50, before_seq: minSeq })
               .then(response => {
-                // Backend returns messages in reverse order (most recent first), reverse for display
-                const reversedMessages = [...response.messages].reverse();
-                const uiMessages: Message[] = reversedMessages.map((msg) => ({
+                // Backend returns oldest first; use as-is and prepend to existing
+                const uiMessages: Message[] = response.messages.map((msg) => ({
                   id: msg.id,
                   role: msg.role as 'user' | 'assistant',
                   content: msg.content,
@@ -524,19 +570,26 @@ export default function App() {
     setChatToDelete(id);
   };
 
-  const confirmDeleteChat = () => {
-    if (chatToDelete) {
-      const chat = chats.find(c => c.id === chatToDelete);
-      setChats(prev => prev.filter(c => c.id !== chatToDelete));
+  const confirmDeleteChat = async () => {
+    if (!chatToDelete) return;
+    const chat = chats.find((c) => c.id === chatToDelete);
+    if (!chat?.conversationId) {
+      setChatToDelete(null);
+      return;
+    }
+    try {
+      await deleteConversation(chat.conversationId);
+      setChats((prev) => prev.filter((c) => c.id !== chatToDelete));
       if (activeChatId === chatToDelete) setActiveChatId(null);
-      // Remove messages from state
-      if (chat?.conversationId) {
-        setMessagesByConversation(prev => {
-          const next = { ...prev };
-          delete next[chat.conversationId];
-          return next;
-        });
-      }
+      setMessagesByConversation((prev) => {
+        const next = { ...prev };
+        delete next[chat.conversationId];
+        return next;
+      });
+    } catch (err) {
+      console.error('Failed to delete conversation:', err);
+      alert('Failed to delete conversation. Please try again.');
+    } finally {
       setChatToDelete(null);
     }
   };
@@ -671,10 +724,20 @@ export default function App() {
             <User size={14} className="text-[var(--text-muted)]" />
           </div>
           <div className="flex-1">
-             <div className="text-sm font-medium text-[var(--text)]">Analyst User</div>
-             <div className="text-xs text-[var(--text-faint)]">Pro Plan</div>
+             <div className="text-sm font-medium text-[var(--text)] truncate">
+              {currentUser?.display_name ?? currentUser?.email ?? 'User'}
+            </div>
+            <div className="text-xs text-[var(--text-faint)] truncate">
+              {currentUser?.display_name ? currentUser.email : (currentUser ? 'Pro Plan' : null)}
+            </div>
           </div>
-          <Settings size={16} className="text-[var(--icon)] hover:text-[var(--text)] cursor-pointer transition-colors" />
+          <button
+            onClick={() => logout()}
+            className="p-1.5 text-[var(--icon)] hover:text-[var(--accent)] hover:bg-[var(--surface-2)] rounded-md transition-colors"
+            title="Log out"
+          >
+            <LogOut size={16} />
+          </button>
         </div>
       </div>
     </div>
@@ -916,6 +979,17 @@ export default function App() {
       </div>
     </div>
   );
+
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--bg)]">
+        <Loader2 className="w-8 h-8 animate-spin text-[var(--accent)]" />
+      </div>
+    );
+  }
+  if (!isAuthenticated) {
+    return <LoginPage onSuccess={(token) => setAccessToken(token)} />;
+  }
 
   return (
     <div className="flex flex-col h-screen bg-[var(--bg)] text-[var(--text)] overflow-hidden font-sans">

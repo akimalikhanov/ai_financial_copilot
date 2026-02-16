@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from uuid import UUID
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import Depends, HTTPException, Request, status
 from redis.asyncio import Redis
@@ -50,7 +50,7 @@ async def get_current_user(request: Request, session: DbSessionDep) -> User:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
-        )
+        ) from None
     user_repo = UserRepository(session)
     user = await user_repo.get_by_id(user_id)
     if not user or not user.is_active:

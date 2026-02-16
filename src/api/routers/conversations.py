@@ -64,6 +64,33 @@ async def list_conversations(
     )
 
 
+@router.delete("/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+) -> dict[str, str]:
+    """Soft-delete a conversation."""
+    try:
+        conv_uuid = UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid conversation_id format",
+        ) from None
+
+    repo = ConversationRepository(session)
+    conversation = await repo.get_by_id(conv_uuid)
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+    _require_owner(conversation.user_id, current_user)
+    await repo.soft_delete(conv_uuid)
+    return {"status": "deleted"}
+
+
 @router.patch("/{conversation_id}")
 async def update_conversation(
     conversation_id: str,

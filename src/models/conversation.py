@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import BigInteger, JSON, ForeignKey, Integer, Text, text
+from sqlalchemy import JSON, BigInteger, ForeignKey, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base

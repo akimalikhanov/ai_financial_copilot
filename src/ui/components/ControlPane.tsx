@@ -676,37 +676,6 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                 </>
               )}
 
-              {/* Recent History */}
-              {statsHistory.length > 1 && (
-                <>
-                  <div className="h-px bg-[var(--border)] my-4" />
-
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">Recent Requests</span>
-                  </div>
-
-                  <div className="space-y-2 max-h-80 overflow-y-auto">
-                    {statsHistory.slice(-5).reverse().map((stat, idx) => {
-                      const requestNumber = statsHistory.length - idx;
-                      return (
-                        <div
-                          key={stat.timestamp}
-                          className="flex items-center justify-between py-2.5 px-3 bg-[var(--surface-2)] rounded-lg border border-[var(--border)] text-xs hover:bg-[var(--surface-3)] transition-colors"
-                        >
-                          <div className="flex items-center gap-2 min-w-0">
-                            <span className="text-[var(--text-faint)] font-mono shrink-0">#{requestNumber}</span>
-                            <span className="text-[var(--text)] truncate">{stat.totalTokens.toLocaleString()} tokens</span>
-                          </div>
-                          <div className="flex items-center gap-3 shrink-0">
-                            <span className="text-[var(--accent)] font-mono">{formatCost(stat.cost)}</span>
-                            <span className="text-[var(--text-faint)] font-mono">{formatLatency(stat.latencyMs)}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </>
-              )}
             </div>
           )}
         </div>

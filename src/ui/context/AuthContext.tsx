@@ -6,6 +6,7 @@ type AuthContextValue = {
   setAccessToken: (token: string | null) => void;
   logout: () => Promise<void>;
   isAuthenticated: boolean;
+  authChecked: boolean;
   refreshTokens: () => Promise<string | null>;
 };
 
@@ -13,6 +14,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
   const refreshTokens = useCallback(async (): Promise<string | null> => {
     try {
@@ -40,8 +42,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [accessToken]);
 
   useEffect(() => {
-    if (accessToken !== null) return;
-    refreshTokens();
+    if (accessToken !== null) {
+      setAuthChecked(true);
+      return;
+    }
+    refreshTokens().finally(() => setAuthChecked(true));
   }, []);
 
   const value = useMemo<AuthContextValue>(
@@ -50,9 +55,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setAccessToken,
       logout,
       isAuthenticated: accessToken !== null,
+      authChecked,
       refreshTokens,
     }),
-    [accessToken, setAccessToken, logout, refreshTokens]
+    [accessToken, setAccessToken, logout, authChecked, refreshTokens]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

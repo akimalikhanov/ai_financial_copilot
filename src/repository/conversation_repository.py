@@ -38,7 +38,9 @@ class ConversationRepository:
     ) -> tuple[list[Conversation], int]:
         """List non-deleted conversations for a user, ordered by activity."""
         count_result = await self.session.execute(
-            select(func.count()).select_from(Conversation).where(
+            select(func.count())
+            .select_from(Conversation)
+            .where(
                 Conversation.user_id == user_id,
                 Conversation.deleted_at.is_(None),
             )
@@ -51,11 +53,7 @@ class ConversationRepository:
                 Conversation.user_id == user_id,
                 Conversation.deleted_at.is_(None),
             )
-            .order_by(
-                func.coalesce(
-                    Conversation.last_message_at, Conversation.created_at
-                ).desc()
-            )
+            .order_by(func.coalesce(Conversation.last_message_at, Conversation.created_at).desc())
             .limit(limit)
             .offset(offset)
         )
@@ -82,6 +80,16 @@ class ConversationRepository:
             await self.session.flush()
         return conversation
 
+    async def soft_delete(self, conversation_id: UUID) -> bool:
+        """Soft-delete a conversation (set deleted_at). Returns True if found."""
+        conversation = await self.get_by_id(conversation_id)
+        if not conversation:
+            return False
+        now_utc = datetime.now(UTC).replace(tzinfo=None)
+        conversation.deleted_at = now_utc
+        await self.session.flush()
+        return True
+
     async def update_on_message(
         self,
         conversation_id: UUID,
@@ -106,4 +114,4 @@ class ConversationRepository:
             )
         )
         await self.session.flush()
-        return result.rowcount > 0
+        return getattr(result, "rowcount", 0) > 0

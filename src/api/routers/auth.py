@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import bcrypt
-import os
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
 from src.api.deps import CurrentUserDep
 from src.db.connection import DbSessionDep
-from src.models.user import User
 from src.repository.session_repository import SessionRepository
 from src.repository.user_repository import UserRepository
 from src.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserResponse
@@ -22,7 +22,6 @@ from src.services.auth.jwt_service import (
     get_access_token_expire_seconds,
     get_refresh_cookie_max_age,
 )
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -107,7 +106,11 @@ async def login(
     """Verify credentials, return access_token in JSON, set refresh cookie."""
     user_repo = UserRepository(session)
     user = await user_repo.get_by_email(request.email)
-    if not user or not user.password_hash or not _verify_password(request.password, user.password_hash):
+    if (
+        not user
+        or not user.password_hash
+        or not _verify_password(request.password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -134,27 +137,37 @@ async def refresh(
     token = http_request.cookies.get(REFRESH_COOKIE)
     if not token:
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token"
+        )
     payload = decode_token(token)
     if not payload or payload.get("type") != "refresh":
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+        )
     user_id_str = payload.get("sub")
     jti = payload.get("jti")
     if not user_id_str or not jti:
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+        )
     try:
         user_id = UUID(user_id_str)
         session_id = UUID(jti)
     except ValueError:
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token"
+        ) from None
     session_repo = SessionRepository(session)
     sess = await session_repo.get_valid_by_id(session_id)
     if not sess:
         _clear_refresh_cookie(response)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired or revoked")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired or revoked"
+        )
     access_token = create_access_token(user_id)
     return TokenResponse(
         access_token=access_token,

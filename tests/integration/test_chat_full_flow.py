@@ -7,22 +7,32 @@ Requires: PostgreSQL (via PgBouncer) and Redis running (e.g. docker-compose up -
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from uuid import uuid4
 
 import pytest
 
-from tests.integration.conftest import MOCK_RESPONSE
-
 from src.workers.chat_worker import run_consume_loop
+from tests.integration.conftest import MOCK_RESPONSE
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app) -> None:
     """
-    Full flow: create conversation → enqueue chat → worker processes → SSE delivers events → DB updated.
+    Full flow: register → login → create conversation → enqueue chat → worker processes → SSE → DB updated.
     """
+    # 0. Register and get token (unique email so reruns don't get 409)
+    email = f"chatflow-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register",
+        json={"email": email, "password": "testpass123"},
+    )
+    assert reg.status_code == 200
+    token = reg.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
     shutdown = asyncio.Event()
     worker_task = asyncio.create_task(
         run_consume_loop(
@@ -33,16 +43,17 @@ async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app
         )
     )
     try:
-        # 1. Create conversation
+        # 1. Create conversation (authenticated)
         conv_resp = await async_client.post(
             "/v1/conversations",
-            json={"title": "Integration test", "user_id": None},
+            json={"title": "Integration test"},
+            headers=headers,
         )
         assert conv_resp.status_code == 200
         conv_data = conv_resp.json()
         conversation_id = conv_data["conversation_id"]
 
-        # 2. Enqueue chat (API → Redis queue)
+        # 2. Enqueue chat (API → Redis queue, authenticated)
         enqueue_resp = await async_client.post(
             "/v1/chat",
             json={
@@ -53,6 +64,7 @@ async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app
                 "model": "gpt-4o-mini",
                 "params": {},
             },
+            headers=headers,
         )
         assert enqueue_resp.status_code == 200
         enqueue_data = enqueue_resp.json()
@@ -67,6 +79,7 @@ async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app
             "/v1/chat/stream",
             params={"request_id": str(request_id)},
             timeout=timeout_seconds,
+            headers=headers,
         ) as stream_response:
             assert stream_response.status_code == 200
             current_event: str | None = None
@@ -100,7 +113,5 @@ async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app
     finally:
         shutdown.set()
         worker_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await worker_task
-        except asyncio.CancelledError:
-            pass

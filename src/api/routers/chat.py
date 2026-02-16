@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from typing import cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep
@@ -50,12 +51,12 @@ async def chat_enqueue(
     existing = await llm_request_repo.get_by_client_request_id(
         req.conversation_id, req.client_request_id
     )
-    if existing and existing.assistant_message_id:
-        assistant_msg = await message_repo.get_by_id(existing.assistant_message_id)
-        user_msg = await message_repo.get_by_id(existing.user_message_id)
+    if existing and existing.assistant_message_id and existing.user_message_id:
+        assistant_msg = await message_repo.get_by_id(cast(UUID, existing.assistant_message_id))
+        user_msg = await message_repo.get_by_id(cast(UUID, existing.user_message_id))
         return schemas.ChatEnqueueResponse(
             request_id=existing.id,
-            user_message_id=existing.user_message_id,
+            user_message_id=cast(UUID, existing.user_message_id),
             user_seq=user_msg.seq if user_msg else 0,
             assistant_message_id=existing.assistant_message_id,
             assistant_seq=assistant_msg.seq if assistant_msg else 0,
@@ -63,9 +64,7 @@ async def chat_enqueue(
         )
 
     # Create or find user message (idempotent by client_msg_id)
-    user_message = await message_repo.get_by_client_msg_id(
-        req.conversation_id, req.client_msg_id
-    )
+    user_message = await message_repo.get_by_client_msg_id(req.conversation_id, req.client_msg_id)
     if not user_message:
         user_message = await message_repo.create(
             conversation_id=req.conversation_id,
@@ -130,9 +129,7 @@ async def chat_stream_subscribe(
         nonlocal last_id
         try:
             while True:
-                result = await redis.xread(
-                    {stream_key: last_id}, block=15000, count=10
-                )
+                result = await redis.xread({stream_key: last_id}, block=15000, count=10)
                 if not result:
                     yield ": keepalive\n\n"
                     continue
@@ -140,7 +137,9 @@ async def chat_stream_subscribe(
                 for _, events in result:
                     for eid, raw_data in events:
                         last_id = eid
-                        payload_str = raw_data.get("payload") if isinstance(raw_data, dict) else None
+                        payload_str = (
+                            raw_data.get("payload") if isinstance(raw_data, dict) else None
+                        )
                         if not payload_str:
                             continue
                         try:
