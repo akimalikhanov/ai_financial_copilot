@@ -13,6 +13,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "asyncpg" },
     { name = "google-api-core" },
+    { name = "jinja2" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "redis" },
@@ -22,6 +23,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "pre-commit" },
     { name = "pyright" },
     { name = "pytest" },
@@ -38,15 +40,17 @@ llm-engine = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "google-api-core", specifier = ">=2.29.0" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
-    { name = "redis", specifier = ">=5.0.0" },
+    { name = "redis", specifier = ">=7.1.1" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "sqlalchemy", specifier = ">=2.0.46" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.28.0" },
     { name = "pre-commit", specifier = ">=4.5.1" },
     { name = "pyright", specifier = ">=1.1.408" },
     { name = "pytest", specifier = ">=8.0.0" },

@@ -21,7 +21,6 @@ from src.repository import (
     MessageRepository,
 )
 from src.schemas import chat as schemas
-from src.services.context import build_context
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -79,10 +78,6 @@ async def chat_enqueue(
             req.conversation_id, user_message.id, user_message.seq
         )
 
-    _, included_message_ids = await build_context(
-        message_repo, req.conversation_id, after_seq=None, max_messages=100
-    )
-
     llm = llm_router.get(req.model)
     llm_request, assistant_placeholder = await llm_request_repo.create_with_placeholder(
         conversation_id=req.conversation_id,
@@ -92,7 +87,6 @@ async def chat_enqueue(
         user_message_id=user_message.id,
         snapshot_seq=user_message.seq,
         client_request_id=req.client_request_id,
-        included_message_ids=included_message_ids,
         request_params=req.params,
         initial_status="queued",
     )

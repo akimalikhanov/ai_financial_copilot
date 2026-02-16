@@ -31,18 +31,93 @@ from src.services.llm_adapters.base_adapter import Role as AdapterRole
 from src.services.llm_adapters.base_adapter import (
     ChatMessage as AdapterChatMessage,
 )
+from src.api.logging import JsonFormatter
 from src.services.llm_router import get_router
 from src.utils.config import get_redis_url
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
+
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that flushes after each emit (fixes buffering when run without TTY)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
+def _configure_worker_logging() -> None:
+    """Configure JSON logging for the worker (same format as API, with flush for non-TTY)."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handler = _FlushingStreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
 
 CONSUMER_GROUP = "chat-workers"
 WORKER_ID = os.getenv("CHAT_WORKER_ID", "worker-1")
-BLOCK_MS = 15000
+BLOCK_MS = int(os.getenv("CHAT_WORKER_BLOCK_MS", "15000"))
+
+
+async def run_consume_loop(
+    redis: Redis,
+    llm_router,
+    shutdown: asyncio.Event,
+    *,
+    block_ms: int = 500,
+) -> None:
+    """
+    Consume jobs from chat queue until shutdown is set.
+    Does NOT init/shutdown DB or close redis (for integration test use).
+    """
+    try:
+        await redis.xgroup_create(
+            CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True
+        )
+    except Exception as e:
+        if "BUSYGROUP" not in str(e) and "already exists" not in str(e).lower():
+            logger.warning("consumer_group_create", extra={"error": str(e)})
+
+    while not shutdown.is_set():
+        try:
+            result = await redis.xreadgroup(
+                groupname=CONSUMER_GROUP,
+                consumername=WORKER_ID,
+                streams={CHAT_QUEUE_STREAM: ">"},
+                block=block_ms,
+                count=1,
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("xreadgroup_error", extra={"error": str(e)})
+            await asyncio.sleep(0.1)
+            continue
+
+        if not result:
+            continue
+
+        for _stream_name, messages in result:
+            for msg_id, raw in messages:
+                payload_str = raw.get("payload") if isinstance(raw, dict) else ""
+                try:
+                    data = json.loads(payload_str)
+                    rid = data.get("request_id")
+                except (json.JSONDecodeError, KeyError):
+                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                    continue
+
+                if not rid:
+                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                    continue
+
+                try:
+                    await process_request(redis, rid, llm_router)
+                finally:
+                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
 
 
 def _to_adapter_messages(messages: list[schemas.ChatMessage]) -> list[AdapterChatMessage]:
@@ -211,6 +286,7 @@ async def process_request(
 
 async def run_worker() -> None:
     """Main worker loop."""
+    _configure_worker_logging()
     await init_db()
     redis = Redis.from_url(get_redis_url(), decode_responses=True)
     llm_router = get_router()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from redis.asyncio import Redis
@@ -12,8 +13,8 @@ from src.utils.config import get_redis_url
 
 logger = logging.getLogger(__name__)
 
-# Stream keys
-CHAT_QUEUE_STREAM = "chat:queue"
+# Stream keys (use chat:queue:test for integration tests to avoid clashing with real worker)
+CHAT_QUEUE_STREAM = os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
 CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
 
 
