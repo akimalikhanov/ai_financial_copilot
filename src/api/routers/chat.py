@@ -7,10 +7,10 @@ import json
 from collections.abc import AsyncGenerator
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, status
 from fastapi.responses import StreamingResponse
 
-from src.api.deps import LLMRouterDep, RedisDep
+from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.message import MessageRole
@@ -31,6 +31,7 @@ async def chat_enqueue(
     session: DbSessionDep,
     redis: RedisDep,
     llm_router: LLMRouterDep,
+    current_user: CurrentUserDep,
 ) -> schemas.ChatEnqueueResponse:
     """
     Producer: persist user message + enqueue LLM request in one call.
@@ -40,6 +41,10 @@ async def chat_enqueue(
     conversation_repo = ConversationRepository(session)
     message_repo = MessageRepository(session)
     llm_request_repo = LLMRequestRepository(session)
+
+    conversation = await conversation_repo.get_by_id(req.conversation_id)
+    if not conversation or conversation.user_id != current_user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
 
     # Idempotency: return existing if already processed
     existing = await llm_request_repo.get_by_client_request_id(
@@ -56,10 +61,6 @@ async def chat_enqueue(
             assistant_seq=assistant_msg.seq if assistant_msg else 0,
             status=existing.status or "queued",
         )
-
-    conversation = await conversation_repo.get_by_id(req.conversation_id)
-    if not conversation:
-        raise HTTPException(404, f"Conversation {req.conversation_id} not found")
 
     # Create or find user message (idempotent by client_msg_id)
     user_message = await message_repo.get_by_client_msg_id(
@@ -107,11 +108,21 @@ async def chat_enqueue(
 @router.get("/stream")
 async def chat_stream_subscribe(
     request: Request,
+    session: DbSessionDep,
     redis: RedisDep,
+    current_user: CurrentUserDep,
     request_id: UUID = Query(..., alias="request_id"),
     after_event_id: str = Query("0-0", alias="after_event_id"),
 ) -> StreamingResponse:
     """Subscriber: SSE from Redis chat:events:{request_id}. Reconnect via after_event_id or Last-Event-ID."""
+    llm_request_repo = LLMRequestRepository(session)
+    conversation_repo = ConversationRepository(session)
+    llm_request = await llm_request_repo.get_by_id(request_id)
+    if not llm_request:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Request not found")
+    conversation = await conversation_repo.get_by_id(llm_request.conversation_id)
+    if not conversation or conversation.user_id != current_user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
     last_id = request.headers.get("Last-Event-ID") or after_event_id
     stream_key = events_stream_key(str(request_id))
 

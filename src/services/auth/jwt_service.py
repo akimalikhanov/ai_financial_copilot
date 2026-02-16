@@ -49,6 +49,16 @@ def _refresh_expire_minutes() -> int:
     return _parse_expire(raw, 7 * 24 * 60)
 
 
+def get_access_token_expire_seconds() -> int:
+    """Seconds until access token expiry (for TokenResponse.expires_in)."""
+    return _access_expire_minutes() * 60
+
+
+def get_refresh_cookie_max_age() -> int:
+    """Max-Age in seconds for refresh token cookie."""
+    return _refresh_expire_minutes() * 60
+
+
 def create_access_token(user_id: UUID) -> str:
     """Create a short-lived access token."""
     exp = datetime.now(timezone.utc) + timedelta(minutes=_access_expire_minutes())
