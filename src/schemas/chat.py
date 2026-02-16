@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Any
 from uuid import UUID
@@ -67,7 +68,7 @@ class ErrorResponse(BaseModel):
 
 class CreateConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    user_id: UUID | None = None
+
     title: str | None = None
     settings: dict[str, Any] = Field(default_factory=dict)
 
@@ -80,6 +81,22 @@ class CreateConversationResponse(BaseModel):
 class UpdateConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str | None = None
+
+
+class ConversationListItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    title: str | None
+    created_at: datetime
+    last_message_at: datetime | None
+
+
+class ListConversationsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversations: list[ConversationListItem]
+    total: int
 
 
 class StreamDoneEvent(BaseModel):

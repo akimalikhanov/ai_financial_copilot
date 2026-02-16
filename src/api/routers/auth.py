@@ -9,10 +9,12 @@ import bcrypt
 import os
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from src.api.deps import CurrentUserDep
 from src.db.connection import DbSessionDep
+from src.models.user import User
 from src.repository.session_repository import SessionRepository
 from src.repository.user_repository import UserRepository
-from src.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
+from src.schemas.auth import LoginRequest, RegisterRequest, TokenResponse, UserResponse
 from src.services.auth.jwt_service import (
     create_access_token,
     create_refresh_token,
@@ -157,6 +159,16 @@ async def refresh(
     return TokenResponse(
         access_token=access_token,
         expires_in=get_access_token_expire_seconds(),
+    )
+
+
+@router.get("/me", response_model=UserResponse)
+async def me(current_user: CurrentUserDep) -> UserResponse:
+    """Return current user (requires Bearer token)."""
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        display_name=current_user.display_name,
     )
 
 

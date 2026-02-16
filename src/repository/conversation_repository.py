@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.conversation import Conversation
@@ -32,6 +32,35 @@ class ConversationRepository:
         self.session.add(conversation)
         await self.session.flush()
         return conversation
+
+    async def list_by_user(
+        self, user_id: UUID, limit: int = 50, offset: int = 0
+    ) -> tuple[list[Conversation], int]:
+        """List non-deleted conversations for a user, ordered by activity."""
+        count_result = await self.session.execute(
+            select(func.count()).select_from(Conversation).where(
+                Conversation.user_id == user_id,
+                Conversation.deleted_at.is_(None),
+            )
+        )
+        total = count_result.scalar() or 0
+
+        result = await self.session.execute(
+            select(Conversation)
+            .where(
+                Conversation.user_id == user_id,
+                Conversation.deleted_at.is_(None),
+            )
+            .order_by(
+                func.coalesce(
+                    Conversation.last_message_at, Conversation.created_at
+                ).desc()
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+        conversations = list(result.scalars().all())
+        return conversations, total
 
     async def get_by_id(self, conversation_id: UUID) -> Conversation | None:
         """Get conversation by ID."""

@@ -38,6 +38,32 @@ async def create_conversation(
     return schemas.CreateConversationResponse(conversation_id=conversation.id)
 
 
+@router.get("", response_model=schemas.ListConversationsResponse)
+async def list_conversations(
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> schemas.ListConversationsResponse:
+    """List conversations for the current user."""
+    repo = ConversationRepository(session)
+    conversations, total = await repo.list_by_user(
+        user_id=current_user.id, limit=limit, offset=offset
+    )
+    return schemas.ListConversationsResponse(
+        conversations=[
+            schemas.ConversationListItem(
+                id=c.id,
+                title=c.title,
+                created_at=c.created_at,
+                last_message_at=c.last_message_at,
+            )
+            for c in conversations
+        ],
+        total=total,
+    )
+
+
 @router.patch("/{conversation_id}")
 async def update_conversation(
     conversation_id: str,

@@ -554,6 +554,31 @@ COMMENT ON CONSTRAINT llm_requests_user_message_fk ON llm_requests IS
 COMMENT ON CONSTRAINT llm_requests_assistant_message_fk ON llm_requests IS
   'FK to pre-created assistant message placeholder.';
 
+-- ============================================================================
+-- Add user_id FKs to users (conversations, messages, llm_requests)
+-- ============================================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'conversations_user_id_fk') THEN
+    ALTER TABLE conversations
+      ADD CONSTRAINT conversations_user_id_fk
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'messages_user_id_fk') THEN
+    ALTER TABLE messages
+      ADD CONSTRAINT messages_user_id_fk
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'llm_requests_user_id_fk') THEN
+    ALTER TABLE llm_requests
+      ADD CONSTRAINT llm_requests_user_id_fk
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
 SQL
 
 echo ">> Granting permissions to application user..."

@@ -1,5 +1,26 @@
 export type Role = 'system' | 'developer' | 'user' | 'assistant' | 'tool';
 
+// --- Auth token wiring (in-memory only; set by AuthContext) ---
+let getAccessToken: () => string | null = () => null;
+let setAccessTokenFn: (token: string | null) => void = () => {};
+let onRefreshFailureFn: () => void = () => {};
+
+export function setAccessTokenGetter(fn: () => string | null) {
+  getAccessToken = fn;
+}
+
+export function setAccessTokenSetter(fn: (token: string | null) => void) {
+  setAccessTokenFn = fn;
+}
+
+export function setOnRefreshFailure(fn: () => void) {
+  onRefreshFailureFn = fn;
+}
+
+export function getAccessTokenValue(): string | null {
+  return getAccessToken();
+}
+
 export interface ChatMessage {
   role: Role;
   content: string;
@@ -127,6 +148,46 @@ type SseEvent = {
   data: string;
 };
 
+type FetchApiOptions = RequestInit & {
+  skipAuthRetry?: boolean; // set true for /auth/refresh to avoid retry loop
+};
+
+async function fetchApi(url: string, options: FetchApiOptions = {}): Promise<Response> {
+  const { skipAuthRetry, ...init } = options;
+  const token = getAccessToken();
+
+  const headers = new Headers(init.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const config: RequestInit = { ...init, headers, credentials: 'include' };
+
+  let res = await fetch(url, config);
+
+  if (res.status === 401 && !skipAuthRetry) {
+    try {
+      const refreshRes = await fetch(joinUrl(API_BASE_URL, '/v1/auth/refresh'), {
+        method: 'POST',
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      } as RequestInit);
+      if (refreshRes.ok) {
+        const data = (await refreshRes.json()) as { access_token: string };
+        setAccessTokenFn(data.access_token);
+        const retryHeaders = new Headers(init.headers);
+        retryHeaders.set('Authorization', `Bearer ${data.access_token}`);
+        res = await fetch(url, { ...init, headers: retryHeaders, credentials: 'include' });
+      } else {
+        onRefreshFailureFn();
+        throw await toApiErrorFromResponse(refreshRes);
+      }
+    } catch (e) {
+      onRefreshFailureFn();
+      throw e;
+    }
+  }
+
+  return res;
+}
+
 const parseSseEvent = (rawEvent: string): SseEvent | null => {
   const lines = rawEvent.split('\n');
   let event = '';
@@ -167,11 +228,9 @@ export interface ModelsResponse {
 export const fetchModels = async (): Promise<ModelInfo[]> => {
   let response: Response;
   try {
-    response = await fetch(joinUrl(API_BASE_URL, '/v1/models'), {
+    response = await fetchApi(joinUrl(API_BASE_URL, '/v1/models'), {
       method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
+      headers: { Accept: 'application/json' },
     });
   } catch (error) {
     throw toApiErrorFromThrowable(error);
@@ -185,10 +244,94 @@ export const fetchModels = async (): Promise<ModelInfo[]> => {
   return data.models;
 };
 
+// --- Auth API ---
+
+export interface UserInfo {
+  id: string;
+  email: string;
+  display_name: string | null;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  user: UserInfo;
+}
+
+export const login = async (email: string, password: string): Promise<LoginResponse> => {
+  const res = await fetch(joinUrl(API_BASE_URL, '/v1/auth/login'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  const data = (await res.json()) as { access_token: string };
+  const meRes = await fetch(joinUrl(API_BASE_URL, '/v1/auth/me'), {
+    method: 'GET',
+    credentials: 'include',
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${data.access_token}`,
+    },
+  });
+  if (!meRes.ok) throw await toApiErrorFromResponse(meRes);
+  const user = (await meRes.json()) as UserInfo;
+  return { access_token: data.access_token, user };
+};
+
+export const register = async (
+  email: string,
+  password: string,
+  displayName?: string | null
+): Promise<LoginResponse> => {
+  const res = await fetch(joinUrl(API_BASE_URL, '/v1/auth/register'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ email, password, display_name: displayName ?? null }),
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  const data = (await res.json()) as { access_token: string };
+  const meRes = await fetch(joinUrl(API_BASE_URL, '/v1/auth/me'), {
+    method: 'GET',
+    credentials: 'include',
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${data.access_token}`,
+    },
+  });
+  if (!meRes.ok) throw await toApiErrorFromResponse(meRes);
+  const user = (await meRes.json()) as UserInfo;
+  return { access_token: data.access_token, user };
+};
+
+export const refreshTokens = async (): Promise<{ access_token: string }> => {
+  const res = await fetch(joinUrl(API_BASE_URL, '/v1/auth/refresh'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as { access_token: string };
+};
+
+export const logout = async (): Promise<void> => {
+  await fetch(joinUrl(API_BASE_URL, '/v1/auth/logout'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { Accept: 'application/json' },
+  });
+};
+
 // --- Conversations API ---
 
 export interface CreateConversationRequest {
-  user_id?: string | null;
   title?: string | null;
   settings?: Record<string, unknown>;
 }
@@ -197,12 +340,40 @@ export interface CreateConversationResponse {
   conversation_id: string;
 }
 
+export interface ConversationListItem {
+  id: string;
+  title: string | null;
+  created_at: string;
+  last_message_at: string | null;
+}
+
+export interface ListConversationsResponse {
+  conversations: ConversationListItem[];
+  total: number;
+}
+
+export const fetchConversations = async (
+  limit = 50,
+  offset = 0
+): Promise<ListConversationsResponse> => {
+  const params = new URLSearchParams();
+  params.set('limit', limit.toString());
+  params.set('offset', offset.toString());
+  const url = `/v1/conversations?${params}`;
+  const res = await fetchApi(joinUrl(API_BASE_URL, url), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as ListConversationsResponse;
+};
+
 export const createConversation = async (
   request: CreateConversationRequest
 ): Promise<CreateConversationResponse> => {
   let response: Response;
   try {
-    response = await fetch(joinUrl(API_BASE_URL, '/v1/conversations'), {
+    response = await fetchApi(joinUrl(API_BASE_URL, '/v1/conversations'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -235,7 +406,7 @@ export const updateConversation = async (
 ): Promise<UpdateConversationResponse> => {
   let response: Response;
   try {
-    response = await fetch(
+    response = await fetchApi(
       joinUrl(API_BASE_URL, `/v1/conversations/${conversationId}`),
       {
         method: 'PATCH',
@@ -297,11 +468,9 @@ export const fetchMessages = async (
     }
     const queryString = searchParams.toString();
     const url = `/v1/conversations/${conversationId}/messages${queryString ? `?${queryString}` : ''}`;
-    response = await fetch(joinUrl(API_BASE_URL, url), {
+    response = await fetchApi(joinUrl(API_BASE_URL, url), {
       method: 'GET',
-      headers: {
-        Accept: 'application/json',
-      },
+      headers: { Accept: 'application/json' },
     });
   } catch (error) {
     throw toApiErrorFromThrowable(error);
@@ -338,7 +507,7 @@ export interface ChatEnqueueResponse {
 export const chatEnqueue = async (
   request: ChatEnqueueRequest
 ): Promise<ChatEnqueueResponse> => {
-  const response = await fetch(joinUrl(API_BASE_URL, '/v1/chat'), {
+  const response = await fetchApi(joinUrl(API_BASE_URL, '/v1/chat'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -369,7 +538,7 @@ export const chatStreamSubscribe = async (
   const url = `${joinUrl(API_BASE_URL, '/v1/chat/stream')}?${params}`;
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchApi(url, {
       method: 'GET',
       headers: { Accept: 'text/event-stream' },
     });
