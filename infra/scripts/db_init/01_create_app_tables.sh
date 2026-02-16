@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS users (
   auth_subject      text,
   -- Provider subject / user id (e.g., OAuth "sub"). Lets you map external accounts.
 
+  password_hash     text,
+  -- Bcrypt hash for local auth (NULL when using OAuth).
+
   email_verified_at timestamptz,
   -- Timestamp when email was verified (NULL if not verified).
 
@@ -125,6 +128,7 @@ COMMENT ON COLUMN users.email IS 'Case-insensitive unique email (citext).';
 COMMENT ON COLUMN users.display_name IS 'Optional display name shown in UI.';
 COMMENT ON COLUMN users.auth_provider IS 'Auth provider key (local/google/etc.).';
 COMMENT ON COLUMN users.auth_subject IS 'External provider subject/user id.';
+COMMENT ON COLUMN users.password_hash IS 'Bcrypt hash for local auth (NULL when using OAuth).';
 COMMENT ON COLUMN users.email_verified_at IS 'When email was verified (NULL otherwise).';
 COMMENT ON COLUMN users.is_active IS 'Whether account is active (soft disable).';
 COMMENT ON COLUMN users.created_at IS 'Row creation time.';
@@ -146,6 +150,30 @@ DROP TRIGGER IF EXISTS trg_users_updated_at ON users;
 CREATE TRIGGER trg_users_updated_at
 BEFORE UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
+-- Table: sessions (refresh token invalidation on logout)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id           uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  expires_at        timestamptz NOT NULL,
+  revoked_at        timestamptz
+  -- revoked_at IS NOT NULL means session was logged out
+);
+COMMENT ON TABLE sessions IS 'User sessions for refresh tokens; revoke on logout.';
+COMMENT ON COLUMN sessions.id IS 'Primary key UUID (session id in refresh token JWT).';
+COMMENT ON COLUMN sessions.user_id IS 'FK to users (cascade on delete).';
+COMMENT ON COLUMN sessions.created_at IS 'Session creation time.';
+COMMENT ON COLUMN sessions.expires_at IS 'Session expiry (refresh token valid until then).';
+COMMENT ON COLUMN sessions.revoked_at IS 'Set on logout; non-NULL means session revoked.';
+
+CREATE INDEX IF NOT EXISTS sessions_user_expires_idx ON sessions (user_id, expires_at);
+COMMENT ON INDEX sessions_user_expires_idx IS 'Lookup sessions by user and expiry.';
+CREATE INDEX IF NOT EXISTS sessions_id_revoked_idx ON sessions (id) WHERE revoked_at IS NULL;
+COMMENT ON INDEX sessions_id_revoked_idx IS 'Valid session lookup (not revoked).';
 
 -- ============================================================================
 -- Table: conversations
