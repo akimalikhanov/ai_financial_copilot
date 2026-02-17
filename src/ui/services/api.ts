@@ -637,3 +637,37 @@ export const chatStreamSubscribe = async (
     reader.releaseLock();
   }
 };
+
+// --- Chat Stats API ---
+
+export interface RequestStatsItem {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  cost_usd: number | null;
+  latency_ms: number | null;
+  ttft_ms: number | null;
+  tps: number | null;
+  model: string;
+  created_at: string;
+}
+
+export interface ChatStatsResponse {
+  requests: RequestStatsItem[];
+}
+
+export const fetchChatStats = async (
+  conversationId: string,
+  limit = 50
+): Promise<ChatStatsResponse> => {
+  const res = await fetchApi(
+    joinUrl(
+      API_BASE_URL,
+      `/v1/chat/stats?conversation_id=${conversationId}&limit=${limit}`
+    ),
+    { method: 'GET', headers: { Accept: 'application/json' } }
+  );
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return res.json();
+};

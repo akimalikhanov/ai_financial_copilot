@@ -26,6 +26,39 @@ from src.schemas import chat as schemas
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
 
+@router.get("/stats", response_model=schemas.ChatStatsResponse)
+async def chat_stats(
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+    conversation_id: UUID = Query(..., alias="conversation_id"),
+    limit: int = Query(50, ge=1, le=100),
+) -> schemas.ChatStatsResponse:
+    """Return recent LLM request stats for a conversation (conversation-scoped)."""
+    conversation_repo = ConversationRepository(session)
+    conversation = await conversation_repo.get_by_id(conversation_id)
+    if not conversation or conversation.user_id != current_user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Conversation not found")
+
+    llm_request_repo = LLMRequestRepository(session)
+    requests = await llm_request_repo.list_recent_by_conversation_id(conversation_id, limit=limit)
+    items = [
+        schemas.RequestStatsItem(
+            input_tokens=r.prompt_tokens,
+            output_tokens=r.completion_tokens,
+            reasoning_tokens=r.reasoning_tokens,
+            total_tokens=r.total_tokens,
+            cost_usd=float(r.cost_usd) if r.cost_usd is not None else None,
+            latency_ms=r.latency_ms,
+            ttft_ms=r.ttft_ms,
+            tps=r.tps,
+            model=r.model,
+            created_at=r.created_at,
+        )
+        for r in requests
+    ]
+    return schemas.ChatStatsResponse(requests=items)
+
+
 @router.post("", response_model=schemas.ChatEnqueueResponse)
 async def chat_enqueue(
     req: schemas.ChatEnqueueRequest,

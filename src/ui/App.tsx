@@ -8,6 +8,7 @@ import { MOCK_DOCS, COMPANIES, YEARS } from './services/mockData';
 import {
   chatEnqueue,
   chatStreamSubscribe,
+  fetchChatStats,
   fetchModels,
   getMe,
   createConversation,
@@ -17,7 +18,7 @@ import {
   deleteConversation,
   ApiError,
   ModelInfo,
-  LLMStreamChunk,
+  type RequestStatsItem,
   type UserInfo,
 } from './services/api';
 import { useAuth } from './context/AuthContext';
@@ -92,7 +93,6 @@ export default function App() {
   });
   const [lastRequestStats, setLastRequestStats] = useState<RequestStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<RequestStats[]>([]);
-  const requestStartTimeRef = useRef<number>(0);
 
   // Current user (fetched when authenticated)
   const [currentUser, setCurrentUser] = useState<UserInfo | null>(null);
@@ -112,13 +112,6 @@ export default function App() {
     document.documentElement.classList.toggle('dark', isDarkMode);
     document.documentElement.classList.toggle('light', !isDarkMode);
   }, [isDarkMode]);
-
-  // Reset request stats when auth state changes (login or logout) so the same tab doesn't show the previous user's stats
-  useEffect(() => {
-    if (!authChecked) return;
-    setLastRequestStats(null);
-    setStatsHistory([]);
-  }, [authChecked, isAuthenticated]);
 
   // --- Derived State ---
   const activeChat = chats.find(c => c.id === activeChatId);
@@ -363,31 +356,51 @@ export default function App() {
     };
   }, [activeModel]);
 
-  // --- Helper to record stats from API response ---
-  const recordStats = useCallback((stats: LLMStreamChunk['stats'], model: string) => {
-    if (!stats) return;
-
-    const reasoningTokens = stats.reasoning_tokens ?? 0;
-    const inputTokens = stats.input_tokens ?? 0;
-    const outputTokens = stats.output_tokens ?? 0;
-    const totalTokens = stats.total_tokens ?? (inputTokens + outputTokens + reasoningTokens);
-
-    const newStats: RequestStats = {
-      inputTokens,
-      outputTokens,
-      reasoningTokens,
-      totalTokens,
-      cost: stats.cost_usd ?? 0,
-      latencyMs: stats.latency_ms ?? (Date.now() - requestStartTimeRef.current),
-      ttftMs: stats.ttft_ms ?? null,
-      tps: stats.tps ?? null,
-      model,
-      timestamp: Date.now(),
-    };
-
-    setLastRequestStats(newStats);
-    setStatsHistory(prev => [...prev, newStats]);
+  // --- Load stats from DB (conversation-scoped) ---
+  const fetchStats = useCallback(async (conversationId: string | undefined) => {
+    if (!conversationId) {
+      setLastRequestStats(null);
+      setStatsHistory([]);
+      return;
+    }
+    try {
+      const { requests } = await fetchChatStats(conversationId, 50);
+      const mapItem = (r: RequestStatsItem): RequestStats => {
+        const input = r.input_tokens ?? 0;
+        const output = r.output_tokens ?? 0;
+        const reasoning = r.reasoning_tokens ?? 0;
+        const total = r.total_tokens ?? input + output + reasoning;
+        return {
+          inputTokens: input,
+          outputTokens: output,
+          reasoningTokens: reasoning,
+          totalTokens: total,
+          cost: r.cost_usd ?? 0,
+          latencyMs: r.latency_ms ?? 0,
+          ttftMs: r.ttft_ms ?? null,
+          tps: r.tps ?? null,
+          model: r.model,
+          timestamp: new Date(r.created_at).getTime(),
+        };
+      };
+      const history = requests.map(mapItem);
+      setLastRequestStats(history[0] ?? null);
+      setStatsHistory(history);
+    } catch (err) {
+      console.error('Failed to load stats:', err);
+    }
   }, []);
+
+  // Fetch stats when pane opens or conversation changes; clear when no active chat
+  useEffect(() => {
+    if (!isControlPaneOpen || !isAuthenticated) return;
+    if (!activeChat?.conversationId) {
+      setLastRequestStats(null);
+      setStatsHistory([]);
+      return;
+    }
+    fetchStats(activeChat.conversationId);
+  }, [isControlPaneOpen, isAuthenticated, activeChatId, activeChat?.conversationId, fetchStats]);
 
   // --- Handlers ---
 
@@ -431,7 +444,6 @@ export default function App() {
 
     const clientMsgId = crypto.randomUUID();
     const clientRequestId = crypto.randomUUID();
-    requestStartTimeRef.current = Date.now();
 
     const extraParams: Record<string, unknown> = {};
     if (modelCapabilities.supportsReasoningEffort && modelParams.reasoningEffort) {
@@ -486,7 +498,7 @@ export default function App() {
               content: m.content + chunk.text,
             }));
           }
-          if (chunk.stats) recordStats(chunk.stats, activeModel);
+          if (chunk.stats) fetchStats(conversationId);
           setIsTyping(false);
           setIsAwaitingResponse(false);
         },

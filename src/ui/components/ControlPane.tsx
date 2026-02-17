@@ -650,13 +650,13 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                 </div>
               )}
 
-              {/* Session Totals */}
+              {/* Conversation Totals */}
               {statsHistory.length > 0 && (
                 <>
                   <div className="h-px bg-[var(--border)] my-4" />
 
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">Session Totals</span>
+                    <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wider">Conversation Totals</span>
                     <span className="text-[10px] text-[var(--text-faint)]">{sessionTotals.requests} requests</span>
                   </div>
 

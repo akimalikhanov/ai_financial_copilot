@@ -21,6 +21,29 @@ class LLMRequestRepository:
         result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
         return result.scalar_one_or_none()
 
+    async def list_recent_by_user_id(self, user_id: UUID, limit: int = 50) -> list[LLMRequest]:
+        """List LLM requests for user, newest first."""
+        result = await self.session.execute(
+            select(LLMRequest)
+            .where(LLMRequest.user_id == user_id)
+            .order_by(LLMRequest.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def list_recent_by_conversation_id(
+        self, conversation_id: UUID, limit: int = 50
+    ) -> list[LLMRequest]:
+        """List LLM requests for a conversation, newest first. Only completed (has stats)."""
+        result = await self.session.execute(
+            select(LLMRequest)
+            .where(LLMRequest.conversation_id == conversation_id)
+            .where(LLMRequest.status == "completed")
+            .order_by(LLMRequest.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
     async def get_by_client_request_id(
         self, conversation_id: UUID, client_request_id: str
     ) -> LLMRequest | None:

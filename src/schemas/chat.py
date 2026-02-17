@@ -135,3 +135,31 @@ class ChatEnqueueResponse(BaseModel):
     assistant_message_id: UUID
     assistant_seq: int
     status: str = "queued"
+
+
+# --- Stats (GET /v1/chat/stats) ---
+
+
+class RequestStatsItem(BaseModel):
+    """Single LLM request stats for stats API."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_usd: float | None = None
+    latency_ms: int | None = None
+    ttft_ms: int | None = None
+    tps: int | None = None
+    model: str
+    created_at: datetime
+
+
+class ChatStatsResponse(BaseModel):
+    """Response from GET /v1/chat/stats."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requests: list[RequestStatsItem]
