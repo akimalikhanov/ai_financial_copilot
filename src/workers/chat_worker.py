@@ -171,7 +171,7 @@ async def process_request(
 
         # Build context (same sliding window as producer)
         context_messages, _ = await build_context(
-            message_repo, conversation_id, after_seq=None, max_messages=100
+            message_repo, conversation_id, after_seq=None, max_messages=50
         )
         adapter_messages = _to_adapter_messages(context_messages)
 
@@ -290,9 +290,7 @@ async def run_worker() -> None:
         await redis.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
         logger.info("consumer_group_created", extra={"group": CONSUMER_GROUP})
     except Exception as e:
-        if "BUSYGROUP" in str(e) or "already exists" in str(e).lower():
-            logger.info("consumer_group_exists", extra={"group": CONSUMER_GROUP})
-        else:
+        if "BUSYGROUP" not in str(e) and "already exists" not in str(e).lower():
             logger.warning("consumer_group_create", extra={"error": str(e)})
 
     shutdown = asyncio.Event()

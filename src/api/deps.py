@@ -8,9 +8,11 @@ from redis.asyncio import Redis
 
 from src.db.connection import DbSessionDep
 from src.models.user import User
+from src.redis_client import check_chat_rate_limit
 from src.repository.user_repository import UserRepository
 from src.services.auth.jwt_service import decode_token
 from src.services.llm_router import LLMRouter
+from src.utils.config import get_rate_limit_retry_after_sec
 
 
 def get_llm_router(request: Request) -> LLMRouter:
@@ -59,6 +61,20 @@ async def get_current_user(request: Request, session: DbSessionDep) -> User:
             detail="User not found",
         )
     return user
+
+
+async def chat_rate_limit(
+    redis: Annotated[Redis, Depends(get_redis)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> None:
+    """Rate limit chat enqueue per user. Raises 429 if over limit."""
+    allowed, _ = await check_chat_rate_limit(redis, str(current_user.id))
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Retry later.",
+            headers={"Retry-After": str(get_rate_limit_retry_after_sec())},
+        )
 
 
 # Type alias for dependency injection - use in route signatures

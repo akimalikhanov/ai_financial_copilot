@@ -183,6 +183,26 @@ def get_db_url() -> str:
     return f"postgresql+asyncpg://{db_user}:{db_password}@{host}:{port}/{db_name}"
 
 
+def get_rate_limit_window_ms() -> int:
+    """Rate limit window in milliseconds (RATE_LIMIT_WINDOW_MS, default 60000)."""
+    return int(os.getenv("RATE_LIMIT_WINDOW_MS", "60000"))
+
+
+def get_rate_limit_max_requests() -> int:
+    """Max requests per window (RATE_LIMIT_MAX_REQUESTS, default 30)."""
+    return int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "30"))
+
+
+def get_rate_limit_retry_after_sec() -> int:
+    """Seconds to suggest in Retry-After header (derived from window)."""
+    return get_rate_limit_window_ms() // 1000
+
+
+def get_chat_queue_stream() -> str:
+    """Redis stream key for chat queue (CHAT_QUEUE_STREAM, default chat:queue)."""
+    return os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
+
+
 def get_redis_url() -> str:
     """
     Build Redis connection URL from environment variables.

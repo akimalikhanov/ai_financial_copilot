@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep
+from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.message import MessageRole
@@ -72,6 +72,7 @@ async def chat_enqueue(
     Returns request_id, user_message_id, assistant_message_id.
     Worker processes and emits events to Redis stream.
     """
+    await chat_rate_limit(redis, current_user)
     conversation_repo = ConversationRepository(session)
     message_repo = MessageRepository(session)
     llm_request_repo = LLMRequestRepository(session)
