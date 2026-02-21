@@ -1,0 +1,55 @@
+# /etc/garage.toml
+# Single-node "production-ish" Garage config (local-only by default)
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+# For single-node this is OK. For higher throughput consider lmdb (and read migration notes).
+db_engine = "sqlite"
+
+replication_factor = 1
+
+# -----------------------
+# RPC (internal cluster)
+# -----------------------
+rpc_bind_addr = "[::]:3901"
+
+# Single-node:
+rpc_public_addr = "127.0.0.1:3901"
+
+# RPC secret: used for node-to-node auth. File is in ./secrets/ (mounted as /run/secrets).
+# Generate: openssl rand -hex 32 > secrets/garage_rpc_secret
+rpc_secret_file = "/run/secrets/garage_rpc_secret"
+
+# -----------------------
+# S3 API
+# -----------------------
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+# -----------------------
+# S3 Web
+# -----------------------
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+# Optional K2V API (you had it)
+[k2v_api]
+api_bind_addr = "[::]:3904"
+
+# -----------------------
+# Admin + Metrics
+# -----------------------
+# Admin token: for garage CLI / admin API. Metrics token: for Prometheus etc.
+# Files are in ./secrets/ (mounted as /run/secrets). Generate with:
+#   openssl rand -base64 32 > secrets/garage_admin_token
+#   openssl rand -base64 32 > secrets/garage_metrics_token
+[admin]
+api_bind_addr = "[::]:3903"
+
+admin_token_file = "/run/secrets/garage_admin_token"
+metrics_token_file = "/run/secrets/garage_metrics_token"

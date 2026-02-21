@@ -1,7 +1,8 @@
 """
 Integration test: full flow API → queue → worker → DB + SSE.
 
-Requires: PostgreSQL (via PgBouncer) and Redis running (e.g. docker-compose up -d postgres pgbouncer redis).
+Requires: PostgreSQL (via PgBouncer) and Redis (redis-app, redis-broker) running
+(e.g. docker-compose up -d postgres pgbouncer redis-app redis-broker).
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ async def test_chat_full_flow_api_queue_worker_sse(async_client, integration_app
     shutdown = asyncio.Event()
     worker_task = asyncio.create_task(
         run_consume_loop(
+            integration_app.state.redis_broker,
             integration_app.state.redis,
             integration_app.state.llm_router,
             shutdown,

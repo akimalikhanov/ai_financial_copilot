@@ -203,23 +203,32 @@ def get_chat_queue_stream() -> str:
     return os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
 
 
-def get_redis_url() -> str:
-    """
-    Build Redis connection URL from environment variables.
-
-    Environment variables:
-      - REDIS_HOST: Redis host (default: localhost)
-      - REDIS_PORT: Redis port (default: 6379)
-      - REDIS_DB: Redis DB index (default: 0)
-      - REDIS_PASSWORD: Redis password (optional)
-
-    Returns:
-        Redis connection URL string.
-    """
-    host = os.getenv("REDIS_HOST", "localhost")
-    port = os.getenv("REDIS_PORT", "6379")
-    db = os.getenv("REDIS_DB", "0")
-    password = os.getenv("REDIS_PASSWORD")
+def _build_redis_url(host: str, port: str, db: str, password: str | None) -> str:
     if password:
         return f"redis://:{password}@{host}:{port}/{db}"
     return f"redis://{host}:{port}/{db}"
+
+
+def get_redis_app_url() -> str:
+    """
+    Redis for rate limit, cache, SSE stream (chat:events:*).
+    Env: REDIS_APP_HOST, REDIS_APP_PORT, REDIS_APP_DB, REDIS_APP_PASSWORD.
+    Falls back to REDIS_* if REDIS_APP_* not set.
+    """
+    host = os.getenv("REDIS_APP_HOST") or os.getenv("REDIS_HOST", "localhost")
+    port = os.getenv("REDIS_APP_PORT") or os.getenv("REDIS_PORT", "6379")
+    db = os.getenv("REDIS_APP_DB") or os.getenv("REDIS_DB", "0")
+    password = os.getenv("REDIS_APP_PASSWORD") or os.getenv("REDIS_PASSWORD")
+    return _build_redis_url(host, port, db, password)
+
+
+def get_redis_broker_url() -> str:
+    """
+    Redis for Celery broker / queue (chat:queue, PDF tasks).
+    Env: REDIS_BROKER_HOST, REDIS_BROKER_PORT, REDIS_BROKER_DB, REDIS_BROKER_PASSWORD.
+    """
+    host = os.getenv("REDIS_BROKER_HOST", "localhost")
+    port = os.getenv("REDIS_BROKER_PORT", "6380")
+    db = os.getenv("REDIS_BROKER_DB", "0")
+    password = os.getenv("REDIS_BROKER_PASSWORD") or os.getenv("REDIS_PASSWORD")
+    return _build_redis_url(host, port, db, password)

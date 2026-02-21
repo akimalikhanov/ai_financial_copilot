@@ -10,8 +10,11 @@ networks:
 
 volumes:
   postgres_data:
-  redis_data:
+  redis_app_data:
+  redis_broker_data:
   qdrant_data:
+  garage_data:
+  garage_meta:
 
 services:
   postgres:
@@ -100,9 +103,9 @@ services:
     networks: [backend]
     restart: unless-stopped
 
-  redis:
-    image: redis:7.2.12-alpine # pinned, stable :contentReference[oaicite:2]{index=2}
-    container_name: redis
+  redis-app:
+    image: redis:7.2.12-alpine
+    container_name: redis-app
     restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
@@ -110,7 +113,7 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
-      - redis_data:/data
+      - redis_app_data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
@@ -118,7 +121,29 @@ services:
       retries: 15
       start_period: 10s
     cpus: "0.50"
-    mem_limit: 1g
+    mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  redis-broker:
+    image: redis:7.2.12-alpine
+    container_name: redis-broker
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_broker_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    cpus: "0.50"
+    mem_limit: 512m
     <<: *default-logging
     networks: [backend]
 
@@ -133,6 +158,45 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     # Optional: you can keep a simple liveness check here or omit it entirely
+
+  # Garage: S3-compatible object storage (alternative to MinIO), e.g. for PDFs.
+  # Docs: https://garagehq.deuxfleurs.fr/documentation/
+  garage:
+    image: dxflrs/garage:v2.2.0
+    container_name: garage
+    restart: unless-stopped
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - ./garage/secrets:/run/secrets:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    ports:
+      - "127.0.0.1:${GARAGE_S3_PORT:-3900}:3900"
+      - "127.0.0.1:3901:3901"
+      - "127.0.0.1:3902:3902"
+      - "127.0.0.1:3903:3903"
+    cpus: "0.50"
+    mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  # One-time bootstrap: layout, bucket pdfs, key app-key.
+  # Run: docker compose run --rm garage-bootstrap  (or: docker compose up garage-bootstrap)
+  garage-bootstrap:
+    profiles:
+      - garage-bootstrap
+    build:
+      context: ..
+      dockerfile: docker/garage/garage_bootstrap.Dockerfile
+    container_name: garage-bootstrap
+    depends_on:
+      garage:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./garage/secrets:/secrets
+    networks: [backend]
+    restart: "no"
 
   qdrant-hc:
     image: busybox:1.36

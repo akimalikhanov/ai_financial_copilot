@@ -12,7 +12,11 @@ from httpx import ASGITransport, AsyncClient
 
 from src.api.routers import get_routers
 from src.db import init_db, shutdown_db
-from src.redis_client import close_redis_client, create_redis_client
+from src.redis_client import (
+    close_redis_client,
+    create_redis_app_client,
+    create_redis_broker_client,
+)
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
 from src.services.llm_router import LLMRouter, RoutedLLM
 
@@ -65,12 +69,14 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Lifespan that uses mock LLM router."""
     await init_db()
     app.state.llm_router = _create_mock_router()
-    app.state.redis = await create_redis_client()
+    app.state.redis = await create_redis_app_client()
+    app.state.redis_broker = await create_redis_broker_client()
 
     yield
 
     await app.state.llm_router.close()
     await close_redis_client(app.state.redis)
+    await close_redis_client(app.state.redis_broker)
     await shutdown_db()
 
 

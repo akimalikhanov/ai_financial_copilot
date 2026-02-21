@@ -90,5 +90,5 @@ line-ending = "auto"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-    "integration: integration tests (require Docker: postgres, pgbouncer, redis)",
+    "integration: integration tests (require Docker: postgres, pgbouncer, redis-app, redis-broker)",
 ]

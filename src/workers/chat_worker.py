@@ -33,7 +33,7 @@ from src.services.llm_adapters.base_adapter import (
 )
 from src.services.llm_adapters.base_adapter import Role as AdapterRole
 from src.services.llm_router import get_router
-from src.utils.config import get_redis_url
+from src.utils.config import get_redis_app_url, get_redis_broker_url
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,8 @@ BLOCK_MS = int(os.getenv("CHAT_WORKER_BLOCK_MS", "15000"))
 
 
 async def run_consume_loop(
-    redis: Redis,
+    redis_broker: Redis,
+    redis_app: Redis,
     llm_router,
     shutdown: asyncio.Event,
     *,
@@ -75,14 +76,14 @@ async def run_consume_loop(
     Does NOT init/shutdown DB or close redis (for integration test use).
     """
     try:
-        await redis.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
+        await redis_broker.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
     except Exception as e:
         if "BUSYGROUP" not in str(e) and "already exists" not in str(e).lower():
             logger.warning("consumer_group_create", extra={"error": str(e)})
 
     while not shutdown.is_set():
         try:
-            result = await redis.xreadgroup(
+            result = await redis_broker.xreadgroup(
                 groupname=CONSUMER_GROUP,
                 consumername=WORKER_ID,
                 streams={CHAT_QUEUE_STREAM: ">"},
@@ -106,17 +107,17 @@ async def run_consume_loop(
                     data = json.loads(payload_str or "")
                     rid = data.get("request_id")
                 except (json.JSONDecodeError, KeyError):
-                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                    await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
                     continue
 
                 if not rid:
-                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                    await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
                     continue
 
                 try:
-                    await process_request(redis, rid, llm_router)
+                    await process_request(redis_app, rid, llm_router)
                 finally:
-                    await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                    await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
 
 
 def _to_adapter_messages(messages: list[schemas.ChatMessage]) -> list[AdapterChatMessage]:
@@ -139,7 +140,7 @@ async def add_event(redis: Redis, request_id: str, event_type: str, data: dict) 
 
 
 async def process_request(
-    redis: Redis,
+    redis_app: Redis,
     request_id: str,
     llm_router,
 ) -> None:
@@ -153,14 +154,14 @@ async def process_request(
         llm_request = await llm_request_repo.get_by_id(UUID(request_id))
         if not llm_request:
             logger.error("llm_request_not_found", extra={"request_id": request_id})
-            await add_event(redis, request_id, "error", {"error": "Request not found"})
+            await add_event(redis_app, request_id, "error", {"error": "Request not found"})
             return
 
         conversation_id = llm_request.conversation_id
         assistant_message_id = llm_request.assistant_message_id
         if not assistant_message_id:
             logger.error("no_assistant_placeholder", extra={"request_id": request_id})
-            await add_event(redis, request_id, "error", {"error": "No assistant placeholder"})
+            await add_event(redis_app, request_id, "error", {"error": "No assistant placeholder"})
             return
 
         assistant_msg = await message_repo.get_by_id(assistant_message_id)
@@ -184,7 +185,7 @@ async def process_request(
         except Exception as e:
             logger.exception("llm_router_error", extra={"request_id": request_id})
             await llm_request_repo.update_status(UUID(request_id), "failed")
-            await add_event(redis, request_id, "error", {"error": str(e)})
+            await add_event(redis_app, request_id, "error", {"error": str(e)})
             await session.commit()
             return
 
@@ -200,7 +201,7 @@ async def process_request(
             async for chunk in stream:
                 accumulated_content += chunk.text
                 if not chunk.is_final:
-                    await add_event(redis, request_id, "delta", {"text": chunk.text})
+                    await add_event(redis_app, request_id, "delta", {"text": chunk.text})
                     continue
 
                 # Final chunk: update DB, emit usage event
@@ -254,7 +255,7 @@ async def process_request(
                         "tps": chunk.stats.tps,
                         "cost_usd": chunk.stats.cost_usd,
                     }
-                await add_event(redis, request_id, "usage", usage_data)
+                await add_event(redis_app, request_id, "usage", usage_data)
                 await session.commit()
 
         except Exception as e:
@@ -273,7 +274,7 @@ async def process_request(
             msg = result.scalar_one_or_none()
             if msg:
                 msg.status = MessageStatus.error
-            await add_event(redis, request_id, "error", {"error": str(e)})
+            await add_event(redis_app, request_id, "error", {"error": str(e)})
             await session.commit()
 
 
@@ -281,13 +282,14 @@ async def run_worker() -> None:
     """Main worker loop."""
     _configure_worker_logging()
     await init_db()
-    redis = Redis.from_url(get_redis_url(), decode_responses=True)
+    redis_broker = Redis.from_url(get_redis_broker_url(), decode_responses=True)
+    redis_app = Redis.from_url(get_redis_app_url(), decode_responses=True)
     llm_router = get_router()
 
     # Create consumer group (ignore error if already exists)
     # $ = only new messages from now; use "0" to process from start
     try:
-        await redis.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
+        await redis_broker.xgroup_create(CHAT_QUEUE_STREAM, CONSUMER_GROUP, id="$", mkstream=True)
         logger.info("consumer_group_created", extra={"group": CONSUMER_GROUP})
     except Exception as e:
         if "BUSYGROUP" not in str(e) and "already exists" not in str(e).lower():
@@ -309,7 +311,7 @@ async def run_worker() -> None:
     try:
         while not shutdown.is_set():
             try:
-                result = await redis.xreadgroup(
+                result = await redis_broker.xreadgroup(
                     groupname=CONSUMER_GROUP,
                     consumername=WORKER_ID,
                     streams={CHAT_QUEUE_STREAM: ">"},
@@ -334,20 +336,21 @@ async def run_worker() -> None:
                         rid = data.get("request_id")
                     except (json.JSONDecodeError, KeyError):
                         logger.warning("invalid_queue_payload", extra={"msg_id": msg_id})
-                        await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                        await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
                         continue
 
                     if not rid:
-                        await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                        await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
                         continue
 
                     try:
-                        await process_request(redis, rid, llm_router)
+                        await process_request(redis_app, rid, llm_router)
                     finally:
-                        await redis.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
+                        await redis_broker.xack(CHAT_QUEUE_STREAM, CONSUMER_GROUP, msg_id)
 
     finally:
-        await redis.aclose()
+        await redis_broker.aclose()
+        await redis_app.aclose()
         await shutdown_db()
         logger.info("chat_worker_stopped")
 

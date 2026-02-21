@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-echo ">> Initializing core DB schema (users, conversations, llm_requests, messages)..."
+echo ">> Initializing core DB schema (users, conversations, llm_requests, messages, documents)..."
 
 # Use APP_DB environment variable (defaults to 'app' if not set)
 APP_DB="${APP_DB:-app}"
@@ -492,6 +492,93 @@ COMMENT ON INDEX messages_metadata_gin_idx IS
 DROP TRIGGER IF EXISTS trg_messages_updated_at ON messages;
 CREATE TRIGGER trg_messages_updated_at
 BEFORE UPDATE ON messages
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
+-- Table: documents (user-uploaded PDFs)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS documents (
+  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Primary key UUID for the document.
+
+  user_id            uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Owner of this document. Cascades delete with the user.
+
+  conversation_id    uuid REFERENCES conversations(id) ON DELETE SET NULL,
+  -- Optional: conversation this document is attached to (NULL = library-only).
+
+  original_filename  text NOT NULL,
+  -- Original filename as uploaded (e.g., "annual_report_2024.pdf").
+
+  storage_key        text NOT NULL,
+  -- Object storage key (S3/Garage) for the PDF file.
+
+  content_type       text NOT NULL DEFAULT 'application/pdf',
+  -- MIME type (typically application/pdf).
+
+  file_size_bytes    bigint,
+  -- File size in bytes.
+
+  status             text NOT NULL DEFAULT 'pending',
+  -- Lifecycle: pending, processing, ready, failed, superseded.
+
+  processing_error   text,
+  -- Error message if status = failed.
+
+  page_count         integer,
+  -- Number of pages (extracted during processing).
+
+  extracted_title    text,
+  -- Document title (from first page or filename).
+
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  -- Upload timestamp.
+
+  updated_at         timestamptz NOT NULL DEFAULT now(),
+  -- Last update timestamp (trigger managed).
+
+  metadata           jsonb NOT NULL DEFAULT '{}'::jsonb
+  -- Extracted metadata (dates, company names, report type) + flexible future fields.
+);
+
+COMMENT ON TABLE documents IS
+  'User-uploaded PDF documents. Stores metadata and storage reference; file content in object storage.';
+
+COMMENT ON COLUMN documents.id IS 'Primary key UUID.';
+COMMENT ON COLUMN documents.user_id IS 'Owner user id (cascade on delete).';
+COMMENT ON COLUMN documents.conversation_id IS 'Optional conversation attachment (NULL = library-only).';
+COMMENT ON COLUMN documents.original_filename IS 'Original filename as uploaded.';
+COMMENT ON COLUMN documents.storage_key IS 'Object storage key (S3/Garage) for the PDF.';
+COMMENT ON COLUMN documents.content_type IS 'MIME type (typically application/pdf).';
+COMMENT ON COLUMN documents.file_size_bytes IS 'File size in bytes.';
+COMMENT ON COLUMN documents.status IS 'Lifecycle: pending/processing/ready/failed/superseded.';
+COMMENT ON COLUMN documents.processing_error IS 'Error message if status = failed.';
+COMMENT ON COLUMN documents.page_count IS 'Number of pages (extracted during processing).';
+COMMENT ON COLUMN documents.extracted_title IS 'Document title from first page or filename.';
+COMMENT ON COLUMN documents.created_at IS 'Upload timestamp.';
+COMMENT ON COLUMN documents.updated_at IS 'Row last update time (trigger managed).';
+COMMENT ON COLUMN documents.metadata IS 'Extracted metadata (dates, company names, report type) + flexible future fields.';
+
+CREATE INDEX IF NOT EXISTS documents_user_idx
+  ON documents (user_id, created_at DESC);
+COMMENT ON INDEX documents_user_idx IS
+  'List documents by user, newest first (document library).';
+
+CREATE INDEX IF NOT EXISTS documents_conv_idx
+  ON documents (conversation_id)
+  WHERE conversation_id IS NOT NULL;
+COMMENT ON INDEX documents_conv_idx IS
+  'Documents attached to a conversation.';
+
+CREATE INDEX IF NOT EXISTS documents_status_idx
+  ON documents (user_id, status);
+COMMENT ON INDEX documents_status_idx IS
+  'Filter by processing status per user.';
+
+DROP TRIGGER IF EXISTS trg_documents_updated_at ON documents;
+CREATE TRIGGER trg_documents_updated_at
+BEFORE UPDATE ON documents
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ============================================================================

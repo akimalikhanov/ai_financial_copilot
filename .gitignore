@@ -34,7 +34,9 @@ AGENTS.md
 
 # misc
 experiments/
+infra/docker/garage/secrets/
 docs/
+data/
 
 test.txt
 test.sh

@@ -11,7 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
+from src.api.deps import CurrentUserDep, LLMRouterDep, RedisBrokerDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.message import MessageRole
@@ -64,6 +64,7 @@ async def chat_enqueue(
     req: schemas.ChatEnqueueRequest,
     session: DbSessionDep,
     redis: RedisDep,
+    redis_broker: RedisBrokerDep,
     llm_router: LLMRouterDep,
     current_user: CurrentUserDep,
 ) -> schemas.ChatEnqueueResponse:
@@ -126,7 +127,7 @@ async def chat_enqueue(
     )
     await session.commit()
 
-    await enqueue_chat_request(redis, str(llm_request.id))
+    await enqueue_chat_request(redis_broker, str(llm_request.id))
 
     return schemas.ChatEnqueueResponse(
         request_id=llm_request.id,

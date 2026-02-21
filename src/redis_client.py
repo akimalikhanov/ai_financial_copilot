@@ -12,7 +12,8 @@ from src.utils.config import (
     get_chat_queue_stream,
     get_rate_limit_max_requests,
     get_rate_limit_window_ms,
-    get_redis_url,
+    get_redis_app_url,
+    get_redis_broker_url,
 )
 
 CHAT_QUEUE_STREAM = get_chat_queue_stream()
@@ -24,10 +25,14 @@ def events_stream_key(request_id: str) -> str:
     return f"{CHAT_EVENTS_STREAM_PREFIX}{request_id}"
 
 
-async def create_redis_client() -> Redis:
-    """Create async Redis client."""
-    url = get_redis_url()
-    return Redis.from_url(url, decode_responses=True)
+async def create_redis_app_client() -> Redis:
+    """Create async Redis client for app (rate limit, cache, SSE stream)."""
+    return Redis.from_url(get_redis_app_url(), decode_responses=True)
+
+
+async def create_redis_broker_client() -> Redis:
+    """Create async Redis client for broker (chat:queue, PDF tasks)."""
+    return Redis.from_url(get_redis_broker_url(), decode_responses=True)
 
 
 async def close_redis_client(client: Redis) -> None:

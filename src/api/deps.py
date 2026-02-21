@@ -21,8 +21,13 @@ def get_llm_router(request: Request) -> LLMRouter:
 
 
 def get_redis(request: Request) -> Redis:
-    """Retrieve Redis client from app state."""
+    """Retrieve Redis app client (rate limit, cache, SSE stream)."""
     return request.app.state.redis
+
+
+def get_redis_broker(request: Request) -> Redis:
+    """Retrieve Redis broker client (chat:queue, PDF tasks)."""
+    return request.app.state.redis_broker
 
 
 async def get_current_user(request: Request, session: DbSessionDep) -> User:
@@ -80,4 +85,5 @@ async def chat_rate_limit(
 # Type alias for dependency injection - use in route signatures
 LLMRouterDep = Annotated[LLMRouter, Depends(get_llm_router)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
+RedisBrokerDep = Annotated[Redis, Depends(get_redis_broker)]
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
