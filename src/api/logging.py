@@ -151,6 +151,31 @@ class JsonFormatter(logging.Formatter):
 
 
 # ---------------------------------------------------------------------------
+# Worker Logging (chat worker, Celery worker)
+# ---------------------------------------------------------------------------
+
+
+class FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that flushes after each emit (fixes buffering when run without TTY)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
+def configure_worker_logging() -> None:
+    """Configure JSON logging for workers (same format as API, with flush for non-TTY)."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handler = FlushingStreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+# ---------------------------------------------------------------------------
 # Unified Request Logging Middleware
 # ---------------------------------------------------------------------------
 

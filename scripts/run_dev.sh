@@ -13,6 +13,8 @@ trap cleanup SIGINT SIGTERM
 pids+=($!)
 .venv/bin/python -m src.workers.chat_worker &
 pids+=($!)
+.venv/bin/python -m src.workers.ingestion_worker &
+pids+=($!)
 (cd src/ui && npm run dev) &
 pids+=($!)
 wait

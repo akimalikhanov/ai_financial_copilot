@@ -13,6 +13,11 @@ api:
 worker:
 	.venv/bin/python -m src.workers.chat_worker
 
+# Run only the ingestion (Celery) worker
+.PHONY: worker-ingestion
+worker-ingestion:
+	.venv/bin/python -m src.workers.ingestion_worker
+
 # Run only the frontend
 .PHONY: ui
 ui:

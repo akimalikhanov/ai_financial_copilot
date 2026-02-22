@@ -4,13 +4,13 @@ import {
   LogOut, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2, Pencil, Loader2
 } from 'lucide-react';
 import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
-import { MOCK_DOCS, COMPANIES, YEARS } from './services/mockData';
 import {
   chatEnqueue,
   chatStreamSubscribe,
   fetchChatStats,
   fetchModels,
   getMe,
+  listDocuments,
   createConversation,
   fetchMessages,
   updateConversation,
@@ -20,6 +20,7 @@ import {
   ModelInfo,
   type RequestStatsItem,
   type UserInfo,
+  type DocumentListItemResponse,
 } from './services/api';
 import { useAuth } from './context/AuthContext';
 import { LoginPage } from './components/LoginPage';
@@ -37,6 +38,28 @@ const FALLBACK_MODELS: ModelInfo[] = [
 
 // --- Helpers ---
 const generateId = () => Math.random().toString(36).slice(2, 11);
+const mapDocStatus = (s: string): Document['status'] =>
+  s === 'ready' ? 'Ready' : s === 'failed' ? 'Error' : 'Processing';
+
+const toYear = (v: unknown): number => {
+  if (typeof v === 'number' && Number.isFinite(v)) return Math.trunc(v);
+  if (typeof v === 'string' && v.trim().length > 0) {
+    const n = Number(v);
+    if (Number.isFinite(n)) return Math.trunc(n);
+  }
+  return 0;
+};
+
+const toUiDoc = (d: DocumentListItemResponse): Document => ({
+  id: d.id,
+  title: d.extracted_title ?? d.original_filename,
+  company: (d.metadata?.company as string | undefined) ?? '',
+  year: toYear(d.metadata?.year),
+  type: (d.metadata?.type as string | undefined) ?? '',
+  pages: d.page_count ?? 0,
+  status: mapDocStatus(d.status),
+  tags: [],
+});
 
 export default function App() {
   const { authChecked, isAuthenticated, setAccessToken, logout } = useAuth();
@@ -47,7 +70,7 @@ export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
 
   // Data
-  const [docs, setDocs] = useState<Document[]>(MOCK_DOCS);
+  const [docs, setDocs] = useState<Document[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
 
   // Messages (fetched from backend, keyed by conversationId)
@@ -148,6 +171,29 @@ export default function App() {
       .catch((err) => console.error('Failed to load current user:', err));
     return () => { cancelled = true; };
   }, [isAuthenticated]);
+
+  // Load documents when authenticated
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setDocs([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await listDocuments();
+        if (!cancelled) setDocs(res.documents.map(toUiDoc));
+      } catch (err) {
+        console.error('Failed to load documents:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isAuthenticated]);
+
+  const refreshDocs = useCallback(async () => {
+    const res = await listDocuments();
+    setDocs(res.documents.map(toUiDoc));
+  }, []);
 
   // Load conversations when authenticated (7.6)
   useEffect(() => {
@@ -929,6 +975,10 @@ export default function App() {
         </div>
 
         {/* Filters */}
+        {(() => {
+          const companies = Array.from(new Set(docs.map(d => d.company).filter(Boolean))).sort();
+          const years = Array.from(new Set(docs.map(d => d.year).filter(y => y > 0))).sort((a, b) => Number(b) - Number(a));
+          return (
         <div className="flex gap-4 mb-6">
             <div className="relative flex-1 max-w-md">
                 <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
@@ -936,13 +986,15 @@ export default function App() {
             </div>
             <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
                 <option>All Companies</option>
-                {COMPANIES.map(c => <option key={c}>{c}</option>)}
+                {companies.map(c => <option key={c}>{c}</option>)}
             </select>
              <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
                 <option>All Years</option>
-                {YEARS.map(y => <option key={y}>{y}</option>)}
+                {years.map(y => <option key={y}>{y}</option>)}
             </select>
         </div>
+          );
+        })()}
 
         {/* Table */}
         <div className="border border-[var(--border)] rounded-lg overflow-hidden bg-[var(--surface-1)]">
@@ -1009,7 +1061,7 @@ export default function App() {
       <UploadModal
         isOpen={isUploadOpen}
         onClose={() => setIsUploadOpen(false)}
-        onUpload={(meta) => setDocs(prev => [{ id: Date.now().toString(), pages: 0, status: 'Processing', tags: [], ...meta }, ...prev])}
+        onUpload={() => { void refreshDocs(); }}
       />
 
       {/* Doc Picker Modal */}

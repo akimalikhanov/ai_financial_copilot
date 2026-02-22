@@ -232,3 +232,29 @@ def get_redis_broker_url() -> str:
     db = os.getenv("REDIS_BROKER_DB", "0")
     password = os.getenv("REDIS_BROKER_PASSWORD") or os.getenv("REDIS_PASSWORD")
     return _build_redis_url(host, port, db, password)
+
+
+def get_s3_endpoint_url() -> str:
+    """S3/Garage endpoint (AWS_ENDPOINT_URL, default http://127.0.0.1:3900)."""
+    return os.getenv("AWS_ENDPOINT_URL", "http://127.0.0.1:3900")
+
+
+def get_s3_bucket() -> str:
+    """S3/Garage bucket for PDFs (S3_BUCKET, default pdfs)."""
+    return os.getenv("S3_BUCKET", "pdfs")
+
+
+def get_s3_access_key() -> str:
+    """S3/Garage access key (AWS_ACCESS_KEY_ID). Required for uploads."""
+    val = os.getenv("AWS_ACCESS_KEY_ID")
+    if not val:
+        raise RuntimeError("AWS_ACCESS_KEY_ID is required for S3/Garage uploads")
+    return val
+
+
+def get_s3_secret_key() -> str:
+    """S3/Garage secret key (AWS_SECRET_ACCESS_KEY). Required for uploads."""
+    val = os.getenv("AWS_SECRET_ACCESS_KEY")
+    if not val:
+        raise RuntimeError("AWS_SECRET_ACCESS_KEY is required for S3/Garage uploads")
+    return val

@@ -339,6 +339,55 @@ export const getMe = async (): Promise<UserInfo> => {
   return (await response.json()) as UserInfo;
 };
 
+// --- Documents API ---
+
+export interface UploadDocumentResponse {
+  id: string;
+  status: string;
+  original_filename: string;
+  storage_key: string;
+  created_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface DocumentListItemResponse {
+  id: string;
+  status: string;
+  original_filename: string;
+  created_at: string;
+  extracted_title: string | null;
+  page_count: number | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface ListDocumentsResponse {
+  documents: DocumentListItemResponse[];
+  total: number;
+}
+
+export const listDocuments = async (): Promise<ListDocumentsResponse> => {
+  let response: Response;
+  try {
+    response = await fetchApi(joinUrl(API_BASE_URL, '/v1/documents'), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+  } catch (error) {
+    throw toApiErrorFromThrowable(error);
+  }
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+  return (await response.json()) as ListDocumentsResponse;
+};
+
+export const uploadDocument = async (formData: FormData): Promise<UploadDocumentResponse> => {
+  const response = await fetchApi(joinUrl(API_BASE_URL, '/v1/documents/upload'), {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+  return response.json() as Promise<UploadDocumentResponse>;
+};
+
 // --- Conversations API ---
 
 export interface CreateConversationRequest {

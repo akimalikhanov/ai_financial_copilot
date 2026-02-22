@@ -17,7 +17,7 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 
-from src.api.logging import JsonFormatter
+from src.api.logging import configure_worker_logging
 from src.db import get_session_factory, init_db, shutdown_db
 from src.models.message import Message, MessageStatus
 from src.redis_client import CHAT_QUEUE_STREAM, events_stream_key
@@ -36,26 +36,6 @@ from src.services.llm_router import get_router
 from src.utils.config import get_redis_app_url, get_redis_broker_url
 
 logger = logging.getLogger(__name__)
-
-
-class _FlushingStreamHandler(logging.StreamHandler):
-    """StreamHandler that flushes after each emit (fixes buffering when run without TTY)."""
-
-    def emit(self, record: logging.LogRecord) -> None:
-        super().emit(record)
-        self.flush()
-
-
-def _configure_worker_logging() -> None:
-    """Configure JSON logging for the worker (same format as API, with flush for non-TTY)."""
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    handler = _FlushingStreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(level)
 
 
 CONSUMER_GROUP = "chat-workers"
@@ -280,7 +260,7 @@ async def process_request(
 
 async def run_worker() -> None:
     """Main worker loop."""
-    _configure_worker_logging()
+    configure_worker_logging()
     await init_db()
     redis_broker = Redis.from_url(get_redis_broker_url(), decode_responses=True)
     redis_app = Redis.from_url(get_redis_app_url(), decode_responses=True)
