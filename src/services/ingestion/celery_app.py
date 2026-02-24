@@ -7,6 +7,7 @@ import logging
 from uuid import UUID
 
 from celery import Celery
+from celery.exceptions import Retry
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -29,20 +30,34 @@ celery_app.conf.update(
 )
 
 
-async def _set_document_ready(document_id: str) -> None:
+async def _set_document_ready(document_id: str) -> bool:
     engine = create_async_engine(get_db_url(), poolclass=NullPool)
     async with async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
     )() as session:
         repo = DocumentRepository(session)
-        await repo.update_status(UUID(document_id), "ready")
+        updated = await repo.update_status(UUID(document_id), "ready")
         await session.commit()
     await engine.dispose()
+    return updated
 
 
-@celery_app.task(name="ingest_document")
-def ingest_document(document_id: str) -> None:
+@celery_app.task(bind=True, name="ingest_document")
+def ingest_document(self, document_id: str) -> None:
     """Set document status to ready. Enqueued by upload API."""
     logger.info("ingest_document.received", extra={"document_id": document_id})
-    asyncio.run(_set_document_ready(document_id))
-    logger.info("ingest_document.done", extra={"document_id": document_id})
+    try:
+        updated = asyncio.run(_set_document_ready(document_id))
+        if not updated:
+            # Usually means the API transaction hasn't committed yet.
+            logger.warning(
+                "ingest_document.not_found_retrying",
+                extra={"document_id": document_id, "attempt": getattr(self.request, "retries", 0)},
+            )
+            raise self.retry(countdown=1, max_retries=10)
+        logger.info("ingest_document.done", extra={"document_id": document_id})
+    except Retry:
+        raise
+    except Exception:
+        logger.exception("ingest_document.failed", extra={"document_id": document_id})
+        raise

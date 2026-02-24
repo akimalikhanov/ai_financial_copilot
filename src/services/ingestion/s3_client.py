@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from uuid import UUID
 
@@ -25,7 +26,9 @@ async def upload_pdf(
     user_id: UUID,
     doc_id: UUID,
     filename: str,
-    body: bytes,
+    fileobj,
+    *,
+    content_length: int | None = None,
 ) -> str:
     """
     Upload PDF to S3/Garage. Returns storage_key.
@@ -40,10 +43,13 @@ async def upload_pdf(
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
     ) as client:
+        with contextlib.suppress(Exception):
+            fileobj.seek(0)
         await client.put_object(
             Bucket=get_s3_bucket(),
             Key=storage_key,
-            Body=body,
+            Body=fileobj,
             ContentType="application/pdf",
+            **({"ContentLength": content_length} if content_length is not None else {}),
         )
     return storage_key

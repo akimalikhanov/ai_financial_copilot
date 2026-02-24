@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import cast
 from uuid import uuid4
 
@@ -19,6 +20,8 @@ router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 ALLOWED_CONTENT_TYPE = "application/pdf"
+
+logger = logging.getLogger(__name__)
 
 
 @router.get("", response_model=ListDocumentsResponse)
@@ -61,8 +64,15 @@ async def upload_document(
             detail="Only PDF files are allowed",
         )
 
-    body = await file.read()
-    if len(body) > MAX_FILE_SIZE:
+    try:
+        pos = file.file.tell()
+        file.file.seek(0, 2)
+        file_size = file.file.tell()
+        file.file.seek(pos)
+    except Exception:
+        file_size = None
+
+    if file_size is not None and file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="File size exceeds 50MB limit",
@@ -73,7 +83,8 @@ async def upload_document(
         user_id=current_user.id,
         doc_id=doc_id,
         filename=file.filename or "document.pdf",
-        body=body,
+        fileobj=file.file,
+        content_length=file_size,
     )
 
     metadata: dict = {}
@@ -90,11 +101,17 @@ async def upload_document(
         original_filename=file.filename or "document.pdf",
         storage_key=storage_key,
         content_type=ALLOWED_CONTENT_TYPE,
-        file_size_bytes=len(body),
+        file_size_bytes=file_size,
         metadata=metadata if metadata else None,
     )
 
+    # Commit the new document row before enqueueing the task.
+    # Otherwise the worker can run before the transaction commits and "update 0 rows",
+    # leaving the document stuck in `pending`.
+    await session.commit()
+
     cast(Task, ingest_document).delay(str(doc.id))
+    logger.info("document.ingestion_enqueued", extra={"document_id": str(doc.id)})
 
     return UploadDocumentResponse(
         id=doc.id,
