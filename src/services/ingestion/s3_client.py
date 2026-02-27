@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import contextlib
 import re
+import tempfile
+from pathlib import Path
 from uuid import UUID
 
 import aioboto3
@@ -53,3 +55,44 @@ async def upload_pdf(
             **({"ContentLength": content_length} if content_length is not None else {}),
         )
     return storage_key
+
+
+async def download_file(storage_key: str) -> Path:
+    """Download an object to a local tempfile and return its path."""
+    suffix = Path(storage_key).suffix or ".bin"
+    session = aioboto3.Session()
+    async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
+        "s3",
+        endpoint_url=get_s3_endpoint_url(),
+        region_name="garage",
+        aws_access_key_id=get_s3_access_key(),
+        aws_secret_access_key=get_s3_secret_key(),
+    ) as client:
+        resp = await client.get_object(Bucket=get_s3_bucket(), Key=storage_key)
+        body = resp["Body"]
+        data = body.read()
+        if hasattr(data, "__await__"):
+            data = await data
+        with tempfile.NamedTemporaryFile(prefix="s3_", suffix=suffix, delete=False) as f:
+            f.write(data)
+            return Path(f.name)
+
+
+async def upload_bytes(key: str, data: bytes, content_type: str) -> str:
+    """Upload in-memory bytes to S3/Garage. Returns key."""
+    session = aioboto3.Session()
+    async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
+        "s3",
+        endpoint_url=get_s3_endpoint_url(),
+        region_name="garage",
+        aws_access_key_id=get_s3_access_key(),
+        aws_secret_access_key=get_s3_secret_key(),
+    ) as client:
+        await client.put_object(
+            Bucket=get_s3_bucket(),
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+            ContentLength=len(data),
+        )
+    return key

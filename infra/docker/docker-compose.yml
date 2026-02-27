@@ -224,9 +224,29 @@ services:
 
   # Garage: S3-compatible object storage (alternative to MinIO), e.g. for PDFs.
   # Docs: https://garagehq.deuxfleurs.fr/documentation/
+  garage-secrets:
+    image: alpine:3.20
+    container_name: garage-secrets
+    volumes:
+      - ./garage/secrets:/secrets
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      [
+        "set -e; apk add --no-cache openssl >/dev/null; \
+        test -f /secrets/garage_rpc_secret || openssl rand -hex 32 > /secrets/garage_rpc_secret; \
+        test -f /secrets/garage_admin_token || openssl rand -base64 32 > /secrets/garage_admin_token; \
+        test -f /secrets/garage_metrics_token || openssl rand -base64 32 > /secrets/garage_metrics_token; \
+        chmod 600 /secrets/garage_rpc_secret /secrets/garage_admin_token /secrets/garage_metrics_token || true;",
+      ]
+    restart: "no"
+    <<: *default-logging
+
   garage:
     image: dxflrs/garage:v2.2.0
     container_name: garage
+    depends_on:
+      garage-secrets:
+        condition: service_completed_successfully
     restart: unless-stopped
     volumes:
       - ./garage/garage.toml:/etc/garage.toml:ro
@@ -248,16 +268,16 @@ services:
   garage-bootstrap:
     profiles:
       - garage-bootstrap
-    build:
-      context: ..
-      dockerfile: docker/garage/garage_bootstrap.Dockerfile
+    image: docker:cli
     container_name: garage-bootstrap
     depends_on:
       garage:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ../scripts/garage_bootstrap.sh:/bootstrap.sh:ro
       - ./garage/secrets:/secrets
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
     networks: [backend]
     restart: "no"
 

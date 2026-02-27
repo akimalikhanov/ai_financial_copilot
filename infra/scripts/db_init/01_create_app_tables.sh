@@ -582,6 +582,53 @@ BEFORE UPDATE ON documents
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ============================================================================
+-- Table: chunks (structure-aware document chunks for RAG)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS chunks (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_id   uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  chunk_index   integer NOT NULL,
+
+  -- text variants: raw (ch.text) and enriched (contextualize with headings)
+  raw_text      text NOT NULL,
+  enriched_text text NOT NULL,
+
+  -- structure + navigation
+  heading_trail text[],
+  chunk_type    text NOT NULL CHECK (chunk_type IN ('text', 'table', 'picture')),
+
+  -- citations
+  page_start    integer,
+  page_end      integer,
+  token_count   integer,
+
+  -- flexible payloads
+  provenance      jsonb NOT NULL DEFAULT '[]'::jsonb,
+  metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
+
+  -- embedding tracking (set when chunk is embedded)
+  embedding_model text,
+
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (document_id, chunk_index)
+);
+
+COMMENT ON TABLE chunks IS
+  'Document chunks from HybridChunker. raw_text=ch.text, enriched_text=contextualize(chunk) for embeddings.';
+COMMENT ON COLUMN chunks.raw_text IS 'Raw chunk text without heading prefix (for snippets/citations).';
+COMMENT ON COLUMN chunks.enriched_text IS 'Heading-prefixed text used for embeddings and LLM context.';
+COMMENT ON COLUMN chunks.heading_trail IS 'Breadcrumb headings from HybridChunker meta.';
+COMMENT ON COLUMN chunks.chunk_type IS 'Chunk type: text, table, or picture.';
+COMMENT ON COLUMN chunks.provenance IS 'List of {page_no, bbox, charspan} for citation highlighting.';
+COMMENT ON COLUMN chunks.embedding_model IS 'Model id used to embed this chunk (e.g. sentence-transformers/all-MiniLM-L6-v2).';
+
+CREATE INDEX IF NOT EXISTS chunks_document_idx
+  ON chunks (document_id);
+COMMENT ON INDEX chunks_document_idx IS
+  'List chunks by document for ingestion and retrieval.';
+
+-- ============================================================================
 -- Add llm_requests table FK constraint (after llm_requests exists)
 -- ============================================================================
 

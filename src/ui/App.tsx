@@ -214,9 +214,15 @@ export default function App() {
     return () => { cancelled = true; };
   }, [isAuthenticated]);
 
-  // Fetch available models on mount
+  // Fetch available models when authenticated (same as docs/conversations)
   useEffect(() => {
+    if (!isAuthenticated) {
+      setModels(FALLBACK_MODELS);
+      setModelsLoading(false);
+      return;
+    }
     let cancelled = false;
+    setModelsLoading(true);
     (async () => {
       try {
         const fetched = await fetchModels();
@@ -236,7 +242,7 @@ export default function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [isAuthenticated]);
 
   // Fetch messages when conversation is selected
   useEffect(() => {

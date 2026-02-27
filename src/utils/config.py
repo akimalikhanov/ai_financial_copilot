@@ -240,8 +240,28 @@ def get_s3_endpoint_url() -> str:
 
 
 def get_s3_bucket() -> str:
-    """S3/Garage bucket for PDFs (S3_BUCKET, default pdfs)."""
+    """Legacy S3/Garage bucket env (S3_BUCKET, default pdfs)."""
     return os.getenv("S3_BUCKET", "pdfs")
+
+
+def get_s3_raw_bucket() -> str:
+    """Bucket for raw PDFs (S3_RAW_BUCKET, falls back to S3_BUCKET, default pdfs)."""
+    return os.getenv("S3_RAW_BUCKET") or get_s3_bucket()
+
+
+def get_s3_docling_bucket() -> str:
+    """Bucket for Docling JSON artifacts (S3_DOCLING_BUCKET, default docling)."""
+    return os.getenv("S3_DOCLING_BUCKET", "docling")
+
+
+def get_s3_rendered_bucket() -> str:
+    """Bucket for rendered MD/HTML artifacts (S3_RENDERED_BUCKET, default rendered)."""
+    return os.getenv("S3_RENDERED_BUCKET", "rendered")
+
+
+def get_s3_chunks_bucket() -> str:
+    """Bucket for chunks.jsonl artifacts (S3_CHUNKS_BUCKET, default chunks)."""
+    return os.getenv("S3_CHUNKS_BUCKET", "chunks")
 
 
 def get_s3_access_key() -> str:
