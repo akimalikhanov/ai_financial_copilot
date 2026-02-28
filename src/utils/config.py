@@ -278,3 +278,84 @@ def get_s3_secret_key() -> str:
     if not val:
         raise RuntimeError("AWS_SECRET_ACCESS_KEY is required for S3/Garage uploads")
     return val
+
+
+def _parse_bool(val: str | None, default: bool) -> bool:
+    """Parse env var as bool. 1/true/yes/on -> True, 0/false/no/off -> False."""
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+def get_docling_do_ocr() -> bool:
+    """DOCLING_DO_OCR (default: true)."""
+    return _parse_bool(os.getenv("DOCLING_DO_OCR"), True)
+
+
+def get_docling_do_table_structure() -> bool:
+    """DOCLING_DO_TABLE_STRUCTURE (default: true)."""
+    return _parse_bool(os.getenv("DOCLING_DO_TABLE_STRUCTURE"), True)
+
+
+def get_docling_do_picture_description() -> bool:
+    """DOCLING_DO_PICTURE_DESCRIPTION (default: true)."""
+    return _parse_bool(os.getenv("DOCLING_DO_PICTURE_DESCRIPTION"), True)
+
+
+def get_docling_generate_picture_images() -> bool:
+    """DOCLING_GENERATE_PICTURE_IMAGES (default: false)."""
+    return _parse_bool(os.getenv("DOCLING_GENERATE_PICTURE_IMAGES"), False)
+
+
+def get_docling_generate_page_images() -> bool:
+    """
+    DOCLING_GENERATE_PAGE_IMAGES (default: false).
+    When do_picture_description is true, this is forced to true (VLM needs page images).
+    """
+    if get_docling_do_picture_description():
+        return True
+    return _parse_bool(os.getenv("DOCLING_GENERATE_PAGE_IMAGES"), False)
+
+
+def get_docling_document_timeout() -> float:
+    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0)."""
+    val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "300")
+    try:
+        return float(val)
+    except ValueError:
+        return 300.0
+
+
+def get_chunking_tokenizer_model() -> str:
+    """CHUNKING_TOKENIZER_MODEL (default: nomic-ai/nomic-embed-text-v1.5)."""
+    return os.getenv("CHUNKING_TOKENIZER_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+
+
+def get_chunking_max_tokens() -> int:
+    """CHUNKING_MAX_TOKENS (default: 1000)."""
+    val = os.getenv("CHUNKING_MAX_TOKENS", "1000")
+    try:
+        return int(val)
+    except ValueError:
+        return 1000
+
+
+def get_embedding_provider() -> str:
+    """EMBEDDING_PROVIDER (default: local). Use 'openai' for OpenAI API."""
+    return os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+
+
+def get_embedding_model() -> str:
+    """EMBEDDING_MODEL or EMBED_MODEL_ID (default: all-MiniLM-L6-v2)."""
+    return os.getenv("EMBEDDING_MODEL") or os.getenv("EMBED_MODEL_ID") or "all-MiniLM-L6-v2"
+
+
+def get_embedding_dim() -> int | None:
+    """EMBEDDING_DIM (optional). If set, validates embedding vector length."""
+    raw = os.getenv("EMBEDDING_DIM")
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError("EMBEDDING_DIM must be an integer") from exc
