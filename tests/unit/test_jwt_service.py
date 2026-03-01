@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import jwt
@@ -47,7 +47,7 @@ def test_decode_token_invalid_returns_none() -> None:
 def test_decode_token_wrong_secret_returns_none() -> None:
     user_id = uuid4()
     token = jwt.encode(
-        {"sub": str(user_id), "type": "access", "exp": datetime.now(timezone.utc) + timedelta(minutes=15)},
+        {"sub": str(user_id), "type": "access", "exp": datetime.now(UTC) + timedelta(minutes=15)},
         "wrong-secret",
         algorithm="HS256",
     )
@@ -58,7 +58,7 @@ def test_decode_token_expired_returns_none() -> None:
     user_id = uuid4()
     secret = "test-secret-key-min-32-chars-long"
     token = jwt.encode(
-        {"sub": str(user_id), "type": "access", "exp": datetime.now(timezone.utc) - timedelta(minutes=1)},
+        {"sub": str(user_id), "type": "access", "exp": datetime.now(UTC) - timedelta(minutes=1)},
         secret,
         algorithm="HS256",
     )

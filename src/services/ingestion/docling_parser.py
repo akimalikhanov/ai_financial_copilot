@@ -36,6 +36,7 @@ class ParseResult:
     document: DoclingDocument
     page_count: int
     extracted_title: str | None
+    parse_status: str  # Docling ConversionStatus as string: success, partial_success, etc.
     metadata: dict
 
 
@@ -80,16 +81,24 @@ def parse(pdf_path: Path) -> ParseResult:
     converter.initialize_pipeline(InputFormat.PDF)
 
     result = converter.convert(pdf_path)
-    if result.status != ConversionStatus.SUCCESS:
+    if result.status == ConversionStatus.SUCCESS:
+        pass
+    elif result.status == ConversionStatus.PARTIAL_SUCCESS:
+        _LOG.warning(
+            "Docling conversion partial success: some pages may have failed, using extracted content"
+        )
+    else:
         raise RuntimeError(f"Docling conversion failed: {result.status}")
 
     document = result.document
     page_count = len(result.pages)
     extracted_title = _extract_title(document)
+    parse_status = result.status.name.lower()  # e.g. success, partial_success
 
     return ParseResult(
         document=document,
         page_count=page_count,
         extracted_title=extracted_title,
+        parse_status=parse_status,
         metadata={},
     )

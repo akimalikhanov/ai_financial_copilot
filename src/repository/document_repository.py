@@ -51,6 +51,60 @@ class DocumentRepository:
         await self.session.flush()
         return getattr(result, "rowcount", 0) > 0
 
+    async def get_by_id(self, document_id: UUID) -> Document | None:
+        return await self.session.get(Document, document_id)
+
+    async def update_metadata(
+        self,
+        document_id: UUID,
+        *,
+        page_count: int | None = None,
+        extracted_title: str | None = None,
+        parse_status: str | None = None,
+        metadata: dict | None = None,
+    ) -> bool:
+        from sqlalchemy import update
+
+        values: dict = {}
+        if page_count is not None:
+            values["page_count"] = page_count
+        if extracted_title is not None:
+            values["extracted_title"] = extracted_title
+        if parse_status is not None:
+            values["parse_status"] = parse_status
+        if metadata is not None:
+            values["document_metadata"] = metadata
+        if not values:
+            return False
+
+        result = await self.session.execute(
+            update(Document).where(Document.id == document_id).values(**values)
+        )
+        await self.session.flush()
+        return getattr(result, "rowcount", 0) > 0
+
+    async def set_failed(self, document_id: UUID, error: str) -> bool:
+        from sqlalchemy import update
+
+        result = await self.session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(status="failed", processing_error=error)
+        )
+        await self.session.flush()
+        return getattr(result, "rowcount", 0) > 0
+
+    async def set_ingest_time_seconds(self, document_id: UUID, ingest_time_seconds: float) -> bool:
+        from sqlalchemy import update
+
+        result = await self.session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(ingest_time_seconds=ingest_time_seconds)
+        )
+        await self.session.flush()
+        return getattr(result, "rowcount", 0) > 0
+
     async def list_by_user(self, user_id: UUID) -> list[Document]:
         """List documents owned by a user (newest first)."""
         result = await self.session.execute(

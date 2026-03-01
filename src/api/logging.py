@@ -163,12 +163,44 @@ class FlushingStreamHandler(logging.StreamHandler):
         self.flush()
 
 
+class IncludeLoggerPrefixFilter(logging.Filter):
+    """Allow only log records from specific logger prefixes."""
+
+    def __init__(self, prefixes: tuple[str, ...]) -> None:
+        super().__init__()
+        self.prefixes = prefixes
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name.startswith(self.prefixes)
+
+
 def configure_worker_logging() -> None:
     """Configure JSON logging for workers (same format as API, with flush for non-TTY)."""
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     handler = FlushingStreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
+    # For ingestion worker logs, keep output focused to pipeline stage/task logs.
+    only_ingestion_logs = os.getenv("INGESTION_LOG_ONLY_PIPELINE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if only_ingestion_logs:
+        handler.addFilter(
+            IncludeLoggerPrefixFilter(
+                prefixes=(
+                    "src.services.ingestion.celery_app",
+                    "celery.worker.strategy",
+                )
+            )
+        )
+        # RapidOCR installs its own non-propagating stream handler; mute it explicitly.
+        rapidocr_logger = logging.getLogger("RapidOCR")
+        rapidocr_logger.handlers.clear()
+        rapidocr_logger.propagate = False
+        rapidocr_logger.disabled = True
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)

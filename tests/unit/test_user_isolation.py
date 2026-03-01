@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import uuid4
+from collections.abc import Generator
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -13,8 +14,8 @@ from fastapi.testclient import TestClient
 from src.api.deps import get_current_user
 from src.api.routers import conversations
 from src.db.connection import get_db_session
-from src.models.user import User
 from src.models.conversation import Conversation
+from src.models.user import User
 
 
 def _app() -> FastAPI:
@@ -28,11 +29,13 @@ async def _mock_get_db():
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client() -> Generator[TestClient, None, None]:
     c = TestClient(_app())
-    c.app.dependency_overrides[get_db_session] = _mock_get_db
+    app = c.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_db_session] = _mock_get_db
     yield c
-    c.app.dependency_overrides.clear()
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -46,8 +49,8 @@ def user_a() -> User:
         password_hash=None,
         email_verified_at=None,
         is_active=True,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
         last_seen_at=None,
         metadata_={},
     )
@@ -70,8 +73,8 @@ def test_get_messages_returns_404_when_conversation_owned_by_other_user(
         id=conv_id,
         user_id=user_b_id,
         title="B's conversation",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
         deleted_at=None,
         last_message_at=None,
         settings={},
@@ -81,10 +84,10 @@ def test_get_messages_returns_404_when_conversation_owned_by_other_user(
     mock_conv_repo.get_by_id = AsyncMock(return_value=conv)
     mock_msg_repo = MagicMock()
 
-    def _fake_conv_repo(session: object) -> MagicMock:
+    def _fake_conv_repo(_session: object) -> MagicMock:
         return mock_conv_repo
 
-    def _fake_msg_repo(session: object) -> MagicMock:
+    def _fake_msg_repo(_session: object) -> MagicMock:
         return mock_msg_repo
 
     monkeypatch.setattr("src.api.routers.conversations.ConversationRepository", _fake_conv_repo)
@@ -93,10 +96,12 @@ def test_get_messages_returns_404_when_conversation_owned_by_other_user(
     async def _override_current_user() -> User:
         return user_a
 
-    client.app.dependency_overrides[get_current_user] = _override_current_user
+    app = client.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_current_user] = _override_current_user
     try:
         resp = client.get(f"/v1/conversations/{conv_id}/messages")
         assert resp.status_code == 404
         assert resp.json().get("detail") == "Conversation not found"
     finally:
-        del client.app.dependency_overrides[get_current_user]
+        del app.dependency_overrides[get_current_user]

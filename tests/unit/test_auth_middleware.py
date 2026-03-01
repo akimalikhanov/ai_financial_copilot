@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import UUID
+from collections.abc import Generator
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
@@ -30,11 +31,13 @@ async def _mock_get_db():
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client() -> Generator[TestClient, None, None]:
     c = TestClient(_app())
-    c.app.dependency_overrides[get_db_session] = _mock_get_db
+    app = c.app
+    assert isinstance(app, FastAPI)
+    app.dependency_overrides[get_db_session] = _mock_get_db
     yield c
-    c.app.dependency_overrides.clear()
+    app.dependency_overrides.clear()
 
 
 def test_missing_authorization_returns_401(client: TestClient) -> None:
@@ -62,8 +65,8 @@ def test_valid_token_returns_user(
         password_hash=None,
         email_verified_at=None,
         is_active=True,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
         last_seen_at=None,
         metadata_={},
     )

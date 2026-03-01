@@ -1,18 +1,32 @@
-"""Celery app and tasks for PDF ingestion. API enqueues; worker updates document status."""
+"""Celery app and ingestion pipeline task."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import shutil
+import tempfile
+from pathlib import Path
+from time import perf_counter
 from uuid import UUID
 
 from celery import Celery
 from celery.exceptions import Retry
+from celery.signals import setup_logging, worker_process_init
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from src.repository.document_repository import DocumentRepository
-from src.utils.config import get_db_url, get_redis_broker_url
+from src.api.logging import configure_worker_logging
+from src.utils.config import (
+    get_db_url,
+    get_embedding_dim,
+    get_embedding_model,
+    get_redis_broker_url,
+    get_s3_chunks_bucket,
+    get_s3_docling_bucket,
+    get_s3_rendered_bucket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,36 +40,308 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
-    worker_hijack_root_logger=False,  # Use our JSON logging from configure_worker_logging
+    worker_hijack_root_logger=False,
 )
 
 
-async def _set_document_ready(document_id: str) -> bool:
+@setup_logging.connect
+def _on_celery_setup_logging(**_kwargs: object) -> None:
+    # Use app-wide JSON logging instead of Celery's default logging setup.
+    configure_worker_logging()
+
+
+@worker_process_init.connect
+def _on_worker_process_init(**_kwargs: object) -> None:
+    # Ensure task child processes emit structured logs too.
+    configure_worker_logging()
+
+
+def _make_session_factory():
     engine = create_async_engine(get_db_url(), poolclass=NullPool)
-    async with async_sessionmaker(
+    factory = async_sessionmaker(
         engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
-    )() as session:
-        repo = DocumentRepository(session)
-        updated = await repo.update_status(UUID(document_id), "ready")
-        await session.commit()
-    await engine.dispose()
-    return updated
+    )
+    return engine, factory
+
+
+def _export_artifacts(document) -> tuple[bytes, bytes]:
+    """Serialize DoclingDocument to JSON and Markdown bytes without embedded images."""
+    from docling_core.types.doc.base import ImageRefMode
+
+    td = Path(tempfile.mkdtemp(prefix="docling_"))
+    try:
+        json_p = td / "doc.json"
+        md_p = td / "doc.md"
+        document.save_as_json(json_p, image_mode=ImageRefMode.PLACEHOLDER)
+        document.save_as_markdown(md_p, image_mode=ImageRefMode.PLACEHOLDER)
+        return json_p.read_bytes(), md_p.read_bytes()
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+async def _run_pipeline(document_id: str) -> None:  # noqa: C901
+    from src.repository.chunk_repository import ChunkRepository
+    from src.repository.document_repository import DocumentRepository
+    from src.services.ingestion import (
+        chunker,
+        docling_parser,
+        embedder,
+        opensearch_client,
+        qdrant_client,
+        s3_client,
+    )
+
+    engine, sf = _make_session_factory()
+    doc_uuid = UUID(document_id)
+    pdf_path: Path | None = None
+    pipeline_started_at = perf_counter()
+    stage_total = 11
+    stage_index = 0
+    current_stage = "initializing"
+
+    def _log_stage(stage_name: str) -> None:
+        nonlocal stage_index, current_stage
+        stage_index += 1
+        current_stage = stage_name
+        logger.info(
+            f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
+            extra={
+                "document_id": document_id,
+                "stage": stage_name,
+                "stage_index": stage_index,
+                "stage_total": stage_total,
+            },
+        )
+
+    try:
+        # -- fetch document record, set status -> processing ----------------
+        _log_stage("fetch_document_record")
+        async with sf() as session:
+            repo = DocumentRepository(session)
+            doc = await repo.get_by_id(doc_uuid)
+            if doc is None:
+                raise LookupError(f"Document {document_id} not found")
+            storage_key = doc.storage_key
+            user_id = str(doc.user_id)
+            await repo.update_status(doc_uuid, "processing")
+            await session.commit()
+
+        # -- download raw PDF -----------------------------------------------
+        _log_stage("download_pdf")
+        pdf_path = await s3_client.download_file(storage_key)
+
+        # -- parse with Docling (CPU/GPU-bound) -----------------------------
+        _log_stage("parse_pdf_docling")
+        parse_result = await asyncio.to_thread(docling_parser.parse, pdf_path)
+
+        # -- export artifacts (CPU-bound serialization) ---------------------
+        _log_stage("export_docling_artifacts")
+        json_bytes, md_bytes = await asyncio.to_thread(_export_artifacts, parse_result.document)
+
+        # -- update metadata + upload artifacts (parallel I/O) --------------
+        _log_stage("save_metadata_and_upload_artifacts")
+        base_key = f"processed/{user_id}/{document_id}"
+
+        async def _save_metadata():
+            async with sf() as session:
+                repo = DocumentRepository(session)
+                await repo.update_metadata(
+                    doc_uuid,
+                    page_count=parse_result.page_count,
+                    extracted_title=parse_result.extracted_title,
+                    parse_status=parse_result.parse_status,
+                    metadata=parse_result.metadata,
+                )
+                await session.commit()
+
+        await asyncio.gather(
+            _save_metadata(),
+            s3_client.upload_bytes(
+                f"{base_key}/docling.json",
+                json_bytes,
+                "application/json",
+                bucket=get_s3_docling_bucket(),
+            ),
+            s3_client.upload_bytes(
+                f"{base_key}/document.md",
+                md_bytes,
+                "text/markdown",
+                bucket=get_s3_rendered_bucket(),
+            ),
+        )
+
+        # -- chunk document (CPU-bound) -------------------------------------
+        _log_stage("chunk_document")
+        chunks = await asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
+
+        if not chunks:
+            logger.info(
+                "pipeline.no_chunks",
+                extra={"document_id": document_id, "stage": "chunk_document"},
+            )
+            _log_stage("finalize_ready")
+            ingest_time_seconds = round(perf_counter() - pipeline_started_at, 3)
+            async with sf() as session:
+                repo = DocumentRepository(session)
+                await repo.update_status(doc_uuid, "ready")
+                await repo.set_ingest_time_seconds(doc_uuid, ingest_time_seconds)
+                await session.commit()
+            logger.info(
+                "pipeline.complete",
+                extra={
+                    "document_id": document_id,
+                    "chunks": 0,
+                    "ingest_time_seconds": ingest_time_seconds,
+                },
+            )
+            return
+
+        # -- persist chunks to Postgres -------------------------------------
+        _log_stage("persist_chunks_postgres")
+        embedding_model = get_embedding_model()
+        for c in chunks:
+            c["embedding_model"] = embedding_model
+
+        async with sf() as session:
+            chunk_repo = ChunkRepository(session)
+            db_chunks = await chunk_repo.create_many(doc_uuid, chunks)
+            await session.commit()
+
+        # -- generate embeddings (CPU/GPU-bound) ----------------------------
+        _log_stage("embed_chunks")
+        texts = [c["enriched_text"] for c in chunks]
+        vectors = await asyncio.to_thread(embedder.embed_chunks, texts)
+
+        # -- prepare Qdrant payload -----------------------------------------
+        chunks_with_vectors = [
+            {
+                "vector": vec,
+                "chunk_id": db_chunk.id,
+                "chunk_index": c["chunk_index"],
+                "chunk_type": c.get("chunk_type"),
+                "page_start": c.get("page_start"),
+                "page_end": c.get("page_end"),
+                "heading_trail": c.get("heading_trail"),
+            }
+            for c, vec, db_chunk in zip(chunks, vectors, db_chunks, strict=True)
+        ]
+
+        # -- prepare OpenSearch payload -------------------------------------
+        os_chunks = [
+            {
+                "chunk_id": db_chunk.id,
+                "chunk_index": c["chunk_index"],
+                "enriched_text": c["enriched_text"],
+                "heading_trail": c.get("heading_trail"),
+                "chunk_type": c.get("chunk_type"),
+                "page_start": c.get("page_start"),
+                "page_end": c.get("page_end"),
+                "metadata": c.get("metadata", {}),
+            }
+            for c, db_chunk in zip(chunks, db_chunks, strict=True)
+        ]
+
+        # -- ensure collections/indices exist (parallel) --------------------
+        _log_stage("ensure_vector_and_search_indexes")
+        dim = len(vectors[0]) if vectors else (get_embedding_dim() or 384)
+        await asyncio.gather(
+            asyncio.to_thread(qdrant_client.ensure_collection, "documents", dim),
+            asyncio.to_thread(opensearch_client.ensure_index, "chunks"),
+        )
+
+        # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
+        _log_stage("index_and_backup_chunks")
+        chunks_jsonl = "\n".join(
+            json.dumps(
+                {
+                    "chunk_id": str(db.id),
+                    "chunk_index": c["chunk_index"],
+                    "raw_text": c["raw_text"],
+                    "enriched_text": c["enriched_text"],
+                    "heading_trail": c.get("heading_trail"),
+                    "chunk_type": c.get("chunk_type"),
+                    "page_start": c.get("page_start"),
+                    "page_end": c.get("page_end"),
+                    "token_count": c.get("token_count"),
+                    "provenance": c.get("provenance"),
+                    "metadata": c.get("metadata", {}),
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            for c, db in zip(chunks, db_chunks, strict=True)
+        ).encode()
+
+        await asyncio.gather(
+            asyncio.to_thread(
+                qdrant_client.upsert_chunks,
+                "documents",
+                document_id,
+                chunks_with_vectors,
+            ),
+            asyncio.to_thread(opensearch_client.bulk_index, "chunks", document_id, os_chunks),
+            s3_client.upload_bytes(
+                f"{base_key}/chunks.jsonl",
+                chunks_jsonl,
+                "application/jsonl",
+                bucket=get_s3_chunks_bucket(),
+            ),
+        )
+
+        # -- finalize -> ready ----------------------------------------------
+        _log_stage("finalize_ready")
+        ingest_time_seconds = round(perf_counter() - pipeline_started_at, 3)
+        async with sf() as session:
+            repo = DocumentRepository(session)
+            await repo.update_status(doc_uuid, "ready")
+            await repo.set_ingest_time_seconds(doc_uuid, ingest_time_seconds)
+            await session.commit()
+
+        logger.info(
+            "pipeline.complete",
+            extra={
+                "document_id": document_id,
+                "chunks": len(chunks),
+                "ingest_time_seconds": ingest_time_seconds,
+            },
+        )
+
+    except LookupError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "pipeline.failed_at_stage",
+            extra={"document_id": document_id, "stage": current_stage},
+        )
+        try:
+            async with sf() as session:
+                await DocumentRepository(session).set_failed(doc_uuid, str(exc))
+                await session.commit()
+        except Exception:
+            logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
+        raise
+    finally:
+        if pdf_path is not None:
+            pdf_path.unlink(missing_ok=True)
+        await engine.dispose()
 
 
 @celery_app.task(bind=True, name="ingest_document")
 def ingest_document(self, document_id: str) -> None:
-    """Set document status to ready. Enqueued by upload API."""
-    logger.info("ingest_document.received", extra={"document_id": document_id})
+    """Full ingestion pipeline: parse -> chunk -> embed -> index -> finalize."""
+    logger.info("ingest_document.start", extra={"document_id": document_id})
     try:
-        updated = asyncio.run(_set_document_ready(document_id))
-        if not updated:
-            # Usually means the API transaction hasn't committed yet.
-            logger.warning(
-                "ingest_document.not_found_retrying",
-                extra={"document_id": document_id, "attempt": getattr(self.request, "retries", 0)},
-            )
-            raise self.retry(countdown=1, max_retries=10)
+        asyncio.run(_run_pipeline(document_id))
         logger.info("ingest_document.done", extra={"document_id": document_id})
+    except LookupError:
+        logger.warning(
+            "ingest_document.not_found_retrying",
+            extra={
+                "document_id": document_id,
+                "attempt": getattr(self.request, "retries", 0),
+            },
+        )
+        raise self.retry(countdown=1, max_retries=10) from None
     except Retry:
         raise
     except Exception:

@@ -532,6 +532,12 @@ CREATE TABLE IF NOT EXISTS documents (
   extracted_title    text,
   -- Document title (from first page or filename).
 
+  ingest_time_seconds double precision,
+  -- End-to-end ingestion duration in seconds, measured by ingestion worker.
+
+  parse_status       text,
+  -- Docling conversion status: success, partial_success (some pages failed), or failure.
+
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- Upload timestamp.
 
@@ -556,9 +562,21 @@ COMMENT ON COLUMN documents.status IS 'Lifecycle: pending/processing/ready/faile
 COMMENT ON COLUMN documents.processing_error IS 'Error message if status = failed.';
 COMMENT ON COLUMN documents.page_count IS 'Number of pages (extracted during processing).';
 COMMENT ON COLUMN documents.extracted_title IS 'Document title from first page or filename.';
+COMMENT ON COLUMN documents.ingest_time_seconds IS 'End-to-end ingestion duration in seconds, measured by ingestion worker.';
+COMMENT ON COLUMN documents.parse_status IS 'Docling conversion status: success, partial_success (some pages failed), or failure.';
 COMMENT ON COLUMN documents.created_at IS 'Upload timestamp.';
 COMMENT ON COLUMN documents.updated_at IS 'Row last update time (trigger managed).';
 COMMENT ON COLUMN documents.metadata IS 'Extracted metadata (dates, company names, report type) + flexible future fields.';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS ingest_time_seconds double precision;
+COMMENT ON COLUMN documents.ingest_time_seconds IS
+  'End-to-end ingestion duration in seconds, measured by ingestion worker.';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS parse_status text;
+COMMENT ON COLUMN documents.parse_status IS
+  'Docling conversion status: success, partial_success (some pages failed), or failure.';
 
 CREATE INDEX IF NOT EXISTS documents_user_idx
   ON documents (user_id, created_at DESC);

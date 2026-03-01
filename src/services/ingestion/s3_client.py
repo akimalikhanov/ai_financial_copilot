@@ -14,6 +14,7 @@ from src.utils.config import (
     get_s3_access_key,
     get_s3_bucket,
     get_s3_endpoint_url,
+    get_s3_raw_bucket,
     get_s3_secret_key,
 )
 
@@ -48,7 +49,7 @@ async def upload_pdf(
         with contextlib.suppress(Exception):
             fileobj.seek(0)
         await client.put_object(
-            Bucket=get_s3_bucket(),
+            Bucket=get_s3_raw_bucket(),
             Key=storage_key,
             Body=fileobj,
             ContentType="application/pdf",
@@ -57,9 +58,10 @@ async def upload_pdf(
     return storage_key
 
 
-async def download_file(storage_key: str) -> Path:
+async def download_file(storage_key: str, *, bucket: str | None = None) -> Path:
     """Download an object to a local tempfile and return its path."""
     suffix = Path(storage_key).suffix or ".bin"
+    target_bucket = bucket or get_s3_raw_bucket()
     session = aioboto3.Session()
     async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
         "s3",
@@ -68,7 +70,7 @@ async def download_file(storage_key: str) -> Path:
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
     ) as client:
-        resp = await client.get_object(Bucket=get_s3_bucket(), Key=storage_key)
+        resp = await client.get_object(Bucket=target_bucket, Key=storage_key)
         body = resp["Body"]
         data = body.read()
         if hasattr(data, "__await__"):
@@ -78,8 +80,15 @@ async def download_file(storage_key: str) -> Path:
             return Path(f.name)
 
 
-async def upload_bytes(key: str, data: bytes, content_type: str) -> str:
+async def upload_bytes(
+    key: str,
+    data: bytes,
+    content_type: str,
+    *,
+    bucket: str | None = None,
+) -> str:
     """Upload in-memory bytes to S3/Garage. Returns key."""
+    target_bucket = bucket or get_s3_bucket()
     session = aioboto3.Session()
     async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
         "s3",
@@ -89,7 +98,7 @@ async def upload_bytes(key: str, data: bytes, content_type: str) -> str:
         aws_secret_access_key=get_s3_secret_key(),
     ) as client:
         await client.put_object(
-            Bucket=get_s3_bucket(),
+            Bucket=target_bucket,
             Key=key,
             Body=data,
             ContentType=content_type,
