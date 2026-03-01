@@ -532,11 +532,14 @@ CREATE TABLE IF NOT EXISTS documents (
   extracted_title    text,
   -- Document title (from first page or filename).
 
-  ingest_time_seconds double precision,
-  -- End-to-end ingestion duration in seconds, measured by ingestion worker.
+  ingest_time_seconds jsonb,
+  -- JSON: {stages: {stage_name: seconds}, total_time: float}. Per-stage + total ingestion times.
 
   parse_status       text,
   -- Docling conversion status: success, partial_success (some pages failed), or failure.
+
+  ingest_attempt_count integer NOT NULL DEFAULT 0,
+  -- Number of times ingestion has been attempted (caps crash-redelivery loops).
 
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- Upload timestamp.
@@ -562,21 +565,45 @@ COMMENT ON COLUMN documents.status IS 'Lifecycle: pending/processing/ready/faile
 COMMENT ON COLUMN documents.processing_error IS 'Error message if status = failed.';
 COMMENT ON COLUMN documents.page_count IS 'Number of pages (extracted during processing).';
 COMMENT ON COLUMN documents.extracted_title IS 'Document title from first page or filename.';
-COMMENT ON COLUMN documents.ingest_time_seconds IS 'End-to-end ingestion duration in seconds, measured by ingestion worker.';
+COMMENT ON COLUMN documents.ingest_time_seconds IS 'JSON: {stages: {stage_name: seconds}, total_time: float}. Per-stage + total ingestion times.';
 COMMENT ON COLUMN documents.parse_status IS 'Docling conversion status: success, partial_success (some pages failed), or failure.';
+COMMENT ON COLUMN documents.ingest_attempt_count IS 'Number of times ingestion has been attempted (caps crash-redelivery loops).';
 COMMENT ON COLUMN documents.created_at IS 'Upload timestamp.';
 COMMENT ON COLUMN documents.updated_at IS 'Row last update time (trigger managed).';
 COMMENT ON COLUMN documents.metadata IS 'Extracted metadata (dates, company names, report type) + flexible future fields.';
 
 ALTER TABLE documents
-  ADD COLUMN IF NOT EXISTS ingest_time_seconds double precision;
+  ADD COLUMN IF NOT EXISTS ingest_time_seconds jsonb;
+
+-- Migrate existing double precision to jsonb (preserves old scalar values as total_time)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'documents'
+    AND column_name = 'ingest_time_seconds' AND data_type = 'double precision'
+  ) THEN
+    ALTER TABLE documents
+      ALTER COLUMN ingest_time_seconds TYPE jsonb
+      USING jsonb_build_object(
+        'stages', '{}'::jsonb,
+        'total_time', COALESCE(ingest_time_seconds, 0)
+      );
+  END IF;
+END $$;
+
 COMMENT ON COLUMN documents.ingest_time_seconds IS
-  'End-to-end ingestion duration in seconds, measured by ingestion worker.';
+  'JSON: {stages: {stage_name: seconds}, total_time: float}. Per-stage + total ingestion times.';
 
 ALTER TABLE documents
   ADD COLUMN IF NOT EXISTS parse_status text;
 COMMENT ON COLUMN documents.parse_status IS
   'Docling conversion status: success, partial_success (some pages failed), or failure.';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS ingest_attempt_count integer NOT NULL DEFAULT 0;
+COMMENT ON COLUMN documents.ingest_attempt_count IS
+  'Number of times ingestion has been attempted (caps crash-redelivery loops).';
 
 CREATE INDEX IF NOT EXISTS documents_user_idx
   ON documents (user_id, created_at DESC);

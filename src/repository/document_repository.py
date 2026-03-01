@@ -39,14 +39,20 @@ class DocumentRepository:
         await self.session.flush()
         return doc
 
-    async def update_status(self, document_id: UUID, status: str) -> bool:
+    async def update_status(
+        self, document_id: UUID, status: str, *, clear_processing_error: bool = False
+    ) -> bool:
         """Update document status. Returns True if a row was updated."""
         from sqlalchemy import update
 
         from src.models.document import Document
 
+        values: dict[str, str | None] = {"status": status}
+        if clear_processing_error:
+            values["processing_error"] = None
+
         result = await self.session.execute(
-            update(Document).where(Document.id == document_id).values(status=status)
+            update(Document).where(Document.id == document_id).values(**values)
         )
         await self.session.flush()
         return getattr(result, "rowcount", 0) > 0
@@ -94,13 +100,28 @@ class DocumentRepository:
         await self.session.flush()
         return getattr(result, "rowcount", 0) > 0
 
-    async def set_ingest_time_seconds(self, document_id: UUID, ingest_time_seconds: float) -> bool:
+    async def increment_attempt_count(self, document_id: UUID) -> int:
+        """Atomically increment and return the new attempt count."""
         from sqlalchemy import update
 
         result = await self.session.execute(
             update(Document)
             .where(Document.id == document_id)
-            .values(ingest_time_seconds=ingest_time_seconds)
+            .values(ingest_attempt_count=Document.ingest_attempt_count + 1)
+            .returning(Document.ingest_attempt_count)
+        )
+        await self.session.flush()
+        return result.scalar_one()
+
+    async def set_ingest_time_seconds(
+        self, document_id: UUID, ingest_times: dict[str, object]
+    ) -> bool:
+        from sqlalchemy import update
+
+        result = await self.session.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(ingest_time_seconds=ingest_times)
         )
         await self.session.flush()
         return getattr(result, "rowcount", 0) > 0

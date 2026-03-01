@@ -103,5 +103,5 @@ def delete_by_document(index: str, doc_id: UUID | str) -> None:
     _get_client().delete_by_query(
         index=index,
         body={"query": {"term": {"document_id": str(doc_id)}}},
-        params={"conflicts": "proceed", "refresh": "true"},
+        params={"conflicts": "proceed"},
     )

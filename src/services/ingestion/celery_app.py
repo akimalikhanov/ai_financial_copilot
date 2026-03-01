@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -12,7 +13,7 @@ from time import perf_counter
 from uuid import UUID
 
 from celery import Celery
-from celery.exceptions import Retry
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 from celery.signals import setup_logging, worker_process_init
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -30,17 +31,39 @@ from src.utils.config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _get_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return int(raw)
+
+
 celery_app = Celery(
     "ingestion",
     broker=get_redis_broker_url(),
     include=["src.services.ingestion.celery_app"],
 )
 
+task_soft_time_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
+task_time_limit = _get_int_env("CELERY_TASK_TIME_LIMIT_SECONDS")
+
+INGEST_MAX_ATTEMPTS = int(os.getenv("INGEST_MAX_ATTEMPTS", "3"))
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
     worker_hijack_root_logger=False,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
+    task_track_started=True,
+    broker_transport_options={
+        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT_SECONDS", "7200"))
+    },
+    task_soft_time_limit=task_soft_time_limit,
+    task_time_limit=task_time_limit,
 )
 
 
@@ -95,14 +118,19 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     doc_uuid = UUID(document_id)
     pdf_path: Path | None = None
     pipeline_started_at = perf_counter()
+    stage_start = perf_counter()
+    stage_times: dict[str, float] = {}
     stage_total = 11
     stage_index = 0
     current_stage = "initializing"
 
     def _log_stage(stage_name: str) -> None:
-        nonlocal stage_index, current_stage
+        nonlocal stage_index, current_stage, stage_start
+        if current_stage != "initializing":
+            stage_times[current_stage] = round(perf_counter() - stage_start, 3)
         stage_index += 1
         current_stage = stage_name
+        stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
             extra={
@@ -121,9 +149,27 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             doc = await repo.get_by_id(doc_uuid)
             if doc is None:
                 raise LookupError(f"Document {document_id} not found")
+
+            attempt = await repo.increment_attempt_count(doc_uuid)
+            if attempt > INGEST_MAX_ATTEMPTS:
+                await repo.set_failed(
+                    doc_uuid,
+                    f"Exceeded max ingestion attempts ({INGEST_MAX_ATTEMPTS})",
+                )
+                await session.commit()
+                logger.warning(
+                    "pipeline.max_attempts_exceeded",
+                    extra={
+                        "document_id": document_id,
+                        "attempt": attempt,
+                        "max_attempts": INGEST_MAX_ATTEMPTS,
+                    },
+                )
+                return
+
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
-            await repo.update_status(doc_uuid, "processing")
+            await repo.update_status(doc_uuid, "processing", clear_processing_error=True)
             await session.commit()
 
         # -- download raw PDF -----------------------------------------------
@@ -180,18 +226,22 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 extra={"document_id": document_id, "stage": "chunk_document"},
             )
             _log_stage("finalize_ready")
-            ingest_time_seconds = round(perf_counter() - pipeline_started_at, 3)
+            stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
+            ingest_times = {
+                "stages": stage_times,
+                "total_time": round(perf_counter() - pipeline_started_at, 3),
+            }
             async with sf() as session:
                 repo = DocumentRepository(session)
                 await repo.update_status(doc_uuid, "ready")
-                await repo.set_ingest_time_seconds(doc_uuid, ingest_time_seconds)
+                await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
             logger.info(
                 "pipeline.complete",
                 extra={
                     "document_id": document_id,
                     "chunks": 0,
-                    "ingest_time_seconds": ingest_time_seconds,
+                    "ingest_times": ingest_times,
                 },
             )
             return
@@ -273,6 +323,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         ).encode()
 
         await asyncio.gather(
+            asyncio.to_thread(qdrant_client.delete_by_document, "documents", document_id),
+            asyncio.to_thread(opensearch_client.delete_by_document, "chunks", document_id),
+        )
+
+        await asyncio.gather(
             asyncio.to_thread(
                 qdrant_client.upsert_chunks,
                 "documents",
@@ -290,11 +345,15 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- finalize -> ready ----------------------------------------------
         _log_stage("finalize_ready")
-        ingest_time_seconds = round(perf_counter() - pipeline_started_at, 3)
+        stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
+        ingest_times = {
+            "stages": stage_times,
+            "total_time": round(perf_counter() - pipeline_started_at, 3),
+        }
         async with sf() as session:
             repo = DocumentRepository(session)
             await repo.update_status(doc_uuid, "ready")
-            await repo.set_ingest_time_seconds(doc_uuid, ingest_time_seconds)
+            await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
             await session.commit()
 
         logger.info(
@@ -302,11 +361,32 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             extra={
                 "document_id": document_id,
                 "chunks": len(chunks),
-                "ingest_time_seconds": ingest_time_seconds,
+                "ingest_times": ingest_times,
             },
         )
 
     except LookupError:
+        raise
+    except SoftTimeLimitExceeded:
+        elapsed = round(perf_counter() - pipeline_started_at, 1)
+        msg = (
+            f"Ingestion timed out after {elapsed}s at stage '{current_stage}' "
+            f"(soft_time_limit={task_soft_time_limit}s)"
+        )
+        logger.error(
+            "pipeline.soft_time_limit",
+            extra={
+                "document_id": document_id,
+                "stage": current_stage,
+                "elapsed_seconds": elapsed,
+            },
+        )
+        try:
+            async with sf() as session:
+                await DocumentRepository(session).set_failed(doc_uuid, msg)
+                await session.commit()
+        except Exception:
+            logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
     except Exception as exc:
         logger.exception(
@@ -343,6 +423,12 @@ def ingest_document(self, document_id: str) -> None:
         )
         raise self.retry(countdown=1, max_retries=10) from None
     except Retry:
+        raise
+    except SoftTimeLimitExceeded:
+        logger.error(
+            "ingest_document.soft_time_limit",
+            extra={"document_id": document_id},
+        )
         raise
     except Exception:
         logger.exception("ingest_document.failed", extra={"document_id": document_id})

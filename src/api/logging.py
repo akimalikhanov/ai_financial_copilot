@@ -197,10 +197,10 @@ def configure_worker_logging() -> None:
             )
         )
         # RapidOCR installs its own non-propagating stream handler; mute it explicitly.
-        rapidocr_logger = logging.getLogger("RapidOCR")
-        rapidocr_logger.handlers.clear()
-        rapidocr_logger.propagate = False
-        rapidocr_logger.disabled = True
+        # rapidocr_logger = logging.getLogger("RapidOCR")
+        # rapidocr_logger.handlers.clear()
+        # rapidocr_logger.propagate = False
+        # rapidocr_logger.disabled = True
     root = logging.getLogger()
     root.handlers.clear()
     root.addHandler(handler)
