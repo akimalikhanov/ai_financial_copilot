@@ -13,7 +13,7 @@ import socket
 from celery.signals import worker_process_init
 
 from src.api.logging import configure_worker_logging
-from src.services.ingestion.celery_app import celery_app
+from src.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ if __name__ == "__main__":
     pool = os.getenv("CELERY_WORKER_POOL", "prefork")
     concurrency = os.getenv("CELERY_WORKER_CONCURRENCY")
 
-    argv = ["worker", "--loglevel=info", "--pool", pool, "-n", nodename]
+    argv = ["worker", "--loglevel=info", "--pool", pool, "-n", nodename, "-Q", "ingestion"]
     if concurrency:
         argv.extend(["--concurrency", concurrency])
 

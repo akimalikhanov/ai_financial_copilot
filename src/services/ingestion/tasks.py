@@ -1,4 +1,4 @@
-"""Celery app and ingestion pipeline task."""
+"""Ingestion pipeline task."""
 
 from __future__ import annotations
 
@@ -12,24 +12,26 @@ from pathlib import Path
 from time import perf_counter
 from uuid import UUID
 
-from celery import Celery
 from celery.exceptions import Retry, SoftTimeLimitExceeded
-from celery.signals import setup_logging, worker_process_init
+from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
+from src.celery_app import celery_app
 from src.utils.config import (
     get_db_url,
     get_embedding_dim,
     get_embedding_model,
-    get_redis_broker_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_rendered_bucket,
 )
 
 logger = logging.getLogger(__name__)
+_worker_loop: asyncio.AbstractEventLoop | None = None
+_engine = None
+_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 def _get_int_env(name: str) -> int | None:
@@ -39,52 +41,40 @@ def _get_int_env(name: str) -> int | None:
     return int(raw)
 
 
-celery_app = Celery(
-    "ingestion",
-    broker=get_redis_broker_url(),
-    include=["src.services.ingestion.celery_app"],
-)
-
-task_soft_time_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
-task_time_limit = _get_int_env("CELERY_TASK_TIME_LIMIT_SECONDS")
-
+_task_soft_time_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
 INGEST_MAX_ATTEMPTS = int(os.getenv("INGEST_MAX_ATTEMPTS", "3"))
-
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    worker_hijack_root_logger=False,
-    task_acks_late=True,
-    task_reject_on_worker_lost=True,
-    worker_prefetch_multiplier=1,
-    task_track_started=True,
-    broker_transport_options={
-        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT_SECONDS", "7200"))
-    },
-    task_soft_time_limit=task_soft_time_limit,
-    task_time_limit=task_time_limit,
-)
 
 
 @setup_logging.connect
 def _on_celery_setup_logging(**_kwargs: object) -> None:
-    # Use app-wide JSON logging instead of Celery's default logging setup.
     configure_worker_logging()
 
 
 @worker_process_init.connect
 def _on_worker_process_init(**_kwargs: object) -> None:
-    # Ensure task child processes emit structured logs too.
+    global _worker_loop, _engine, _session_factory
     configure_worker_logging()
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+    if _engine is None:
+        _engine = create_async_engine(get_db_url(), poolclass=NullPool)
+    if _session_factory is None:
+        _session_factory = async_sessionmaker(
+            _engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        )
 
 
-def _make_session_factory():
-    engine = create_async_engine(get_db_url(), poolclass=NullPool)
-    factory = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
-    )
-    return engine, factory
+@worker_process_shutdown.connect
+def _on_worker_process_shutdown(**_kwargs: object) -> None:
+    global _worker_loop, _engine, _session_factory
+    if _worker_loop is None or _worker_loop.is_closed():
+        return
+    if _engine is not None:
+        _worker_loop.run_until_complete(_engine.dispose())
+    _engine = None
+    _session_factory = None
+    _worker_loop.close()
+    _worker_loop = None
 
 
 def _export_artifacts(document) -> tuple[bytes, bytes]:
@@ -114,7 +104,9 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         s3_client,
     )
 
-    engine, sf = _make_session_factory()
+    if _session_factory is None:
+        raise RuntimeError("Ingestion worker DB session factory is not initialized")
+    sf = _session_factory
     doc_uuid = UUID(document_id)
     pdf_path: Path | None = None
     pipeline_started_at = perf_counter()
@@ -180,7 +172,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         _log_stage("parse_pdf_docling")
         parse_result = await asyncio.to_thread(docling_parser.parse, pdf_path)
 
-        # -- export artifacts (CPU-bound serialization) ---------------------
+        # -- export artifacts (CPU-bound serialization) --------------------
         _log_stage("export_docling_artifacts")
         json_bytes, md_bytes = await asyncio.to_thread(_export_artifacts, parse_result.document)
 
@@ -371,7 +363,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         elapsed = round(perf_counter() - pipeline_started_at, 1)
         msg = (
             f"Ingestion timed out after {elapsed}s at stage '{current_stage}' "
-            f"(soft_time_limit={task_soft_time_limit}s)"
+            f"(soft_time_limit={_task_soft_time_limit}s)"
         )
         logger.error(
             "pipeline.soft_time_limit",
@@ -403,7 +395,6 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     finally:
         if pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
-        await engine.dispose()
 
 
 @celery_app.task(bind=True, name="ingest_document")
@@ -411,7 +402,9 @@ def ingest_document(self, document_id: str) -> None:
     """Full ingestion pipeline: parse -> chunk -> embed -> index -> finalize."""
     logger.info("ingest_document.start", extra={"document_id": document_id})
     try:
-        asyncio.run(_run_pipeline(document_id))
+        if _worker_loop is None or _worker_loop.is_closed():
+            raise RuntimeError("Ingestion worker loop is not initialized")
+        _worker_loop.run_until_complete(_run_pipeline(document_id))
         logger.info("ingest_document.done", extra={"document_id": document_id})
     except LookupError:
         logger.warning(

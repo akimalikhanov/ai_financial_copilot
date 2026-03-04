@@ -8,7 +8,7 @@ dev:
 api:
 	.venv/bin/uvicorn src.main:app --reload --host 0.0.0.0
 
-# Run only the chat worker
+# Run only the chat worker (Celery worker, queue: chat)
 .PHONY: worker
 worker:
 	.venv/bin/python -m src.workers.chat_worker

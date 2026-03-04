@@ -25,6 +25,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "fakeredis[lua]>=2.34.1",
     "httpx>=0.28.0",
     "notebook>=7.5.4",
     "pre-commit>=4.5.1",

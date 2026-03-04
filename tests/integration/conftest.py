@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -12,11 +13,7 @@ from httpx import ASGITransport, AsyncClient
 
 from src.api.routers import get_routers
 from src.db import init_db, shutdown_db
-from src.redis_client import (
-    close_redis_client,
-    create_redis_app_client,
-    create_redis_broker_client,
-)
+from src.redis_client import close_redis_client, create_redis_app_client
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
 from src.services.llm_router import LLMRouter, RoutedLLM
 
@@ -70,21 +67,43 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_db()
     app.state.llm_router = _create_mock_router()
     app.state.redis = await create_redis_app_client()
-    app.state.redis_broker = await create_redis_broker_client()
 
     yield
 
     await app.state.llm_router.close()
     await close_redis_client(app.state.redis)
-    await close_redis_client(app.state.redis_broker)
     await shutdown_db()
 
 
 @pytest.fixture(autouse=True)
-def _integration_redis_stream(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Use isolated Redis stream so real worker won't consume test jobs."""
-    monkeypatch.setattr("src.redis_client.CHAT_QUEUE_STREAM", "chat:queue:integration-test")
-    monkeypatch.setattr("src.workers.chat_worker.CHAT_QUEUE_STREAM", "chat:queue:integration-test")
+def _celery_eager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run Celery tasks synchronously in tests; execute task logic on worker loop in a thread."""
+    from src.celery_app import celery_app
+    from src.workers.chat_worker import (
+        _get_worker_loop,
+        _initialize_worker_resources,
+        _process_chat_async,
+        process_chat,
+    )
+
+    celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+
+    def _run_in_thread(request_id: str) -> None:
+        _initialize_worker_resources()
+        _get_worker_loop().run_until_complete(_process_chat_async(request_id))
+
+    def _patched_run(request_id: str) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            _run_in_thread(request_id)
+            return
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(_run_in_thread, request_id).result()
+
+    monkeypatch.setattr(process_chat, "run", _patched_run)
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +111,7 @@ def _patch_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure get_router returns mock in integration tests (no real API calls)."""
     mock_router = _create_mock_router()
     monkeypatch.setattr("src.services.llm_router.get_router", lambda *_args, **_kwargs: mock_router)
+    monkeypatch.setattr("src.workers.chat_worker.get_router", lambda *_args, **_kwargs: mock_router)
 
 
 @pytest.fixture(autouse=True)

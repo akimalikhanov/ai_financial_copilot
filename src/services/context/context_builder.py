@@ -26,9 +26,9 @@ def _db_message_to_chat_message(message: Message) -> schemas.ChatMessage:
 async def build_context(
     message_repo: MessageRepository,
     conversation_id: UUID,
-    after_seq: int | None = None,
+    before_seq: int | None = None,
     max_messages: int = 50,
-) -> tuple[list[schemas.ChatMessage], list[UUID]]:
+) -> tuple[list[schemas.ChatMessage], int]:
     """
     Build context messages for LLM request with sliding window optimization.
 
@@ -38,23 +38,15 @@ async def build_context(
     Args:
         message_repo: Message repository instance
         conversation_id: Conversation ID
-        after_seq: If provided, fetch messages after this seq (for incremental)
+        before_seq: If provided, exclude messages with seq >= this (e.g. assistant placeholder)
         max_messages: Maximum number of messages to include (sliding window)
 
     Returns:
-        Tuple of (messages, included_message_ids)
+        Tuple of (messages, latest_seq). latest_seq is the last message's seq, or 0 if empty.
     """
-    if after_seq is not None:
-        # Incremental fetch: get messages after the given seq
-        # This is useful for UI pagination, but for LLM context we want full history
-        # So we ignore after_seq and use sliding window instead
-        pass
-
-    # Use sliding window: get most recent messages (more efficient than all messages)
-    # This ensures we don't fetch thousands of messages for long conversations
-    db_messages = await message_repo.get_recent(conversation_id, max_messages)
-
+    db_messages = await message_repo.get_recent(
+        conversation_id, max_messages, before_seq=before_seq
+    )
     messages = [_db_message_to_chat_message(msg) for msg in db_messages]
-    included_message_ids = [msg.id for msg in db_messages]
-
-    return messages, included_message_ids
+    latest_seq = db_messages[-1].seq if db_messages else 0
+    return messages, latest_seq

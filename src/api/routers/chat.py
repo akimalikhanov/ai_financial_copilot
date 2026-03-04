@@ -3,25 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncGenerator
 from typing import cast
 from uuid import UUID
 
+from celery import Task
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from src.api.deps import CurrentUserDep, LLMRouterDep, RedisBrokerDep, RedisDep, chat_rate_limit
+from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.message import MessageRole
-from src.redis_client import enqueue_chat_request, events_stream_key
+from src.redis_client import append_chat_tail, events_stream_key
 from src.repository import (
     ConversationRepository,
     LLMRequestRepository,
     MessageRepository,
 )
 from src.schemas import chat as schemas
+from src.workers.chat_worker import process_chat
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -64,7 +67,6 @@ async def chat_enqueue(
     req: schemas.ChatEnqueueRequest,
     session: DbSessionDep,
     redis: RedisDep,
-    redis_broker: RedisBrokerDep,
     llm_router: LLMRouterDep,
     current_user: CurrentUserDep,
 ) -> schemas.ChatEnqueueResponse:
@@ -127,7 +129,18 @@ async def chat_enqueue(
     )
     await session.commit()
 
-    await enqueue_chat_request(redis_broker, str(llm_request.id))
+    with contextlib.suppress(Exception):
+        await append_chat_tail(
+            redis,
+            str(req.conversation_id),
+            schemas.ChatMessage(
+                role=schemas.Role.user,
+                content=req.content,
+            ).model_dump(mode="json"),
+            user_message.seq,
+        )
+
+    cast(Task, process_chat).delay(str(llm_request.id))
 
     return schemas.ChatEnqueueResponse(
         request_id=llm_request.id,
@@ -162,13 +175,27 @@ async def chat_stream_subscribe(
 
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
+        empty_polls = 0
         try:
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=10)
                 if not result:
+                    empty_polls += 1
+                    if empty_polls >= 3:
+                        req = await llm_request_repo.get_by_id(request_id)
+                        if req and req.status == "failed":
+                            yield _sse_event(
+                                "error",
+                                {
+                                    "error_type": "WorkerError",
+                                    "message": req.error_message or "Processing failed",
+                                },
+                            )
+                            return
                     yield ": keepalive\n\n"
                     continue
 
+                empty_polls = 0
                 for _, events in result:
                     for eid, raw_data in events:
                         last_id = eid

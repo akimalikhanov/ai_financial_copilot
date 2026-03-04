@@ -191,7 +191,7 @@ def configure_worker_logging() -> None:
         handler.addFilter(
             IncludeLoggerPrefixFilter(
                 prefixes=(
-                    "src.services.ingestion.celery_app",
+                    "src.services.ingestion.tasks",
                     "celery.worker.strategy",
                 )
             )

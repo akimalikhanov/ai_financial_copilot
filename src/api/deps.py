@@ -25,11 +25,6 @@ def get_redis(request: Request) -> Redis:
     return request.app.state.redis
 
 
-def get_redis_broker(request: Request) -> Redis:
-    """Retrieve Redis broker client (chat:queue, PDF tasks)."""
-    return request.app.state.redis_broker
-
-
 async def get_current_user(request: Request, session: DbSessionDep) -> User:
     """Extract Bearer token, decode JWT, load user; raise 401 if invalid."""
     auth = request.headers.get("Authorization")
@@ -85,5 +80,4 @@ async def chat_rate_limit(
 # Type alias for dependency injection - use in route signatures
 LLMRouterDep = Annotated[LLMRouter, Depends(get_llm_router)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
-RedisBrokerDep = Annotated[Redis, Depends(get_redis_broker)]
 CurrentUserDep = Annotated[User, Depends(get_current_user)]

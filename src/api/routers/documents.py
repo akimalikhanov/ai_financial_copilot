@@ -13,8 +13,8 @@ from src.api.deps import CurrentUserDep
 from src.db import DbSessionDep
 from src.repository import DocumentRepository
 from src.schemas.documents import DocumentListItem, ListDocumentsResponse, UploadDocumentResponse
-from src.services.ingestion.celery_app import ingest_document
 from src.services.ingestion.s3_client import upload_pdf
+from src.services.ingestion.tasks import ingest_document
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 

@@ -203,6 +203,16 @@ def get_chat_queue_stream() -> str:
     return os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
 
 
+def get_chat_tail_ttl() -> int:
+    """Chat tail cache TTL in seconds (CHAT_TAIL_TTL, default 1800)."""
+    return int(os.getenv("CHAT_TAIL_TTL", "1800"))
+
+
+def get_chat_tail_max_messages() -> int:
+    """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 50)."""
+    return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
+
+
 def _build_redis_url(host: str, port: str, db: str, password: str | None) -> str:
     if password:
         return f"redis://:{password}@{host}:{port}/{db}"
