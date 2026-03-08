@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 
@@ -92,3 +93,23 @@ def delete_by_document(collection: str, doc_id: UUID | str) -> None:
         ),
         wait=True,
     )
+
+
+def delete_by_chunk_ids(collection: str, chunk_ids: Sequence[UUID | str]) -> None:
+    """Delete vectors by point IDs (chunk IDs)."""
+    if not chunk_ids:
+        return
+
+    from qdrant_client.http.models import ExtendedPointId, PointIdsList
+
+    ids = [str(cid) for cid in chunk_ids]
+    _get_client().delete(
+        collection_name=collection,
+        points_selector=PointIdsList(points=cast(list[ExtendedPointId], ids)),
+        wait=True,
+    )
+
+
+def reset_client() -> None:
+    """Clear cached client (call after fork)."""
+    _get_client.cache_clear()

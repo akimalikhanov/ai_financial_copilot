@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -82,6 +83,30 @@ def _infer_chunk_type(doc_items: Iterable[Any]) -> str:
     return "text"
 
 
+_tokenizer: HuggingFaceTokenizer | None = None
+_tokenizer_lock = threading.Lock()
+
+
+def _get_tokenizer() -> HuggingFaceTokenizer:
+    """Lazy-init singleton. Thread-safe. Must be called after fork (Celery prefork)."""
+    global _tokenizer
+    if _tokenizer is not None:
+        return _tokenizer
+    with _tokenizer_lock:
+        if _tokenizer is not None:
+            return _tokenizer
+        hf = AutoTokenizer.from_pretrained(get_chunking_tokenizer_model())
+        _tokenizer = HuggingFaceTokenizer(tokenizer=hf, max_tokens=get_chunking_max_tokens())
+        return _tokenizer
+
+
+def reset_tokenizer() -> None:
+    """Call from worker_process_init to clear stale state after fork."""
+    global _tokenizer
+    with _tokenizer_lock:
+        _tokenizer = None
+
+
 def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[dict[str, Any]]:
     """
     Chunk a DoclingDocument with HybridChunker.
@@ -89,8 +114,7 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
     Returns a list of dicts ready for ChunkRepository.create_many().
     Each chunk includes document_id for tracing and Qdrant payload.
     """
-    hf_tokenizer = AutoTokenizer.from_pretrained(get_chunking_tokenizer_model())
-    tokenizer = HuggingFaceTokenizer(tokenizer=hf_tokenizer, max_tokens=get_chunking_max_tokens())
+    tokenizer = _get_tokenizer()
     chunker = HybridChunker(
         tokenizer=tokenizer,
         merge_peers=True,

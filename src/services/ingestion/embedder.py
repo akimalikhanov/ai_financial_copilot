@@ -31,6 +31,12 @@ def _get_openai_client():
     return OpenAI()
 
 
+def reset_clients() -> None:
+    """Clear cached clients/models (call after fork)."""
+    _get_sentence_transformer.cache_clear()
+    _get_openai_client.cache_clear()
+
+
 def _embed_local(chunks: list[str], model_name: str) -> list[list[float]]:
     model = _get_sentence_transformer(model_name)
     vectors = model.encode(chunks, batch_size=32, convert_to_numpy=True, show_progress_bar=False)

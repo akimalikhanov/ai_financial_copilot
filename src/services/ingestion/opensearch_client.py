@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
@@ -105,3 +106,25 @@ def delete_by_document(index: str, doc_id: UUID | str) -> None:
         body={"query": {"term": {"document_id": str(doc_id)}}},
         params={"conflicts": "proceed"},
     )
+
+
+def bulk_delete(index: str, chunk_ids: Sequence[UUID | str]) -> None:
+    """Bulk-delete chunks by _id (chunk_id)."""
+    if not chunk_ids:
+        return
+
+    try:
+        from opensearchpy.helpers import bulk
+    except ImportError as exc:
+        raise RuntimeError(
+            "opensearch-py is required for full-text indexing. "
+            "Install it with `.venv/bin/python -m pip install opensearch-py`."
+        ) from exc
+
+    actions = [{"_op_type": "delete", "_index": index, "_id": str(cid)} for cid in chunk_ids]
+    bulk(_get_client(), actions, refresh=True)
+
+
+def reset_client() -> None:
+    """Clear cached client (call after fork)."""
+    _get_client.cache_clear()

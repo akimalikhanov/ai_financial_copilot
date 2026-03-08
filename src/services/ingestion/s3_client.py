@@ -58,8 +58,11 @@ async def upload_pdf(
     return storage_key
 
 
+_STREAM_CHUNK_SIZE = 1024 * 256  # 256 KB
+
+
 async def download_file(storage_key: str, *, bucket: str | None = None) -> Path:
-    """Download an object to a local tempfile and return its path."""
+    """Download an object to a local tempfile and return its path. Streams to disk to avoid loading entire file into memory."""
     suffix = Path(storage_key).suffix or ".bin"
     target_bucket = bucket or get_s3_raw_bucket()
     session = aioboto3.Session()
@@ -72,11 +75,14 @@ async def download_file(storage_key: str, *, bucket: str | None = None) -> Path:
     ) as client:
         resp = await client.get_object(Bucket=target_bucket, Key=storage_key)
         body = resp["Body"]
-        data = body.read()
-        if hasattr(data, "__await__"):
-            data = await data
         with tempfile.NamedTemporaryFile(prefix="s3_", suffix=suffix, delete=False) as f:
-            f.write(data)
+            while True:
+                chunk = body.read(_STREAM_CHUNK_SIZE)
+                if hasattr(chunk, "__await__"):
+                    chunk = await chunk
+                if not chunk:
+                    break
+                f.write(chunk)
             return Path(f.name)
 
 

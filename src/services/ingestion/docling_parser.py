@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -62,6 +63,31 @@ def _create_converter() -> DocumentConverter:
     )
 
 
+_converter: DocumentConverter | None = None
+_converter_lock = threading.Lock()
+
+
+def _get_converter() -> DocumentConverter:
+    """Lazy-init singleton. Thread-safe. Must be called after fork (Celery prefork)."""
+    global _converter
+    if _converter is not None:
+        return _converter
+    with _converter_lock:
+        if _converter is not None:
+            return _converter
+        converter = _create_converter()
+        converter.initialize_pipeline(InputFormat.PDF)
+        _converter = converter
+        return _converter
+
+
+def reset_converter() -> None:
+    """Call from worker_process_init to clear stale state after fork."""
+    global _converter
+    with _converter_lock:
+        _converter = None
+
+
 def _extract_title(document: DoclingDocument) -> str | None:
     """Extract title from first TitleItem in document texts."""
     for item in document.texts:
@@ -77,9 +103,7 @@ def parse(pdf_path: Path) -> ParseResult:
     Parse PDF with Docling. Returns DoclingDocument and extracted metadata.
     Raises RuntimeError if conversion fails.
     """
-    converter = _create_converter()
-    converter.initialize_pipeline(InputFormat.PDF)
-
+    converter = _get_converter()
     result = converter.convert(pdf_path)
     if result.status == ConversionStatus.SUCCESS:
         pass

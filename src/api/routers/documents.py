@@ -75,7 +75,7 @@ async def upload_document(
     if file_size is not None and file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File size exceeds 50MB limit",
+            detail=f"File size exceeds {MAX_FILE_SIZE // (1024 * 1024)}MB limit",
         )
 
     doc_id = uuid4()

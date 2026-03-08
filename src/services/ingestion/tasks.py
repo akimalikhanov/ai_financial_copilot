@@ -19,6 +19,11 @@ from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.services.ingestion.chunker import reset_tokenizer
+from src.services.ingestion.docling_parser import reset_converter
+from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
+from src.services.ingestion.opensearch_client import reset_client as reset_opensearch_client
+from src.services.ingestion.qdrant_client import reset_client as reset_qdrant_client
 from src.utils.config import (
     get_db_url,
     get_embedding_dim,
@@ -54,6 +59,11 @@ def _on_celery_setup_logging(**_kwargs: object) -> None:
 def _on_worker_process_init(**_kwargs: object) -> None:
     global _worker_loop, _engine, _session_factory
     configure_worker_logging()
+    reset_converter()
+    reset_tokenizer()
+    reset_embedding_clients()
+    reset_qdrant_client()
+    reset_opensearch_client()
     if _worker_loop is None or _worker_loop.is_closed():
         _worker_loop = asyncio.new_event_loop()
     if _engine is None:
@@ -246,6 +256,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         async with sf() as session:
             chunk_repo = ChunkRepository(session)
+            old_db_chunks = await chunk_repo.list_by_document(doc_uuid)
+            old_chunk_ids = [c.id for c in old_db_chunks]
             db_chunks = await chunk_repo.create_many(doc_uuid, chunks)
             await session.commit()
 
@@ -315,11 +327,6 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         ).encode()
 
         await asyncio.gather(
-            asyncio.to_thread(qdrant_client.delete_by_document, "documents", document_id),
-            asyncio.to_thread(opensearch_client.delete_by_document, "chunks", document_id),
-        )
-
-        await asyncio.gather(
             asyncio.to_thread(
                 qdrant_client.upsert_chunks,
                 "documents",
@@ -333,6 +340,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "application/jsonl",
                 bucket=get_s3_chunks_bucket(),
             ),
+        )
+
+        await asyncio.gather(
+            asyncio.to_thread(qdrant_client.delete_by_chunk_ids, "documents", old_chunk_ids),
+            asyncio.to_thread(opensearch_client.bulk_delete, "chunks", old_chunk_ids),
         )
 
         # -- finalize -> ready ----------------------------------------------
