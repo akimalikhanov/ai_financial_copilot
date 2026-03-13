@@ -2,46 +2,36 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
-from functools import lru_cache
+from contextlib import suppress
 from typing import Any, cast
 from uuid import UUID
 
-
-@lru_cache(maxsize=1)
-def _get_client():
-    try:
-        from qdrant_client import QdrantClient
-    except ImportError as exc:
-        raise RuntimeError(
-            "qdrant-client is required for vector storage. "
-            "Install it with `.venv/bin/python -m pip install qdrant-client`."
-        ) from exc
-
-    host = os.getenv("QDRANT_HOST", "localhost")
-    port = int(os.getenv("QDRANT_PORT", "6333"))
-    return QdrantClient(host=host, port=port)
+from src.services.qdrant_client import get_client
+from src.services.qdrant_client import reset_client as reset_shared_client
 
 
 def ensure_collection(name: str, dim: int) -> None:
-    """Create collection if it does not exist."""
-    from qdrant_client.http.models import Distance, VectorParams
+    """Create collection if it does not exist; create payload indexes for filtering."""
+    from qdrant_client.http.models import Distance, PayloadSchemaType, VectorParams
 
-    client = _get_client()
-    if client.collection_exists(collection_name=name):
-        return
-
-    client.create_collection(
-        collection_name=name,
-        vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
-    )
+    client = get_client()
+    if not client.collection_exists(collection_name=name):
+        client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+        )
+    for field in ("user_id", "document_id"):
+        with suppress(Exception):
+            client.create_payload_index(name, field, PayloadSchemaType.KEYWORD)
 
 
 def upsert_chunks(
     collection: str,
     doc_id: UUID | str,
     chunks_with_vectors: list[dict[str, Any]],
+    *,
+    user_id: UUID | str,
 ) -> None:
     """
     Upsert chunk vectors with lean payload.
@@ -66,6 +56,7 @@ def upsert_chunks(
         payload: dict[str, Any] = {
             "chunk_id": str(chunk_id),
             "document_id": doc_id_str,
+            "user_id": str(user_id),
             "chunk_index": chunk_index,
         }
         for key in ("chunk_type", "page_start", "page_end", "heading_trail"):
@@ -74,14 +65,14 @@ def upsert_chunks(
 
         points.append(PointStruct(id=str(chunk_id), vector=vector, payload=payload))
 
-    _get_client().upsert(collection_name=collection, points=points, wait=True)
+    get_client().upsert(collection_name=collection, points=points, wait=True)
 
 
 def delete_by_document(collection: str, doc_id: UUID | str) -> None:
     """Delete all vectors for a document."""
     from qdrant_client.http.models import FieldCondition, Filter, MatchValue
 
-    _get_client().delete(
+    get_client().delete(
         collection_name=collection,
         points_selector=Filter(
             must=[
@@ -103,7 +94,7 @@ def delete_by_chunk_ids(collection: str, chunk_ids: Sequence[UUID | str]) -> Non
     from qdrant_client.http.models import ExtendedPointId, PointIdsList
 
     ids = [str(cid) for cid in chunk_ids]
-    _get_client().delete(
+    get_client().delete(
         collection_name=collection,
         points_selector=PointIdsList(points=cast(list[ExtendedPointId], ids)),
         wait=True,
@@ -112,4 +103,4 @@ def delete_by_chunk_ids(collection: str, chunk_ids: Sequence[UUID | str]) -> Non
 
 def reset_client() -> None:
     """Clear cached client (call after fork)."""
-    _get_client.cache_clear()
+    reset_shared_client()

@@ -22,8 +22,8 @@ from src.celery_app import celery_app
 from src.services.ingestion.chunker import reset_tokenizer
 from src.services.ingestion.docling_parser import reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
-from src.services.ingestion.opensearch_client import reset_client as reset_opensearch_client
-from src.services.ingestion.qdrant_client import reset_client as reset_qdrant_client
+from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
+from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
 from src.utils.config import (
     get_db_url,
     get_embedding_dim,
@@ -109,8 +109,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         chunker,
         docling_parser,
         embedder,
-        opensearch_client,
-        qdrant_client,
+        opensearch_ingest,
+        qdrant_ingest,
         s3_client,
     )
 
@@ -299,8 +299,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         _log_stage("ensure_vector_and_search_indexes")
         dim = len(vectors[0]) if vectors else (get_embedding_dim() or 384)
         await asyncio.gather(
-            asyncio.to_thread(qdrant_client.ensure_collection, "documents", dim),
-            asyncio.to_thread(opensearch_client.ensure_index, "chunks"),
+            asyncio.to_thread(qdrant_ingest.ensure_collection, "documents", dim),
+            asyncio.to_thread(opensearch_ingest.ensure_index, "chunks"),
         )
 
         # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
@@ -328,12 +328,19 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         await asyncio.gather(
             asyncio.to_thread(
-                qdrant_client.upsert_chunks,
+                qdrant_ingest.upsert_chunks,
                 "documents",
                 document_id,
                 chunks_with_vectors,
+                user_id=user_id,
             ),
-            asyncio.to_thread(opensearch_client.bulk_index, "chunks", document_id, os_chunks),
+            asyncio.to_thread(
+                opensearch_ingest.bulk_index,
+                "chunks",
+                document_id,
+                os_chunks,
+                user_id=user_id,
+            ),
             s3_client.upload_bytes(
                 f"{base_key}/chunks.jsonl",
                 chunks_jsonl,
@@ -343,8 +350,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         )
 
         await asyncio.gather(
-            asyncio.to_thread(qdrant_client.delete_by_chunk_ids, "documents", old_chunk_ids),
-            asyncio.to_thread(opensearch_client.bulk_delete, "chunks", old_chunk_ids),
+            asyncio.to_thread(qdrant_ingest.delete_by_chunk_ids, "documents", old_chunk_ids),
+            asyncio.to_thread(opensearch_ingest.bulk_delete, "chunks", old_chunk_ids),
         )
 
         # -- finalize -> ready ----------------------------------------------

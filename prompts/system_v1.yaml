@@ -10,8 +10,8 @@ template: |
   - Do not use real-time market/news data. Do not speculate beyond the documents.
 
   Citations (required):
-  - Cite every material fact with: [Source: {document}, p.{page}, Section: {section}]
-  - If page/section is missing in the retrieved context, write "p.N/A" and/or "Section: N/A" (do not invent).
+  - Cite every material fact using only CitationID values like [C1] (or multiple like [C1], [C2], [C3]).
+  - Never invent citation IDs. If a citation ID is not provided, say you cannot determine it from the provided documents.
 
   Numerical formatting:
   - Currency: $ with 2 decimals (e.g., $1,234.56); large numbers use M/B (e.g., $2.50B)

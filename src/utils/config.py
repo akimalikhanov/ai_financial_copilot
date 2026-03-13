@@ -198,11 +198,6 @@ def get_rate_limit_retry_after_sec() -> int:
     return get_rate_limit_window_ms() // 1000
 
 
-def get_chat_queue_stream() -> str:
-    """Redis stream key for chat queue (CHAT_QUEUE_STREAM, default chat:queue)."""
-    return os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
-
-
 def get_chat_tail_ttl() -> int:
     """Chat tail cache TTL in seconds (CHAT_TAIL_TTL, default 1800)."""
     return int(os.getenv("CHAT_TAIL_TTL", "1800"))
@@ -211,6 +206,12 @@ def get_chat_tail_ttl() -> int:
 def get_chat_tail_max_messages() -> int:
     """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 50)."""
     return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
+
+
+# --- Redis ---
+def get_chat_queue_stream() -> str:
+    """Redis stream key for chat queue (CHAT_QUEUE_STREAM, default chat:queue)."""
+    return os.getenv("CHAT_QUEUE_STREAM", "chat:queue")
 
 
 def _build_redis_url(host: str, port: str, db: str, password: str | None) -> str:
@@ -244,6 +245,7 @@ def get_redis_broker_url() -> str:
     return _build_redis_url(host, port, db, password)
 
 
+# --- S3 ---
 def get_s3_endpoint_url() -> str:
     """S3/Garage endpoint (AWS_ENDPOINT_URL, default http://127.0.0.1:3900)."""
     return os.getenv("AWS_ENDPOINT_URL", "http://127.0.0.1:3900")
@@ -297,6 +299,7 @@ def _parse_bool(val: str | None, default: bool) -> bool:
     return val.lower() in ("1", "true", "yes", "on")
 
 
+# --- Docling ---
 def get_docling_do_ocr() -> bool:
     """DOCLING_DO_OCR (default: true)."""
     return _parse_bool(os.getenv("DOCLING_DO_OCR"), True)
@@ -350,6 +353,24 @@ def get_chunking_max_tokens() -> int:
         return 1000
 
 
+def get_chunking_min_tokens() -> int:
+    """CHUNKING_MIN_TOKENS (default: 100)."""
+    val = os.getenv("CHUNKING_MIN_TOKENS", "100")
+    try:
+        return int(val)
+    except ValueError:
+        return 100
+
+
+def get_chunking_max_merge_multiplier() -> float:
+    """CHUNKING_MAX_MERGE_MULTIPLIER (default: 2.0)."""
+    val = os.getenv("CHUNKING_MAX_MERGE_MULTIPLIER", "2.0")
+    try:
+        return float(val)
+    except ValueError:
+        return 2.0
+
+
 def get_embedding_provider() -> str:
     """EMBEDDING_PROVIDER (default: local). Use 'openai' for OpenAI API."""
     return os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
@@ -369,3 +390,54 @@ def get_embedding_dim() -> int | None:
         return int(raw)
     except ValueError as exc:
         raise RuntimeError("EMBEDDING_DIM must be an integer") from exc
+
+
+# --- RAG retrieval ---
+def get_rag_top_k() -> int:
+    return int(os.getenv("RAG_TOP_K", "15"))
+
+
+def get_rag_max_chunks() -> int:
+    return int(os.getenv("RAG_MAX_CHUNKS", "10"))
+
+
+def get_rag_max_tokens() -> int:
+    return int(os.getenv("RAG_MAX_TOKENS", "4000"))
+
+
+def get_rag_vector_weight() -> float:
+    return float(os.getenv("RAG_VECTOR_WEIGHT", "0.6"))
+
+
+def get_rag_score_threshold() -> float:
+    return float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
+
+
+def get_vector_search_top_k() -> int:
+    """VECTOR_SEARCH_TOP_K (default: 10)."""
+    return int(os.getenv("VECTOR_SEARCH_TOP_K", "10"))
+
+
+def get_keyword_search_top_k() -> int:
+    """KEYWORD_SEARCH_TOP_K (default: 10)."""
+    return int(os.getenv("KEYWORD_SEARCH_TOP_K", "10"))
+
+
+def get_fuse_rrf_k() -> int:
+    """FUSE_RRF_K (default: 60)."""
+    return int(os.getenv("FUSE_RRF_K", "60"))
+
+
+def get_fuse_rrf_final_top_k() -> int:
+    """FUSE_RRF_FINAL_TOP_K (default: 15)."""
+    return int(os.getenv("FUSE_RRF_FINAL_TOP_K", "15"))
+
+
+def get_fuse_rrf_vector_weight() -> float:
+    """FUSE_RRF_VECTOR_WEIGHT (default: 0.6)."""
+    return float(os.getenv("FUSE_RRF_VECTOR_WEIGHT", "0.6"))
+
+
+def get_fuse_rrf_keyword_weight() -> float:
+    """FUSE_RRF_KEYWORD_WEIGHT (default: 0.4)."""
+    return float(os.getenv("FUSE_RRF_KEYWORD_WEIGHT", "0.4"))

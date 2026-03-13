@@ -117,12 +117,12 @@ def _mock_ingestion_services():
         patch("src.services.ingestion.tasks._export_artifacts") as mock_export,
         patch("src.services.ingestion.chunker.chunk_document") as mock_chunk,
         patch("src.services.ingestion.embedder.embed_chunks") as mock_embed,
-        patch("src.services.ingestion.qdrant_client.ensure_collection") as mock_qdrant_ensure,
-        patch("src.services.ingestion.qdrant_client.delete_by_chunk_ids") as mock_qdrant_delete,
-        patch("src.services.ingestion.qdrant_client.upsert_chunks") as mock_qdrant_upsert,
-        patch("src.services.ingestion.opensearch_client.ensure_index") as mock_os_ensure,
-        patch("src.services.ingestion.opensearch_client.bulk_delete") as mock_os_delete,
-        patch("src.services.ingestion.opensearch_client.bulk_index") as mock_os_bulk,
+        patch("src.services.ingestion.qdrant_ingest.ensure_collection") as mock_qdrant_ensure,
+        patch("src.services.ingestion.qdrant_ingest.delete_by_chunk_ids") as mock_qdrant_delete,
+        patch("src.services.ingestion.qdrant_ingest.upsert_chunks") as mock_qdrant_upsert,
+        patch("src.services.ingestion.opensearch_ingest.ensure_index") as mock_os_ensure,
+        patch("src.services.ingestion.opensearch_ingest.bulk_delete") as mock_os_delete,
+        patch("src.services.ingestion.opensearch_ingest.bulk_index") as mock_os_bulk,
     ):
         mock_s3_download.return_value = Path("/tmp/fake_doc.pdf")
         mock_s3_upload.return_value = None
@@ -149,7 +149,7 @@ def _mock_ingestion_services():
 
 
 @pytest.fixture
-def _patch_session_factory(_ingestion_session: AsyncSession):
+def _patch_session_factory(ingestion_session: AsyncSession):  # noqa: ARG001
     """Patch the ingestion task's session factory to use our test session."""
     engine = create_async_engine(get_db_url(), poolclass=NullPool)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

@@ -59,3 +59,9 @@ class ChunkRepository:
             select(Chunk).where(Chunk.document_id == document_id).order_by(Chunk.chunk_index.asc())
         )
         return list(result.scalars().all())
+
+    async def get_by_ids(self, chunk_ids: list[UUID]) -> list[Chunk]:
+        if not chunk_ids:
+            return []
+        result = await self.session.execute(select(Chunk).where(Chunk.id.in_(chunk_ids)))
+        return list(result.scalars().all())

@@ -2,37 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
-from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
-
-@lru_cache(maxsize=1)
-def _get_client():
-    try:
-        from opensearchpy import OpenSearch
-    except ImportError as exc:
-        raise RuntimeError(
-            "opensearch-py is required for full-text indexing. "
-            "Install it with `.venv/bin/python -m pip install opensearch-py`."
-        ) from exc
-
-    host = os.getenv("OPENSEARCH_BIND_HOST", "localhost")
-    port = int(os.getenv("OPENSEARCH_HTTP_PORT", "9200"))
-    return OpenSearch(
-        hosts=[{"host": host, "port": port}],
-        use_ssl=False,
-        verify_certs=False,
-        ssl_assert_hostname=False,
-        ssl_show_warn=False,
-    )
+from src.services.opensearch_client import get_client
+from src.services.opensearch_client import reset_client as reset_shared_client
 
 
 def ensure_index(name: str) -> None:
     """Create index with mappings if it does not exist."""
-    client = _get_client()
+    client = get_client()
     if client.indices.exists(index=name):
         return
 
@@ -48,6 +28,7 @@ def ensure_index(name: str) -> None:
             "mappings": {
                 "properties": {
                     "document_id": {"type": "keyword"},
+                    "user_id": {"type": "keyword"},
                     "chunk_id": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
                     "enriched_text": {"type": "text"},
@@ -62,7 +43,13 @@ def ensure_index(name: str) -> None:
     )
 
 
-def bulk_index(index: str, doc_id: UUID | str, chunks: list[dict[str, Any]]) -> None:
+def bulk_index(
+    index: str,
+    doc_id: UUID | str,
+    chunks: list[dict[str, Any]],
+    *,
+    user_id: UUID | str,
+) -> None:
     """Bulk-index document chunks for full-text retrieval."""
     if not chunks:
         return
@@ -83,6 +70,7 @@ def bulk_index(index: str, doc_id: UUID | str, chunks: list[dict[str, Any]]) -> 
             "_id": str(item["chunk_id"]),
             "_source": {
                 "document_id": doc_id_str,
+                "user_id": str(user_id),
                 "chunk_id": str(item["chunk_id"]),
                 "chunk_index": item["chunk_index"],
                 "enriched_text": item["enriched_text"],
@@ -90,18 +78,17 @@ def bulk_index(index: str, doc_id: UUID | str, chunks: list[dict[str, Any]]) -> 
                 "chunk_type": item.get("chunk_type"),
                 "page_start": item.get("page_start"),
                 "page_end": item.get("page_end"),
-                "metadata": item.get("metadata", {}),
             },
         }
         for item in chunks
     ]
 
-    bulk(_get_client(), actions, refresh=True)
+    bulk(get_client(), actions, refresh=True)
 
 
 def delete_by_document(index: str, doc_id: UUID | str) -> None:
     """Delete all indexed chunks for a document."""
-    _get_client().delete_by_query(
+    get_client().delete_by_query(
         index=index,
         body={"query": {"term": {"document_id": str(doc_id)}}},
         params={"conflicts": "proceed"},
@@ -122,9 +109,9 @@ def bulk_delete(index: str, chunk_ids: Sequence[UUID | str]) -> None:
         ) from exc
 
     actions = [{"_op_type": "delete", "_index": index, "_id": str(cid)} for cid in chunk_ids]
-    bulk(_get_client(), actions, refresh=True)
+    bulk(get_client(), actions, refresh=True)
 
 
 def reset_client() -> None:
     """Clear cached client (call after fork)."""
-    _get_client.cache_clear()
+    reset_shared_client()
