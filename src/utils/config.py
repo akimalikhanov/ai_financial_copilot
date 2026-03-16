@@ -441,3 +441,34 @@ def get_fuse_rrf_vector_weight() -> float:
 def get_fuse_rrf_keyword_weight() -> float:
     """FUSE_RRF_KEYWORD_WEIGHT (default: 0.4)."""
     return float(os.getenv("FUSE_RRF_KEYWORD_WEIGHT", "0.4"))
+
+
+# --- Reranker ---
+def get_reranker_enabled() -> bool:
+    """RERANKER_ENABLED (default: False)."""
+    return os.getenv("RERANKER_ENABLED", "false").lower() in ("true", "1", "yes")
+
+
+def get_reranker_base_url() -> str:
+    """RERANKER_BASE_URL (default: http://localhost:8080)."""
+    return os.getenv("RERANKER_BASE_URL", "http://localhost:8080")
+
+
+def get_reranker_model_name() -> str:
+    """RERANKER_MODEL_NAME (default: Alibaba-NLP/gte-reranker-modernbert-base)."""
+    return os.getenv("RERANKER_MODEL_NAME", "Alibaba-NLP/gte-reranker-modernbert-base")
+
+
+def get_reranker_timeout_seconds() -> float:
+    """RERANKER_TIMEOUT_SECONDS (default: 10.0)."""
+    return float(os.getenv("RERANKER_TIMEOUT_SECONDS", "10.0"))
+
+
+def get_reranker_top_k() -> int:
+    """RERANKER_TOP_K (default: 10). Number of chunks to return after reranking."""
+    return int(os.getenv("RERANKER_TOP_K", "10"))
+
+
+def get_reranker_max_input() -> int:
+    """RERANKER_MAX_INPUT (default: 30). Max chunks to send to reranker per query."""
+    return int(os.getenv("RERANKER_MAX_INPUT", "30"))

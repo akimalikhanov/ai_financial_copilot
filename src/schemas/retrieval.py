@@ -32,36 +32,57 @@ class RetrievedChunk:
 
 @dataclass(slots=True, frozen=True)
 class ChunkPromptPayload:
+    """Prompt-ready chunk for context assembly."""
+
     chunk_id: UUID
     document_id: UUID
     document_name: str
     page_numbers: tuple[int, ...]
-    section_title: str | None
-
-    # Prompt-ready block with a placeholder for citation ID.
-    # Example:
-    #   "[__REF__ | Apple 10-K 2024 | p.42 | Risk Factors]\n<enriched_text>"
-    prompt_block_template: str
-
-    # Token count of prompt_block_template measured with a fixed-width ref
-    # like "C000", so runtime replacement stays effectively stable.
-    prompt_token_count: int
-
-    # Optional short snippet for UI citation drawers / collapsible source list.
-    # Not needed by the model, so keep it optional.
+    heading_trail: tuple[str, ...]  # e.g. ("Starvest plc Report...", "CONTENTS")
+    prompt_text: str  # e.g. "[__REF__ | Doc | p.42 | Section]\n<enriched_text>"
     snippet: str | None = None
+    provenance: ChunkProvenance | None = None
 
 
 @dataclass(slots=True, frozen=True)
 class Citation:
-    ref_id: str  # "C1", "C2", ...
+    ref_id: str
     ref_index: int
     chunk_id: UUID
     document_id: UUID
     document_name: str
+    filename: str | None
     page_numbers: tuple[int, ...]
-    section_title: str | None
+    heading_path: tuple[str, ...]
     snippet: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class BoundingBox:
+    left: float
+    top: float
+    right: float
+    bottom: float
+    coord_origin: str
+
+
+@dataclass(slots=True, frozen=True)
+class ProvenanceItem:
+    page_no: int
+    label: str
+    self_ref: str | None
+    charspan: tuple[int, int] | None
+    bbox: BoundingBox | None
+
+
+@dataclass(slots=True, frozen=True)
+class ChunkProvenance:
+    filename: str | None
+    mimetype: str | None
+    binary_hash: int | None
+    page_span: tuple[int, int] | None
+    doc_item_refs: tuple[str, ...]
+    items: tuple[ProvenanceItem, ...]
 
 
 @dataclass(slots=True, frozen=True)
@@ -69,9 +90,9 @@ class ContextItem:
     ref_id: str
     chunk_id: UUID
     score: float
-    token_count: int
     prompt_text: str
     citation: Citation
+    provenance: ChunkProvenance | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -79,7 +100,6 @@ class RAGContext:
     formatted_context: str
     items: tuple[ContextItem, ...]
     chunk_count: int
-    token_count: int
 
     @property
     def citations(self) -> tuple[Citation, ...]:

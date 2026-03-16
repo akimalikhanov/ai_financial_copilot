@@ -16,6 +16,7 @@ volumes:
   opensearch_data:
   garage_data:
   garage_meta:
+  tei_data:
 
 services:
   postgres:
@@ -202,6 +203,33 @@ services:
       start_period: 60s
     cpus: "0.50"
     mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0
+    container_name: tei
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model-id
+      - ${RERANKER_MODEL_NAME:-Alibaba-NLP/gte-reranker-modernbert-base}
+      - --dtype
+      - float16
+    ports:
+      - "${RERANKER_BIND_HOST:-127.0.0.1}:${RERANKER_PORT:-8080}:80"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - tei_data:/data
+    cpus: "2.00"
+    mem_limit: 4g
     <<: *default-logging
     networks: [backend]
 
