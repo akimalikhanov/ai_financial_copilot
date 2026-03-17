@@ -393,6 +393,11 @@ def get_embedding_dim() -> int | None:
 
 
 # --- RAG retrieval ---
+def get_query_router_model() -> str:
+    """Model ID for query routing (QUERY_ROUTER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
+    return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
+
+
 def get_rag_top_k() -> int:
     return int(os.getenv("RAG_TOP_K", "15"))
 

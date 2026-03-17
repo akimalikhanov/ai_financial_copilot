@@ -6,7 +6,30 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+from pydantic import BaseModel
+
 RetrievalSource = Literal["vector", "keyword", "hybrid"]
+
+Route = Literal["direct_answer", "retrieve"]
+
+
+class RouterOutput(BaseModel):
+    """Schema for LLM router response. LLM must output valid JSON matching this structure."""
+
+    route: Route
+    user_intent: str
+    reason: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProcessedQuery:
+    """Result of query preprocessing and routing."""
+
+    normalized_text: str
+    route: Route
+    user_intent: str
+    reason: str | None = None
+
 
 REF_PLACEHOLDER = "__REF__"  # safer than str.format() for arbitrary chunk text
 
