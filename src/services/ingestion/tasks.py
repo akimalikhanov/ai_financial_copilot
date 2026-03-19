@@ -143,6 +143,10 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             },
         )
 
+    def _flush_stage_times() -> None:
+        if current_stage != "initializing":
+            stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+
     try:
         # -- fetch document record, set status -> processing ----------------
         _log_stage("fetch_document_record")
@@ -379,34 +383,51 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     except LookupError:
         raise
     except SoftTimeLimitExceeded:
+        _flush_stage_times()
         elapsed = round(perf_counter() - pipeline_started_at, 1)
         msg = (
             f"Ingestion timed out after {elapsed}s at stage '{current_stage}' "
             f"(soft_time_limit={_task_soft_time_limit}s)"
         )
+        ingest_times = {
+            "stages": stage_times,
+            "total_time": round(perf_counter() - pipeline_started_at, 3),
+            "failed_at_stage": current_stage,
+        }
         logger.error(
             "pipeline.soft_time_limit",
             extra={
                 "document_id": document_id,
                 "stage": current_stage,
                 "elapsed_seconds": elapsed,
+                "stage_times": stage_times,
             },
         )
         try:
             async with sf() as session:
-                await DocumentRepository(session).set_failed(doc_uuid, msg)
+                repo = DocumentRepository(session)
+                await repo.set_failed(doc_uuid, msg)
+                await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
     except Exception as exc:
+        _flush_stage_times()
+        ingest_times = {
+            "stages": stage_times,
+            "total_time": round(perf_counter() - pipeline_started_at, 3),
+            "failed_at_stage": current_stage,
+        }
         logger.exception(
             "pipeline.failed_at_stage",
-            extra={"document_id": document_id, "stage": current_stage},
+            extra={"document_id": document_id, "stage": current_stage, "stage_times": stage_times},
         )
         try:
             async with sf() as session:
-                await DocumentRepository(session).set_failed(doc_uuid, str(exc))
+                repo = DocumentRepository(session)
+                await repo.set_failed(doc_uuid, str(exc))
+                await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})

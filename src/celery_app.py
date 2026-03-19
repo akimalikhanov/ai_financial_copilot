@@ -21,7 +21,7 @@ celery_app = Celery(
     broker=get_redis_broker_url(),
     include=[
         "src.services.ingestion.tasks",
-        "src.workers.chat_worker",
+        "src.services.chat.tasks",
     ],
 )
 

@@ -220,7 +220,8 @@ async def test_chat_error_propagation_sse(async_client, monkeypatch: pytest.Monk
     error_msg = "Simulated streaming error"
     error_router = _create_error_router(error_msg)
     monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: error_router)
-    monkeypatch.setattr("src.workers.chat_worker.get_router", lambda *_a, **_k: error_router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: error_router)
+    monkeypatch.setattr("src.services.chat.tasks._router", error_router)
 
     email = f"chatflow-err-{uuid4().hex}@test.com"
     reg = await async_client.post(

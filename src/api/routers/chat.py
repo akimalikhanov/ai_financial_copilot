@@ -24,7 +24,7 @@ from src.repository import (
     MessageRepository,
 )
 from src.schemas import chat as schemas
-from src.workers.chat_worker import process_chat
+from src.services.chat.tasks import process_chat
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 

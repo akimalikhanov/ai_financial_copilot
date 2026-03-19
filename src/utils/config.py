@@ -477,3 +477,12 @@ def get_reranker_top_k() -> int:
 def get_reranker_max_input() -> int:
     """RERANKER_MAX_INPUT (default: 30). Max chunks to send to reranker per query."""
     return int(os.getenv("RERANKER_MAX_INPUT", "30"))
+
+
+def get_chat_retrieval_timeout() -> float:
+    """CHAT_RETRIEVAL_TIMEOUT in seconds (default: 200.0). Per-backend retrieval timeout, fail-open."""
+    val = os.getenv("CHAT_RETRIEVAL_TIMEOUT", "200")
+    try:
+        return float(val)
+    except ValueError:
+        return 200.0

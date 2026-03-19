@@ -79,10 +79,10 @@ async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def _celery_eager(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run Celery tasks synchronously in tests; execute task logic on worker loop in a thread."""
     from src.celery_app import celery_app
-    from src.workers.chat_worker import (
+    from src.services.chat.tasks import (
         _get_worker_loop,
         _initialize_worker_resources,
-        _process_chat_async,
+        _run_chat_pipeline,
         process_chat,
     )
 
@@ -90,7 +90,7 @@ def _celery_eager(monkeypatch: pytest.MonkeyPatch) -> None:
 
     def _run_in_thread(request_id: str) -> None:
         _initialize_worker_resources()
-        _get_worker_loop().run_until_complete(_process_chat_async(request_id))
+        _get_worker_loop().run_until_complete(_run_chat_pipeline(request_id))
 
     def _patched_run(request_id: str) -> None:
         try:
@@ -111,7 +111,7 @@ def _patch_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure get_router returns mock in integration tests (no real API calls)."""
     mock_router = _create_mock_router()
     monkeypatch.setattr("src.services.llm_router.get_router", lambda *_args, **_kwargs: mock_router)
-    monkeypatch.setattr("src.workers.chat_worker.get_router", lambda *_args, **_kwargs: mock_router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_args, **_kwargs: mock_router)
 
 
 @pytest.fixture(autouse=True)

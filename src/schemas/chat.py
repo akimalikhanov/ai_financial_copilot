@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from redis.asyncio import Redis
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.models.llm_request import LLMRequest
+    from src.schemas.retrieval import ProcessedQuery, RAGContext
+    from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
 
 
 class Role(str, Enum):
@@ -23,6 +32,27 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+
+
+@dataclass
+class ChatPipelineState:
+    """Pipeline state passed between chat pipeline stages."""
+
+    request_id: str
+    redis_app: Redis
+    session: AsyncSession
+    llm_request: LLMRequest | None = None
+    conversation_id: UUID | None = None
+    assistant_message_id: UUID | None = None
+    assistant_seq: int = 0
+    context_messages: list[ChatMessage] | None = None
+    user_query_raw: str = ""
+    processed_query: ProcessedQuery | None = None
+    rag_context: RAGContext | None = None
+    rag_context_str: str = ""
+    adapter_messages: list[AdapterChatMessage] | None = None
+    accumulated_content: str = ""
+    params: dict = field(default_factory=dict)
 
 
 class LLMResponseStats(BaseModel):
