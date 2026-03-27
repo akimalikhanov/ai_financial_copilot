@@ -45,7 +45,7 @@ def assemble_rag_context(
         if payload is None:
             raise ValueError(f"Missing ChunkPromptPayload for chunk_id={chunk.chunk_id}")
 
-        ref_id = f"C{idx + 1}"
+        ref_id = f"S{idx + 1}"
         prompt_text = payload.prompt_text.replace(REF_PLACEHOLDER, ref_id)
 
         citation = Citation(

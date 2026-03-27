@@ -424,7 +424,10 @@ CREATE TABLE IF NOT EXISTS messages (
   -- Stable per-conversation ordering number (use instead of created_at for pagination).
 
   content            text NOT NULL,
-  -- Message text (assistant output or user input). Keep as text to avoid bloat.
+  -- Message text (clean, markup-stripped version for display).
+
+  raw_content        text,
+  -- Raw LLM output including any citation markup (e.g., <claim> tags). Nullable; NULL for user messages.
 
   content_format     text NOT NULL DEFAULT 'text/markdown',
   -- Content type hint (text/plain, text/markdown, etc).
@@ -460,7 +463,8 @@ COMMENT ON COLUMN messages.user_id IS 'Denormalized FK to users for auth/audit.'
 COMMENT ON COLUMN messages.role IS 'Role: system/user/assistant/tool.';
 COMMENT ON COLUMN messages.status IS 'Status: completed/in_progress/cancelled/error.';
 COMMENT ON COLUMN messages.seq IS 'Stable per-conversation ordering number.';
-COMMENT ON COLUMN messages.content IS 'Message body (text).';
+COMMENT ON COLUMN messages.content IS 'Message body (clean text, citation markup stripped).';
+COMMENT ON COLUMN messages.raw_content IS 'Raw LLM output with citation markup (e.g., <claim> tags). NULL for user/system messages.';
 COMMENT ON COLUMN messages.content_format IS 'Content format hint (e.g., text/markdown).';
 COMMENT ON COLUMN messages.metadata IS 'JSON metadata: citations, tool payloads, etc.';
 COMMENT ON COLUMN messages.client_msg_id IS 'Client idempotency id (unique per conversation).';

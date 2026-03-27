@@ -63,6 +63,16 @@ def _page_numbers(page_start: int | None, page_end: int | None) -> tuple[int, ..
     return tuple(range(page_start, page_end + 1))
 
 
+def _snippet_text(text: str, max_chars: int = 200) -> str | None:
+    """Short preview of chunk body for citations/UI (whitespace-normalized, truncated)."""
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return None
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 1].rstrip() + "…"
+
+
 def _format_prompt_block(
     doc_name: str,
     page_numbers: tuple[int, ...],
@@ -121,7 +131,7 @@ async def get_chunk_prompt_payloads(
             page_numbers=page_numbers,
             heading_trail=heading_trail,
             prompt_text=prompt_text,
-            snippet=None,
+            snippet=_snippet_text(chunk.raw_text, max_chars=150),
             provenance=provenance,
         )
 

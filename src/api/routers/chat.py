@@ -176,6 +176,7 @@ async def chat_stream_subscribe(
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
+        yield ": ok\n\n"
         try:
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=10)

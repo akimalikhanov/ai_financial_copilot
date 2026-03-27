@@ -104,6 +104,8 @@ class MessageRepository:
         message_id: UUID,
         content: str,
         request_id: UUID | None = None,
+        raw_content: str | None = None,
+        metadata_updates: dict | None = None,
     ) -> Message | None:
         """Update message content and status on stream completion."""
         result = await self.session.execute(select(Message).where(Message.id == message_id))
@@ -113,8 +115,12 @@ class MessageRepository:
 
         message.content = content
         message.status = MessageStatus.completed
+        if raw_content is not None:
+            message.raw_content = raw_content
         if request_id is not None:
             message.request_id = request_id
+        if metadata_updates:
+            message.message_metadata = {**message.message_metadata, **metadata_updates}
 
         await self.session.flush()
         return message

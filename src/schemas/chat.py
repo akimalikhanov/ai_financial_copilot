@@ -52,6 +52,7 @@ class ChatPipelineState:
     rag_context_str: str = ""
     adapter_messages: list[AdapterChatMessage] | None = None
     accumulated_content: str = ""
+    clean_content: str = ""
     params: dict = field(default_factory=dict)
 
 

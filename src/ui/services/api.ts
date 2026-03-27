@@ -70,6 +70,29 @@ export interface ApiError {
   raw?: unknown;
 }
 
+// --- Citation streaming event types ---
+
+export interface CitationSpanEvent {
+  start: number;
+  end: number;
+  ref_ids: string[];
+  display_labels: string[];
+}
+
+export interface ReferencesEvent {
+  items: {
+    ref_id: string;
+    display_label: string;
+    chunk_id: string;
+    document_id: string;
+    document_name: string;
+    filename: string | null;
+    page_numbers: number[];
+    heading_path: string[];
+    snippet: string | null;
+  }[];
+}
+
 type ApiErrorOptions = {
   statusCode?: number;
   fallbackMessage?: string;
@@ -593,13 +616,48 @@ export const chatEnqueue = async (
   return (await response.json()) as ChatEnqueueResponse;
 };
 
+const MAX_SSE_RETRIES = 2;
+const SSE_RETRY_DELAY_MS = 500;
+
 export const chatStreamSubscribe = async (
   requestId: string,
   onDelta: (chunk: LLMStreamChunk) => void,
+  onCitationSpan: (span: CitationSpanEvent) => void,
+  onReferences: (refs: ReferencesEvent) => void,
   onFinal: (chunk: LLMStreamChunk) => void,
   onError: (error: ApiError) => void,
   afterEventId?: string
 ): Promise<void> => {
+  for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
+    const result = await _doStreamAttempt(
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId
+    );
+    if (result === 'done' || result === 'server-error') return;
+    // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
+    if (attempt < MAX_SSE_RETRIES) {
+      await new Promise((r) => setTimeout(r, SSE_RETRY_DELAY_MS));
+      continue;
+    }
+    // Exhausted retries
+    onError({ message: 'Unable to connect to the server. Check your internet connection and try again.' });
+  }
+};
+
+/**
+ * Single SSE stream attempt. Returns:
+ * - 'done': stream completed successfully (or onError called for a server-side error)
+ * - 'server-error': non-retryable error (HTTP error, server-sent error event)
+ * - 'connection-error': connection-level failure before any content events — safe to retry
+ */
+async function _doStreamAttempt(
+  requestId: string,
+  onDelta: (chunk: LLMStreamChunk) => void,
+  onCitationSpan: (span: CitationSpanEvent) => void,
+  onReferences: (refs: ReferencesEvent) => void,
+  onFinal: (chunk: LLMStreamChunk) => void,
+  onError: (error: ApiError) => void,
+  afterEventId?: string,
+): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
     params.set('after_event_id', afterEventId);
@@ -611,21 +669,21 @@ export const chatStreamSubscribe = async (
       method: 'GET',
       headers: { Accept: 'text/event-stream' },
     });
-  } catch (error) {
-    onError(toApiErrorFromThrowable(error));
-    return;
+  } catch {
+    return 'connection-error';
   }
   if (!response.ok) {
     onError(await toApiErrorFromResponse(response));
-    return;
+    return 'server-error';
   }
   if (!response.body) {
     onError({ message: 'Stream response has no body', statusCode: response.status });
-    return;
+    return 'server-error';
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let receivedContent = false;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -648,22 +706,41 @@ export const chatStreamSubscribe = async (
             /* keep raw */
           }
           onError(toApiError(payload, { fallbackMessage: 'Streaming error', statusCode: response.status }));
-          return;
+          return 'server-error';
+        }
+        // Handle citation_span events
+        if (parsed.event === 'citation_span') {
+          try {
+            const span = JSON.parse(parsed.data) as CitationSpanEvent;
+            onCitationSpan(span);
+            receivedContent = true;
+          } catch { /* ignore malformed */ }
+          continue;
+        }
+        // Handle references events
+        if (parsed.event === 'references') {
+          try {
+            const refs = JSON.parse(parsed.data) as ReferencesEvent;
+            onReferences(refs);
+            receivedContent = true;
+          } catch { /* ignore malformed */ }
+          continue;
         }
         let payload: LLMStreamChunk | null = null;
         try {
           payload = JSON.parse(parsed.data) as LLMStreamChunk;
         } catch {
           onError(toApiError(parsed.data, { fallbackMessage: 'Failed to parse stream payload', statusCode: response.status }));
-          return;
+          return 'server-error';
         }
         const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
         const safePayload: LLMStreamChunk = { ...payload, is_final: isFinal };
         if (isFinal) {
           onFinal(safePayload);
-        } else {
-          onDelta(safePayload);
+          return 'done';
         }
+        onDelta(safePayload);
+        receivedContent = true;
       }
     }
     if (buffer.trim().length > 0) {
@@ -673,19 +750,26 @@ export const chatStreamSubscribe = async (
           const payload = JSON.parse(parsed.data) as LLMStreamChunk;
           const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
           const safePayload = { ...payload, is_final: isFinal };
-          if (isFinal) onFinal(safePayload);
-          else onDelta(safePayload);
+          if (isFinal) {
+            onFinal(safePayload);
+            return 'done';
+          }
+          onDelta(safePayload);
+          receivedContent = true;
         } catch {
           onError(toApiError(buffer, { fallbackMessage: 'Failed to parse trailing payload', statusCode: response.status }));
+          return 'server-error';
         }
       }
     }
-  } catch (error) {
-    onError(toApiErrorFromThrowable(error));
+    // Stream ended without a final event
+    return receivedContent ? 'done' : 'connection-error';
+  } catch {
+    return receivedContent ? 'done' : 'connection-error';
   } finally {
     reader.releaseLock();
   }
-};
+}
 
 // --- Chat Stats API ---
 

@@ -23,11 +23,32 @@ export interface Citation {
   bboxHint?: BoundingBox;
 }
 
+export interface CitationSpan {
+  start: number;
+  end: number;
+  refIds: string[];
+  displayLabels: string[];
+}
+
+export interface ReferenceItem {
+  refId: string;
+  displayLabel: string;
+  chunkId: string;
+  documentId: string;
+  documentName: string;
+  filename: string | null;
+  pageNumbers: number[];
+  headingPath: string[];
+  snippet: string | null;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   citations?: Citation[];
+  citationSpans?: CitationSpan[];
+  references?: ReferenceItem[];
   timestamp: number;
 }
 

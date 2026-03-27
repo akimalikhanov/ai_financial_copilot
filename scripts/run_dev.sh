@@ -9,7 +9,7 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-.venv/bin/uvicorn src.main:app --reload --host 0.0.0.0 &
+.venv/bin/uvicorn src.main:app --reload --reload-dir src --host 0.0.0.0 &
 pids+=($!)
 .venv/bin/python -m src.workers.chat_worker &
 pids+=($!)

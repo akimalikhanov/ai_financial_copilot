@@ -252,6 +252,17 @@ def reset_tokenizer() -> None:
         _tokenizer = None
 
 
+def _build_picture_descriptions(document: DoclingDocument) -> dict[str, str]:
+    """Map self_ref → VLM description text for all pictures that have one."""
+    result: dict[str, str] = {}
+    for pic in document.pictures:
+        if pic.meta is not None and pic.meta.description is not None:
+            text = (pic.meta.description.text or "").strip()
+            if text:
+                result[pic.self_ref] = text
+    return result
+
+
 def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[dict[str, Any]]:
     """
     Chunk a DoclingDocument with the custom HybridChunker.
@@ -268,24 +279,42 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         max_merge_multiplier=get_chunking_max_merge_multiplier(),
     )
     doc_id_str = str(document_id)
+    pic_descriptions = _build_picture_descriptions(document)
     rows: list[dict[str, Any]] = []
 
     for i, chunk in enumerate(chunker.chunk(dl_doc=document)):
         doc_chunk = DocChunk.model_validate(chunk)
         doc_items = list(doc_chunk.meta.doc_items)
-        enriched_text = chunker.contextualize(chunk=chunk)
         chunk_meta = parse_chunk_metadata(doc_chunk)
+        chunk_type = _infer_chunk_type(doc_items)
         page_span = chunk_meta["page_span"]
         labels = sorted({label for item in doc_items if (label := _label_to_str(item)) is not None})
+
+        raw_text = chunk.text
+        if chunk_type == "picture":
+            for ref in chunk_meta["doc_item_refs"]:
+                if ref in pic_descriptions:
+                    raw_text = pic_descriptions[ref]
+                    break
+
+        # For picture chunks with a VLM description, build enriched_text manually
+        # (chunker.contextualize would return the useless "<!-- image -->" placeholder)
+        if chunk_type == "picture" and raw_text != chunk.text:
+            headings = chunk_meta["headings"] or []
+            parts = [f"[SECTION] {h}" for h in headings]
+            parts.append(raw_text)
+            enriched_text = "\n".join(parts)
+        else:
+            enriched_text = chunker.contextualize(chunk=chunk)
 
         rows.append(
             {
                 "document_id": doc_id_str,
                 "chunk_index": i,
-                "raw_text": chunk.text,
+                "raw_text": raw_text,
                 "enriched_text": enriched_text,
                 "heading_trail": chunk_meta["headings"] or None,
-                "chunk_type": _infer_chunk_type(doc_items),
+                "chunk_type": chunk_type,
                 "page_start": page_span["start"],
                 "page_end": page_span["end"],
                 "token_count": tokenizer.count_tokens(enriched_text),

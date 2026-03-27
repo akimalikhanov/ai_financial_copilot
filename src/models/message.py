@@ -80,6 +80,7 @@ class Message(Base):
     )
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_format: Mapped[str] = mapped_column(
         String,
         nullable=False,

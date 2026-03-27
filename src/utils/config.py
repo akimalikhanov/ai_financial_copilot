@@ -330,6 +330,21 @@ def get_docling_generate_page_images() -> bool:
     return _parse_bool(os.getenv("DOCLING_GENERATE_PAGE_IMAGES"), False)
 
 
+def get_docling_picture_vlm_model() -> str:
+    """DOCLING_PICTURE_VLM_MODEL — HuggingFace repo_id for picture description (default: SmolVLM-256M)."""
+    return os.getenv("DOCLING_PICTURE_VLM_MODEL", "HuggingFaceTB/SmolVLM-256M-Instruct")
+
+
+def get_docling_picture_vlm_prompt() -> str:
+    """DOCLING_PICTURE_VLM_PROMPT — prompt sent to the VLM for each picture."""
+    return os.getenv(
+        "DOCLING_PICTURE_VLM_PROMPT",
+        "Describe this financial chart or figure. "
+        "Include: chart type, axes labels, key data points, trends, and notable patterns. "
+        "Be precise with numbers and units.",
+    )
+
+
 def get_docling_document_timeout() -> float:
     """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0)."""
     val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "300")
@@ -477,6 +492,11 @@ def get_reranker_top_k() -> int:
 def get_reranker_max_input() -> int:
     """RERANKER_MAX_INPUT (default: 30). Max chunks to send to reranker per query."""
     return int(os.getenv("RERANKER_MAX_INPUT", "30"))
+
+
+def get_system_prompt_version() -> str:
+    """SYSTEM_PROMPT_VERSION (default: v2). Controls which system prompt YAML is loaded."""
+    return os.getenv("SYSTEM_PROMPT_VERSION", "v2")
 
 
 def get_chat_retrieval_timeout() -> float:

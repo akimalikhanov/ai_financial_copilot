@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
 from docling.datamodel.base_models import ConversionStatus, InputFormat
-from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions
+from docling.datamodel.pipeline_options import (
+    PictureDescriptionVlmOptions,
+    ThreadedPdfPipelineOptions,
+)
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from docling_core.types.doc.labels import DocItemLabel
@@ -22,6 +25,8 @@ from src.utils.config import (
     get_docling_document_timeout,
     get_docling_generate_page_images,
     get_docling_generate_picture_images,
+    get_docling_picture_vlm_model,
+    get_docling_picture_vlm_prompt,
 )
 
 if TYPE_CHECKING:
@@ -49,8 +54,13 @@ def _create_converter() -> DocumentConverter:
         do_ocr=get_docling_do_ocr(),
         do_table_structure=get_docling_do_table_structure(),
         do_picture_description=get_docling_do_picture_description(),
+        picture_description_options=PictureDescriptionVlmOptions(
+            repo_id=get_docling_picture_vlm_model(),
+            prompt=get_docling_picture_vlm_prompt(),
+        ),
         generate_picture_images=get_docling_generate_picture_images(),
         generate_page_images=get_docling_generate_page_images(),
+        images_scale=2.0,
         document_timeout=get_docling_document_timeout(),
     )
     return DocumentConverter(

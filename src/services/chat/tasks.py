@@ -25,7 +25,15 @@ from src.repository import (
 )
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
-from src.services.chat.events import build_usage_event, error_event
+from src.services.chat.citation_parser import BracketCitationParser
+from src.services.chat.events import (
+    ThinkingStripper,
+    build_all_references,
+    build_references_list,
+    build_usage_event,
+    error_event,
+    span_to_dict,
+)
 from src.services.context import build_context
 from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
 from src.services.llm_adapters.base_adapter import Role as AdapterRole
@@ -33,7 +41,11 @@ from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.chat_rag import resolve_doc_ids, run_chat_rag_pipeline
 from src.services.retrieval.query_processor import process_query
-from src.utils.config import get_chat_tail_max_messages, get_db_url, get_redis_app_url
+from src.utils.config import (
+    get_chat_tail_max_messages,
+    get_db_url,
+    get_redis_app_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +258,19 @@ async def _run_chat_pipeline(request_id: str) -> None:
 
             # 5. render_prompt
             _log_stage("render_prompt")
+            # Resolve model + citation_mode before rendering so prompt version is model-aware
+            try:
+                llm = router.get(llm_request.model)
+            except Exception as e:
+                logger.exception("llm_router_error", extra={"request_id": request_id})
+                await llm_request_repo.update_status(UUID(request_id), "failed")
+                await add_event(redis_app, request_id, "error", error_event(e))
+                await session.commit()
+                return
+
+            citation_mode = llm.capabilities.get("citation_mode", "none")
+            prompt_version = "v3_bracket" if citation_mode == "bracket" else "v3_none"
+
             renderer = get_prompt_renderer()
             rendered_user = renderer.render_user_message(
                 context=state.rag_context_str,
@@ -259,20 +284,14 @@ async def _run_chat_pipeline(request_id: str) -> None:
 
             state.params = dict(llm_request.request_params or {})
             state.adapter_messages = [
-                AdapterChatMessage(role=AdapterRole.system, content=get_system_prompt()),
+                AdapterChatMessage(
+                    role=AdapterRole.system,
+                    content=get_system_prompt(version=prompt_version),
+                ),
             ] + _to_adapter_messages(modified)
 
             # 6. stream_llm_response
             _log_stage("stream_llm_response")
-            try:
-                llm = router.get(llm_request.model)
-            except Exception as e:
-                logger.exception("llm_router_error", extra={"request_id": request_id})
-                await llm_request_repo.update_status(UUID(request_id), "failed")
-                await add_event(redis_app, request_id, "error", error_event(e))
-                await session.commit()
-                return
-
             temperature = state.params.get("temperature")
             max_tokens = state.params.get("max_tokens")
             extra = {
@@ -286,19 +305,99 @@ async def _run_chat_pipeline(request_id: str) -> None:
                 **extra,
             )
 
+            parser = BracketCitationParser() if citation_mode == "bracket" else None
+            think_stripper = ThinkingStripper()
+
             try:
                 async for chunk in stream:
-                    state.accumulated_content += chunk.text
-                    if not chunk.is_final:
-                        await add_event(redis_app, request_id, "delta", {"text": chunk.text})
-                        continue
+                    state.accumulated_content += chunk.text  # raw for DB
+                    visible_chunk = think_stripper.feed(chunk.text)
+
+                    if parser is not None:
+                        # Bracket-citation mode: strip [S1] markers, track spans
+                        result = parser.feed(visible_chunk)
+                        state.clean_content += result.visible_text
+
+                        if not chunk.is_final:
+                            if result.visible_text:
+                                await add_event(
+                                    redis_app, request_id, "delta", {"text": result.visible_text}
+                                )
+                            for span in result.completed_spans:
+                                labels = parser.label_map.get_labels_for_refs(span.ref_ids)
+                                await add_event(
+                                    redis_app,
+                                    request_id,
+                                    "citation_span",
+                                    span_to_dict(span, labels),
+                                )
+                            continue
+
+                        # ── Final chunk (bracket mode) ──
+                        final_result = parser.finalize()
+                        state.clean_content += final_result.visible_text
+                        if final_result.visible_text:
+                            await add_event(
+                                redis_app, request_id, "delta", {"text": final_result.visible_text}
+                            )
+                        for span in final_result.completed_spans:
+                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
+                            await add_event(
+                                redis_app,
+                                request_id,
+                                "citation_span",
+                                span_to_dict(span, labels),
+                            )
+
+                        # Emit references: only cited sources
+                        if state.rag_context and parser.label_map.mapping:
+                            ref_items = build_references_list(state.rag_context, parser.label_map)
+                            await add_event(
+                                redis_app, request_id, "references", {"items": ref_items}
+                            )
+
+                    else:
+                        # No-citation mode: raw text = clean text, no span parsing
+                        state.clean_content += visible_chunk
+
+                        if not chunk.is_final:
+                            if visible_chunk:
+                                await add_event(
+                                    redis_app, request_id, "delta", {"text": visible_chunk}
+                                )
+                            continue
+
+                        # ── Final chunk (no-citation mode) ──
+                        # Emit ALL retrieved sources as evidence panel references
+                        if state.rag_context and state.rag_context.items:
+                            ref_items = build_all_references(state.rag_context)
+                            await add_event(
+                                redis_app, request_id, "references", {"items": ref_items}
+                            )
 
                     # 7. persist_and_emit
                     _log_stage("persist_and_emit")
+                    # Build citation metadata for persistence
+                    citation_meta: dict = {}
+                    if parser is not None:
+                        if parser.all_spans:
+                            citation_meta["citation_spans"] = [
+                                span_to_dict(s, parser.label_map.get_labels_for_refs(s.ref_ids))
+                                for s in parser.all_spans
+                            ]
+                        if state.rag_context and parser.label_map.mapping:
+                            citation_meta["references"] = build_references_list(
+                                state.rag_context, parser.label_map
+                            )
+                    elif state.rag_context and state.rag_context.items:
+                        citation_meta["references"] = build_all_references(state.rag_context)
+
                     await message_repo.update_on_final(
                         message_id=state.assistant_message_id,
-                        content=state.accumulated_content,
+                        content=state.clean_content,
+                        raw_content=state.accumulated_content,
                         request_id=UUID(request_id),
+                        metadata_updates=citation_meta or None,
                     )
                     if chunk.stats:
                         await llm_request_repo.update_on_final(
@@ -337,6 +436,8 @@ async def _run_chat_pipeline(request_id: str) -> None:
                         state.assistant_message_id,
                         state.assistant_seq,
                         chunk.stats,
+                        citation_spans=parser.all_spans if parser is not None else None,
+                        label_map=parser.label_map if parser is not None else None,
                     )
                     await add_event(redis_app, request_id, "usage", usage_data)
                     await session.commit()
@@ -347,7 +448,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
                             str(state.conversation_id),
                             schemas.ChatMessage(
                                 role=schemas.Role.assistant,
-                                content=state.accumulated_content,
+                                content=state.clean_content,
                             ).model_dump(mode="json"),
                             state.assistant_seq,
                         )

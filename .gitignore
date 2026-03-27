@@ -30,7 +30,9 @@ wheels/
 
 # docs
 .cursor/
+.claude
 AGENTS.md
+CLAUDE.md
 
 # misc
 experiments/

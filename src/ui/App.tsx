@@ -3,7 +3,8 @@ import {
   MessageSquare, BookOpen, Plus, Send, Search,
   LogOut, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle, ChevronDown, Bot, Sun, Moon, Settings2, Pencil, Loader2
 } from 'lucide-react';
-import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation } from './types';
+import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation, ReferenceItem } from './types';
+import { CitedText } from './components/CitedText';
 import {
   chatEnqueue,
   chatStreamSubscribe,
@@ -50,6 +51,32 @@ const toYear = (v: unknown): number => {
   return 0;
 };
 
+/** Map a backend MessageResponse (with metadata) to a frontend Message, restoring citations. */
+const toUiMessage = (msg: { id: string; role: string; content: string; created_at: string; metadata?: Record<string, unknown> }): Message => {
+  const meta = msg.metadata || {};
+  const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels: string[] }> | undefined;
+  const refs = meta.references as Array<Record<string, unknown>> | undefined;
+  return {
+    id: msg.id,
+    role: msg.role as 'user' | 'assistant',
+    content: msg.content,
+    timestamp: new Date(msg.created_at).getTime(),
+    citations: meta.citations as Citation[] | undefined,
+    citationSpans: spans?.map((s) => ({ start: s.start, end: s.end, refIds: s.ref_ids, displayLabels: s.display_labels })),
+    references: refs?.map((r: Record<string, unknown>) => ({
+      refId: r.ref_id as string,
+      displayLabel: r.display_label as string,
+      chunkId: r.chunk_id as string,
+      documentId: r.document_id as string,
+      documentName: r.document_name as string,
+      filename: (r.filename as string | null),
+      pageNumbers: r.page_numbers as number[],
+      headingPath: r.heading_path as string[],
+      snippet: (r.snippet as string | null),
+    })),
+  };
+};
+
 const toUiDoc = (d: DocumentListItemResponse): Document => ({
   id: d.id,
   title: d.extracted_title ?? d.original_filename,
@@ -60,6 +87,136 @@ const toUiDoc = (d: DocumentListItemResponse): Document => ({
   status: mapDocStatus(d.status),
   tags: [],
 });
+
+function EvidenceList({
+  references,
+  onRefClick,
+}: {
+  references: ReferenceItem[];
+  onRefClick: (ref: ReferenceItem) => void;
+}) {
+  const sorted = [...references].sort((a, b) =>
+    a.displayLabel.localeCompare(b.displayLabel, undefined, { numeric: true })
+  );
+  const [open, setOpen] = useState(false);
+
+  const toggle = () => setOpen((o) => !o);
+
+  return (
+    <div className="mt-3">
+      {/* Section header — click to toggle */}
+      <button
+        onClick={toggle}
+        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer
+          hover:bg-[var(--surface-1)] transition-colors group mb-1"
+      >
+        <span className="text-[10px] font-semibold uppercase tracking-widest text-[var(--text-faint)] group-hover:text-[var(--accent)] transition-colors flex-shrink-0">
+          Evidence
+        </span>
+        {/* Pill preview strip — visible only when collapsed */}
+        {!open && (() => {
+          const PILL_LIMIT = 2;
+          const visible = sorted.slice(0, PILL_LIMIT);
+          const overflow = sorted.length - PILL_LIMIT;
+          return (
+            <div className="flex items-center gap-1 flex-1 overflow-hidden">
+              {visible.map((ref) => (
+                <span
+                  key={ref.refId}
+                  className="inline-flex items-center justify-center h-4 min-w-[1.25rem] px-1 rounded
+                    text-[9px] font-mono font-bold bg-[var(--accent-subtle)] text-[var(--accent)]
+                    border border-[var(--accent)] border-opacity-30 leading-none flex-shrink-0"
+                >
+                  {ref.displayLabel}
+                </span>
+              ))}
+              {overflow > 0 && (
+                <span className="text-[9px] text-[var(--text-faint)] font-mono flex-shrink-0">
+                  +{overflow} more
+                </span>
+              )}
+            </div>
+          );
+        })()}
+        {open && <div className="flex-1 h-px bg-[var(--border)]" />}
+        <ChevronDown
+          size={12}
+          className={`text-[var(--text-faint)] group-hover:text-[var(--accent)] transition-all flex-shrink-0 ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+
+      {/* Reference cards — grid 0fr→1fr for smooth roll-out */}
+      <div
+        className="grid transition-[grid-template-rows] duration-300 ease-in-out"
+        style={{ gridTemplateRows: open ? '1fr' : '0fr' }}
+      >
+        <div className="overflow-hidden">
+        <div className="space-y-1 pb-0.5">
+          {sorted.map((ref) => {
+            const headingPath =
+              ref.headingPath && ref.headingPath.length > 0 ? ref.headingPath.join(' › ') : null;
+            const pages =
+              ref.pageNumbers && ref.pageNumbers.length > 0
+                ? `p.\u00a0${ref.pageNumbers.join(', ')}`
+                : null;
+            const snippet =
+              ref.snippet
+                ? ref.snippet.length > 140
+                  ? ref.snippet.slice(0, 137) + '…'
+                  : ref.snippet
+                : null;
+
+            return (
+              <button
+                key={ref.refId}
+                onClick={() => onRefClick(ref)}
+                className="w-full flex items-stretch gap-3 bg-[var(--surface-1)] border border-[var(--border)]
+                  hover:border-[var(--accent)] hover:bg-[var(--surface-2)] rounded-xl px-3 py-2.5
+                  text-left transition-all group"
+              >
+                {/* Label badge */}
+                <div className="flex-shrink-0 flex items-start pt-0.5">
+                  <span
+                    className="inline-flex items-center justify-center h-5 min-w-[1.5rem] px-1 rounded
+                      text-[10px] font-mono font-bold bg-[var(--accent-subtle)] text-[var(--accent)]
+                      border border-[var(--accent)] border-opacity-30
+                      group-hover:bg-[var(--accent)] group-hover:text-white group-hover:border-opacity-100
+                      transition-all leading-none"
+                  >
+                    {ref.displayLabel}
+                  </span>
+                </div>
+
+                {/* Content */}
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  <div className="text-xs font-semibold text-[var(--text)] truncate leading-snug">
+                    {ref.documentName || 'Unknown document'}
+                  </div>
+                  {headingPath && (
+                    <div className="text-[10px] text-[var(--accent)] truncate leading-snug opacity-80">
+                      {headingPath}
+                    </div>
+                  )}
+                  {pages && (
+                    <div className="text-[10px] text-[var(--text-faint)] font-mono leading-snug">
+                      {pages}
+                    </div>
+                  )}
+                  {snippet && (
+                    <p className="text-[11px] text-[var(--text-faint)] italic leading-snug mt-1 line-clamp-2">
+                      "{snippet}"
+                    </p>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const { authChecked, isAuthenticated, setAccessToken, logout } = useAuth();
@@ -261,13 +418,7 @@ export default function App() {
         const response = await fetchMessages(conversationId, { limit: 50 });
         if (!cancelled) {
           // Backend returns oldest first (ascending by seq); use as-is for display
-          const uiMessages: Message[] = response.messages.map((msg) => ({
-            id: msg.id,
-            role: msg.role as 'user' | 'assistant',
-            content: msg.content,
-            timestamp: new Date(msg.created_at).getTime(),
-            citations: (msg.metadata?.citations as Citation[] | undefined),
-          }));
+          const uiMessages: Message[] = response.messages.map(toUiMessage);
           setMessagesByConversation((prev) => ({
             ...prev,
             [conversationId]: uiMessages,
@@ -337,13 +488,7 @@ export default function App() {
             fetchMessages(conversationId, { limit: 50, before_seq: minSeq })
               .then(response => {
                 // Backend returns oldest first; use as-is and prepend to existing
-                const uiMessages: Message[] = response.messages.map((msg) => ({
-                  id: msg.id,
-                  role: msg.role as 'user' | 'assistant',
-                  content: msg.content,
-                  timestamp: new Date(msg.created_at).getTime(),
-                  citations: (msg.metadata?.citations as Citation[] | undefined),
-                }));
+                const uiMessages: Message[] = response.messages.map(toUiMessage);
                 setMessagesByConversation(prev => {
                   const existing = prev[conversationId] || [];
                   // Prepend older messages (they come before existing messages chronologically)
@@ -536,6 +681,7 @@ export default function App() {
       });
       await chatStreamSubscribe(
         enqueueRes.request_id,
+        // onDelta
         (chunk) => {
           updateMessage(conversationId, placeholderId, (m) => ({
             ...m,
@@ -543,6 +689,36 @@ export default function App() {
           }));
           stopTypingForText(chunk.text);
         },
+        // onCitationSpan
+        (span) => {
+          updateMessage(conversationId, placeholderId, (m) => ({
+            ...m,
+            citationSpans: [...(m.citationSpans || []), {
+              start: span.start,
+              end: span.end,
+              refIds: span.ref_ids,
+              displayLabels: span.display_labels,
+            }],
+          }));
+        },
+        // onReferences
+        (refs) => {
+          updateMessage(conversationId, placeholderId, (m) => ({
+            ...m,
+            references: refs.items.map((r) => ({
+              refId: r.ref_id,
+              displayLabel: r.display_label,
+              chunkId: r.chunk_id,
+              documentId: r.document_id,
+              documentName: r.document_name,
+              filename: r.filename,
+              pageNumbers: r.page_numbers,
+              headingPath: r.heading_path,
+              snippet: r.snippet,
+            })),
+          }));
+        },
+        // onFinal
         (chunk) => {
           if (chunk.text) {
             updateMessage(conversationId, placeholderId, (m) => ({
@@ -554,6 +730,7 @@ export default function App() {
           setIsTyping(false);
           setIsAwaitingResponse(false);
         },
+        // onError
         (error) => {
           updateMessage(conversationId, placeholderId, (m) => ({
             ...m,
@@ -600,6 +777,24 @@ export default function App() {
 
     setActivePdfDocId(doc.id);
     setActiveHighlight(citation.bboxHint);
+  };
+
+  const handleReferenceClick = (ref: ReferenceItem) => {
+    const doc = docs.find(d => d.id === ref.documentId);
+    if (!doc) return;
+
+    setIsEvidenceOpen(true);
+    setMobileTab('EVIDENCE');
+
+    const page = ref.pageNumbers[0] || 1;
+    setOpenPdfTabs(prev => {
+      const exists = prev.find(p => p.doc.id === doc.id);
+      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page } : p);
+      return [...prev, { doc, page }];
+    });
+
+    setActivePdfDocId(doc.id);
+    setActiveHighlight(undefined);
   };
 
   const handleNewChat = async () => {
@@ -877,11 +1072,27 @@ export default function App() {
                           ? 'bg-[var(--bubble-user-bg)] text-[var(--text)] rounded-br-md max-w-[85%]'
                           : 'bg-[var(--bubble-assistant-bg)] text-[var(--text)] rounded-bl-md'
                       }`} style={{ width: 'fit-content', maxWidth: '100%' }}>
-                          <div className="whitespace-pre-wrap break-words">{msg.content}</div>
+                          {msg.citationSpans && msg.citationSpans.length > 0 ? (
+                            <CitedText
+                              text={msg.content}
+                              spans={msg.citationSpans}
+                              references={msg.references || []}
+                              onCitationClick={handleReferenceClick}
+                            />
+                          ) : (
+                            <div className="whitespace-pre-wrap break-words">{msg.content}</div>
+                          )}
                       </div>
 
-                      {/* Citations Grid */}
-                      {msg.citations && msg.citations.length > 0 && (
+                      {/* Evidence section (new structured references) */}
+                      {msg.references && msg.references.length > 0 && (
+                        <EvidenceList
+                          references={msg.references}
+                          onRefClick={handleReferenceClick}
+                        />
+                      )}
+                      {/* Legacy citations grid (fallback for old messages) */}
+                      {!msg.references?.length && msg.citations && msg.citations.length > 0 && (
                           <div className={`flex flex-wrap gap-2 mt-2 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                               {msg.citations.map((c, i) => {
                                   const doc = docs.find(d => d.id === c.docId);
