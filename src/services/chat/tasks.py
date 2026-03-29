@@ -41,6 +41,7 @@ from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.chat_rag import resolve_doc_ids, run_chat_rag_pipeline
 from src.services.retrieval.query_processor import process_query
+from src.services.retrieval.reranker import Reranker, get_reranker
 from src.utils.config import (
     get_chat_tail_max_messages,
     get_db_url,
@@ -54,10 +55,11 @@ _redis_app: Redis | None = None
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _router: LLMRouter | None = None
+_reranker: Reranker | None = None
 
 
 def _initialize_worker_resources() -> None:
-    global _worker_loop, _redis_app, _engine, _session_factory, _router
+    global _worker_loop, _redis_app, _engine, _session_factory, _router, _reranker
     if _worker_loop is None or _worker_loop.is_closed():
         _worker_loop = asyncio.new_event_loop()
     if _redis_app is None:
@@ -73,6 +75,8 @@ def _initialize_worker_resources() -> None:
         )
     if _router is None:
         _router = get_router()
+    if _reranker is None:
+        _reranker = get_reranker()
 
 
 def _get_worker_loop() -> asyncio.AbstractEventLoop:
@@ -87,6 +91,12 @@ def _get_router() -> LLMRouter:
     return _router
 
 
+def _get_reranker() -> Reranker:
+    if _reranker is None:
+        raise RuntimeError("Chat worker reranker is not initialized")
+    return _reranker
+
+
 @setup_logging.connect
 def _on_celery_setup_logging(**_kwargs: object) -> None:
     configure_worker_logging()
@@ -94,14 +104,14 @@ def _on_celery_setup_logging(**_kwargs: object) -> None:
 
 @worker_process_init.connect
 def _on_worker_process_init(**_kwargs: object) -> None:
-    global _worker_loop, _redis_app, _engine, _session_factory, _router
+    global _worker_loop, _redis_app, _engine, _session_factory, _router, _reranker
     configure_worker_logging()
     _initialize_worker_resources()
 
 
 @worker_process_shutdown.connect
 def _on_worker_process_shutdown(**_kwargs: object) -> None:
-    global _worker_loop, _redis_app, _engine, _session_factory, _router
+    global _worker_loop, _redis_app, _engine, _session_factory, _router, _reranker
     if _worker_loop is None or _worker_loop.is_closed():
         return
     if _router is not None:
@@ -111,6 +121,7 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
     if _engine is not None:
         _worker_loop.run_until_complete(_engine.dispose())
     _router = None
+    _reranker = None
     _redis_app = None
     _engine = None
     _session_factory = None
@@ -250,6 +261,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     state.processed_query.normalized_text,
                     llm_request.user_id,
                     doc_ids,
+                    reranker=_get_reranker(),
                 )
                 state.rag_context_str = (
                     state.rag_context.formatted_context

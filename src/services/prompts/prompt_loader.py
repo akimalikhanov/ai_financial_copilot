@@ -51,6 +51,8 @@ class PromptLoader:
         if not self._prompts_dir.exists():
             raise PromptLoaderError(f"Prompts directory does not exist: {self._prompts_dir}")
 
+        self._cache: dict[tuple[str, str], PromptTemplate] = {}
+
     @property
     def prompts_dir(self) -> Path:
         """Return the prompts directory path."""
@@ -84,6 +86,10 @@ class PromptLoader:
         Raises:
             PromptLoaderError: If the template file doesn't exist or is invalid.
         """
+        cache_key = (name, version)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         template_path = self._get_template_path(name, version)
 
         if not template_path.exists():
@@ -107,9 +113,12 @@ class PromptLoader:
             raise PromptLoaderError(f"Template file must contain a YAML mapping: {template_path}")
 
         try:
-            return PromptTemplate(**data)
+            result = PromptTemplate(**data)
         except Exception as e:
             raise PromptLoaderError(f"Invalid template structure in {template_path}: {e}") from e
+
+        self._cache[cache_key] = result
+        return result
 
     def list_versions(self, name: str) -> list[str]:
         """

@@ -37,12 +37,20 @@ def fuse_rrf(
     vector_results: list[RetrievedChunk],
     keyword_results: list[RetrievedChunk],
     *,
-    vector_weight: float = get_fuse_rrf_vector_weight(),
-    keyword_weight: float = get_fuse_rrf_keyword_weight(),
-    k: int = get_fuse_rrf_k(),
-    final_top_k: int = get_fuse_rrf_final_top_k(),
+    vector_weight: float | None = None,
+    keyword_weight: float | None = None,
+    k: int | None = None,
+    final_top_k: int | None = None,
 ) -> list[RetrievedChunk]:
     """Fuse vector and keyword rankings with reciprocal rank fusion."""
+    if vector_weight is None:
+        vector_weight = get_fuse_rrf_vector_weight()
+    if keyword_weight is None:
+        keyword_weight = get_fuse_rrf_keyword_weight()
+    if k is None:
+        k = get_fuse_rrf_k()
+    if final_top_k is None:
+        final_top_k = get_fuse_rrf_final_top_k()
     if final_top_k <= 0:
         return []
     if k < 0:

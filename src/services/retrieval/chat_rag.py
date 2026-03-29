@@ -15,7 +15,7 @@ from src.services.retrieval.hybrid_retriever import fuse_rrf
 from src.services.retrieval.opensearch_retriever import retrieve as opensearch_retrieve
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.qdrant_retriever import retrieve as qdrant_retrieve
-from src.services.retrieval.reranker import get_reranker
+from src.services.retrieval.reranker import Reranker, get_reranker
 from src.utils.config import (
     get_chat_retrieval_timeout,
     get_keyword_search_top_k,
@@ -49,6 +49,7 @@ async def run_chat_rag_pipeline(
     user_id: UUID,
     doc_ids: list[UUID],
     timeout: float | None = None,
+    reranker: Reranker | None = None,
 ) -> RAGContext:
     """Embed query, run parallel Qdrant + OpenSearch, fuse RRF, hydrate, rerank, assemble."""
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
@@ -76,7 +77,8 @@ async def run_chat_rag_pipeline(
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
     texts = {cid: payloads[cid].prompt_text for cid in chunk_ids if cid in payloads}
 
-    reranker = get_reranker()
+    if reranker is None:
+        reranker = get_reranker()
     reranked = await reranker.rerank(query, capped, texts)
 
     return assemble_rag_context(reranked, payloads)

@@ -159,14 +159,23 @@ def get_system_prompt(version: str = "v1") -> str:
     return template.template
 
 
+_renderer: PromptRenderer | None = None
+
+
 def get_prompt_renderer(loader: PromptLoader | None = None) -> PromptRenderer:
     """
-    Get a PromptRenderer instance.
+    Get the cached PromptRenderer singleton (default loader).
 
     Args:
         loader: Optional PromptLoader. If None, uses the default cached loader.
+            Passing a custom loader bypasses the singleton (test/override use only).
 
     Returns:
         PromptRenderer instance.
     """
-    return PromptRenderer(loader)
+    global _renderer
+    if loader is not None:
+        return PromptRenderer(loader)
+    if _renderer is None:
+        _renderer = PromptRenderer()
+    return _renderer
