@@ -402,6 +402,20 @@ export const listDocuments = async (): Promise<ListDocumentsResponse> => {
   return (await response.json()) as ListDocumentsResponse;
 };
 
+export interface DocumentFilterOptionsResponse {
+  companies: string[];
+  years: number[];
+}
+
+export const fetchFilterOptions = async (): Promise<DocumentFilterOptionsResponse> => {
+  const response = await fetchApi(joinUrl(API_BASE_URL, '/v1/documents/filter-options'), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+  return response.json() as Promise<DocumentFilterOptionsResponse>;
+};
+
 export const uploadDocument = async (formData: FormData): Promise<UploadDocumentResponse> => {
   const response = await fetchApi(joinUrl(API_BASE_URL, '/v1/documents/upload'), {
     method: 'POST',

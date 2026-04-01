@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from collections.abc import AsyncGenerator
 from typing import cast
@@ -17,7 +16,7 @@ from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.message import MessageRole
-from src.redis_client import append_chat_tail, events_stream_key
+from src.redis_client import events_stream_key
 from src.repository import (
     ConversationRepository,
     LLMRequestRepository,
@@ -25,6 +24,7 @@ from src.repository import (
 )
 from src.schemas import chat as schemas
 from src.services.chat.tasks import process_chat
+from src.services.context import ConversationHistory
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -129,16 +129,8 @@ async def chat_enqueue(
     )
     await session.commit()
 
-    with contextlib.suppress(Exception):
-        await append_chat_tail(
-            redis,
-            str(req.conversation_id),
-            schemas.ChatMessage(
-                role=schemas.Role.user,
-                content=req.content,
-            ).model_dump(mode="json"),
-            user_message.seq,
-        )
+    history = ConversationHistory(redis, message_repo)
+    await history.append_user(req.conversation_id, req.content, user_message.seq)
 
     cast(Task, process_chat).delay(str(llm_request.id))
 

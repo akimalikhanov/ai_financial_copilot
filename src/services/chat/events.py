@@ -47,6 +47,14 @@ class ThinkingStripper:
         return "".join(out)
 
 
+def out_of_scope_response() -> str:
+    """Fixed redirect message for out-of-scope queries."""
+    return (
+        "I'm focused on financial document analysis and can't help with that. "
+        "Feel free to ask about financial reports, filings, or documents you've uploaded."
+    )
+
+
 def error_event(exc: Exception, user_message: str | None = None) -> dict:
     """Structured error event for frontend display."""
     return {

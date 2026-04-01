@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.document import Document
@@ -148,3 +149,120 @@ class DocumentRepository:
             )
         )
         return list(result.scalars().all())
+
+    async def find_by_metadata_filters(
+        self,
+        user_id: UUID,
+        *,
+        companies: list[str] | None = None,
+        years: list[int] | None = None,
+        types: list[str] | None = None,
+    ) -> list[UUID]:
+        """Find ready document IDs matching metadata filters (ILIKE for strings, = for year)."""
+        conditions = ["user_id = CAST(:user_id AS uuid)", "status = 'ready'"]
+        params: dict = {"user_id": str(user_id)}
+
+        if companies:
+            clauses = []
+            for i, c in enumerate(companies):
+                key = f"company_{i}"
+                clauses.append(f"metadata->>'company' ILIKE :{key}")
+                params[key] = f"%{c}%"
+            conditions.append(f"({' OR '.join(clauses)})")
+
+        if years:
+            params["years"] = years
+            conditions.append("(metadata->>'year')::int = ANY(:years)")
+
+        if types:
+            clauses = []
+            for i, t in enumerate(types):
+                key = f"type_{i}"
+                clauses.append(f"metadata->>'type' ILIKE :{key}")
+                params[key] = f"%{t}%"
+            conditions.append(f"({' OR '.join(clauses)})")
+
+        where = " AND ".join(conditions)
+        rows = (
+            await self.session.execute(text(f"SELECT id FROM documents WHERE {where}"), params)
+        ).fetchall()  # noqa: S608
+        return [row[0] for row in rows]
+
+    async def get_filter_options(self, user_id: UUID) -> dict[str, list]:
+        """Return distinct non-null companies and years for a user's ready documents."""
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    SELECT
+                        metadata->>'company' AS company,
+                        metadata->>'year'    AS year
+                    FROM documents
+                    WHERE user_id = CAST(:user_id AS uuid)
+                      AND status = 'ready'
+                      AND (metadata->>'company' IS NOT NULL OR metadata->>'year' IS NOT NULL)
+                    """
+                ),
+                {"user_id": str(user_id)},
+            )
+        ).fetchall()
+
+        companies: set[str] = set()
+        years: set[int] = set()
+        for company, year in rows:
+            if company:
+                companies.add(company)
+            if year:
+                with contextlib.suppress(ValueError):
+                    years.add(int(year))
+
+        return {
+            "companies": sorted(companies),
+            "years": sorted(years, reverse=True),
+        }
+
+    async def find_by_company_similarity(
+        self,
+        user_id: UUID,
+        name: str,
+        *,
+        threshold: float = 0.3,
+        years: list[int] | None = None,
+        constrain_to: list[UUID] | None = None,
+        limit: int = 10,
+    ) -> list[UUID]:
+        """Find document IDs by fuzzy-matching metadata company name (pg_trgm).
+
+        Returns doc IDs ordered by similarity descending, up to ``limit``.
+        """
+        params: dict = {
+            "user_id": str(user_id),
+            "name": name.lower(),
+            "threshold": threshold,
+            "limit": limit,
+        }
+
+        year_clause = ""
+        if years:
+            params["years"] = years
+            year_clause = "AND (metadata->>'year')::int = ANY(:years)"
+
+        constrain_clause = ""
+        if constrain_to:
+            params["constrain_to"] = [str(d) for d in constrain_to]
+            constrain_clause = "AND id = ANY(CAST(:constrain_to AS uuid[]))"
+
+        stmt = text(f"""
+            SELECT id FROM documents
+            WHERE user_id = CAST(:user_id AS uuid)
+              AND status = 'ready'
+              AND metadata->>'company' IS NOT NULL
+              AND similarity(lower(metadata->>'company'), :name) > :threshold
+              {year_clause}
+              {constrain_clause}
+            ORDER BY similarity(lower(metadata->>'company'), :name) DESC
+            LIMIT :limit
+        """)
+
+        rows = (await self.session.execute(stmt, params)).fetchall()
+        return [row[0] for row in rows]

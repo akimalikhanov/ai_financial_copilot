@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.repository.document_repository import DocumentRepository
+from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterOutput
+from src.services.router.entity_resolver import resolve_entities_to_doc_ids
+from src.utils.config import get_router_config
+
+
+async def resolve_scope(
+    session: AsyncSession,
+    user_id: UUID,
+    scope: ChatScope | None,
+    router_output: RouterOutput,
+) -> DocumentScopeResult:
+    """Resolve document scope using two layers:
+    Layer 1 — user-explicit scope (selectedDocs/thisDoc/filteredByMetadata).
+    Layer 2 — entity narrowing (allDocs or broad filteredByMetadata).
+    """
+    cfg = get_router_config()
+    filtered_md_thresh = int(cfg["filtered_md_thresh"])
+    has_entities = bool(router_output.entities or router_output.time_references)
+
+    # --- selectedDocs / thisDoc: use doc_ids directly, skip Layer 2 ---
+    if scope is not None and scope.mode in ("selectedDocs", "thisDoc"):
+        return DocumentScopeResult(
+            doc_ids=scope.doc_ids or None,
+            source="explicit",
+        )
+
+    # --- filteredByMetadata: resolve filters (Layer 1), then optionally narrow (Layer 2) ---
+    if scope is not None and scope.mode == "filteredByMetadata":
+        repo = DocumentRepository(session)
+        layer1_ids = await repo.find_by_metadata_filters(
+            user_id,
+            companies=scope.filters.company or None,
+            years=scope.filters.year or None,
+            types=scope.filters.type or None,
+        )
+
+        # Small result set — treat like selectedDocs, skip Layer 2
+        if len(layer1_ids) <= filtered_md_thresh:
+            return DocumentScopeResult(
+                doc_ids=layer1_ids or None,
+                source="filtered",
+            )
+
+        # Large result set + entities → intersect with entity resolution
+        if has_entities:
+            matched, unresolved = await resolve_entities_to_doc_ids(
+                session,
+                user_id,
+                router_output.entities,
+                router_output.time_references,
+                constrain_to=layer1_ids,
+            )
+            return DocumentScopeResult(
+                doc_ids=matched if matched else layer1_ids,
+                source="filtered",
+                unresolved_entities=unresolved,
+            )
+
+        # Large result set, no entities → return Layer 1 as-is
+        return DocumentScopeResult(
+            doc_ids=layer1_ids,
+            source="filtered",
+        )
+
+    # --- allDocs / None → Layer 2 does the heavy lifting ---
+    if has_entities:
+        matched, unresolved = await resolve_entities_to_doc_ids(
+            session,
+            user_id,
+            router_output.entities,
+            router_output.time_references,
+        )
+        if matched:
+            return DocumentScopeResult(
+                doc_ids=matched,
+                source="entity_resolved",
+                unresolved_entities=unresolved,
+            )
+        return DocumentScopeResult(
+            doc_ids=None,
+            source="all",
+            unresolved_entities=unresolved,
+        )
+
+    # No entities, no scope → no pre-filter
+    return DocumentScopeResult(doc_ids=None, source="all")

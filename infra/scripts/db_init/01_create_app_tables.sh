@@ -29,6 +29,9 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- citext provides case-insensitive text (great for unique emails)
 CREATE EXTENSION IF NOT EXISTS citext;
 
+-- pg_trgm enables trigram-based fuzzy text search (used for conversation title search)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- ============================================================================
 -- Enums / Types
 -- ============================================================================

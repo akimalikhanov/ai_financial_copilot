@@ -9,9 +9,10 @@ interface ScopeBarProps {
   onFilterChange: (filters: Partial<Scope['filters']>) => void;
   onModeChange: (mode: Scope['mode']) => void;
   onAddFiles?: () => void;
+  filterOptions?: { companies: string[]; years: number[] };
 }
 
-export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChange, onFilterChange, onAddFiles }) => {
+export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChange, onFilterChange, onAddFiles, filterOptions }) => {
   return (
     <div className="flex flex-col gap-4 p-4 border-b border-[var(--border)] bg-[var(--surface-1)]">
       {/* Mode Switcher */}
@@ -52,30 +53,24 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
         <div className="flex flex-wrap gap-2 animate-fade-in">
           <select
             className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
+            value={scope.filters.company?.[0] ?? ''}
             onChange={(e) => onFilterChange({ company: e.target.value ? [e.target.value] : undefined })}
           >
             <option value="">All Companies</option>
-            <option value="NVIDIA Corp">NVIDIA Corp</option>
-            <option value="Tesla Inc">Tesla Inc</option>
-            <option value="Apple Inc">Apple Inc</option>
+            {(filterOptions?.companies ?? []).map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
           </select>
 
           <select
-             className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
-             onChange={(e) => onFilterChange({ year: e.target.value ? [parseInt(e.target.value)] : undefined })}
+            className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
+            value={scope.filters.year?.[0] ?? ''}
+            onChange={(e) => onFilterChange({ year: e.target.value ? [parseInt(e.target.value)] : undefined })}
           >
             <option value="">All Years</option>
-            <option value="2023">2023</option>
-            <option value="2022">2022</option>
-          </select>
-
-           <select
-             className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-md px-3 py-1.5 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1 focus:ring-[var(--focus-ring)] outline-none cursor-pointer"
-             onChange={(e) => onFilterChange({ type: e.target.value ? [e.target.value] : undefined })}
-          >
-            <option value="">All Types</option>
-            <option value="Annual Report">Annual Report</option>
-            <option value="10-K">10-K</option>
+            {(filterOptions?.years ?? []).map((y) => (
+              <option key={y} value={y}>{y}</option>
+            ))}
           </select>
         </div>
       )}

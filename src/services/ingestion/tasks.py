@@ -122,9 +122,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
+    stage_order: list[str] = []
     stage_total = 11
     stage_index = 0
     current_stage = "initializing"
+    upload_metadata: dict = {}
 
     def _log_stage(stage_name: str) -> None:
         nonlocal stage_index, current_stage, stage_start
@@ -132,6 +134,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
         stage_index += 1
         current_stage = stage_name
+        stage_order.append(stage_name)
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
@@ -146,6 +149,14 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     def _flush_stage_times() -> None:
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+
+    def _format_stage_times() -> dict[str, float]:
+        """Return stages dict numbered in execution order, sorted by stage number."""
+        formatted: dict[str, float] = {}
+        for idx, name in enumerate(stage_order, start=1):
+            if name in stage_times:
+                formatted[f"{idx:02d}. {name}"] = stage_times[name]
+        return dict(sorted(formatted.items()))
 
     try:
         # -- fetch document record, set status -> processing ----------------
@@ -175,6 +186,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
+            upload_metadata = dict(doc.document_metadata or {})
             await repo.update_status(doc_uuid, "processing", clear_processing_error=True)
             await session.commit()
 
@@ -197,12 +209,16 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         async def _save_metadata():
             async with sf() as session:
                 repo = DocumentRepository(session)
+                merged_metadata = {
+                    **upload_metadata,
+                    **parse_result.metadata,
+                }
                 await repo.update_metadata(
                     doc_uuid,
                     page_count=parse_result.page_count,
                     extracted_title=parse_result.extracted_title,
                     parse_status=parse_result.parse_status,
-                    metadata=parse_result.metadata,
+                    metadata=merged_metadata,
                 )
                 await session.commit()
 
@@ -234,7 +250,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             _log_stage("finalize_ready")
             stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
             ingest_times = {
-                "stages": stage_times,
+                "stages": _format_stage_times(),
                 "total_time": round(perf_counter() - pipeline_started_at, 3),
             }
             async with sf() as session:
@@ -362,7 +378,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         _log_stage("finalize_ready")
         stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
         ingest_times = {
-            "stages": stage_times,
+            "stages": _format_stage_times(),
             "total_time": round(perf_counter() - pipeline_started_at, 3),
         }
         async with sf() as session:
@@ -390,7 +406,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             f"(soft_time_limit={_task_soft_time_limit}s)"
         )
         ingest_times = {
-            "stages": stage_times,
+            "stages": _format_stage_times(),
             "total_time": round(perf_counter() - pipeline_started_at, 3),
             "failed_at_stage": current_stage,
         }
@@ -400,7 +416,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "document_id": document_id,
                 "stage": current_stage,
                 "elapsed_seconds": elapsed,
-                "stage_times": stage_times,
+                "stage_times": _format_stage_times(),
             },
         )
         try:
@@ -415,13 +431,17 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     except Exception as exc:
         _flush_stage_times()
         ingest_times = {
-            "stages": stage_times,
+            "stages": _format_stage_times(),
             "total_time": round(perf_counter() - pipeline_started_at, 3),
             "failed_at_stage": current_stage,
         }
         logger.exception(
             "pipeline.failed_at_stage",
-            extra={"document_id": document_id, "stage": current_stage, "stage_times": stage_times},
+            extra={
+                "document_id": document_id,
+                "stage": current_stage,
+                "stage_times": _format_stage_times(),
+            },
         )
         try:
             async with sf() as session:

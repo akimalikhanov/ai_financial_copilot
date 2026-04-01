@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 RetrievalSource = Literal["vector", "keyword", "hybrid"]
 
-Route = Literal["direct_answer", "retrieve"]
+Route = Literal["direct_answer", "retrieve", "out_of_scope"]
 
 
 class RouterOutput(BaseModel):

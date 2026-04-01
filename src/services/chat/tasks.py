@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
 from src.models.message import Message, MessageStatus
-from src.redis_client import add_event, append_chat_tail, cas_populate_chat_tail, get_chat_tail
+from src.redis_client import add_event
 from src.repository import (
     ConversationRepository,
     LLMRequestRepository,
@@ -25,6 +25,8 @@ from src.repository import (
 )
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
+from src.schemas.query_router import ChatScope, RouterInput
+from src.schemas.retrieval import ProcessedQuery
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.events import (
     ThinkingStripper,
@@ -32,21 +34,18 @@ from src.services.chat.events import (
     build_references_list,
     build_usage_event,
     error_event,
+    out_of_scope_response,
     span_to_dict,
 )
-from src.services.context import build_context
-from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
-from src.services.llm_adapters.base_adapter import Role as AdapterRole
+from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
-from src.services.retrieval.chat_rag import resolve_doc_ids, run_chat_rag_pipeline
-from src.services.retrieval.query_processor import process_query
+from src.services.retrieval.chat_rag import run_chat_rag_pipeline
+
+# from src.services.retrieval.query_processor import process_query
 from src.services.retrieval.reranker import Reranker, get_reranker
-from src.utils.config import (
-    get_chat_tail_max_messages,
-    get_db_url,
-    get_redis_app_url,
-)
+from src.services.router.router import route_query
+from src.utils.config import get_db_url, get_redis_app_url
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +55,22 @@ _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _router: LLMRouter | None = None
 _reranker: Reranker | None = None
+
+
+def _parse_scope(raw: object) -> ChatScope | None:
+    """Parse scope dict from message metadata. Converts camelCase docIds → doc_ids."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        normalized = {
+            "mode": raw.get("mode", "allDocs"),
+            "doc_ids": [str(x) for x in raw.get("docIds", [])],
+            "filters": raw.get("filters", {}),
+        }
+        return ChatScope.model_validate(normalized)
+    except Exception:
+        logger.warning("scope_parse_failed", extra={"raw": str(raw)[:200]})
+        return None
 
 
 def _initialize_worker_resources() -> None:
@@ -129,18 +144,6 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
     _worker_loop = None
 
 
-def _to_adapter_messages(messages: list[schemas.ChatMessage]) -> list[AdapterChatMessage]:
-    return [
-        AdapterChatMessage(
-            role=AdapterRole(m.role),
-            content=m.content,
-            name=m.name,
-            tool_call_id=m.tool_call_id,
-        )
-        for m in messages
-    ]
-
-
 async def _run_chat_pipeline(request_id: str) -> None:
     if _session_factory is None or _redis_app is None:
         raise RuntimeError("Chat worker resources are not initialized")
@@ -207,34 +210,13 @@ async def _run_chat_pipeline(request_id: str) -> None:
 
             # 2. build_conversation_context
             _log_stage("build_conversation_context")
-            user_seq = llm_request.snapshot_seq or 0
-            cached = await get_chat_tail(redis_app, str(state.conversation_id))
-            if cached is not None:
-                cached_msgs, cached_seq = cached
-                if cached_seq >= user_seq:
-                    try:
-                        state.context_messages = [
-                            schemas.ChatMessage.model_validate(m) for m in cached_msgs
-                        ]
-                    except Exception:
-                        logger.warning(
-                            "invalid_chat_tail_cache",
-                            extra={"conversation_id": str(state.conversation_id)},
-                        )
-
-            if state.context_messages is None:
-                state.context_messages, latest_seq = await build_context(
-                    message_repo,
-                    state.conversation_id,
-                    before_seq=state.assistant_seq,
-                    max_messages=get_chat_tail_max_messages(),
-                )
-                await cas_populate_chat_tail(
-                    redis_app,
-                    str(state.conversation_id),
-                    [m.model_dump(mode="json") for m in state.context_messages],
-                    latest_seq,
-                )
+            history = ConversationHistory(redis_app, message_repo)
+            state.history = history
+            state.context_messages = await history.load(
+                state.conversation_id,
+                before_seq=state.assistant_seq,
+                snapshot_seq=llm_request.snapshot_seq or 0,
+            )
 
             last_user = next(
                 (m for m in reversed(state.context_messages) if m.role == schemas.Role.user),
@@ -245,17 +227,91 @@ async def _run_chat_pipeline(request_id: str) -> None:
             # 3. route_query
             _log_stage("route_query")
             router = _get_router()
-            state.processed_query = await process_query(state.user_query_raw, router=router)
-            logger.info(
-                "rag_route", extra={"request_id": request_id, "route": state.processed_query.route}
+
+            user_db_msg = (
+                await message_repo.get_by_id(llm_request.user_message_id)
+                if llm_request.user_message_id
+                else None
             )
+            raw_scope = (user_db_msg.message_metadata or {}).get("scope") if user_db_msg else None
+            chat_scope = _parse_scope(raw_scope)
+
+            router_input = RouterInput(
+                query=state.user_query_raw,
+                scope=chat_scope,
+                conversation_history=[
+                    {"role": m.role.value, "content": m.content}
+                    for m in (state.context_messages or [])
+                ],
+            )
+            state.router_output, state.scope_result = await route_query(
+                router_input,
+                user_id=llm_request.user_id,
+                llm_router=router,
+                session=session,
+            )
+            # Shim for downstream stages that still read processed_query.route
+            state.processed_query = ProcessedQuery(
+                normalized_text=state.user_query_raw.strip(),
+                route="retrieve"
+                if state.router_output.route == "retrieval"
+                else state.router_output.route,
+                user_intent=state.router_output.user_intent,
+                reason=state.router_output.reasoning,
+            )
+            logger.info(
+                "rag_route",
+                extra={
+                    "request_id": request_id,
+                    "route": state.router_output.route,
+                    "confidence": state.router_output.route_confidence,
+                    "entities": [e.model_dump() for e in state.router_output.entities],
+                    "scope_source": state.scope_result.source if state.scope_result else None,
+                },
+            )
+
+            # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
+            if state.processed_query.route == "out_of_scope":
+                redirect_text = out_of_scope_response()
+                await add_event(redis_app, request_id, "delta", {"text": redirect_text})
+                await message_repo.update_on_final(
+                    message_id=state.assistant_message_id,
+                    content=redirect_text,
+                    raw_content=redirect_text,
+                    request_id=UUID(request_id),
+                )
+                await llm_request_repo.update_status(UUID(request_id), "completed")
+                await conversation_repo.update_on_message(
+                    conversation_id=state.conversation_id,
+                    message_id=state.assistant_message_id,
+                    new_seq=state.assistant_seq,
+                )
+                usage_data = build_usage_event(
+                    redirect_text,
+                    None,
+                    state.assistant_message_id,
+                    state.assistant_seq,
+                    None,
+                )
+                await add_event(redis_app, request_id, "usage", usage_data)
+                await session.commit()
+                try:
+                    await state.history.append_assistant(
+                        state.conversation_id,
+                        redirect_text,
+                        state.assistant_seq,
+                    )
+                except Exception:
+                    logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
+                logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
+                return
 
             # 4. build_rag_context
             _log_stage("build_rag_context")
             if state.processed_query.route == "direct_answer" or not llm_request.user_id:
                 state.rag_context_str = "(No document context - general question.)"
             else:
-                doc_ids = resolve_doc_ids(llm_request.user_id)
+                doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
                 state.rag_context = await run_chat_rag_pipeline(
                     session,
                     state.processed_query.normalized_text,
@@ -284,23 +340,14 @@ async def _run_chat_pipeline(request_id: str) -> None:
             prompt_version = "v3_bracket" if citation_mode == "bracket" else "v3_none"
 
             renderer = get_prompt_renderer()
-            rendered_user = renderer.render_user_message(
-                context=state.rag_context_str,
-                user_query=state.user_query_raw,
-            )
-            modified = list(state.context_messages)
-            if modified and modified[-1].role == schemas.Role.user:
-                modified[-1] = schemas.ChatMessage(role=schemas.Role.user, content=rendered_user)
-            else:
-                modified.append(schemas.ChatMessage(role=schemas.Role.user, content=rendered_user))
-
             state.params = dict(llm_request.request_params or {})
-            state.adapter_messages = [
-                AdapterChatMessage(
-                    role=AdapterRole.system,
-                    content=get_system_prompt(version=prompt_version),
-                ),
-            ] + _to_adapter_messages(modified)
+            state.adapter_messages = assemble_prompt(
+                history=state.context_messages,
+                system_prompt=get_system_prompt(version=prompt_version),
+                rag_context=state.rag_context_str,
+                user_query=state.user_query_raw,
+                renderer=renderer,
+            )
 
             # 6. stream_llm_response
             _log_stage("stream_llm_response")
@@ -455,13 +502,9 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     await session.commit()
 
                     try:
-                        await append_chat_tail(
-                            redis_app,
-                            str(state.conversation_id),
-                            schemas.ChatMessage(
-                                role=schemas.Role.assistant,
-                                content=state.clean_content,
-                            ).model_dump(mode="json"),
+                        await state.history.append_assistant(
+                            state.conversation_id,
+                            state.clean_content,
                             state.assistant_seq,
                         )
                     except Exception:

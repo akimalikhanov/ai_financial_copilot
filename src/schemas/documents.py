@@ -42,3 +42,12 @@ class ListDocumentsResponse(BaseModel):
 
     documents: list[DocumentListItem]
     total: int
+
+
+class DocumentFilterOptionsResponse(BaseModel):
+    """Response from GET /v1/documents/filter-options."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    companies: list[str]
+    years: list[int]

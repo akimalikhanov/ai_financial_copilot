@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_DOC_ID = UUID("9e1284e3-ef0b-49e6-a1b9-a9292a7e0fa2")
 
 
+# DEPRECATED: replaced by src.services.router.scope_resolver.resolve_scope + ChatPipelineState.scope_result
 def resolve_doc_ids(_user_id: UUID) -> list[UUID]:
     """Resolve document IDs for retrieval. For now returns a single hard-coded UUID."""
     return [_DEFAULT_DOC_ID]
@@ -47,7 +48,7 @@ async def run_chat_rag_pipeline(
     session: AsyncSession,
     query: str,
     user_id: UUID,
-    doc_ids: list[UUID],
+    doc_ids: list[UUID] | None,
     timeout: float | None = None,
     reranker: Reranker | None = None,
 ) -> RAGContext:

@@ -12,7 +12,12 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from src.api.deps import CurrentUserDep
 from src.db import DbSessionDep
 from src.repository import DocumentRepository
-from src.schemas.documents import DocumentListItem, ListDocumentsResponse, UploadDocumentResponse
+from src.schemas.documents import (
+    DocumentFilterOptionsResponse,
+    DocumentListItem,
+    ListDocumentsResponse,
+    UploadDocumentResponse,
+)
 from src.services.ingestion.s3_client import upload_pdf
 from src.services.ingestion.tasks import ingest_document
 
@@ -44,6 +49,16 @@ async def list_documents(
         for d in docs
     ]
     return ListDocumentsResponse(documents=items, total=len(items))
+
+
+@router.get("/filter-options", response_model=DocumentFilterOptionsResponse)
+async def get_filter_options(
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+) -> DocumentFilterOptionsResponse:
+    repo = DocumentRepository(session)
+    options = await repo.get_filter_options(current_user.id)
+    return DocumentFilterOptionsResponse(**options)
 
 
 @router.post("/upload", response_model=UploadDocumentResponse)

@@ -12,6 +12,7 @@ import {
   fetchModels,
   getMe,
   listDocuments,
+  fetchFilterOptions,
   createConversation,
   fetchMessages,
   updateConversation,
@@ -229,6 +230,7 @@ export default function App() {
   // Data
   const [docs, setDocs] = useState<Document[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
+  const [filterOptions, setFilterOptions] = useState<{ companies: string[]; years: number[] }>({ companies: [], years: [] });
 
   // Messages (fetched from backend, keyed by conversationId)
   const [messagesByConversation, setMessagesByConversation] = useState<Record<string, Message[]>>({});
@@ -333,13 +335,17 @@ export default function App() {
   useEffect(() => {
     if (!isAuthenticated) {
       setDocs([]);
+      setFilterOptions({ companies: [], years: [] });
       return;
     }
     let cancelled = false;
     (async () => {
       try {
-        const res = await listDocuments();
-        if (!cancelled) setDocs(res.documents.map(toUiDoc));
+        const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
+        if (!cancelled) {
+          setDocs(docsRes.documents.map(toUiDoc));
+          setFilterOptions(opts);
+        }
       } catch (err) {
         console.error('Failed to load documents:', err);
       }
@@ -348,8 +354,9 @@ export default function App() {
   }, [isAuthenticated]);
 
   const refreshDocs = useCallback(async () => {
-    const res = await listDocuments();
-    setDocs(res.documents.map(toUiDoc));
+    const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
+    setDocs(docsRes.documents.map(toUiDoc));
+    setFilterOptions(opts);
   }, []);
 
   // Load conversations when authenticated (7.6)
@@ -661,6 +668,13 @@ export default function App() {
           temperature: modelParams.temperature,
           max_tokens: modelParams.maxTokens,
           ...extraParams,
+        },
+        metadata: {
+          scope: {
+            mode: scope.mode,
+            docIds: scope.docIds,
+            filters: scope.filters,
+          },
         },
       });
 
@@ -1033,6 +1047,7 @@ export default function App() {
             onModeChange={(m) => setScope(s => ({ ...s, mode: m }))}
             onFilterChange={(f) => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
             onAddFiles={() => setIsDocPickerOpen(true)}
+            filterOptions={filterOptions}
         />
 
         {/* Messages */}

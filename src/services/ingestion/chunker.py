@@ -307,6 +307,10 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         else:
             enriched_text = chunker.contextualize(chunk=chunk)
 
+        # PostgreSQL UTF-8 rejects null bytes; strip them from parsed PDF text
+        raw_text = raw_text.replace("\x00", "")
+        enriched_text = enriched_text.replace("\x00", "")
+
         rows.append(
             {
                 "document_id": doc_id_str,

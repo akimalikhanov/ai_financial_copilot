@@ -506,3 +506,20 @@ def get_chat_retrieval_timeout() -> float:
         return float(val)
     except ValueError:
         return 200.0
+
+
+# --- Query router ---
+def get_router_config() -> dict[str, float | int]:
+    """Query router configuration from environment variables.
+
+    Returns:
+        Dict with keys: temperature, max_tokens, entity_similarity_threshold,
+        entity_max_candidates, filtered_md_thresh.
+    """
+    return {
+        "temperature": float(os.getenv("ROUTER_TEMPERATURE", "0.0")),
+        "max_tokens": int(os.getenv("ROUTER_MAX_TOKENS", "800")),
+        "entity_similarity_threshold": float(os.getenv("ENTITY_SIMILARITY_THRESHOLD", "0.3")),
+        "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
+        "filtered_md_thresh": int(os.getenv("FILTERED_MD_THRESH", "5")),
+    }

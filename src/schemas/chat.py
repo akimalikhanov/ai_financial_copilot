@@ -13,7 +13,9 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from src.models.llm_request import LLMRequest
+    from src.schemas.query_router import DocumentScopeResult, RouterOutput
     from src.schemas.retrieval import ProcessedQuery, RAGContext
+    from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
 
 
@@ -45,9 +47,12 @@ class ChatPipelineState:
     conversation_id: UUID | None = None
     assistant_message_id: UUID | None = None
     assistant_seq: int = 0
+    history: ConversationHistory | None = None
     context_messages: list[ChatMessage] | None = None
     user_query_raw: str = ""
     processed_query: ProcessedQuery | None = None
+    router_output: RouterOutput | None = None
+    scope_result: DocumentScopeResult | None = None
     rag_context: RAGContext | None = None
     rag_context_str: str = ""
     adapter_messages: list[AdapterChatMessage] | None = None
