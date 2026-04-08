@@ -149,9 +149,19 @@ class OpenAIAdapter(LLMAdapter):
             if req.verbosity is not None:
                 kwargs["verbosity"] = req.verbosity
 
-        # Merge extra params from ChatRequest
+        # Merge extra params from ChatRequest.
+        # enable_thinking is Qwen3-specific: must be nested under extra_body.chat_template_kwargs.
         if req.extra_params:
-            kwargs.update(req.extra_params)
+            extra = dict(req.extra_params)
+            if "enable_thinking" in extra:
+                is_qwen = req.model.lower().startswith("qwen")
+                if is_qwen:
+                    kwargs.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})[
+                        "enable_thinking"
+                    ] = extra.pop("enable_thinking")
+                else:
+                    extra.pop("enable_thinking")  # silently drop for non-Qwen models
+            kwargs.update(extra)
 
         return kwargs
 

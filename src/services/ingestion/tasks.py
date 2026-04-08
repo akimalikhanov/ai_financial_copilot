@@ -24,6 +24,12 @@ from src.services.ingestion.docling_parser import reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
 from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
 from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
+from src.services.ingestion.table_summarizer import reset as reset_table_summarizer
+from src.services.ingestion.table_summarizer import (
+    summarize_table_chunks as _summarize_table_chunks,
+)
+from src.services.llm_router import get_router
+from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_db_url,
     get_embedding_dim,
@@ -31,6 +37,7 @@ from src.utils.config import (
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_rendered_bucket,
+    get_table_summarizer_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +69,9 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     reset_converter()
     reset_tokenizer()
     reset_embedding_clients()
+    reset_table_summarizer()
+    get_router.cache_clear()
+    get_prompt_loader.cache_clear()
     reset_qdrant_client()
     reset_opensearch_client()
     if _worker_loop is None or _worker_loop.is_closed():
@@ -123,7 +133,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     stage_order: list[str] = []
-    stage_total = 11
+    stage_total = 12 if get_table_summarizer_enabled() else 11
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
@@ -268,6 +278,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             )
             return
 
+        # -- summarize table chunks (LLM call, optional) ----------------------
+        if get_table_summarizer_enabled():
+            _log_stage("summarize_table_chunks")
+            chunks = await _summarize_table_chunks(chunks)
+
         # -- persist chunks to Postgres -------------------------------------
         _log_stage("persist_chunks_postgres")
         embedding_model = get_embedding_model()
@@ -282,8 +297,10 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             await session.commit()
 
         # -- generate embeddings (CPU/GPU-bound) ----------------------------
+        # When summarizer is enabled, table chunks embed their NL summary;
+        # otherwise (or on summarization failure) fall back to enriched_text.
         _log_stage("embed_chunks")
-        texts = [c["enriched_text"] for c in chunks]
+        texts = [c.get("table_nl_summary") or c["enriched_text"] for c in chunks]
         vectors = await asyncio.to_thread(embedder.embed_chunks, texts)
 
         # -- prepare Qdrant payload -----------------------------------------
@@ -337,6 +354,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                     "page_start": c.get("page_start"),
                     "page_end": c.get("page_end"),
                     "token_count": c.get("token_count"),
+                    "table_nl_summary": c.get("table_nl_summary"),
+                    "table_nl_summary_model": c.get("table_nl_summary_model"),
                     "provenance": c.get("provenance"),
                     "metadata": c.get("metadata", {}),
                 },

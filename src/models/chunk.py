@@ -34,6 +34,8 @@ class Chunk(Base):
         nullable=False,
         server_default=text("'[]'::jsonb"),
     )
+    table_nl_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    table_nl_summary_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
     chunk_metadata: Mapped[dict] = mapped_column(
         "metadata",

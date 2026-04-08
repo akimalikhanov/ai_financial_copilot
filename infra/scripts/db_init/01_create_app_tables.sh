@@ -659,6 +659,11 @@ CREATE TABLE IF NOT EXISTS chunks (
   provenance      jsonb NOT NULL DEFAULT '[]'::jsonb,
   metadata        jsonb NOT NULL DEFAULT '{}'::jsonb,
 
+  -- NL summary for table chunks (used for embedding instead of raw markdown table)
+  table_nl_summary text,
+  -- model used to generate the NL summary (NULL for non-table chunks or on failure)
+  table_nl_summary_model text,
+
   -- embedding tracking (set when chunk is embedded)
   embedding_model text,
 

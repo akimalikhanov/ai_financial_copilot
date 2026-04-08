@@ -44,6 +44,8 @@ class ChunkRepository:
                 page_end=c.get("page_end"),
                 token_count=c.get("token_count"),
                 provenance=c.get("provenance") if c.get("provenance") is not None else [],
+                table_nl_summary=c.get("table_nl_summary"),
+                table_nl_summary_model=c.get("table_nl_summary_model"),
                 embedding_model=c.get("embedding_model"),
                 chunk_metadata=c.get("metadata") or {},
             )

@@ -19,6 +19,7 @@ from src.services.prompts.prompt_renderer import get_prompt_renderer
 from src.services.router.parser import parse_router_response
 from src.services.router.scope_resolver import resolve_scope
 from src.utils.config import get_query_router_model, get_router_config
+from src.utils.json_schema import build_response_format
 
 logger = logging.getLogger(__name__)
 
@@ -41,40 +42,8 @@ def _normalize(raw: str) -> str:
     return cleaned
 
 
-def _make_strict(obj: dict) -> None:
-    """Mutate a JSON schema object in-place for OpenAI strict mode.
-
-    Strict mode requires:
-    - additionalProperties: false on every object
-    - required lists every key in properties (including optional/defaulted ones)
-    """
-    if obj.get("type") == "object" and "properties" in obj:
-        obj["additionalProperties"] = False
-        obj["required"] = list(obj["properties"].keys())
-        for prop in obj["properties"].values():
-            if isinstance(prop, dict):
-                _make_strict(prop)
-    for key in ("anyOf", "oneOf", "allOf"):
-        for sub in obj.get(key, []):
-            if isinstance(sub, dict):
-                _make_strict(sub)
-    for def_schema in obj.get("$defs", {}).values():
-        if isinstance(def_schema, dict):
-            _make_strict(def_schema)
-
-
 def _router_response_format() -> dict:
-    schema = RouterOutput.model_json_schema()
-    _make_strict(schema)
-
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "query_router",
-            "schema": schema,
-            "strict": True,
-        },
-    }
+    return build_response_format("query_router", RouterOutput.model_json_schema())
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:

@@ -413,6 +413,37 @@ def get_query_router_model() -> str:
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
 
 
+def get_table_summarizer_enabled() -> bool:
+    """Whether table summarization is enabled (TABLE_SUMMARIZER_ENABLED, default: true)."""
+    return os.getenv("TABLE_SUMMARIZER_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def get_table_summarizer_model() -> str:
+    """Model ID for table chunk summarization (TABLE_SUMMARIZER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
+    return os.getenv("TABLE_SUMMARIZER_MODEL", "gpt-4o-mini")
+
+
+def get_table_summarizer_enable_thinking() -> bool:
+    """Whether to enable thinking for table summarizer (TABLE_SUMMARIZER_ENABLE_THINKING, default: false).
+    Set to true only for models that support thinking (e.g. Qwen3). Passed as extra_body to vLLM."""
+    return os.getenv("TABLE_SUMMARIZER_ENABLE_THINKING", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def get_table_summarizer_batch_size() -> int:
+    """Number of tables to summarize per LLM call (TABLE_SUMMARIZER_BATCH_SIZE, default: 3)."""
+    return int(os.getenv("TABLE_SUMMARIZER_BATCH_SIZE", "3"))
+
+
 def get_rag_top_k() -> int:
     return int(os.getenv("RAG_TOP_K", "15"))
 
