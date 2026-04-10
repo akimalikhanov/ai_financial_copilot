@@ -38,10 +38,8 @@ class RouterInput(BaseModel):
 
 class RouterOutput(BaseModel):
     route: Literal["direct_answer", "retrieval", "out_of_scope"]
-    route_confidence: float
     entities: list[ExtractedEntity] = []
     time_references: list[TimeRef] = []
-    doc_type_hints: list[str] = []
     user_intent: str
     needs_decomposition: bool
     reasoning: str
@@ -50,4 +48,3 @@ class RouterOutput(BaseModel):
 class DocumentScopeResult(BaseModel):
     doc_ids: list[UUID] | None  # None = no pre-filter (search all user docs)
     source: Literal["explicit", "filtered", "entity_resolved", "all"]
-    unresolved_entities: list[ExtractedEntity] = []  # Entities with no matching docs

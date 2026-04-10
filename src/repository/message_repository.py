@@ -106,6 +106,7 @@ class MessageRepository:
         request_id: UUID | None = None,
         raw_content: str | None = None,
         metadata_updates: dict | None = None,
+        trace: dict | None = None,
     ) -> Message | None:
         """Update message content and status on stream completion."""
         result = await self.session.execute(select(Message).where(Message.id == message_id))
@@ -121,6 +122,8 @@ class MessageRepository:
             message.request_id = request_id
         if metadata_updates:
             message.message_metadata = {**message.message_metadata, **metadata_updates}
+        if trace is not None:
+            message.trace = trace
 
         await self.session.flush()
         return message

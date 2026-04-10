@@ -290,6 +290,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             c["embedding_model"] = embedding_model
 
         async with sf() as session:
+            if await DocumentRepository(session).get_by_id(doc_uuid) is None:
+                raise LookupError(f"Document {document_id} no longer exists")
             chunk_repo = ChunkRepository(session)
             old_db_chunks = await chunk_repo.list_by_document(doc_uuid)
             old_chunk_ids = [c.id for c in old_db_chunks]

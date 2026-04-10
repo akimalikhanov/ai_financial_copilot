@@ -26,7 +26,7 @@ from src.repository import (
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.retrieval import ProcessedQuery
+from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.events import (
     ThinkingStripper,
@@ -153,6 +153,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
+    retrieval_trace: RetrievalTrace | None = None
     stage_total = 7
     stage_index = 0
     current_stage = "initializing"
@@ -162,7 +163,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
         stage_index += 1
-        current_stage = stage_name
+        current_stage = f"{stage_index:02d}_{stage_name}"
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
@@ -264,8 +265,12 @@ async def _run_chat_pipeline(request_id: str) -> None:
                 extra={
                     "request_id": request_id,
                     "route": state.router_output.route,
-                    "confidence": state.router_output.route_confidence,
                     "entities": [e.model_dump() for e in state.router_output.entities],
+                    "time_references": [
+                        t.model_dump() for t in state.router_output.time_references
+                    ],
+                    "user_intent": state.router_output.user_intent,
+                    "needs_decomposition": state.router_output.needs_decomposition,
                     "scope_source": state.scope_result.source if state.scope_result else None,
                 },
             )
@@ -312,7 +317,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
                 state.rag_context_str = "(No document context - general question.)"
             else:
                 doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
-                state.rag_context = await run_chat_rag_pipeline(
+                state.rag_context, retrieval_trace = await run_chat_rag_pipeline(
                     session,
                     state.processed_query.normalized_text,
                     llm_request.user_id,
@@ -451,12 +456,47 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     elif state.rag_context and state.rag_context.items:
                         citation_meta["references"] = build_all_references(state.rag_context)
 
+                    if state.rag_context and state.rag_context.items:
+                        citation_meta["retrieved_chunks"] = [
+                            {"chunk_id": str(item.chunk_id), "score": item.score}
+                            for item in state.rag_context.items
+                        ]
+
+                    # Finalize stage times (stream_llm_response ends here)
+                    stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+                    total_time = round(perf_counter() - pipeline_started_at, 3)
+
+                    # Build pipeline trace
+                    trace_payload: dict = {
+                        "v": 1,
+                        "stage_times": stage_times,
+                        "total_time": total_time,
+                        "router": {
+                            "decision": state.router_output.route,
+                            "reasoning": state.router_output.reasoning[:500]
+                            if state.router_output.reasoning
+                            else None,
+                            "user_intent": state.router_output.user_intent,
+                            "needs_decomposition": state.router_output.needs_decomposition,
+                            "entities": [e.model_dump() for e in state.router_output.entities],
+                            "time_references": [
+                                t.model_dump() for t in state.router_output.time_references
+                            ],
+                            "scope_source": state.scope_result.source
+                            if state.scope_result
+                            else None,
+                        },
+                    }
+                    if retrieval_trace is not None:
+                        trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
+
                     await message_repo.update_on_final(
                         message_id=state.assistant_message_id,
                         content=state.clean_content,
                         raw_content=state.accumulated_content,
                         request_id=UUID(request_id),
                         metadata_updates=citation_meta or None,
+                        trace=trace_payload,
                     )
                     if chunk.stats:
                         await llm_request_repo.update_on_final(

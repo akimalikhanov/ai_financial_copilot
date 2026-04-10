@@ -25,10 +25,8 @@ logger = logging.getLogger(__name__)
 
 _FALLBACK = RouterOutput(
     route="retrieval",
-    route_confidence=0.5,
     entities=[],
     time_references=[],
-    doc_type_hints=[],
     user_intent="fallback",
     needs_decomposition=False,
     reasoning="router_fallback",
@@ -109,6 +107,23 @@ async def route_query(
     normalized = _normalize(inp.query)
     inp = inp.model_copy(update={"query": normalized})
 
+    # selectedDocs / thisDoc: scope is fully explicit, entities never used by scope_resolver
+    # → skip LLM call entirely, force retrieval deterministically
+    if inp.scope is not None and inp.scope.mode in ("selectedDocs", "thisDoc"):
+        output = RouterOutput(
+            route="retrieval",
+            entities=[],
+            time_references=[],
+            user_intent="document_query",
+            needs_decomposition=False,
+            reasoning="explicit_scope",
+        )
+        logger.info("route_query_done route=retrieval entities=0 (explicit scope)")
+        if session is not None and user_id is not None:
+            scope_result = await resolve_scope(session, user_id, inp.scope, output)
+            return output, scope_result
+        return output, None
+
     router = llm_router if llm_router is not None else get_router()
     model_id = get_query_router_model()
 
@@ -171,15 +186,6 @@ async def route_query(
     if output is None:
         return _FALLBACK, None
 
-    # Scope-based overrides (post-LLM, deterministic)
-    _has_active_scope = inp.scope is not None and (
-        inp.scope.mode in ("selectedDocs", "thisDoc")
-        or (
-            inp.scope.mode == "filteredByMetadata"
-            and (inp.scope.filters.company or inp.scope.filters.year)
-        )
-    )
-
     # if output.route == "retrieval" and not output.entities and not _has_active_scope:
     #     # Retrieval with no entities and no scope — ask user to be more specific
     #     logger.info("route_query_override route=retrieval→direct_answer reason=no_entity_no_scope")
@@ -193,9 +199,8 @@ async def route_query(
     #     output = output.model_copy(update={"route": "retrieval", "route_confidence": 1.0})
 
     logger.info(
-        "route_query_done route=%s confidence=%.2f entities=%d",
+        "route_query_done route=%s entities=%d",
         output.route,
-        output.route_confidence,
         len(output.entities),
     )
 

@@ -182,3 +182,21 @@ class ParserOutput:
 
     visible_text: str
     completed_spans: list[AnswerCitationSpan]
+
+
+class RetrievalHit(BaseModel):
+    """Compact hit for trace persistence — IDs and scores only, no text."""
+
+    id: str
+    score: float | None = None
+    vector_score: float | None = None
+    keyword_score: float | None = None
+
+
+class RetrievalTrace(BaseModel):
+    """Per-request retrieval trace stored in message.trace['retrieval']."""
+
+    qdrant: list[RetrievalHit] = []
+    opensearch: list[RetrievalHit] = []
+    fused: list[RetrievalHit] = []
+    reranked: list[RetrievalHit] = []

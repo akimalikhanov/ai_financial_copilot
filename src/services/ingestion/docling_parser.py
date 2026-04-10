@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import (
+    EasyOcrOptions,
     PictureDescriptionVlmOptions,
     ThreadedPdfPipelineOptions,
 )
@@ -48,10 +49,11 @@ class ParseResult:
 
 def _create_converter() -> DocumentConverter:
     """Create DocumentConverter with ThreadedStandardPdfPipeline and GPU/CPU auto-detection."""
-    accel = AcceleratorOptions(device=AcceleratorDevice.AUTO)
+    accel = AcceleratorOptions(device=AcceleratorDevice.CUDA, cuda_use_flash_attention2=False)
     opts = ThreadedPdfPipelineOptions(
         accelerator_options=accel,
         do_ocr=get_docling_do_ocr(),
+        ocr_options=EasyOcrOptions(lang=["en"], use_gpu=True),
         do_table_structure=get_docling_do_table_structure(),
         do_picture_description=get_docling_do_picture_description(),
         picture_description_options=PictureDescriptionVlmOptions(

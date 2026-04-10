@@ -31,15 +31,24 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
 
   const handleDragOver = (e: React.DragEvent) => e.preventDefault();
 
+  const deriveCompany = (filename: string): string =>
+    filename.replace(/\.pdf$/i, '').replace(/[_\-]+/g, ' ').trim();
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     const f = e.dataTransfer.files[0];
-    if (f) setFile(f);
+    if (f) {
+      setFile(f);
+      if (!company) setCompany(deriveCompany(f.name));
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) setFile(f);
+    if (f) {
+      setFile(f);
+      if (!company) setCompany(deriveCompany(f.name));
+    }
   };
 
   const handleConfirmUpload = async () => {

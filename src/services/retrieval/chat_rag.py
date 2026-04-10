@@ -8,7 +8,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.schemas.retrieval import RAGContext
+from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
 from src.services.ingestion.embedder import embed_chunks
 from src.services.retrieval.context_assembler import assemble_rag_context
 from src.services.retrieval.hybrid_retriever import fuse_rrf
@@ -34,6 +34,15 @@ def resolve_doc_ids(_user_id: UUID) -> list[UUID]:
     return [_DEFAULT_DOC_ID]
 
 
+def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
+    return RetrievalHit(
+        id=str(chunk.chunk_id),
+        score=round(chunk.score, 4) if chunk.score is not None else None,
+        vector_score=round(chunk.vector_score, 4) if chunk.vector_score is not None else None,
+        keyword_score=round(chunk.keyword_score, 4) if chunk.keyword_score is not None else None,
+    )
+
+
 async def _retrieve_with_timeout(coro, timeout: float | None = None) -> list:
     """Run retrieval coroutine with timeout. Fail open: return [] on error/timeout."""
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
@@ -51,8 +60,11 @@ async def run_chat_rag_pipeline(
     doc_ids: list[UUID] | None,
     timeout: float | None = None,
     reranker: Reranker | None = None,
-) -> RAGContext:
-    """Embed query, run parallel Qdrant + OpenSearch, fuse RRF, hydrate, rerank, assemble."""
+) -> tuple[RAGContext, RetrievalTrace]:
+    """Embed query, run parallel Qdrant + OpenSearch, fuse RRF, hydrate, rerank, assemble.
+
+    Returns (RAGContext, RetrievalTrace) — the trace carries IDs+scores for each pipeline stage.
+    """
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
     query_vector = (await asyncio.to_thread(embed_chunks, [query]))[0]
     vector_top_k = get_vector_search_top_k()
@@ -72,7 +84,11 @@ async def run_chat_rag_pipeline(
     fused = fuse_rrf(vector_results, keyword_results)
     capped = fused[: get_reranker_max_input()]
     if not capped:
-        return RAGContext(formatted_context="", items=(), chunk_count=0)
+        trace = RetrievalTrace(
+            qdrant=[_to_hit(c) for c in vector_results],
+            opensearch=[_to_hit(c) for c in keyword_results],
+        )
+        return RAGContext(formatted_context="", items=(), chunk_count=0), trace
 
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
@@ -82,4 +98,10 @@ async def run_chat_rag_pipeline(
         reranker = get_reranker()
     reranked = await reranker.rerank(query, capped, texts)
 
-    return assemble_rag_context(reranked, payloads)
+    trace = RetrievalTrace(
+        qdrant=[_to_hit(c) for c in vector_results],
+        opensearch=[_to_hit(c) for c in keyword_results],
+        fused=[_to_hit(c) for c in fused],
+        reranked=[_to_hit(c) for c in reranked],
+    )
+    return assemble_rag_context(reranked, payloads), trace

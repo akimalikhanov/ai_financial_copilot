@@ -47,7 +47,6 @@ template: |
   ```json
   {
     "route": "retrieval | direct_answer | out_of_scope",
-    "route_confidence": 0.0,
     "entities": [
       {
         "name": "Apple Inc.",
@@ -62,7 +61,6 @@ template: |
         "period": "Q3"
       }
     ],
-    "doc_type_hints": ["10-K", "earnings_call"],
     "user_intent": "single_lookup | comparison | trend_analysis | definition | other",
     "needs_decomposition": false,
     "reasoning": "brief internal trace"
@@ -76,10 +74,8 @@ template: |
   ```json
   {
     "route": "retrieval",
-    "route_confidence": 0.98,
     "entities": [{"name": "Apple Inc.", "entity_type": "company", "raw_span": "Apple"}],
     "time_references": [{"raw": "Q3 {{ y-1 }}", "year": {{ y-1 }}, "period": "Q3"}],
-    "doc_type_hints": [],
     "user_intent": "single_lookup",
     "needs_decomposition": false,
     "reasoning": "Single company, single metric, single quarter — straightforward retrieval."
@@ -91,7 +87,6 @@ template: |
   ```json
   {
     "route": "retrieval",
-    "route_confidence": 0.97,
     "entities": [
       {"name": "ACME Corp.", "entity_type": "company", "raw_span": "ACME"},
       {"name": "BetaCorp", "entity_type": "company", "raw_span": "BetaCorp"}
@@ -101,7 +96,6 @@ template: |
       {"raw": "last 3 years", "year": {{ y-1 }}, "period": "annual"},
       {"raw": "last 3 years", "year": {{ y-2 }}, "period": "annual"}
     ],
-    "doc_type_hints": [],
     "user_intent": "comparison",
     "needs_decomposition": true,
     "reasoning": "Multi-entity comparison across multiple years requires decomposition. Last 3 years resolved from today ({{ today }}): {{ y }}, {{ y-1 }}, {{ y-2 }}."
@@ -113,10 +107,8 @@ template: |
   ```json
   {
     "route": "retrieval",
-    "route_confidence": 0.95,
     "entities": [{"name": "ACME Corp.", "entity_type": "company", "raw_span": "their"}],
     "time_references": [],
-    "doc_type_hints": [],
     "user_intent": "single_lookup",
     "needs_decomposition": false,
     "reasoning": "Coreference 'their' resolved to ACME Corp from recent context."
@@ -128,10 +120,8 @@ template: |
   ```json
   {
     "route": "direct_answer",
-    "route_confidence": 0.99,
     "entities": [],
     "time_references": [],
-    "doc_type_hints": [],
     "user_intent": "other",
     "needs_decomposition": false,
     "reasoning": "Greeting and capability question — no retrieval needed."
@@ -143,10 +133,8 @@ template: |
   ```json
   {
     "route": "retrieval",
-    "route_confidence": 0.85,
     "entities": [{"name": "Mercury", "entity_type": "company", "raw_span": "Mercury"}],
     "time_references": [],
-    "doc_type_hints": [],
     "user_intent": "trend_analysis",
     "needs_decomposition": false,
     "reasoning": "Ambiguous entity — multiple companies may match. Route to retrieval; resolver handles disambiguation."
@@ -158,10 +146,8 @@ template: |
   ```json
   {
     "route": "retrieval",
-    "route_confidence": 0.9,
     "entities": [{"name": "ACME Corp.", "entity_type": "company", "raw_span": "ACME"}],
     "time_references": [{"raw": "since the restructuring", "year": null, "period": null}],
-    "doc_type_hints": [],
     "user_intent": "trend_analysis",
     "needs_decomposition": false,
     "reasoning": "Temporal reference is ambiguous without an exact date. Entity resolved from context."
@@ -173,10 +159,8 @@ template: |
   ```json
   {
     "route": "out_of_scope",
-    "route_confidence": 0.99,
     "entities": [],
     "time_references": [],
-    "doc_type_hints": [],
     "user_intent": "other",
     "needs_decomposition": false,
     "reasoning": "Weather query — outside financial document scope."
@@ -188,10 +172,8 @@ template: |
   ```json
   {
     "route": "direct_answer",
-    "route_confidence": 0.97,
     "entities": [],
     "time_references": [],
-    "doc_type_hints": [],
     "user_intent": "definition",
     "needs_decomposition": false,
     "reasoning": "General financial definition — no document retrieval needed."

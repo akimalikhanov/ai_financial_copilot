@@ -65,7 +65,11 @@ def upsert_chunks(
 
         points.append(PointStruct(id=str(chunk_id), vector=vector, payload=payload))
 
-    get_client().upsert(collection_name=collection, points=points, wait=True)
+    # Qdrant's default max_request_size_mb is 32 MB. A 768-dim vector is ~12 KB
+    # in JSON, so 500 points ≈ 6 MB per batch — well within the limit.
+    client = get_client()
+    for i in range(0, len(points), 500):
+        client.upsert(collection_name=collection, points=points[i : i + 500], wait=True)
 
 
 def delete_by_document(collection: str, doc_id: UUID | str) -> None:

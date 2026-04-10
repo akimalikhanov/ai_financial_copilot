@@ -438,6 +438,9 @@ CREATE TABLE IF NOT EXISTS messages (
   metadata           jsonb NOT NULL DEFAULT '{}'::jsonb,
   -- Flexible JSON: citations, tool info, UI flags, structured payloads.
 
+  trace              jsonb,
+  -- Pipeline trace: stage timings, router decision, retrieval hits (IDs+scores). NULL for user messages.
+
   client_msg_id      text,
   -- Optional idempotency key from client. Unique per conversation to prevent duplicates on retries.
 
@@ -474,6 +477,7 @@ COMMENT ON COLUMN messages.client_msg_id IS 'Client idempotency id (unique per c
 COMMENT ON COLUMN messages.request_id IS 'FK to llm_requests table. Links message to LLM request.';
 COMMENT ON COLUMN messages.created_at IS 'Row creation time.';
 COMMENT ON COLUMN messages.updated_at IS 'Row last update time (trigger managed).';
+COMMENT ON COLUMN messages.trace IS 'Pipeline trace: {v, stage_times, total_time, router, retrieval}. NULL for user/system messages.';
 
 CREATE INDEX IF NOT EXISTS messages_conv_seq_idx
   ON messages (conversation_id, seq);

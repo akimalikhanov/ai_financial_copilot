@@ -42,3 +42,5 @@ data/
 
 test.txt
 test.sh
+scripts/bulk_ingest.py
+scripts/eval_qa.py

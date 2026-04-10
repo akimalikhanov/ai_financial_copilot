@@ -95,6 +95,9 @@ class Message(Base):
         server_default=text("'{}'::jsonb"),
     )
 
+    # Pipeline trace (assistant messages only)
+    trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Idempotency and tracing
     client_msg_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     request_id: Mapped[UUID | None] = mapped_column(
