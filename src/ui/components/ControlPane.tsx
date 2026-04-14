@@ -21,7 +21,10 @@ export interface RequestStats {
   inputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
+  /** Chat LLM tokens only — used as the distribution bar denominator so bars fill 100%. */
   totalTokens: number;
+  /** Chat + router combined — used for the "X total" label and session totals. */
+  pipelineTotalTokens: number;
   cost: number;
   latencyMs: number;
   ttftMs: number | null;
@@ -327,7 +330,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
   // Calculate session totals
   const sessionTotals = statsHistory.reduce(
     (acc, stat) => ({
-      tokens: acc.tokens + stat.totalTokens,
+      tokens: acc.tokens + stat.pipelineTotalTokens,
       cost: acc.cost + stat.cost,
       requests: acc.requests + 1,
     }),

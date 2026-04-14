@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from decimal import Decimal
 from time import perf_counter
 from uuid import UUID
 
@@ -23,6 +22,7 @@ from src.repository import (
     LLMRequestRepository,
     MessageRepository,
 )
+from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
@@ -250,6 +250,8 @@ async def _run_chat_pipeline(request_id: str) -> None:
                 user_id=llm_request.user_id,
                 llm_router=router,
                 session=session,
+                parent_request_id=llm_request.id,
+                conversation_id=state.conversation_id,
             )
             # Shim for downstream stages that still read processed_query.route
             state.processed_query = ProcessedQuery(
@@ -266,9 +268,6 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     "request_id": request_id,
                     "route": state.router_output.route,
                     "entities": [e.model_dump() for e in state.router_output.entities],
-                    "time_references": [
-                        t.model_dump() for t in state.router_output.time_references
-                    ],
                     "user_intent": state.router_output.user_intent,
                     "needs_decomposition": state.router_output.needs_decomposition,
                     "scope_source": state.scope_result.source if state.scope_result else None,
@@ -479,9 +478,6 @@ async def _run_chat_pipeline(request_id: str) -> None:
                             "user_intent": state.router_output.user_intent,
                             "needs_decomposition": state.router_output.needs_decomposition,
                             "entities": [e.model_dump() for e in state.router_output.entities],
-                            "time_references": [
-                                t.model_dump() for t in state.router_output.time_references
-                            ],
                             "scope_source": state.scope_result.source
                             if state.scope_result
                             else None,
@@ -501,26 +497,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     if chunk.stats:
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
-                            prompt_tokens=chunk.stats.input_tokens,
-                            completion_tokens=chunk.stats.output_tokens,
-                            reasoning_tokens=chunk.stats.reasoning_tokens,
-                            total_tokens=chunk.stats.total_tokens,
-                            cost_usd=(
-                                Decimal(str(chunk.stats.cost_usd))
-                                if chunk.stats.cost_usd is not None
-                                else None
-                            ),
-                            latency_ms=(
-                                int(chunk.stats.latency_ms)
-                                if chunk.stats.latency_ms is not None
-                                else None
-                            ),
-                            ttft_ms=(
-                                int(chunk.stats.ttft_ms)
-                                if chunk.stats.ttft_ms is not None
-                                else None
-                            ),
-                            tps=int(chunk.stats.tps) if chunk.stats.tps is not None else None,
+                            **stats_to_request_kwargs(chunk.stats),
                         )
                     await llm_request_repo.update_status(UUID(request_id), "completed")
                     await conversation_repo.update_on_message(

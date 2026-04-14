@@ -227,7 +227,6 @@ class DocumentRepository:
         name: str,
         *,
         threshold: float = 0.3,
-        years: list[int] | None = None,
         constrain_to: list[UUID] | None = None,
         limit: int = 10,
     ) -> list[UUID]:
@@ -242,11 +241,6 @@ class DocumentRepository:
             "limit": limit,
         }
 
-        year_clause = ""
-        if years:
-            params["years"] = years
-            year_clause = "AND (metadata->>'year')::int = ANY(:years)"
-
         constrain_clause = ""
         if constrain_to:
             params["constrain_to"] = [str(d) for d in constrain_to]
@@ -258,7 +252,6 @@ class DocumentRepository:
               AND status = 'ready'
               AND metadata->>'company' IS NOT NULL
               AND similarity(lower(metadata->>'company'), :name) > :threshold
-              {year_clause}
               {constrain_clause}
             ORDER BY similarity(lower(metadata->>'company'), :name) DESC
             LIMIT :limit

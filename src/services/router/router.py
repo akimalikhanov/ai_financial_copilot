@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_router import (
     DocumentScopeResult,
     RouterInput,
@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 _FALLBACK = RouterOutput(
     route="retrieval",
     entities=[],
-    time_references=[],
     user_intent="fallback",
     needs_decomposition=False,
     reasoning="router_fallback",
@@ -76,15 +75,18 @@ def _build_messages(
         history_block = "Recent conversation:\n" + "\n".join(turns) + "\n\n"
 
     scope_block = ""
-    if inp.scope is not None and inp.scope.mode == "filteredByMetadata":
-        f = inp.scope.filters
-        parts = []
-        if f.company:
-            parts.append(f"company={', '.join(f.company)}")
-        if f.year:
-            parts.append(f"year={', '.join(str(y) for y in f.year)}")
-        if parts:
-            scope_block = f"Active document scope: {'; '.join(parts)}\n"
+    if inp.scope is not None:
+        if inp.scope.mode == "filteredByMetadata":
+            f = inp.scope.filters
+            parts = []
+            if f.company:
+                parts.append(f"company={', '.join(f.company)}")
+            if f.year:
+                parts.append(f"year={', '.join(str(y) for y in f.year)}")
+            if parts:
+                scope_block = f"Active document scope: {'; '.join(parts)}\n"
+        elif inp.scope.mode in ("selectedDocs", "thisDoc"):
+            scope_block = "Active document scope: specific documents explicitly selected by user\n"
 
     return [
         ChatMessage(role=Role.system, content=system),
@@ -98,34 +100,26 @@ async def route_query(
     user_id: UUID | None = None,
     llm_router: LLMRouter | None = None,
     session: AsyncSession | None = None,
+    parent_request_id: UUID | None = None,
+    conversation_id: UUID | None = None,
 ) -> tuple[RouterOutput, DocumentScopeResult | None]:
     """Route a query and optionally resolve document scope.
 
     Returns (RouterOutput, DocumentScopeResult | None).
     scope_result is None when route != 'retrieval' or session is not provided.
+
+    When `parent_request_id`, `conversation_id`, and `session` are provided, the
+    router's LLM call(s) are logged to llm_requests as a sub-request of the parent
+    chat request, so full-pipeline cost/tokens can be aggregated.
     """
     normalized = _normalize(inp.query)
     inp = inp.model_copy(update={"query": normalized})
 
-    # selectedDocs / thisDoc: scope is fully explicit, entities never used by scope_resolver
-    # → skip LLM call entirely, force retrieval deterministically
-    if inp.scope is not None and inp.scope.mode in ("selectedDocs", "thisDoc"):
-        output = RouterOutput(
-            route="retrieval",
-            entities=[],
-            time_references=[],
-            user_intent="document_query",
-            needs_decomposition=False,
-            reasoning="explicit_scope",
-        )
-        logger.info("route_query_done route=retrieval entities=0 (explicit scope)")
-        if session is not None and user_id is not None:
-            scope_result = await resolve_scope(session, user_id, inp.scope, output)
-            return output, scope_result
-        return output, None
-
     router = llm_router if llm_router is not None else get_router()
     model_id = get_query_router_model()
+    should_log_subrequest = (
+        session is not None and parent_request_id is not None and conversation_id is not None
+    )
 
     try:
         llm = router.get(model_id)
@@ -135,9 +129,7 @@ async def route_query(
 
     try:
         prompt = get_prompt_loader().load("query_router", "v2")
-        system = get_prompt_renderer()._render_template(
-            prompt.template, {"today": date.today().isoformat()}
-        )
+        system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("route_query_prompt_missing", extra={"model": model_id})
         return _FALLBACK, None
@@ -146,6 +138,10 @@ async def route_query(
     messages = _build_messages(inp, system, max_assistant_tokens=150)
 
     cfg = get_router_config()
+    request_params = {
+        "temperature": cfg["temperature"],
+        "max_tokens": int(cfg["max_tokens"]),
+    }
     output: RouterOutput | None = None
     for attempt in range(2):
         try:
@@ -158,6 +154,19 @@ async def route_query(
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})
             return _FALLBACK, None
+
+        if should_log_subrequest:
+            await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
+                parent_request_id=parent_request_id,  # type: ignore[arg-type]
+                conversation_id=conversation_id,  # type: ignore[arg-type]
+                user_id=user_id,
+                provider=llm.provider,
+                model=model_id,
+                request_type="router",
+                request_params=request_params,
+                status="completed",
+                **stats_to_request_kwargs(resp.stats),
+            )
 
         raw = resp.text or ""
         result, error = parse_router_response(raw)

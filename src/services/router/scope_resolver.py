@@ -22,7 +22,7 @@ async def resolve_scope(
     """
     cfg = get_router_config()
     filtered_md_thresh = int(cfg["filtered_md_thresh"])
-    has_entities = bool(router_output.entities or router_output.time_references)
+    has_entities = bool(router_output.entities)
 
     # --- selectedDocs / thisDoc: use doc_ids directly, skip Layer 2 ---
     if scope is not None and scope.mode in ("selectedDocs", "thisDoc"):
@@ -50,17 +50,15 @@ async def resolve_scope(
 
         # Large result set + entities → intersect with entity resolution
         if has_entities:
-            matched, unresolved = await resolve_entities_to_doc_ids(
+            matched, _ = await resolve_entities_to_doc_ids(
                 session,
                 user_id,
                 router_output.entities,
-                router_output.time_references,
                 constrain_to=layer1_ids,
             )
             return DocumentScopeResult(
                 doc_ids=matched if matched else layer1_ids,
                 source="filtered",
-                unresolved_entities=unresolved,
             )
 
         # Large result set, no entities → return Layer 1 as-is
@@ -71,22 +69,19 @@ async def resolve_scope(
 
     # --- allDocs / None → Layer 2 does the heavy lifting ---
     if has_entities:
-        matched, unresolved = await resolve_entities_to_doc_ids(
+        matched, _ = await resolve_entities_to_doc_ids(
             session,
             user_id,
             router_output.entities,
-            router_output.time_references,
         )
         if matched:
             return DocumentScopeResult(
                 doc_ids=matched,
                 source="entity_resolved",
-                unresolved_entities=unresolved,
             )
         return DocumentScopeResult(
             doc_ids=None,
             source="all",
-            unresolved_entities=unresolved,
         )
 
     # No entities, no scope → no pre-filter

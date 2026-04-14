@@ -47,6 +47,16 @@ class LLMRequest(Base):
         nullable=True,
         index=True,
     )
+    parent_request_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("llm_requests.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    request_type: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default=text("'chat'"),
+    )
 
     # LLM provider/model info
     provider: Mapped[str] = mapped_column(Text, nullable=False)

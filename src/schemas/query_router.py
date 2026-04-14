@@ -12,12 +12,6 @@ class ExtractedEntity(BaseModel):
     raw_span: str  # verbatim substring from query
 
 
-class TimeRef(BaseModel):
-    raw: str
-    year: int | None = None
-    period: str | None = None  # "annual" | "H1" | "Q3" etc.
-
-
 class ScopeFilters(BaseModel):
     company: list[str] = []
     year: list[int] = []
@@ -39,7 +33,6 @@ class RouterInput(BaseModel):
 class RouterOutput(BaseModel):
     route: Literal["direct_answer", "retrieval", "out_of_scope"]
     entities: list[ExtractedEntity] = []
-    time_references: list[TimeRef] = []
     user_intent: str
     needs_decomposition: bool
     reasoning: str

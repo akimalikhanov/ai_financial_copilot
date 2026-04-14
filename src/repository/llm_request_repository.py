@@ -8,6 +8,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.llm_request import LLMRequest
 from src.models.message import Message, MessageRole, MessageStatus
+from src.services.llm_adapters.base_adapter import LLMResponseStats
+
+
+def stats_to_request_kwargs(stats: LLMResponseStats | None) -> dict:
+    """Map adapter LLMResponseStats → llm_requests column kwargs (handles type coercion)."""
+    if stats is None:
+        return {}
+    return {
+        "prompt_tokens": stats.input_tokens,
+        "completion_tokens": stats.output_tokens,
+        "reasoning_tokens": stats.reasoning_tokens,
+        "total_tokens": stats.total_tokens,
+        "cost_usd": Decimal(str(stats.cost_usd)) if stats.cost_usd is not None else None,
+        "latency_ms": int(stats.latency_ms) if stats.latency_ms is not None else None,
+        "ttft_ms": int(stats.ttft_ms) if stats.ttft_ms is not None else None,
+        "tps": int(stats.tps) if stats.tps is not None else None,
+    }
 
 
 class LLMRequestRepository:
@@ -22,10 +39,11 @@ class LLMRequestRepository:
         return result.scalar_one_or_none()
 
     async def list_recent_by_user_id(self, user_id: UUID, limit: int = 50) -> list[LLMRequest]:
-        """List LLM requests for user, newest first."""
+        """List top-level chat requests for user, newest first. Excludes sub-requests."""
         result = await self.session.execute(
             select(LLMRequest)
             .where(LLMRequest.user_id == user_id)
+            .where(LLMRequest.parent_request_id.is_(None))
             .order_by(LLMRequest.created_at.desc())
             .limit(limit)
         )
@@ -34,11 +52,12 @@ class LLMRequestRepository:
     async def list_recent_by_conversation_id(
         self, conversation_id: UUID, limit: int = 50
     ) -> list[LLMRequest]:
-        """List LLM requests for a conversation, newest first. Only completed (has stats)."""
+        """List top-level completed chat requests for a conversation. Excludes sub-requests."""
         result = await self.session.execute(
             select(LLMRequest)
             .where(LLMRequest.conversation_id == conversation_id)
             .where(LLMRequest.status == "completed")
+            .where(LLMRequest.parent_request_id.is_(None))
             .order_by(LLMRequest.created_at.desc())
             .limit(limit)
         )
@@ -133,6 +152,52 @@ class LLMRequestRepository:
         await self.session.flush()
 
         return llm_request, assistant_message
+
+    async def create_subrequest(
+        self,
+        parent_request_id: UUID,
+        conversation_id: UUID,
+        user_id: UUID | None,
+        provider: str,
+        model: str,
+        request_type: str,
+        request_params: dict | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        total_tokens: int | None = None,
+        cost_usd: Decimal | None = None,
+        latency_ms: int | None = None,
+        ttft_ms: int | None = None,
+        tps: int | None = None,
+        status: str = "completed",
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> LLMRequest:
+        """Create a completed sub-request row linked to a parent chat request."""
+        sub = LLMRequest(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            provider=provider,
+            model=model,
+            parent_request_id=parent_request_id,
+            request_type=request_type,
+            request_params=request_params or {},
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
+            tps=tps,
+            status=status,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        self.session.add(sub)
+        await self.session.flush()
+        return sub
 
     async def update_on_final(
         self,

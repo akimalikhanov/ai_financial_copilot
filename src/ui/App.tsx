@@ -573,13 +573,17 @@ export default function App() {
         const input = r.input_tokens ?? 0;
         const output = r.output_tokens ?? 0;
         const reasoning = r.reasoning_tokens ?? 0;
-        const total = r.total_tokens ?? input + output + reasoning;
+        const chatTotal = r.total_tokens ?? input + output + reasoning;
         return {
           inputTokens: input,
           outputTokens: output,
           reasoningTokens: reasoning,
-          totalTokens: total,
-          cost: r.cost_usd ?? 0,
+          // Chat LLM only — keeps the distribution bar denominator correct (fills 100%).
+          totalTokens: chatTotal,
+          // Combined pipeline — "X total" label, session token sum.
+          pipelineTotalTokens: r.pipeline_total_tokens ?? chatTotal,
+          // Combined pipeline cost.
+          cost: r.pipeline_cost_usd ?? r.cost_usd ?? 0,
           latencyMs: r.latency_ms ?? 0,
           ttftMs: r.ttft_ms ?? null,
           tps: r.tps ?? null,

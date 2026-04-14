@@ -344,8 +344,15 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   status             text,
   -- Request status: 'pending', 'streaming', 'completed', 'cancelled', 'failed'.
 
-  assistant_message_id uuid
+  assistant_message_id uuid,
   -- Pre-created assistant message placeholder (FK added after messages exists).
+
+  parent_request_id  uuid REFERENCES llm_requests(id) ON DELETE CASCADE,
+  -- Links a sub-call (e.g. query-router LLM) to its parent chat request.
+  -- NULL for top-level chat requests. Used to aggregate full-pipeline cost/tokens.
+
+  request_type       text NOT NULL DEFAULT 'chat'
+  -- Discriminator: 'chat' (default, main assistant response) or 'router' (query routing sub-call).
 );
 
 COMMENT ON TABLE llm_requests IS
@@ -375,6 +382,7 @@ COMMENT ON COLUMN llm_requests.client_request_id IS 'Idempotency key from client
 COMMENT ON COLUMN llm_requests.included_message_ids IS 'Array of message IDs included in LLM context.';
 COMMENT ON COLUMN llm_requests.status IS 'Request status: pending/streaming/completed/cancelled/failed.';
 COMMENT ON COLUMN llm_requests.assistant_message_id IS 'Pre-created assistant message placeholder.';
+
 
 CREATE INDEX IF NOT EXISTS llm_requests_conv_idx
   ON llm_requests (conversation_id);

@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repository.document_repository import DocumentRepository
-from src.schemas.query_router import ExtractedEntity, TimeRef
+from src.schemas.query_router import ExtractedEntity
 from src.utils.config import get_router_config
 
 
@@ -13,7 +13,6 @@ async def resolve_entities_to_doc_ids(
     session: AsyncSession,
     user_id: UUID,
     entities: list[ExtractedEntity],
-    time_refs: list[TimeRef],
     *,
     constrain_to: list[UUID] | None = None,
     threshold: float | None = None,
@@ -33,7 +32,6 @@ async def resolve_entities_to_doc_ids(
         max_candidates = int(cfg["entity_max_candidates"])
 
     repo = DocumentRepository(session)
-    resolved_years = [tr.year for tr in time_refs if tr.year is not None] or None
     matched: set[UUID] = set()
     unresolved: list[ExtractedEntity] = []
 
@@ -42,7 +40,6 @@ async def resolve_entities_to_doc_ids(
             user_id,
             entity.name,
             threshold=float(threshold),
-            years=resolved_years,
             constrain_to=constrain_to,
             limit=int(max_candidates),
         )

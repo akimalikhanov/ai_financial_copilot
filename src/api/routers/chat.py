@@ -11,10 +11,12 @@ from uuid import UUID
 from celery import Task
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import func, select
 
 from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
+from src.models.llm_request import LLMRequest
 from src.models.message import MessageRole
 from src.redis_client import events_stream_key
 from src.repository import (
@@ -44,21 +46,51 @@ async def chat_stats(
 
     llm_request_repo = LLMRequestRepository(session)
     requests = await llm_request_repo.list_recent_by_conversation_id(conversation_id, limit=limit)
-    items = [
-        schemas.RequestStatsItem(
-            input_tokens=r.prompt_tokens,
-            output_tokens=r.completion_tokens,
-            reasoning_tokens=r.reasoning_tokens,
-            total_tokens=r.total_tokens,
-            cost_usd=float(r.cost_usd) if r.cost_usd is not None else None,
-            latency_ms=r.latency_ms,
-            ttft_ms=r.ttft_ms,
-            tps=r.tps,
-            model=r.model,
-            created_at=r.created_at,
+
+    # Aggregate sub-request (router, etc.) cost+tokens per parent in one query.
+    parent_ids = [r.id for r in requests]
+    sub_totals: dict[UUID, tuple[float, int]] = {}
+    if parent_ids:
+        rows = await session.execute(
+            select(
+                LLMRequest.parent_request_id,
+                func.sum(LLMRequest.cost_usd).label("cost_sum"),
+                func.sum(LLMRequest.total_tokens).label("token_sum"),
+            )
+            .where(LLMRequest.parent_request_id.in_(parent_ids))
+            .group_by(LLMRequest.parent_request_id)
         )
-        for r in requests
-    ]
+        for row in rows:
+            sub_totals[row.parent_request_id] = (
+                float(row.cost_sum or 0),
+                int(row.token_sum or 0),
+            )
+
+    items = []
+    for r in requests:
+        chat_cost = float(r.cost_usd) if r.cost_usd is not None else None
+        chat_tokens = r.total_tokens
+        sub_cost, sub_tokens = sub_totals.get(r.id, (0.0, 0))
+        items.append(
+            schemas.RequestStatsItem(
+                input_tokens=r.prompt_tokens,
+                output_tokens=r.completion_tokens,
+                reasoning_tokens=r.reasoning_tokens,
+                total_tokens=chat_tokens,
+                cost_usd=chat_cost,
+                latency_ms=r.latency_ms,
+                ttft_ms=r.ttft_ms,
+                tps=r.tps,
+                model=r.model,
+                created_at=r.created_at,
+                pipeline_cost_usd=(chat_cost or 0.0) + sub_cost
+                if chat_cost is not None or sub_cost
+                else None,
+                pipeline_total_tokens=(chat_tokens or 0) + sub_tokens
+                if chat_tokens is not None or sub_tokens
+                else None,
+            )
+        )
     return schemas.ChatStatsResponse(requests=items)
 
 

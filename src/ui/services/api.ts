@@ -798,6 +798,9 @@ export interface RequestStatsItem {
   tps: number | null;
   model: string;
   created_at: string;
+  // Full pipeline aggregates (chat LLM + router combined).
+  pipeline_cost_usd: number | null;
+  pipeline_total_tokens: number | null;
 }
 
 export interface ChatStatsResponse {

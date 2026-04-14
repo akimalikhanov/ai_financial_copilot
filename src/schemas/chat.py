@@ -192,6 +192,12 @@ class RequestStatsItem(BaseModel):
     model: str
     created_at: datetime
 
+    # Full pipeline aggregates (chat LLM + router sub-requests combined).
+    # Use these for total cost and token count; use the fields above for
+    # per-model breakdowns (token distribution bar, latency, TPS).
+    pipeline_cost_usd: float | None = None
+    pipeline_total_tokens: int | None = None
+
 
 class ChatStatsResponse(BaseModel):
     """Response from GET /v1/chat/stats."""
