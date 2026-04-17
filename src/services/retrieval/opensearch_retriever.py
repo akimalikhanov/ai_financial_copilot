@@ -56,20 +56,6 @@ def _coerce_int(value: Any) -> int | None:
     return int(value)
 
 
-def _normalize_scores(scores: list[float]) -> list[float]:
-    if not scores:
-        return []
-
-    max_score = max(scores)
-    min_score = min(scores)
-    if max_score <= 0:
-        return [0.0] * len(scores)
-    if max_score == min_score:
-        return [1.0] * len(scores)
-    scale = max_score - min_score
-    return [(score - min_score) / scale for score in scores]
-
-
 def _to_retrieved_chunk(
     hit: dict[str, Any],
     normalized_score: float,
@@ -114,10 +100,10 @@ def _search(
         body=_build_query(query_text, user_id, doc_ids, top_k),
     )
     hits = response.get("hits", {}).get("hits", [])
-    scores = _normalize_scores([float(hit.get("_score") or 0.0) for hit in hits])
 
     chunks: list[RetrievedChunk] = []
-    for rank, (hit, score) in enumerate(zip(hits, scores, strict=True), start=1):
+    for rank, hit in enumerate(hits, start=1):
+        score = float(hit.get("_score") or 0.0)
         chunk = _to_retrieved_chunk(hit, score, rank)
         if chunk is not None:
             chunks.append(chunk)

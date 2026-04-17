@@ -41,3 +41,4 @@ class RouterOutput(BaseModel):
 class DocumentScopeResult(BaseModel):
     doc_ids: list[UUID] | None  # None = no pre-filter (search all user docs)
     source: Literal["explicit", "filtered", "entity_resolved", "all"]
+    per_entity_doc_ids: dict[str, list[UUID]] | None = None  # keyed by ExtractedEntity.name

@@ -33,6 +33,9 @@ class Reranker(Protocol):
         texts: dict[UUID, str],
     ) -> list[RetrievedChunk]: ...
 
+    async def aclose(self) -> None:
+        pass
+
 
 class NoOpReranker:
     """Pass-through reranker for disabled reranking or fallback."""
@@ -44,6 +47,9 @@ class NoOpReranker:
         texts: dict[UUID, str],  # noqa: ARG002
     ) -> list[RetrievedChunk]:
         return list(chunks)
+
+    async def aclose(self) -> None:
+        pass
 
 
 class LocalCrossEncoderReranker:
@@ -65,6 +71,10 @@ class LocalCrossEncoderReranker:
         )
         self._top_k = rerank_top_k if rerank_top_k is not None else get_reranker_top_k()
         self._max_input = max_input if max_input is not None else get_reranker_max_input()
+        self._client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def rerank(
         self,
@@ -80,13 +90,12 @@ class LocalCrossEncoderReranker:
             return list(to_rerank)
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(
-                    f"{self._base_url}/rerank",
-                    json={"query": query, "texts": text_list},
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await self._client.post(
+                "/rerank",
+                json={"query": query, "texts": text_list},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             logger.warning("reranker_failed", extra={"error": str(exc)})
             return list(chunks)

@@ -222,6 +222,8 @@ services:
       - ${RERANKER_MODEL_NAME:-Alibaba-NLP/gte-reranker-modernbert-base}
       - --dtype
       - float16
+      - --max-batch-tokens
+      - "8192"
     ports:
       - "${RERANKER_BIND_HOST:-127.0.0.1}:${RERANKER_PORT:-8080}:80"
     environment:

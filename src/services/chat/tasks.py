@@ -19,6 +19,7 @@ from src.models.message import Message, MessageStatus
 from src.redis_client import add_event
 from src.repository import (
     ConversationRepository,
+    DocumentRepository,
     LLMRequestRepository,
     MessageRepository,
 )
@@ -26,6 +27,7 @@ from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
+from src.schemas.query_transform import ScopeDocSummary, TransformedQuery, TransformerInput
 from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.events import (
@@ -43,9 +45,10 @@ from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 
 # from src.services.retrieval.query_processor import process_query
+from src.services.retrieval.query_transformer import transform_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
-from src.utils.config import get_db_url, get_redis_app_url
+from src.utils.config import get_db_url, get_query_transformer_config, get_redis_app_url
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +134,8 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
         return
     if _router is not None:
         _worker_loop.run_until_complete(_router.close())
+    if _reranker is not None and hasattr(_reranker, "aclose"):
+        _worker_loop.run_until_complete(_reranker.aclose())
     if _redis_app is not None:
         _worker_loop.run_until_complete(_redis_app.aclose())
     if _engine is not None:
@@ -154,7 +159,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     retrieval_trace: RetrievalTrace | None = None
-    stage_total = 7
+    stage_total = 8
     stage_index = 0
     current_stage = "initializing"
 
@@ -310,17 +315,127 @@ async def _run_chat_pipeline(request_id: str) -> None:
                 logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
                 return
 
+            # 3.5 transform_query — retrieval route only
+            if state.processed_query.route == "retrieve" and llm_request.user_id:
+                _log_stage("transform_query")
+                doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
+                per_entity = state.scope_result.per_entity_doc_ids if state.scope_result else None
+                known_entity_names: list[str] = list(per_entity.keys()) if per_entity else []
+
+                # Decomposition guard: disable when fewer than 2 resolved entities
+                needs_decomp = state.router_output.needs_decomposition
+                decomp_overridden = False
+                if needs_decomp and (not per_entity or len(per_entity) < 2):
+                    needs_decomp = False
+                    decomp_overridden = True
+                    logger.info(
+                        "decomposition_overridden",
+                        extra={
+                            "request_id": request_id,
+                            "reason": "insufficient_entities",
+                            "entity_count": len(per_entity) if per_entity else 0,
+                        },
+                    )
+
+                scope_docs: list[ScopeDocSummary] = []
+                if doc_ids_scope:
+                    cfg = get_query_transformer_config()
+                    doc_repo = DocumentRepository(session)
+                    rows = await doc_repo.get_scope_doc_summaries(
+                        llm_request.user_id, doc_ids_scope, limit=cfg["max_scope_docs"]
+                    )
+                    scope_docs = [
+                        ScopeDocSummary(document_id=r[0], company=r[1], year=r[2]) for r in rows
+                    ]
+
+                transformer_input = TransformerInput(
+                    user_query_raw=state.user_query_raw,
+                    conversation_history=[
+                        {"role": m.role.value, "content": m.content}
+                        for m in (state.context_messages or [])
+                    ],
+                    router_entities=state.router_output.entities,
+                    user_intent=state.router_output.user_intent,
+                    needs_decomposition=needs_decomp,
+                    scope_docs=scope_docs,
+                    known_entity_names=known_entity_names,
+                )
+                try:
+                    state.transformed_query = await transform_query(
+                        transformer_input,
+                        llm_router=router,
+                        session=session,
+                        parent_request_id=llm_request.id,
+                        conversation_id=state.conversation_id,
+                        user_id=llm_request.user_id,
+                    )
+                    if decomp_overridden:
+                        state.transformed_query.decomposition_overridden = True
+                except Exception:
+                    logger.exception("query_transform_failed", extra={"request_id": request_id})
+                    state.transformed_query = TransformedQuery(
+                        semantic_query=state.user_query_raw,
+                        keyword_query=state.user_query_raw,
+                        fallback=True,
+                    )
+
+                tq = state.transformed_query
+                logger.info(
+                    "query_transform_result",
+                    extra={
+                        "request_id": request_id,
+                        "semantic_query": tq.semantic_query,
+                        "keyword_query": tq.keyword_query,
+                        "fallback": tq.fallback,
+                        "decomposition_overridden": tq.decomposition_overridden,
+                        "sub_query_count": len(tq.sub_queries),
+                        "sub_queries": [
+                            {
+                                "focus_entity": s.focus_entity,
+                                "semantic_query": s.semantic_query,
+                                "keyword_query": s.keyword_query,
+                                "entity_match_quality": s.entity_match_quality,
+                            }
+                            for s in tq.sub_queries
+                        ],
+                    },
+                )
+
             # 4. build_rag_context
             _log_stage("build_rag_context")
             if state.processed_query.route == "direct_answer" or not llm_request.user_id:
                 state.rag_context_str = "(No document context - general question.)"
             else:
                 doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
+                transformed = state.transformed_query or TransformedQuery(
+                    semantic_query=state.user_query_raw,
+                    keyword_query=state.user_query_raw,
+                    fallback=True,
+                )
+                per_entity = state.scope_result.per_entity_doc_ids if state.scope_result else None
+                sub_doc_ids: list[list[UUID] | None] | None = None
+                if transformed.sub_queries and per_entity:
+                    sub_doc_ids = []
+                    for sub in transformed.sub_queries:
+                        ids = per_entity.get(sub.focus_entity)
+                        if not ids:
+                            logger.warning(
+                                "subquery_entity_unresolved",
+                                extra={
+                                    "request_id": request_id,
+                                    "focus_entity": sub.focus_entity,
+                                    "match_quality": sub.entity_match_quality,
+                                },
+                            )
+                        if ids:
+                            sub_doc_ids.append(ids)
+
                 state.rag_context, retrieval_trace = await run_chat_rag_pipeline(
                     session,
-                    state.processed_query.normalized_text,
-                    llm_request.user_id,
-                    doc_ids,
+                    transformed=transformed,
+                    user_id=llm_request.user_id,
+                    doc_ids=doc_ids,
+                    sub_doc_ids=sub_doc_ids,
                     reranker=_get_reranker(),
                 )
                 state.rag_context_str = (
@@ -483,6 +598,15 @@ async def _run_chat_pipeline(request_id: str) -> None:
                             else None,
                         },
                     }
+                    if state.transformed_query is not None:
+                        tq = state.transformed_query
+                        trace_payload["query_transform"] = {
+                            "semantic_query": tq.semantic_query,
+                            "keyword_query": tq.keyword_query,
+                            "sub_queries": [sq.model_dump() for sq in tq.sub_queries],
+                            "fallback": tq.fallback,
+                            "decomposition_overridden": tq.decomposition_overridden,
+                        }
                     if retrieval_trace is not None:
                         trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
 

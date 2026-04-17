@@ -413,6 +413,21 @@ def get_query_router_model() -> str:
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
 
 
+def get_query_transformer_model() -> str:
+    """Model ID for query transformation (QUERY_TRANSFORMER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
+    return os.getenv("QUERY_TRANSFORMER_MODEL", "gpt-4o-mini")
+
+
+def get_query_transformer_config() -> dict:
+    return {
+        "temperature": float(os.getenv("QUERY_TRANSFORMER_TEMPERATURE", "0.0")),
+        "max_tokens": int(os.getenv("QUERY_TRANSFORMER_MAX_TOKENS", "1200")),
+        "timeout": float(os.getenv("QUERY_TRANSFORMER_TIMEOUT", "10.0")),
+        "max_scope_docs": int(os.getenv("QUERY_TRANSFORMER_MAX_SCOPE_DOCS", "10")),
+        "conv_history_tokens": int(os.getenv("QUERY_TRANSFORMER_CONV_HISTORY_TOKENS", "1200")),
+    }
+
+
 def get_table_summarizer_enabled() -> bool:
     """Whether table summarization is enabled (TABLE_SUMMARIZER_ENABLED, default: true)."""
     return os.getenv("TABLE_SUMMARIZER_ENABLED", "true").strip().lower() not in {
@@ -554,3 +569,8 @@ def get_router_config() -> dict[str, float | int]:
         "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
         "filtered_md_thresh": int(os.getenv("FILTERED_MD_THRESH", "5")),
     }
+
+
+def get_multi_pass_chunks_per_sub() -> int:
+    """MULTI_PASS_CHUNKS_PER_SUB (default: 4). Reranker top-k per sub-query pass in multi-pass mode."""
+    return int(os.getenv("MULTI_PASS_CHUNKS_PER_SUB", "4"))

@@ -200,3 +200,5 @@ class RetrievalTrace(BaseModel):
     opensearch: list[RetrievalHit] = []
     fused: list[RetrievalHit] = []
     reranked: list[RetrievalHit] = []
+    # Multi-pass mode: one entry per sub-query pass; single-pass fields above are absent.
+    sub_passes: list[dict] | None = None

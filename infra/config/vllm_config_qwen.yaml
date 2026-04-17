@@ -3,10 +3,10 @@
 model: "Qwen/Qwen3-8B-AWQ"
 host: "0.0.0.0"
 port: 8001
-max_model_len: 4096
+max_model_len: 8192
 max_num_seqs: 4
-max_num_batched_tokens: 16000 # ≤ max_num_seqs * max_model_len
-gpu_memory_utilization: 0.75
+max_num_batched_tokens: 8192 # cap batched tokens to control KV cache pressure
+gpu_memory_utilization: 0.68
 # kv-cache-dtype: fp8
 quantization: awq_marlin
 dtype: half

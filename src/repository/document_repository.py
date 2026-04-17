@@ -221,6 +221,35 @@ class DocumentRepository:
             "years": sorted(years, reverse=True),
         }
 
+    async def get_scope_doc_summaries(
+        self, user_id: UUID, doc_ids: list[UUID], *, limit: int
+    ) -> list[tuple[UUID, str | None, int | None]]:
+        """Return (id, company, year) for ready docs in scope."""
+        if not doc_ids:
+            return []
+        rows = (
+            await self.session.execute(
+                text("""
+                    SELECT
+                        id,
+                        metadata->>'company',
+                        CASE WHEN metadata->>'year' ~ '^[0-9]+$'
+                             THEN (metadata->>'year')::int
+                        END
+                    FROM documents
+                    WHERE user_id = CAST(:user_id AS uuid)
+                      AND id = ANY(CAST(:doc_ids AS uuid[]))
+                      AND status = 'ready'
+                    LIMIT :limit
+                """),
+                {"user_id": str(user_id), "doc_ids": [str(d) for d in doc_ids], "limit": limit},
+            )
+        ).fetchall()
+        return [
+            (UUID(str(row[0])), row[1] or None, int(row[2]) if row[2] is not None else None)
+            for row in rows
+        ]
+
     async def find_by_company_similarity(
         self,
         user_id: UUID,

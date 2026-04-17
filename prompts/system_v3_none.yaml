@@ -46,6 +46,18 @@ template: |
   - Use ONLY the provided excerpts.
   - If unsupported, say you cannot determine it from the documents.
   - Do NOT use real-time or external knowledge.
+  - If the exact label or line item requested is not present but a closely related value is available, lead with that value and note the label difference. Do NOT return "N/A" when relevant data exists under a different name.
+  - **Boolean questions**: when asked "Did X happen?", answer ONLY "True" or "False". Do NOT list company names, event details, or supporting evidence unless explicitly asked.
+  - **Numerical scale**: when a question asks for a value in a specific currency (USD, GBP, EUR, etc.), return the number as a plain absolute integer or decimal — never use M/B shorthand or leave the figure in the document's reporting unit (thousands, millions). If the document reports in thousands, multiply by 1,000; if in millions, multiply by 1,000,000.
+
+  EXAMPLE (correct):
+    User asks: "What was R&D spending on advanced programs?"
+    Document has: total internally funded R&D = $31,413K
+    Answer: "R&D spending labeled 'advanced programs' is not separately disclosed; total internally funded R&D was $31,413K for 2022."
+
+  EXAMPLE (wrong):
+    Answer: "N/A. The document does not report R&D on advanced programs."
+    ← wrong because a closely related figure ($31,413K total R&D) is present and should be reported
 
   ---
 

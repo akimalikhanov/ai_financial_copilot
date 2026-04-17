@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repository.document_repository import DocumentRepository
 from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterOutput
-from src.services.router.entity_resolver import resolve_entities_to_doc_ids
+from src.services.router.entity_resolver import _resolve_all_entities
 from src.utils.config import get_router_config
 
 
@@ -50,15 +50,19 @@ async def resolve_scope(
 
         # Large result set + entities → intersect with entity resolution
         if has_entities:
-            matched, _ = await resolve_entities_to_doc_ids(
+            per_entity = await _resolve_all_entities(
                 session,
                 user_id,
                 router_output.entities,
                 constrain_to=layer1_ids,
+                threshold=float(cfg["entity_similarity_threshold"]),
+                max_candidates=int(cfg["entity_max_candidates"]),
             )
+            matched = list({doc_id for ids in per_entity.values() for doc_id in ids})
             return DocumentScopeResult(
                 doc_ids=matched if matched else layer1_ids,
                 source="filtered",
+                per_entity_doc_ids=per_entity if per_entity else None,
             )
 
         # Large result set, no entities → return Layer 1 as-is
@@ -69,15 +73,19 @@ async def resolve_scope(
 
     # --- allDocs / None → Layer 2 does the heavy lifting ---
     if has_entities:
-        matched, _ = await resolve_entities_to_doc_ids(
+        per_entity = await _resolve_all_entities(
             session,
             user_id,
             router_output.entities,
+            threshold=float(cfg["entity_similarity_threshold"]),
+            max_candidates=int(cfg["entity_max_candidates"]),
         )
+        matched = list({doc_id for ids in per_entity.values() for doc_id in ids})
         if matched:
             return DocumentScopeResult(
                 doc_ids=matched,
                 source="entity_resolved",
+                per_entity_doc_ids=per_entity if per_entity else None,
             )
         return DocumentScopeResult(
             doc_ids=None,

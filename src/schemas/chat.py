@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
     from src.models.llm_request import LLMRequest
     from src.schemas.query_router import DocumentScopeResult, RouterOutput
+    from src.schemas.query_transform import TransformedQuery
     from src.schemas.retrieval import ProcessedQuery, RAGContext
     from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
@@ -53,6 +54,7 @@ class ChatPipelineState:
     processed_query: ProcessedQuery | None = None
     router_output: RouterOutput | None = None
     scope_result: DocumentScopeResult | None = None
+    transformed_query: TransformedQuery | None = None
     rag_context: RAGContext | None = None
     rag_context_str: str = ""
     adapter_messages: list[AdapterChatMessage] | None = None
