@@ -1,12 +1,87 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.document import Document
+
+_CORP_SUFFIXES = (
+    # English
+    "limited",
+    "ltd",
+    "llc",
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "company",
+    "plc",
+    "lp",
+    "llp",
+    "pllc",
+    "pc",
+    "holdings",
+    "holding",
+    "group",
+    "trust",
+    "reit",
+    # Australian/UK/SG/MY
+    "pty",
+    "pte",
+    "sdn",
+    "bhd",
+    # German/Austrian/Swiss
+    "gmbh",
+    "ag",
+    "kg",
+    "kgaa",
+    "se",
+    # Dutch
+    "bv",
+    "nv",
+    "cv",
+    # French/Belgian
+    "sa",
+    "sas",
+    "sarl",
+    "sca",
+    # Italian/Spanish/Portuguese
+    "srl",
+    "spa",
+    "sl",
+    # Nordic
+    "ab",
+    "oy",
+    "oyj",
+    "as",
+    "asa",
+    "aps",
+    # Japanese romanized
+    "kk",
+    "gk",
+)
+_CORP_SUFFIX_RE = re.compile(
+    r"\b(" + "|".join(_CORP_SUFFIXES) + r")\b\.?\s*$",
+    re.IGNORECASE,
+)
+# \m is PostgreSQL's start-of-word anchor; pattern interpolated into SQL literals.
+_CORP_SUFFIX_SQL_RE = r"\m(" + "|".join(_CORP_SUFFIXES) + r")\.?\s*$"
+_MIN_NORMALIZED_LEN = 3
+
+
+def _normalize_company(name: str) -> str:
+    """Strip trailing corporate suffixes for tighter trigram comparison.
+
+    Falls back to the original (lowercased) string when stripping would leave
+    fewer than _MIN_NORMALIZED_LEN characters (e.g. "The Limited" → "the").
+    """
+    lowered = name.lower().strip()
+    stripped = _CORP_SUFFIX_RE.sub("", lowered).strip()
+    return stripped if len(stripped) >= _MIN_NORMALIZED_LEN else lowered
 
 
 class DocumentRepository:
@@ -255,7 +330,7 @@ class DocumentRepository:
         user_id: UUID,
         name: str,
         *,
-        threshold: float = 0.3,
+        threshold: float = 0.5,
         constrain_to: list[UUID] | None = None,
         limit: int = 10,
     ) -> list[UUID]:
@@ -265,7 +340,7 @@ class DocumentRepository:
         """
         params: dict = {
             "user_id": str(user_id),
-            "name": name.lower(),
+            "name": _normalize_company(name),
             "threshold": threshold,
             "limit": limit,
         }
@@ -280,9 +355,23 @@ class DocumentRepository:
             WHERE user_id = CAST(:user_id AS uuid)
               AND status = 'ready'
               AND metadata->>'company' IS NOT NULL
-              AND similarity(lower(metadata->>'company'), :name) > :threshold
+              AND similarity(
+                    trim(regexp_replace(
+                        lower(metadata->>'company'),
+                        '{_CORP_SUFFIX_SQL_RE}',
+                        '', 'i'
+                    )),
+                    :name
+                  ) > :threshold
               {constrain_clause}
-            ORDER BY similarity(lower(metadata->>'company'), :name) DESC
+            ORDER BY similarity(
+                trim(regexp_replace(
+                    lower(metadata->>'company'),
+                    '{_CORP_SUFFIX_SQL_RE}',
+                    '', 'i'
+                )),
+                :name
+            ) DESC
             LIMIT :limit
         """)
 

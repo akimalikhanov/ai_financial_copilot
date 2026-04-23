@@ -24,6 +24,7 @@ def get_client():
         verify_certs=False,
         ssl_assert_hostname=False,
         ssl_show_warn=False,
+        pool_maxsize=10,
     )
 
 

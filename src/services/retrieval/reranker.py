@@ -97,10 +97,10 @@ class LocalCrossEncoderReranker:
             resp.raise_for_status()
             data = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
-            logger.warning("reranker_failed", extra={"error": str(exc)})
+            logger.warning("reranker_failed", extra={"error": str(exc) or type(exc).__name__})
             return list(chunks)
         except Exception as exc:
-            logger.warning("reranker_failed", extra={"error": str(exc)})
+            logger.warning("reranker_failed", extra={"error": str(exc) or type(exc).__name__})
             return list(chunks)
 
         if not isinstance(data, list):

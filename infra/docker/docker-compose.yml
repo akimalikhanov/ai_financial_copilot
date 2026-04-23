@@ -219,11 +219,17 @@ services:
               capabilities: [gpu]
     command:
       - --model-id
-      - ${RERANKER_MODEL_NAME:-Alibaba-NLP/gte-reranker-modernbert-base}
+      - ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
       - --dtype
       - float16
       - --max-batch-tokens
-      - "8192"
+      - "16384"
+      - --max-batch-requests
+      - "16"
+      - --max-client-batch-size
+      - "64"
+      - --payload-limit
+      - "10000000"
     ports:
       - "${RERANKER_BIND_HOST:-127.0.0.1}:${RERANKER_PORT:-8080}:80"
     environment:

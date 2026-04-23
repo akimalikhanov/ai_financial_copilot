@@ -27,7 +27,7 @@ models:
       streaming: true
       tool_calling: true
       citation_mode: bracket
-    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: low, reasoning_effort: low}
+    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: high, reasoning_effort: high}
 
   - id: gpt-5-mini
     label: "OpenAI GPT-5-mini"
@@ -110,4 +110,4 @@ models:
       streaming: true
       tool_calling: true
       citation_mode: bracket
-    params_override: {}
+    params_override: {max_tokens: 1024}

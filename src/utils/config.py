@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import yaml
 from dotenv import load_dotenv
@@ -521,8 +522,8 @@ def get_reranker_base_url() -> str:
 
 
 def get_reranker_model_name() -> str:
-    """RERANKER_MODEL_NAME (default: Alibaba-NLP/gte-reranker-modernbert-base)."""
-    return os.getenv("RERANKER_MODEL_NAME", "Alibaba-NLP/gte-reranker-modernbert-base")
+    """RERANKER_MODEL_NAME (default: BAAI/bge-reranker-v2-m3)."""
+    return os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 
 
 def get_reranker_timeout_seconds() -> float:
@@ -574,3 +575,19 @@ def get_router_config() -> dict[str, float | int]:
 def get_multi_pass_chunks_per_sub() -> int:
     """MULTI_PASS_CHUNKS_PER_SUB (default: 4). Reranker top-k per sub-query pass in multi-pass mode."""
     return int(os.getenv("MULTI_PASS_CHUNKS_PER_SUB", "4"))
+
+
+# --- Eval ---
+def get_eval_user_id() -> UUID | None:
+    raw = os.getenv("EVAL_USER_ID")
+    if not raw:
+        return None
+    return UUID(raw)
+
+
+def get_eval_judge_model() -> str:
+    return os.getenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
+
+
+def get_eval_output_dir() -> Path:
+    return Path(os.getenv("EVAL_OUTPUT_DIR", "data/eval/runs"))

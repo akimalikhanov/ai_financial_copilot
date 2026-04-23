@@ -31,6 +31,11 @@ if TYPE_CHECKING:
     from docling_core.types.doc.document import DoclingDocument
 
 
+def _pg_sanitize(text: str) -> str:
+    """Strip characters PostgreSQL UTF-8 rejects (null bytes from PDF form fields)."""
+    return text.replace("\x00", "")
+
+
 class AnnualReportSerializerProvider(ChunkingSerializerProvider):
     """Serialize table chunks as markdown tables with stable image placeholders."""
 
@@ -307,9 +312,12 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         else:
             enriched_text = chunker.contextualize(chunk=chunk)
 
-        # PostgreSQL UTF-8 rejects null bytes; strip them from parsed PDF text
-        raw_text = raw_text.replace("\x00", "")
-        enriched_text = enriched_text.replace("\x00", "")
+        raw_text = _pg_sanitize(raw_text)
+        enriched_text = _pg_sanitize(enriched_text)
+        chunk_meta = {
+            **chunk_meta,
+            "headings": [_pg_sanitize(h) for h in (chunk_meta["headings"] or [])],
+        }
 
         rows.append(
             {

@@ -191,7 +191,7 @@ async def transform_query(
         return _fallback(inp.user_query_raw)
 
     try:
-        prompt = get_prompt_loader().load("query_transformer", "v1")
+        prompt = get_prompt_loader().load("query_transformer", "v2")
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("transform_query_prompt_missing")
