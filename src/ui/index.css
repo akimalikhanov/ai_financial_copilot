@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 /**
  * Global Styles - ChatGPT-inspired Design System
  *
@@ -17,9 +21,10 @@ html.dark {
   --surface-2: #2F2F2F;       /* Hover states, cards */
   --surface-3: #3D3D3D;       /* Active states, highlights */
 
-  /* Borders - Very subtle 1px dividers */
+  /* Borders */
   --border: #3D3D3D;
   --border-subtle: #2F2F2F;
+  --border-strong: #4D4D4D;
 
   /* Text - High contrast primary, muted secondary */
   --text: #ECECEC;
@@ -33,7 +38,7 @@ html.dark {
   --accent-pressed: #0E8F6F;
   --accent-subtle: rgba(16, 163, 127, 0.12);
   --link: #10A37F;
-  --focus-ring: rgba(16, 163, 127, 0.35);
+  --focus-ring: rgba(16, 163, 127, 0.45);
 
   /* Semantic colors */
   --success: #22C55E;
@@ -61,6 +66,34 @@ html.dark {
   --scrollbar-track: #212121;
   --scrollbar-thumb: #3D3D3D;
   --scrollbar-thumb-hover: #4D4D4D;
+
+  /* Elevation shadows (dark — higher alpha) */
+  --shadow-xs: 0 0 0 1px rgba(0, 0, 0, 0.40);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.30), 0 1px 1px rgba(0, 0, 0, 0.24);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.40), 0 1px 3px rgba(0, 0, 0, 0.30);
+  --shadow-lg: 0 16px 32px rgba(0, 0, 0, 0.50), 0 4px 8px rgba(0, 0, 0, 0.40);
+
+  /* Border radius scale */
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  14px;
+  --radius-xl:  18px;
+  --radius-2xl: 24px;
+
+  /* Layout */
+  --content-max: 48rem;
+
+  /* Typography */
+  --font-display: 'Inter', system-ui, sans-serif;
+  --font-ui:      'Inter', system-ui, sans-serif;
+  --leading-tight:   1.15;
+  --leading-normal:  1.55;
+  --leading-relaxed: 1.7;
+
+  /* Easings */
+  --ease-out-expo:    cubic-bezier(.16,1,.3,1);
+  --ease-in-out-expo: cubic-bezier(.87,0,.13,1);
+  --ease-spring:      cubic-bezier(.5,1.5,.5,1);
 }
 
 html.light {
@@ -73,11 +106,12 @@ html.light {
   /* Borders */
   --border: #E5E5E5;
   --border-subtle: #EFEFEF;
+  --border-strong: #C9C9C9;
 
   /* Text */
   --text: #0D0D0D;
   --text-muted: #6E6E6E;
-  --text-faint: #8E8E8E;
+  --text-faint: #6B6B6B;
   --icon: #6E6E6E;
 
   /* Accent */
@@ -86,7 +120,7 @@ html.light {
   --accent-pressed: #0D8562;
   --accent-subtle: rgba(16, 163, 127, 0.08);
   --link: #10A37F;
-  --focus-ring: rgba(16, 163, 127, 0.25);
+  --focus-ring: rgba(16, 163, 127, 0.45);
 
   /* Semantic */
   --success: #16A34A;
@@ -114,6 +148,29 @@ html.light {
   --scrollbar-track: #FFFFFF;
   --scrollbar-thumb: #D9D9D9;
   --scrollbar-thumb-hover: #BFBFBF;
+
+  /* Elevation shadows (light) */
+  --shadow-xs: 0 0 0 1px rgba(0, 0, 0, 0.06);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 16px 32px rgba(0, 0, 0, 0.12), 0 4px 8px rgba(0, 0, 0, 0.08);
+
+  /* Border radius scale — shared values, same in both modes */
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  14px;
+  --radius-xl:  18px;
+  --radius-2xl: 24px;
+
+  /* Layout */
+  --content-max: 48rem;
+
+  /* Typography */
+  --font-display: 'Inter', system-ui, sans-serif;
+  --font-ui:      'Inter', system-ui, sans-serif;
+  --leading-tight:   1.15;
+  --leading-normal:  1.55;
+  --leading-relaxed: 1.7;
 }
 
 /* ============================================
@@ -171,6 +228,12 @@ a:hover {
 
 code, pre, .font-mono {
   font-family: 'Söhne Mono', 'JetBrains Mono', Menlo, Monaco, 'Courier New', monospace;
+}
+
+/* Native <select> option dropdown colors */
+select option {
+  background-color: var(--input-bg);
+  color: var(--text);
 }
 
 /* ============================================
@@ -280,16 +343,72 @@ code, pre, .font-mono {
   50% { transform: translateY(-4px); }
 }
 
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* --- Phase 4: new keyframes --- */
+
+@keyframes typing {
+  0%, 60%, 100% {
+    opacity: 0.35;
+    transform: translateY(0) scale(1);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-4px) scale(1.08);
+  }
+}
+
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0; }
+}
+
+@keyframes stream-reveal {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes modalBackdropIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes modalBackdropOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+@keyframes modalCardIn {
+  from { opacity: 0; transform: scale(0.97) translateY(8px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
+
+@keyframes modalCardOut {
+  from { opacity: 1; transform: scale(1)    translateY(0); }
+  to   { opacity: 0; transform: scale(0.97) translateY(8px); }
+}
+
+/* --- Animation utilities --- */
+
+.animate-shimmer {
+  background-image: linear-gradient(90deg, transparent, var(--surface-3), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s var(--ease-in-out-expo) infinite;
+}
+
 .animate-fade-in {
-  animation: fadeIn 0.3s ease-out forwards;
+  animation: fadeIn 0.3s var(--ease-out-expo) forwards;
 }
 
 .animate-slide-in-right {
-  animation: slideInRight 0.3s ease-out forwards;
+  animation: slideInRight 0.3s var(--ease-out-expo) forwards;
 }
 
 .animate-slide-in-up {
-  animation: slideInUp 0.2s ease-out forwards;
+  animation: slideInUp 0.2s var(--ease-out-expo) forwards;
 }
 
 .animate-pulse {
@@ -300,20 +419,61 @@ code, pre, .font-mono {
   animation: bounce 0.6s ease-in-out infinite;
 }
 
+/* Typing indicator — apply .typing-dot to each of the 3 dots */
+.typing-dot {
+  animation: typing 1.2s var(--ease-in-out-expo) infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* Streaming caret */
+.animate-caret-blink {
+  animation: caret-blink 1.1s ease-in-out infinite;
+}
+
+/* Per-token reveal on streamed assistant text */
+.animate-stream-reveal {
+  animation: stream-reveal 120ms var(--ease-out-expo) forwards;
+}
+
+/* Modal backdrop */
+.modal-backdrop-enter { animation: modalBackdropIn  180ms var(--ease-out-expo) forwards; }
+.modal-backdrop-exit  { animation: modalBackdropOut 160ms var(--ease-out-expo) forwards; }
+
+/* Modal card */
+.modal-card-enter { animation: modalCardIn  220ms var(--ease-out-expo) forwards; }
+.modal-card-exit  { animation: modalCardOut 160ms var(--ease-out-expo) forwards; }
+
+/* Sidebar scrim — backdrop-blur + fade */
+.sidebar-scrim {
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: fadeIn 180ms var(--ease-out-expo) forwards;
+}
+
+/* Tactile button press */
+.press-scale {
+  transition: transform 80ms ease-out;
+}
+.press-scale:active {
+  transform: scale(0.98);
+  transition-duration: 40ms;
+}
+
 /* ============================================
    TRANSITIONS
    ============================================ */
 
 .transition-colors {
-  transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s var(--ease-out-expo), background-color 0.15s var(--ease-out-expo), border-color 0.15s var(--ease-out-expo);
 }
 
 .transition-all {
-  transition: all 0.2s ease;
+  transition: all 0.2s var(--ease-out-expo);
 }
 
 .transition-transform {
-  transition: transform 0.2s ease;
+  transition: transform 0.2s var(--ease-out-expo);
 }
 
 /* ============================================
@@ -327,4 +487,19 @@ code, pre, .font-mono {
 .no-scrollbar {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+/* ============================================
+   REDUCED MOTION
+   ============================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

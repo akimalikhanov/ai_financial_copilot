@@ -43,87 +43,89 @@ export function LoginPage({ onSuccess }: LoginPageProps) {
   };
 
   const handleModeSwitch = () => {
-    setMode((m) => (m === 'login' ? 'register' : 'login'));
+    setMode(m => m === 'login' ? 'register' : 'login');
     setError(null);
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[var(--bg)] p-4">
-      <Card className="w-full max-w-sm p-6" variant="elevated">
-        <div className="text-center mb-6">
-          <div className="w-12 h-12 bg-[var(--accent)] rounded-xl flex items-center justify-center mx-auto mb-4">
-            <span className="font-bold text-white font-mono text-lg">AI</span>
+    <div
+      className="min-h-screen flex items-center justify-center p-4"
+      style={{ background: 'radial-gradient(ellipse at 50% 40%, var(--surface-1) 0%, var(--bg) 70%)' }}
+    >
+      <div className="w-full max-w-sm animate-fade-in">
+        {/* Wordmark above card */}
+        <div className="text-center mb-8">
+          <div className="w-14 h-14 bg-[var(--accent)] rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-[var(--shadow-md)]">
+            <span className="font-bold text-white font-mono text-xl">AI</span>
           </div>
-          <h1 className="text-xl font-semibold text-[var(--text)]">Financial Copilot</h1>
-          <p className="text-sm text-[var(--text-muted)] mt-1">
-            {mode === 'login' ? 'Sign in to continue' : 'Create an account'}
-          </p>
+          <h1 className="text-2xl font-semibold text-[var(--text)] tracking-tight">Financial Copilot</h1>
+          <p className="text-sm text-[var(--text-muted)] mt-1">Analyze financial documents with AI precision.</p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">
-              Email
-            </label>
-            <Input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="you@example.com"
-              required
-              autoComplete="email"
-            />
-          </div>
+        <Card className="p-8 shadow-[var(--shadow-lg)]" variant="elevated">
+          <p className="text-sm text-[var(--text-muted)] text-center mb-6">
+            {mode === 'login' ? 'Sign in to continue' : 'Create an account'}
+          </p>
 
-          {mode === 'register' && (
+          <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">
-                Display name (optional)
-              </label>
+              <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">Email</label>
               <Input
-                type="text"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="Your name"
-                autoComplete="name"
+                type="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                placeholder="you@example.com"
+                required
+                autoComplete="email"
               />
             </div>
-          )}
 
-          <div>
-            <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">
-              Password
-            </label>
-            <Input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="••••••••"
-              required
-              minLength={6}
-              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-            />
-          </div>
+            {mode === 'register' && (
+              <div>
+                <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">Display name (optional)</label>
+                <Input
+                  type="text"
+                  value={displayName}
+                  onChange={e => setDisplayName(e.target.value)}
+                  placeholder="Your name"
+                  autoComplete="name"
+                />
+              </div>
+            )}
 
-          {error && (
-            <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-md">
-              {error}
+            <div>
+              <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">Password</label>
+              <Input
+                type="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                placeholder="••••••••"
+                required
+                minLength={6}
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              />
             </div>
-          )}
 
-          <Button type="submit" className="w-full" loading={loading} disabled={loading}>
-            {mode === 'login' ? 'Sign in' : 'Create account'}
-          </Button>
-        </form>
+            {error && (
+              <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg border border-[var(--danger)] border-opacity-20">
+                {error}
+              </div>
+            )}
 
-        <button
-          type="button"
-          onClick={handleModeSwitch}
-          className="w-full mt-4 text-sm text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
-        >
-          {mode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign in'}
-        </button>
-      </Card>
+            <Button type="submit" className="w-full" loading={loading} disabled={loading}>
+              {mode === 'login' ? 'Sign in' : 'Create account'}
+            </Button>
+          </form>
+
+          <button
+            type="button"
+            onClick={handleModeSwitch}
+            className="w-full mt-5 text-sm text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
+          >
+            {mode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign in'}
+          </button>
+        </Card>
+      </div>
     </div>
   );
 }

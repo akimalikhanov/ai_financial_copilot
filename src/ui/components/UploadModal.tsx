@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UploadCloud, File, Check, X, Loader2 } from 'lucide-react';
+import { UploadCloud, File, Check, X } from 'lucide-react';
 import { Button, Input, Card } from './ui';
 import { uploadDocument, ApiError, type UploadDocumentResponse } from '../services/api';
 
@@ -18,44 +18,36 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
   const [company, setCompany] = useState('');
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
 
   useEffect(() => {
     if (!isOpen) {
-      setStep(1);
-      setFile(null);
-      setCompany('');
-      setUploading(false);
-      setError(null);
+      setStep(1); setFile(null); setCompany('');
+      setUploading(false); setError(null); setIsDragOver(false);
     }
   }, [isOpen]);
-
-  const handleDragOver = (e: React.DragEvent) => e.preventDefault();
 
   const deriveCompany = (filename: string): string =>
     filename.replace(/\.pdf$/i, '').replace(/[_\-]+/g, ' ').trim();
 
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragOver(true); };
+  const handleDragLeave = () => setIsDragOver(false);
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    setIsDragOver(false);
     const f = e.dataTransfer.files[0];
-    if (f) {
-      setFile(f);
-      if (!company) setCompany(deriveCompany(f.name));
-    }
+    if (f) { setFile(f); if (!company) setCompany(deriveCompany(f.name)); }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) {
-      setFile(f);
-      if (!company) setCompany(deriveCompany(f.name));
-    }
+    if (f) { setFile(f); if (!company) setCompany(deriveCompany(f.name)); }
   };
 
   const handleConfirmUpload = async () => {
     if (!file) return;
-    setStep(3);
-    setUploading(true);
-    setError(null);
+    setStep(3); setUploading(true); setError(null);
     try {
       const formData = new FormData();
       formData.append('file', file);
@@ -74,11 +66,12 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-      <Card className="w-full max-w-lg overflow-hidden shadow-xl" variant="elevated">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 modal-backdrop-enter">
+      <Card className="w-full max-w-lg overflow-hidden shadow-[var(--shadow-lg)] modal-card-enter" variant="elevated">
         <div className="flex items-center justify-between p-4 border-b border-[var(--border)]">
           <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wide">
-            Upload Document <span className="text-[var(--text-faint)] ml-2 font-normal">step {step}/3</span>
+            Upload Document
+            <span className="text-[var(--text-faint)] ml-2 font-normal normal-case tracking-normal">step {step} of 3</span>
           </h3>
           <Button variant="ghost" size="icon" onClick={onClose} disabled={uploading}>
             <X size={18} />
@@ -88,18 +81,17 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
         <div className="p-6">
           {step === 1 && (
             <div
-              className="border-2 border-dashed border-[var(--border)] rounded-xl p-10 flex flex-col items-center justify-center text-center hover:bg-[var(--surface-2)] hover:border-[var(--accent)] transition-colors cursor-pointer"
+              className={`border-2 rounded-xl p-10 flex flex-col items-center justify-center text-center cursor-pointer transition-all ${
+                isDragOver
+                  ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
+                  : 'border-dashed border-[var(--border)] hover:border-[var(--accent)] hover:bg-[var(--surface-2)]'
+              }`}
               onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
               onDrop={handleDrop}
               onClick={() => document.getElementById('file-upload')?.click()}
             >
-              <input
-                id="file-upload"
-                type="file"
-                className="hidden"
-                accept=".pdf"
-                onChange={handleFileChange}
-              />
+              <input id="file-upload" type="file" className="hidden" accept=".pdf" onChange={handleFileChange} />
               {file ? (
                 <div className="flex flex-col items-center">
                   <File size={48} className="text-[var(--accent)] mb-4" />
@@ -108,9 +100,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                 </div>
               ) : (
                 <>
-                  <UploadCloud size={48} className="text-[var(--text-faint)] mb-4" />
+                  <UploadCloud size={48} className={`mb-4 transition-colors ${isDragOver ? 'text-[var(--accent)]' : 'text-[var(--text-faint)]'}`} />
                   <p className="text-[var(--text)] font-medium">Drag PDF here or click to browse</p>
-                  <p className="text-xs text-[var(--text-faint)] mt-2">Max file size 50MB</p>
+                  <p className="text-xs text-[var(--text-faint)] mt-2">Max file size 50 MB</p>
                 </>
               )}
             </div>
@@ -120,15 +112,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Company</label>
-                <Input
-                  placeholder="e.g. Acme Corp"
-                  value={company}
-                  onChange={(e) => setCompany(e.target.value)}
-                />
+                <Input placeholder="e.g. Acme Corp" value={company} onChange={e => setCompany(e.target.value)} />
               </div>
-              {error && (
-                <p className="text-sm text-[var(--danger)]">{error}</p>
-              )}
+              {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
             </div>
           )}
 
@@ -136,7 +122,10 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
             <div className="py-8 flex flex-col items-center gap-4">
               {uploading ? (
                 <>
-                  <Loader2 size={32} className="animate-spin text-[var(--accent)]" />
+                  {/* Shimmer progress bar */}
+                  <div className="w-full h-1.5 bg-[var(--surface-3)] rounded-full overflow-hidden">
+                    <div className="h-full w-full animate-shimmer rounded-full" />
+                  </div>
                   <p className="text-sm text-[var(--text-muted)]">Uploading & processing…</p>
                 </>
               ) : (
@@ -150,12 +139,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
         </div>
 
         <div className="p-4 border-t border-[var(--border)] bg-[var(--surface-1)] flex justify-end gap-2">
-          {step === 1 && (
-            <Button disabled={!file} onClick={() => setStep(2)}>Next: Metadata</Button>
-          )}
-          {step === 2 && (
-            <Button onClick={handleConfirmUpload} disabled={uploading}>Confirm Upload</Button>
-          )}
+          {step === 1 && <Button disabled={!file} onClick={() => setStep(2)}>Next: Metadata</Button>}
+          {step === 2 && <Button onClick={handleConfirmUpload} disabled={uploading}>Confirm Upload</Button>}
         </div>
       </Card>
     </div>

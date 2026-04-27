@@ -1,10 +1,10 @@
 import React, { useState } from 'react';
 import {
-  Settings2, ChevronRight, ChevronLeft, Thermometer,
+  Settings2, ChevronRight, Thermometer,
   Hash, Brain, MessageSquareText, Zap, DollarSign,
   Clock, BarChart3, Sparkles, Info, RotateCcw, ChevronDown, ChevronUp
 } from 'lucide-react';
-import { Button, Badge } from './ui';
+import { Badge } from './ui';
 
 // ============================================
 // TYPES
@@ -222,6 +222,7 @@ const CollapsibleSection: React.FC<CollapsibleSectionProps> = ({
     <div className="bg-[var(--surface-2)] rounded-lg border border-[var(--border)] overflow-hidden">
       <button
         onClick={() => setIsOpen(!isOpen)}
+        aria-expanded={isOpen}
         className="w-full flex items-center justify-between px-4 py-3 hover:bg-[var(--surface-3)] transition-colors"
       >
         <div className="flex items-center gap-2">
@@ -282,6 +283,98 @@ const StatCard: React.FC<StatCardProps> = ({
           {subValue}
         </div>
       )}
+    </div>
+  );
+};
+
+// ============================================
+// TOKEN DISTRIBUTION BAR
+// ============================================
+
+const TokenDistributionBar: React.FC<{ stats: RequestStats }> = ({ stats }) => {
+  const [tooltip, setTooltip] = useState<{ label: string; value: number } | null>(null);
+  const total = stats.totalTokens || 1;
+
+  const segments = [
+    { label: 'Input', value: stats.inputTokens, color: 'var(--accent)', gradientTo: 'var(--accent-hover)' },
+    { label: 'Output', value: stats.outputTokens, color: 'var(--warning)', gradientTo: 'var(--warning)' },
+    ...(stats.reasoningTokens > 0 ? [{ label: 'Reasoning', value: stats.reasoningTokens, color: 'rgba(139,92,246,0.75)', gradientTo: 'rgba(167,139,250,0.75)' }] : []),
+  ].filter(s => s.value > 0);
+
+  return (
+    <div className="bg-[var(--surface-1)] rounded-lg p-3 border border-[var(--border)]">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[10px] uppercase tracking-wider text-[var(--text-faint)]">Distribution</span>
+        <span className="text-[10px] font-mono text-[var(--text-muted)]">{stats.totalTokens.toLocaleString()} total</span>
+      </div>
+
+      {/* Tooltip */}
+      {tooltip && (
+        <div className="mb-2 text-[10px] font-mono bg-[var(--surface-3)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text)]">
+          {tooltip.label}: <span className="text-[var(--accent)] font-bold">{tooltip.value.toLocaleString()}</span>
+          <span className="text-[var(--text-faint)] ml-1">({((tooltip.value / total) * 100).toFixed(1)}%)</span>
+        </div>
+      )}
+
+      <div className="h-3 bg-[var(--surface-3)] rounded-full overflow-hidden flex">
+        {segments.map(seg => (
+          <div
+            key={seg.label}
+            className="h-full transition-all duration-300 cursor-pointer hover:brightness-110"
+            style={{
+              width: `${(seg.value / total) * 100}%`,
+              background: `linear-gradient(90deg, ${seg.color}, ${seg.gradientTo})`,
+            }}
+            onMouseEnter={() => setTooltip({ label: seg.label, value: seg.value })}
+            onMouseLeave={() => setTooltip(null)}
+          />
+        ))}
+      </div>
+
+      <div className="flex items-center gap-3 mt-2">
+        {segments.map(seg => (
+          <div key={seg.label} className="flex items-center gap-1">
+            <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: seg.color }} />
+            <span className="text-[10px] text-[var(--text-faint)]">{seg.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ============================================
+// LATENCY SPARKLINE
+// ============================================
+
+const LatencySparkline: React.FC<{ history: RequestStats[] }> = ({ history }) => {
+  if (history.length < 2) return null;
+  const values = history.map(s => s.latencyMs).reverse();
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const range = max - min || 1;
+  const w = 240;
+  const h = 40;
+  const pad = 2;
+
+  const points = values.map((v, i) => {
+    const x = pad + (i / (values.length - 1)) * (w - pad * 2);
+    const y = pad + ((1 - (v - min) / range) * (h - pad * 2));
+    return `${x},${y}`;
+  }).join(' ');
+
+  const areaPoints = `${pad},${h} ` + points + ` ${w - pad},${h}`;
+
+  return (
+    <div className="mt-2">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] uppercase tracking-wider text-[var(--text-faint)]">Latency trend</span>
+        <span className="text-[10px] font-mono text-[var(--text-faint)]">last {values.length} req</span>
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ height: 40 }}>
+        <polygon points={areaPoints} fill="var(--accent)" opacity="0.15" />
+        <polyline points={points} fill="none" stroke="var(--accent)" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" opacity="0.8" />
+      </svg>
     </div>
   );
 };
@@ -355,6 +448,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
           onClick={onToggle}
           className="fixed right-0 top-1/2 -translate-y-1/2 z-40 bg-[var(--surface-2)] border border-[var(--border)] border-r-0 rounded-l-lg p-2 hover:bg-[var(--surface-3)] transition-colors shadow-lg group"
           title="Open Control Pane"
+          aria-label="Open Control Pane"
         >
           <Settings2 size={18} className="text-[var(--icon)] group-hover:text-[var(--accent)] transition-colors" />
         </button>
@@ -378,6 +472,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
           </div>
           <button
             onClick={onToggle}
+            aria-label="Close Control Pane"
             className="p-1.5 rounded-md hover:bg-[var(--surface-2)] text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"
           >
             <ChevronRight size={16} />
@@ -385,8 +480,10 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
         </div>
 
         {/* Tab Switcher */}
-        <div className="flex border-b border-[var(--border)] shrink-0">
+        <div role="tablist" className="flex border-b border-[var(--border)] shrink-0">
           <button
+            role="tab"
+            aria-selected={activeTab === 'params'}
             onClick={() => setActiveTab('params')}
             className={`
               flex-1 px-4 py-3 text-xs font-semibold uppercase tracking-wider transition-colors relative
@@ -405,6 +502,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
             )}
           </button>
           <button
+            role="tab"
+            aria-selected={activeTab === 'stats'}
             onClick={() => setActiveTab('stats')}
             className={`
               flex-1 px-4 py-3 text-xs font-semibold uppercase tracking-wider transition-colors relative
@@ -546,57 +645,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                         </div>
 
                         {/* Token Distribution Bar */}
-                        <div className="bg-[var(--surface-1)] rounded-lg p-3 border border-[var(--border)]">
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-[10px] uppercase tracking-wider text-[var(--text-faint)]">Distribution</span>
-                            <span className="text-[10px] font-mono text-[var(--text-muted)]">{stats.totalTokens.toLocaleString()} total</span>
-                          </div>
-                          <div className="h-2.5 bg-[var(--surface-3)] rounded-full overflow-hidden flex">
-                            {stats.inputTokens > 0 && (
-                              <div
-                                className="bg-[var(--accent)] transition-all duration-300"
-                                style={{ width: `${(stats.inputTokens / stats.totalTokens) * 100}%` }}
-                                title={`Input: ${stats.inputTokens}`}
-                              />
-                            )}
-                            {stats.outputTokens > 0 && (
-                              <div
-                                className="bg-[var(--warning)] transition-all duration-300"
-                                style={{ width: `${(stats.outputTokens / stats.totalTokens) * 100}%` }}
-                                title={`Output: ${stats.outputTokens}`}
-                              />
-                            )}
-                            {stats.reasoningTokens > 0 && (
-                              <div
-                                className="transition-all duration-300"
-                                style={{
-                                  width: `${(stats.reasoningTokens / stats.totalTokens) * 100}%`,
-                                  backgroundColor: 'rgba(139, 92, 246, 0.7)' // Purple for reasoning
-                                }}
-                                title={`Reasoning: ${stats.reasoningTokens}`}
-                              />
-                            )}
-                          </div>
-                          <div className="flex items-center justify-between mt-2 text-[10px]">
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-full bg-[var(--accent)]" />
-                              <span className="text-[var(--text-faint)]">Input</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-full bg-[var(--warning)]" />
-                              <span className="text-[var(--text-faint)]">Output</span>
-                            </div>
-                            {stats.reasoningTokens > 0 && (
-                              <div className="flex items-center gap-1">
-                                <div
-                                  className="w-2 h-2 rounded-full"
-                                  style={{ backgroundColor: 'rgba(139, 92, 246, 0.7)' }}
-                                />
-                                <span className="text-[var(--text-faint)]">Reasoning</span>
-                              </div>
-                            )}
-                          </div>
-                        </div>
+                        <TokenDistributionBar stats={stats} />
                       </div>
                     </CollapsibleSection>
 
@@ -676,6 +725,8 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
                       icon={<DollarSign size={12} />}
                     />
                   </div>
+
+                  <LatencySparkline history={statsHistory} />
                 </>
               )}
 

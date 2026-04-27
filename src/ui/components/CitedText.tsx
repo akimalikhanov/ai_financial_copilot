@@ -39,8 +39,8 @@ function CitationPopover({ state }: { state: PopoverState }) {
       style={{ left, top, transform: 'translateY(-100%)', width: popoverWidth }}
     >
       <div
-        className="rounded-xl border border-[var(--border)] bg-[var(--surface-1)] shadow-xl text-left overflow-hidden"
-        style={{ boxShadow: '0 8px 32px rgba(0,0,0,0.18)' }}
+        className="rounded-xl border border-[var(--border)] bg-[var(--surface-1)] text-left overflow-hidden animate-fade-in"
+        style={{ boxShadow: 'var(--shadow-md)' }}
       >
         {/* Header row */}
         <div className="flex items-center gap-2 px-3 pt-3 pb-2 border-b border-[var(--border)]">
@@ -130,6 +130,7 @@ export const CitedText: React.FC<CitedTextProps> = ({ text, spans, references, o
       return (
         <button
           key={`pill-${i}-${label}`}
+          aria-label={`View source ${label}${ref?.documentName ? `: ${ref.documentName}` : ''}`}
           onClick={(e) => {
             e.stopPropagation();
             if (ref) onCitationClick(ref);
@@ -138,9 +139,9 @@ export const CitedText: React.FC<CitedTextProps> = ({ text, spans, references, o
           onMouseLeave={hidePopover}
           className="inline-flex items-center ml-0.5 px-1.5 py-0 text-[10px] font-mono font-bold
             bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent)]
-            border-opacity-30 rounded-full cursor-pointer hover:bg-[var(--accent)]
+            border-opacity-30 rounded-[10px] cursor-pointer hover:bg-[var(--accent)]
             hover:text-white hover:border-opacity-100 transition-all align-baseline
-            leading-tight"
+            leading-tight press-scale"
         >
           {label}
         </button>
