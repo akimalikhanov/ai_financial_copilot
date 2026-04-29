@@ -117,6 +117,7 @@ class LLMRequestRepository:
         # Create assistant placeholder
         assistant_message = Message(
             conversation_id=conversation_id,
+            user_id=user_id,
             role=MessageRole.assistant,
             content="",
             seq=next_seq,

@@ -800,6 +800,41 @@ BEGIN
   END IF;
 END $$;
 
+-- ============================================================================
+-- Table: message_feedback (user thumbs up/down on assistant messages)
+-- ============================================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'feedback_rating') THEN
+    CREATE TYPE feedback_rating AS ENUM ('up', 'down');
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS message_feedback (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  message_id  uuid NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id     uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  rating      feedback_rating NOT NULL,
+  comment     text,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (message_id, user_id)
+);
+
+COMMENT ON TABLE message_feedback IS
+  'User thumbs up/down feedback on assistant messages. One row per (message,user).';
+
+CREATE INDEX IF NOT EXISTS message_feedback_message_idx
+  ON message_feedback (message_id);
+CREATE INDEX IF NOT EXISTS message_feedback_user_idx
+  ON message_feedback (user_id, created_at DESC);
+
+DROP TRIGGER IF EXISTS trg_message_feedback_updated_at ON message_feedback;
+CREATE TRIGGER trg_message_feedback_updated_at
+BEFORE UPDATE ON message_feedback
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
 SQL
 
 echo ">> Granting permissions to application user..."

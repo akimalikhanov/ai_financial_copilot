@@ -42,6 +42,11 @@ export interface ReferenceItem {
   snippet: string | null;
 }
 
+export interface MessageFeedback {
+  rating: 'up' | 'down';
+  comment?: string | null;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
@@ -50,6 +55,7 @@ export interface Message {
   citationSpans?: CitationSpan[];
   references?: ReferenceItem[];
   timestamp: number;
+  feedback?: MessageFeedback | null;
 }
 
 export interface Chat {

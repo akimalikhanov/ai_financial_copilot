@@ -3,9 +3,11 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select
 
 from src.api.deps import CurrentUserDep
 from src.db.connection import DbSessionDep
+from src.models.message_feedback import MessageFeedback
 from src.models.user import User
 from src.repository.conversation_repository import ConversationRepository
 from src.repository.message_repository import MessageRepository
@@ -165,7 +167,18 @@ async def get_messages(
         if has_more:
             messages = messages[:-1]  # Remove extra message
 
-    # Convert to response format
+    # Load user's feedback for these messages in one query
+    msg_ids = [msg.id for msg in messages]
+    feedback_map: dict = {}
+    if msg_ids:
+        result = await session.execute(
+            select(MessageFeedback).where(
+                MessageFeedback.user_id == current_user.id,
+                MessageFeedback.message_id.in_(msg_ids),
+            )
+        )
+        feedback_map = {fb.message_id: fb for fb in result.scalars().all()}
+
     return {
         "messages": [
             {
@@ -175,6 +188,14 @@ async def get_messages(
                 "seq": msg.seq,
                 "created_at": msg.created_at.isoformat(),
                 "metadata": msg.message_metadata,
+                "feedback": (
+                    {
+                        "rating": feedback_map[msg.id].rating.value,
+                        "comment": feedback_map[msg.id].comment,
+                    }
+                    if msg.id in feedback_map
+                    else None
+                ),
             }
             for msg in messages
         ],

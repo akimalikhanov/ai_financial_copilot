@@ -34,6 +34,7 @@ import { EvidencePanel } from './components/EvidencePanel';
 import { UploadModal } from './components/UploadModal';
 import { DocPickerModal } from './components/DocPickerModal';
 import { ControlPane, ModelParams, RequestStats, ModelCapabilities } from './components/ControlPane';
+import { MessageActions } from './components/MessageActions';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -81,7 +82,7 @@ function groupChatsByDate(chats: Chat[]): { label: string; items: Chat[] }[] {
   return groups.filter(g => g.items.length > 0);
 }
 
-const toUiMessage = (msg: { id: string; role: string; content: string; created_at: string; metadata?: Record<string, unknown> }): Message => {
+const toUiMessage = (msg: { id: string; role: string; content: string; created_at: string; metadata?: Record<string, unknown>; feedback?: { rating: 'up' | 'down'; comment?: string | null } | null }): Message => {
   const meta = msg.metadata || {};
   const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels: string[] }> | undefined;
   const refs = meta.references as Array<Record<string, unknown>> | undefined;
@@ -103,6 +104,7 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       headingPath: r.heading_path as string[],
       snippet: (r.snippet as string | null),
     })),
+    feedback: msg.feedback ? { rating: msg.feedback.rating, comment: msg.feedback.comment ?? null } : null,
   };
 };
 
@@ -1009,6 +1011,16 @@ export default function App() {
                             <div className="whitespace-pre-wrap break-words">{msg.content}</div>
                           )}
                         </div>
+                      )}
+
+                      {/* Action row (Copy + Thumbs Up/Down) for completed assistant messages */}
+                      {msg.role === 'assistant' && !isStreaming && msg.content && activeChat?.conversationId && (
+                        <MessageActions
+                          messageId={msg.id}
+                          content={msg.content}
+                          feedback={msg.feedback ?? null}
+                          onFeedbackChange={(fb) => updateMessage(activeChat.conversationId, msg.id, (m) => ({ ...m, feedback: fb }))}
+                        />
                       )}
 
                       {/* Evidence section */}

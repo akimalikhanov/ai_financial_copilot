@@ -536,6 +536,11 @@ export const deleteConversation = async (
 
 // --- Messages API ---
 
+export interface MessageFeedbackPayload {
+  rating: 'up' | 'down';
+  comment?: string | null;
+}
+
 export interface MessageResponse {
   id: string;
   role: Role;
@@ -543,7 +548,34 @@ export interface MessageResponse {
   seq: number;
   created_at: string;
   metadata?: Record<string, unknown>;
+  feedback?: MessageFeedbackPayload | null;
 }
+
+export const submitMessageFeedback = async (
+  messageId: string,
+  rating: 'up' | 'down',
+  comment?: string | null,
+): Promise<MessageFeedbackPayload> => {
+  const response = await fetchApi(
+    joinUrl(API_BASE_URL, `/v1/messages/${messageId}/feedback`),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ rating, comment: comment ?? null }),
+    },
+  );
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+  const data = await response.json();
+  return { rating: data.rating, comment: data.comment };
+};
+
+export const deleteMessageFeedback = async (messageId: string): Promise<void> => {
+  const response = await fetchApi(
+    joinUrl(API_BASE_URL, `/v1/messages/${messageId}/feedback`),
+    { method: 'DELETE', headers: { Accept: 'application/json' } },
+  );
+  if (!response.ok && response.status !== 404) throw await toApiErrorFromResponse(response);
+};
 
 export interface FetchMessagesResponse {
   messages: MessageResponse[];
