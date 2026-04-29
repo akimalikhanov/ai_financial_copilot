@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sys
+from collections.abc import Generator
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import Request
 from starlette.responses import Response
@@ -39,6 +41,8 @@ class RequestContext:
     # Timing
     start_time: float = field(default_factory=perf_counter)
     duration_ms: float | None = None
+    # Langfuse trace correlation
+    trace_id: str | None = None
     # Extra fields from route handlers
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -73,6 +77,24 @@ def set_request_meta(
         ctx.model_id = model_id
     if extra:
         ctx.extra.update(extra)
+
+
+def set_trace_id(trace_id: str) -> None:
+    """Stamp the Langfuse trace_id on the current request/worker context."""
+    ctx = _request_ctx.get()
+    if ctx is not None:
+        ctx.trace_id = trace_id
+
+
+@contextlib.contextmanager
+def worker_request_context(request_id: str) -> Generator[RequestContext, None, None]:
+    """Set up a minimal RequestContext for Celery workers so log lines carry request_id and trace_id."""
+    ctx = RequestContext(request_id=request_id, trace_id=UUID(request_id).hex)
+    token: Token[RequestContext | None] = _request_ctx.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _request_ctx.reset(token)
 
 
 def set_request_error(
@@ -135,6 +157,8 @@ class JsonFormatter(logging.Formatter):
         ctx = _request_ctx.get()
         if ctx is not None:
             payload["request_id"] = ctx.request_id
+            if ctx.trace_id is not None:
+                payload["trace_id"] = ctx.trace_id
 
         # Add extra fields from log record
         for key, value in record.__dict__.items():

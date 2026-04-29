@@ -5,6 +5,66 @@ x-logging: &default-logging
       mode: non-blocking
       max-buffer-size: 12m
 
+# Shared env block for both Langfuse services.
+# Required new vars in .env:
+#   CLICKHOUSE_PASSWORD, LANGFUSE_NEXTAUTH_SECRET, LANGFUSE_SALT,
+#   LANGFUSE_ENCRYPTION_KEY (64 hex chars), LANGFUSE_S3_ACCESS_KEY_ID,
+#   LANGFUSE_S3_SECRET_ACCESS_KEY (copy from infra/docker/garage/secrets/garage_s3_creds after bootstrap)
+# Optional (auto-create org/project/user on first boot):
+#   LANGFUSE_INIT_ORG_ID, LANGFUSE_INIT_ORG_NAME, LANGFUSE_INIT_PROJECT_ID,
+#   LANGFUSE_INIT_PROJECT_NAME, LANGFUSE_INIT_PROJECT_PUBLIC_KEY,
+#   LANGFUSE_INIT_PROJECT_SECRET_KEY, LANGFUSE_INIT_USER_EMAIL,
+#   LANGFUSE_INIT_USER_NAME, LANGFUSE_INIT_USER_PASSWORD
+x-langfuse-env: &langfuse-env
+  # Postgres: direct connection (bypass pgbouncer — Prisma migrations need session mode)
+  DATABASE_URL: "postgresql://${LANGFUSE_DB_USER}:${LANGFUSE_DB_PASSWORD}@postgres:5432/${LANGFUSE_DB:-langfuse}"
+  # ClickHouse: HTTP for queries, native for migrations
+  CLICKHOUSE_URL: "http://clickhouse:8123"
+  CLICKHOUSE_MIGRATION_URL: "clickhouse://${CLICKHOUSE_USER:-clickhouse}:${CLICKHOUSE_PASSWORD}@clickhouse:9000"
+  CLICKHOUSE_USER: "${CLICKHOUSE_USER:-clickhouse}"
+  CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+  # Redis: reuse redis-app
+  REDIS_HOST: "redis-app"
+  REDIS_PORT: "6379"
+  REDIS_AUTH: "${REDIS_PASSWORD}"
+  # Auth / crypto
+  NEXTAUTH_SECRET: "${LANGFUSE_NEXTAUTH_SECRET}"
+  SALT: "${LANGFUSE_SALT}"
+  ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY}"
+  TELEMETRY_ENABLED: "false"
+  # S3: Garage (reuse existing object store), bucket "langfuse" created by garage-bootstrap
+  LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "garage"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: "garage"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "true"
+  LANGFUSE_S3_BATCH_EXPORT_BUCKET: "langfuse"
+  LANGFUSE_S3_BATCH_EXPORT_REGION: "garage"
+  LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+  # Optional first-boot seed (all empty = skip)
+  LANGFUSE_INIT_ORG_ID: "${LANGFUSE_INIT_ORG_ID:-}"
+  LANGFUSE_INIT_ORG_NAME: "${LANGFUSE_INIT_ORG_NAME:-}"
+  LANGFUSE_INIT_PROJECT_ID: "${LANGFUSE_INIT_PROJECT_ID:-}"
+  LANGFUSE_INIT_PROJECT_NAME: "${LANGFUSE_INIT_PROJECT_NAME:-}"
+  LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}"
+  LANGFUSE_INIT_PROJECT_SECRET_KEY: "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}"
+  LANGFUSE_INIT_USER_EMAIL: "${LANGFUSE_INIT_USER_EMAIL:-}"
+  LANGFUSE_INIT_USER_NAME: "${LANGFUSE_INIT_USER_NAME:-}"
+  LANGFUSE_INIT_USER_PASSWORD: "${LANGFUSE_INIT_USER_PASSWORD:-}"
+
 networks:
   backend:
 
@@ -17,6 +77,7 @@ volumes:
   garage_data:
   garage_meta:
   tei_data:
+  clickhouse_data:
 
 services:
   postgres:
@@ -48,8 +109,8 @@ services:
       timeout: 3s
       retries: 10
       start_period: 20s
-    cpus: "1.00"
-    mem_limit: 1g
+    cpus: "2.00"
+    mem_limit: 2g
     <<: *default-logging
     networks: [backend]
 
@@ -122,8 +183,8 @@ services:
       timeout: 3s
       retries: 15
       start_period: 10s
-    cpus: "0.50"
-    mem_limit: 512m
+    cpus: "1.00"
+    mem_limit: 1g
     <<: *default-logging
     networks: [backend]
 
@@ -331,8 +392,8 @@ services:
     <<: *default-logging
     command: ["sh", "-c", "sleep 9999999"]
     # Choose ONE endpoint:
-    # - /healthz = “alive” style
-    # - /readyz = “ready” style (preferred if you want readiness gating)
+    # - /healthz = "alive" style
+    # - /readyz = "ready" style (preferred if you want readiness gating)
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://qdrant:6333/readyz"]
       interval: 10s
@@ -341,3 +402,89 @@ services:
       start_period: 20s
 
     restart: unless-stopped
+
+  langfuse-secrets:
+    image: alpine:3.20
+    container_name: langfuse-secrets
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      SECRETS_UID: "${SECRETS_UID:-1000}"
+      SECRETS_GID: "${SECRETS_GID:-1000}"
+    volumes:
+      - ./langfuse/secrets:/secrets
+      - ./garage/secrets:/garage_secrets:ro
+      - ../scripts/langfuse_bootstrap.sh:/langfuse_bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/langfuse_bootstrap.sh"]
+    restart: "no"
+    <<: *default-logging
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.12-alpine
+    container_name: clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.d/langfuse-cluster.xml:/etc/clickhouse-server/config.d/langfuse-cluster.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    cpus: "2.00"
+    mem_limit: 4g
+    <<: *default-logging
+    networks: [backend]
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      garage:
+        condition: service_started
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_URL: "${LANGFUSE_URL:-http://localhost:3003}"
+    ports:
+      - "${LANGFUSE_BIND_HOST:-127.0.0.1}:${LANGFUSE_PORT:-3003}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    cpus: "1.00"
+    mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      garage:
+        condition: service_started
+    environment:
+      <<: *langfuse-env
+    cpus: "1.00"
+    mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]

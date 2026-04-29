@@ -43,7 +43,7 @@ else
   echo "Layout already assigned, skipping."
 fi
 
-DEFAULT_BUCKETS_CSV="pdfs,docling,rendered,chunks"
+DEFAULT_BUCKETS_CSV="pdfs,docling,rendered,chunks,langfuse"
 if [ -n "${GARAGE_BUCKETS+x}" ] && [ -n "${GARAGE_BUCKETS:-}" ]; then
   BUCKETS_CSV="$GARAGE_BUCKETS"
   echo "Using GARAGE_BUCKETS='$BUCKETS_CSV'"

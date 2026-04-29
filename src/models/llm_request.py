@@ -90,6 +90,9 @@ class LLMRequest(Base):
     ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tps: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Observability
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+
     # Error info
     error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability import langfuse as lf_client
 from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
 from src.services.ingestion.embedder import embed_chunks
@@ -25,7 +28,32 @@ from src.utils.config import (
     get_vector_search_top_k,
 )
 
+if TYPE_CHECKING:
+    from langfuse import Langfuse
+
+
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _span(
+    lf: Langfuse | None,
+    name: str,
+    *,
+    as_type: str = "span",
+    input: object = None,
+    **metadata: object,
+):
+    if lf is None:
+        yield None
+        return
+    with lf.start_as_current_observation(
+        as_type=as_type,  # type: ignore[arg-type]
+        name=name,
+        input=input,
+        metadata=metadata or None,
+    ) as obs:
+        yield obs
 
 
 def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
@@ -125,12 +153,21 @@ async def run_chat_rag_pipeline(
     if reranker is None:
         reranker = get_reranker()
 
+    lf = lf_client.get_client()
     sub_queries = transformed.sub_queries
 
     # --- Batch embed: top-level + all sub semantic queries, dedup ---
     all_semantic_texts = [transformed.semantic_query] + [s.semantic_query for s in sub_queries]
     unique_texts = list(dict.fromkeys(all_semantic_texts))  # preserve order, dedup
-    vectors_list = await asyncio.to_thread(embed_chunks, unique_texts)
+    with _span(lf, "embed_query", as_type="embedding", input=unique_texts) as obs:
+        vectors_list = await asyncio.to_thread(embed_chunks, unique_texts)
+        if obs:
+            obs.update(
+                output={
+                    "vector_count": len(vectors_list),
+                    "dims": len(vectors_list[0]) if vectors_list else 0,
+                }
+            )
     text_to_vector: dict[str, list[float]] = dict(zip(unique_texts, vectors_list, strict=True))
     top_level_vector = text_to_vector[transformed.semantic_query]
 
@@ -149,7 +186,30 @@ async def run_chat_rag_pipeline(
                 vec, sub.keyword_query, user_id, sdoc, timeout, vector_top_k, keyword_top_k
             )
 
-        pass_results = await asyncio.gather(*[_sub_pass(i) for i in range(len(sub_queries))])
+        with _span(
+            lf,
+            "hybrid_retrieve",
+            as_type="retriever",
+            input=[
+                {"entity": s.focus_entity, "semantic": s.semantic_query, "keyword": s.keyword_query}
+                for s in sub_queries
+            ],
+            mode="multi_pass",
+        ) as obs:
+            pass_results = await asyncio.gather(*[_sub_pass(i) for i in range(len(sub_queries))])
+            if obs:
+                obs.update(
+                    output=[
+                        {
+                            "entity": sub_queries[i].focus_entity,
+                            "counts": {"vector": len(v), "keyword": len(k), "fused": len(f)},
+                            "vector": [_to_hit(c).model_dump(exclude_none=True) for c in v],
+                            "keyword": [_to_hit(c).model_dump(exclude_none=True) for c in k],
+                            "fused": [_to_hit(c).model_dump(exclude_none=True) for c in f],
+                        }
+                        for i, (v, k, f) in enumerate(pass_results)
+                    ]
+                )
 
         # Collect all chunk_ids across passes for bulk hydration
         all_chunk_ids: list[UUID] = []
@@ -179,9 +239,33 @@ async def run_chat_rag_pipeline(
             reranked = await reranker.rerank(sub.semantic_query, capped, texts_map)
             return reranked[:chunks_per_sub]
 
-        reranked_per_sub = list(
-            await asyncio.gather(*[_rerank_sub(i) for i in range(len(sub_queries))])
-        )
+        with _span(
+            lf,
+            "rerank",
+            as_type="retriever",
+            input=[
+                {
+                    "entity": sub_queries[i].focus_entity,
+                    "input_count": len(pass_results[i][2][:reranker_max_input]),
+                }
+                for i in range(len(sub_queries))
+            ],
+            mode="multi_pass",
+        ) as obs:
+            reranked_per_sub = list(
+                await asyncio.gather(*[_rerank_sub(i) for i in range(len(sub_queries))])
+            )
+            if obs:
+                obs.update(
+                    output=[
+                        {
+                            "entity": sub_queries[i].focus_entity,
+                            "output_count": len(reranked_per_sub[i]),
+                            "top_scores": [round(c.score, 4) for c in reranked_per_sub[i][:5]],
+                        }
+                        for i in range(len(sub_queries))
+                    ]
+                )
 
         for i, (sub, (vec_r, kw_r, fused_r)) in enumerate(
             zip(sub_queries, pass_results, strict=True)
@@ -231,20 +315,52 @@ async def run_chat_rag_pipeline(
             payloads = fallback_payloads
 
         trace = RetrievalTrace(sub_passes=sub_pass_trace)
-        return assemble_rag_context(interleaved, payloads, assume_unique=False), trace
+        with _span(
+            lf,
+            "assemble_context",
+            input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in interleaved],
+        ) as obs:
+            ctx = assemble_rag_context(interleaved, payloads, assume_unique=False)
+            if obs:
+                obs.update(
+                    output={
+                        "chunk_count": ctx.chunk_count,
+                        "context_chars": len(ctx.formatted_context or ""),
+                    }
+                )
+        return ctx, trace
 
     # ---------------------------------------------------------------
     # SINGLE-PASS MODE
     # ---------------------------------------------------------------
-    vec_r, kw_r, fused = await _run_single_pass(
-        top_level_vector,
-        transformed.keyword_query,
-        user_id,
-        doc_ids,
-        timeout,
-        vector_top_k,
-        keyword_top_k,
-    )
+    with _span(
+        lf,
+        "hybrid_retrieve",
+        as_type="retriever",
+        input={
+            "semantic_query": transformed.semantic_query,
+            "keyword_query": transformed.keyword_query,
+        },
+        mode="single_pass",
+    ) as obs:
+        vec_r, kw_r, fused = await _run_single_pass(
+            top_level_vector,
+            transformed.keyword_query,
+            user_id,
+            doc_ids,
+            timeout,
+            vector_top_k,
+            keyword_top_k,
+        )
+        if obs:
+            obs.update(
+                output={
+                    "counts": {"vector": len(vec_r), "keyword": len(kw_r), "fused": len(fused)},
+                    "vector": [_to_hit(c).model_dump(exclude_none=True) for c in vec_r],
+                    "keyword": [_to_hit(c).model_dump(exclude_none=True) for c in kw_r],
+                    "fused": [_to_hit(c).model_dump(exclude_none=True) for c in fused],
+                }
+            )
     capped = fused[:reranker_max_input]
     if not capped:
         trace = RetrievalTrace(
@@ -256,7 +372,27 @@ async def run_chat_rag_pipeline(
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
     texts_map = {cid: payloads[cid].prompt_text for cid in chunk_ids if cid in payloads}
-    reranked = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+    with _span(
+        lf,
+        "rerank",
+        as_type="retriever",
+        input={
+            "query": transformed.semantic_query,
+            "input_count": len(capped),
+            "chunks": [{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in capped],
+        },
+        mode="single_pass",
+    ) as obs:
+        reranked = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        if obs:
+            obs.update(
+                output={
+                    "output_count": len(reranked),
+                    "chunks": [
+                        {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked
+                    ],
+                }
+            )
 
     trace = RetrievalTrace(
         qdrant=[_to_hit(c) for c in vec_r],
@@ -264,4 +400,17 @@ async def run_chat_rag_pipeline(
         fused=[_to_hit(c) for c in fused],
         reranked=[_to_hit(c) for c in reranked],
     )
-    return assemble_rag_context(reranked, payloads), trace
+    with _span(
+        lf,
+        "assemble_context",
+        input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked],
+    ) as obs:
+        ctx = assemble_rag_context(reranked, payloads)
+        if obs:
+            obs.update(
+                output={
+                    "chunk_count": ctx.chunk_count,
+                    "context_chars": len(ctx.formatted_context or ""),
+                }
+            )
+    return ctx, trace

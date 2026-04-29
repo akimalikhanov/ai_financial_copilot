@@ -101,9 +101,39 @@ class RoutedLLM:
     default_stream: bool
     capabilities: dict[str, Any]
 
-    async def complete(self, messages: Sequence[ChatMessage], **params: Any) -> LLMResponse:
+    async def complete(
+        self, messages: Sequence[ChatMessage], *, _lf_name: str = "llm.complete", **params: Any
+    ) -> LLMResponse:
+        from src.observability import langfuse as _lf_mod
+
+        lf = _lf_mod.get_client()
         merged = _merge_params(self.default_params, params)
-        return await self.adapter.complete(messages=messages, **merged)
+        if lf is None:
+            return await self.adapter.complete(messages=messages, **merged)
+        with lf.start_as_current_observation(
+            as_type="generation",
+            name=_lf_name,
+            model=self.model_id,
+            input=[{"role": m.role.value, "content": m.content} for m in messages],
+        ) as gen:
+            response = await self.adapter.complete(messages=messages, **merged)
+            update_kwargs: dict = {"output": response.text}
+            if response.stats:
+                s = response.stats
+                update_kwargs["usage_details"] = {
+                    k: v
+                    for k, v in {
+                        "input": s.input_tokens,
+                        "output": s.output_tokens,
+                        "cache_read_input_tokens": s.cached_input_tokens,
+                        "total": s.total_tokens,
+                    }.items()
+                    if v is not None
+                }
+                if s.cost_usd is not None:
+                    update_kwargs["cost_details"] = {"total": s.cost_usd}
+            gen.update(**update_kwargs)
+            return response
 
     def stream(
         self, messages: Sequence[ChatMessage], **params: Any

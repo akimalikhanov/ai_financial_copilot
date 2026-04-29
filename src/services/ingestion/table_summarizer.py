@@ -125,6 +125,7 @@ async def summarize_table_chunks(chunks: list[dict[str, Any]]) -> list[dict[str,
         try:
             resp = await _llm.complete(
                 messages,
+                _lf_name="table_summarizer",
                 temperature=0.0,
                 max_tokens=300 * len(batch_indices),
                 response_format=response_format,

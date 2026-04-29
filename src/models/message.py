@@ -98,6 +98,9 @@ class Message(Base):
     # Pipeline trace (assistant messages only)
     trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Observability
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+
     # Idempotency and tracing
     client_msg_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     request_id: Mapped[UUID | None] = mapped_column(

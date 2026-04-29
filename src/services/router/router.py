@@ -147,6 +147,7 @@ async def route_query(
         try:
             resp = await llm.complete(
                 messages=messages,
+                _lf_name="query_router",
                 temperature=cfg["temperature"],
                 max_tokens=int(cfg["max_tokens"]),
                 response_format=response_format,

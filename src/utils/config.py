@@ -577,6 +577,24 @@ def get_multi_pass_chunks_per_sub() -> int:
     return int(os.getenv("MULTI_PASS_CHUNKS_PER_SUB", "4"))
 
 
+# --- Langfuse ---
+def get_langfuse_config() -> dict[str, str | float | bool]:
+    """Langfuse observability config from environment variables.
+
+    Returns:
+        Dict with keys: enabled, host, public_key, secret_key, sample_rate, environment.
+        Safe to call when Langfuse is not configured — returns enabled=False.
+    """
+    return {
+        "enabled": _parse_bool(os.getenv("LANGFUSE_ENABLED"), False),
+        "host": os.getenv("LANGFUSE_HOST", "http://localhost:3003"),
+        "public_key": os.getenv("LANGFUSE_PUBLIC_KEY", ""),
+        "secret_key": os.getenv("LANGFUSE_SECRET_KEY", ""),
+        "sample_rate": float(os.getenv("LANGFUSE_SAMPLE_RATE", "1.0")),
+        "environment": os.getenv("LANGFUSE_ENVIRONMENT", "development"),
+    }
+
+
 # --- Eval ---
 def get_eval_user_id() -> UUID | None:
     raw = os.getenv("EVAL_USER_ID")

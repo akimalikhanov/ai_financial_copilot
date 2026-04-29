@@ -206,6 +206,7 @@ async def transform_query(
         try:
             resp = await llm.complete(
                 messages=messages,
+                _lf_name="query_transformer",
                 temperature=cfg["temperature"],
                 max_tokens=int(cfg["max_tokens"]),
                 response_format=response_format,

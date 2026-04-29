@@ -351,8 +351,11 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   -- Links a sub-call (e.g. query-router LLM) to its parent chat request.
   -- NULL for top-level chat requests. Used to aggregate full-pipeline cost/tokens.
 
-  request_type       text NOT NULL DEFAULT 'chat'
+  request_type       text NOT NULL DEFAULT 'chat',
   -- Discriminator: 'chat' (default, main assistant response) or 'router' (query routing sub-call).
+
+  trace_id           text
+  -- Langfuse trace id (equals chat request_id). Links DB row to Langfuse trace.
 );
 
 COMMENT ON TABLE llm_requests IS
@@ -405,6 +408,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS llm_requests_conv_client_req_idx
 COMMENT ON INDEX llm_requests_conv_client_req_idx IS
   'Idempotency constraint: prevent duplicate requests with same client_request_id per conversation.';
 
+CREATE INDEX IF NOT EXISTS llm_requests_trace_id_idx
+  ON llm_requests (trace_id)
+  WHERE trace_id IS NOT NULL;
+COMMENT ON INDEX llm_requests_trace_id_idx IS
+  'Fast lookup of LLM requests by Langfuse trace id.';
+
 DROP TRIGGER IF EXISTS trg_llm_requests_updated_at ON llm_requests;
 CREATE TRIGGER trg_llm_requests_updated_at
 BEFORE UPDATE ON llm_requests
@@ -455,6 +464,9 @@ CREATE TABLE IF NOT EXISTS messages (
   request_id         uuid REFERENCES llm_requests(id) ON DELETE SET NULL,
   -- FK to llm_requests table. Links message to the LLM request that generated it.
 
+  trace_id           text,
+  -- Langfuse trace id (equals chat request_id). Links DB row to Langfuse trace.
+
   created_at         timestamptz NOT NULL DEFAULT now(),
   -- Creation timestamp.
 
@@ -502,6 +514,12 @@ CREATE INDEX IF NOT EXISTS messages_request_id_idx
   WHERE request_id IS NOT NULL;
 COMMENT ON INDEX messages_request_id_idx IS
   'Fast lookup of messages by LLM request id.';
+
+CREATE INDEX IF NOT EXISTS messages_trace_id_idx
+  ON messages (trace_id)
+  WHERE trace_id IS NOT NULL;
+COMMENT ON INDEX messages_trace_id_idx IS
+  'Fast lookup of messages by Langfuse trace id.';
 
 CREATE INDEX IF NOT EXISTS messages_metadata_gin_idx
   ON messages USING gin (metadata);

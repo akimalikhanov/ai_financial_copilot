@@ -212,6 +212,7 @@ class LLMRequestRepository:
         tps: int | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        trace_id: str | None = None,
     ) -> LLMRequest | None:
         """Update LLM request stats on stream completion."""
         result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
@@ -229,6 +230,8 @@ class LLMRequestRepository:
         llm_request.tps = tps
         llm_request.error_code = error_code
         llm_request.error_message = error_message
+        if trace_id is not None:
+            llm_request.trace_id = trace_id
 
         await self.session.flush()
         return llm_request

@@ -107,6 +107,7 @@ async def _route_with_llm(
         try:
             resp = await llm.complete(
                 messages=messages,
+                _lf_name="query_processor",
                 temperature=0,
                 max_tokens=500,
                 response_format=_ROUTER_RESPONSE_FORMAT,

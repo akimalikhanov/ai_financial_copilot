@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from time import perf_counter
 from uuid import UUID
 
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
+from langfuse import propagate_attributes
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from src.api.logging import configure_worker_logging
+from src.api.logging import configure_worker_logging, worker_request_context
 from src.celery_app import celery_app
 from src.models.message import Message, MessageStatus
+from src.observability import langfuse as lf_client
 from src.redis_client import add_event
 from src.repository import (
     ConversationRepository,
@@ -51,6 +54,12 @@ from src.services.router.router import route_query
 from src.utils.config import get_db_url, get_query_transformer_config, get_redis_app_url
 
 logger = logging.getLogger(__name__)
+
+_STAGE_OBS_TYPES: dict[str, str] = {
+    "route_query": "chain",
+    "transform_query": "chain",
+    "build_rag_context": "retriever",
+}
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _redis_app: Redis | None = None
@@ -95,6 +104,7 @@ def _initialize_worker_resources() -> None:
         _router = get_router()
     if _reranker is None:
         _reranker = get_reranker()
+    lf_client.initialize()
 
 
 def _get_worker_loop() -> asyncio.AbstractEventLoop:
@@ -113,6 +123,18 @@ def _get_reranker() -> Reranker:
     if _reranker is None:
         raise RuntimeError("Chat worker reranker is not initialized")
     return _reranker
+
+
+def _get_redis_app() -> Redis:
+    if _redis_app is None:
+        raise RuntimeError("Chat worker Redis is not initialized")
+    return _redis_app
+
+
+def _get_session_factory() -> async_sessionmaker[AsyncSession]:
+    if _session_factory is None:
+        raise RuntimeError("Chat worker session factory is not initialized")
+    return _session_factory
 
 
 @setup_logging.connect
@@ -140,6 +162,8 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
         _worker_loop.run_until_complete(_redis_app.aclose())
     if _engine is not None:
         _worker_loop.run_until_complete(_engine.dispose())
+    lf_client.flush()
+    lf_client.reset()
     _router = None
     _reranker = None
     _redis_app = None
@@ -150,11 +174,13 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
 
 
 async def _run_chat_pipeline(request_id: str) -> None:
-    if _session_factory is None or _redis_app is None:
-        raise RuntimeError("Chat worker resources are not initialized")
+    with worker_request_context(request_id):
+        await _run_chat_pipeline_inner(request_id)
 
-    sf = _session_factory
-    redis_app = _redis_app
+
+async def _run_chat_pipeline_inner(request_id: str) -> None:
+    sf = _get_session_factory()
+    redis_app = _get_redis_app()
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
@@ -164,15 +190,38 @@ async def _run_chat_pipeline(request_id: str) -> None:
     current_stage = "initializing"
 
     def _log_stage(stage_name: str) -> None:
-        nonlocal stage_index, current_stage, stage_start
+        nonlocal stage_index, current_stage, stage_start, _stage_stack
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+            _stage_stack.close()
         stage_index += 1
         current_stage = f"{stage_index:02d}_{stage_name}"
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
             extra={"request_id": request_id, "stage": stage_name},
+        )
+        _stage_stack = contextlib.ExitStack()
+        if lf:
+            _stage_stack.enter_context(
+                lf.start_as_current_observation(
+                    as_type=_STAGE_OBS_TYPES.get(stage_name, "span"),  # type: ignore[arg-type]
+                    name=stage_name,
+                )
+            )
+
+    lf = lf_client.get_client()
+    _lf_stack = contextlib.ExitStack()
+    _stage_stack: contextlib.ExitStack = contextlib.ExitStack()
+    _gen: object = None
+    if lf:
+        _lf_stack.enter_context(
+            lf.start_as_current_observation(
+                as_type="chain",
+                name="chat_pipeline",
+                trace_context={"trace_id": UUID(request_id).hex},
+                input={"request_id": request_id},
+            )
         )
 
     try:
@@ -213,6 +262,15 @@ async def _run_chat_pipeline(request_id: str) -> None:
             assistant_msg = await message_repo.get_by_id(state.assistant_message_id)
             state.assistant_seq = assistant_msg.seq if assistant_msg else 0
             await llm_request_repo.update_status(UUID(request_id), "streaming")
+
+            if lf:
+                _lf_stack.enter_context(
+                    propagate_attributes(
+                        user_id=str(llm_request.user_id) if llm_request.user_id else None,
+                        session_id=str(state.conversation_id),
+                        metadata={"request_id": request_id, "model": llm_request.model},
+                    )
+                )
 
             # 2. build_conversation_context
             _log_stage("build_conversation_context")
@@ -470,6 +528,18 @@ async def _run_chat_pipeline(request_id: str) -> None:
 
             # 6. stream_llm_response
             _log_stage("stream_llm_response")
+            if lf:
+                _gen = _lf_stack.enter_context(
+                    lf.start_as_current_observation(
+                        as_type="generation",
+                        name="chat_model",
+                        model=llm_request.model,
+                        input=[
+                            {"role": m.role.value, "content": m.content}
+                            for m in state.adapter_messages
+                        ],
+                    )
+                )
             temperature = state.params.get("temperature")
             max_tokens = state.params.get("max_tokens")
             extra = {
@@ -610,6 +680,7 @@ async def _run_chat_pipeline(request_id: str) -> None:
                     if retrieval_trace is not None:
                         trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
 
+                    lf_trace_id = UUID(request_id).hex if lf else None
                     await message_repo.update_on_final(
                         message_id=state.assistant_message_id,
                         content=state.clean_content,
@@ -617,12 +688,32 @@ async def _run_chat_pipeline(request_id: str) -> None:
                         request_id=UUID(request_id),
                         metadata_updates=citation_meta or None,
                         trace=trace_payload,
+                        trace_id=lf_trace_id,
                     )
                     if chunk.stats:
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),
+                            trace_id=lf_trace_id,
                         )
+                        if _gen is not None:
+                            s = chunk.stats
+                            _gen.update(  # type: ignore[union-attr]
+                                output=state.accumulated_content,
+                                usage_details={
+                                    k: v
+                                    for k, v in {
+                                        "input": s.input_tokens,
+                                        "output": s.output_tokens,
+                                        "cache_read_input_tokens": s.cached_input_tokens,
+                                        "total": s.total_tokens,
+                                    }.items()
+                                    if v is not None
+                                },
+                                cost_details={"total": s.cost_usd}
+                                if s.cost_usd is not None
+                                else None,
+                            )
                     await llm_request_repo.update_status(UUID(request_id), "completed")
                     await conversation_repo.update_on_message(
                         conversation_id=state.conversation_id,
@@ -691,6 +782,9 @@ async def _run_chat_pipeline(request_id: str) -> None:
             logger.exception("pipeline.set_failed_error", extra={"request_id": request_id})
         await add_event(redis_app, request_id, "error", error_event(exc))
         raise
+    finally:
+        _stage_stack.close()
+        _lf_stack.close()
 
 
 @celery_app.task(bind=True, name="process_chat", acks_late=True, reject_on_worker_lost=True)
