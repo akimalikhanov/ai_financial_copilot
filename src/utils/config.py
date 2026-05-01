@@ -541,6 +541,16 @@ def get_reranker_max_input() -> int:
     return int(os.getenv("RERANKER_MAX_INPUT", "30"))
 
 
+def get_injection_scan_user_input_enabled() -> bool:
+    """INJECTION_SCAN_USER_INPUT (default: true). Regex injection scan on user queries."""
+    return _parse_bool(os.getenv("INJECTION_SCAN_USER_INPUT"), True)
+
+
+def get_injection_scan_chunks_enabled() -> bool:
+    """INJECTION_SCAN_CHUNKS (default: true). Regex injection scan on retrieved RAG chunks."""
+    return _parse_bool(os.getenv("INJECTION_SCAN_CHUNKS"), True)
+
+
 def get_system_prompt_version() -> str:
     """SYSTEM_PROMPT_VERSION (default: v2). Controls which system prompt YAML is loaded."""
     return os.getenv("SYSTEM_PROMPT_VERSION", "v2")

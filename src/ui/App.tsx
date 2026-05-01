@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageSquare, BookOpen, Plus, Send, Search,
-  LogOut, User, FileText, MoreHorizontal, Trash2, ArrowRight, Layers, AlertTriangle,
+  LogOut, User, FileText, Trash2, Layers, AlertTriangle,
   ChevronDown, ChevronLeft, ChevronRight, Bot, Sun, Moon, Monitor, SlidersHorizontal,
   Pencil, Loader2, PanelLeft, Sparkles,
 } from 'lucide-react';
-import { Document, Chat, Message, Scope, ViewMode, MobileTab, Citation, ReferenceItem } from './types';
+import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem } from './types';
 import { CitedText } from './components/CitedText';
 import {
   chatEnqueue,
@@ -20,6 +20,7 @@ import {
   updateConversation,
   fetchConversations,
   deleteConversation,
+  deleteDocument,
   ApiError,
   ModelInfo,
   type RequestStatsItem,
@@ -315,6 +316,13 @@ export default function App() {
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState<string>('');
+
+  // Library state
+  const [libSearch, setLibSearch] = useState('');
+  const [libCompany, setLibCompany] = useState('');
+  const [libYear, setLibYear] = useState('');
+  const [docToDelete, setDocToDelete] = useState<string | null>(null);
+  const [docDeleteLoading, setDocDeleteLoading] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -632,6 +640,13 @@ export default function App() {
           updateMessage(conversationId, placeholderId, m => ({ ...m, content: m.content || `Error: ${error.message}` }));
           setIsTyping(false);
           setIsAwaitingResponse(false);
+        },
+        undefined,
+        (meta) => {
+          updateMessage(conversationId, placeholderId, m => ({
+            ...m,
+            metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route },
+          }));
         }
       );
     } catch (err) {
@@ -978,6 +993,13 @@ export default function App() {
                     )}
 
                     <div className={`space-y-2 ${msg.role === 'user' ? 'flex flex-col items-end ml-[15%] max-w-[85%]' : 'flex-1 min-w-0'}`}>
+                      {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieve' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
+                        <div className="pl-4 mb-1">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                            Limited source coverage — answer may be incomplete
+                          </span>
+                        </div>
+                      )}
                       {msg.role === 'assistant' ? (
                         <div className="pl-4 text-sm leading-relaxed text-[var(--text)]">
                           {msg.citationSpans && msg.citationSpans.length > 0 ? (
@@ -1141,86 +1163,171 @@ export default function App() {
     );
   };
 
-  const renderLibrary = () => (
-    <div className="flex-1 overflow-auto bg-[var(--bg)] p-6 md:p-10 animate-fade-in pb-20 md:pb-10">
-      <div className="max-w-6xl mx-auto">
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-2xl font-semibold text-[var(--text)] mb-2">Document Library</h1>
-            <p className="text-[var(--text-muted)] text-sm">Manage and analyze your financial repository.</p>
-          </div>
-          <Button onClick={() => setIsUploadOpen(true)} className="gap-2">
-            <Plus size={16} /> Upload PDFs
-          </Button>
-        </div>
+  const confirmDeleteDoc = async () => {
+    if (!docToDelete) return;
+    setDocDeleteLoading(true);
+    try {
+      await deleteDocument(docToDelete);
+      setDocs(prev => prev.filter(d => d.id !== docToDelete));
+    } catch (err) {
+      console.error('Failed to delete document:', err);
+      alert('Failed to delete document. Please try again.');
+    } finally {
+      setDocDeleteLoading(false);
+      setDocToDelete(null);
+    }
+  };
 
-        {(() => {
-          const companies = Array.from(new Set(docs.map(d => d.company).filter(Boolean))).sort();
-          const years = Array.from(new Set(docs.map(d => d.year).filter(y => y > 0))).sort((a, b) => Number(b) - Number(a));
-          return (
-            <div className="flex gap-4 mb-6">
-              <div className="relative flex-1 max-w-md">
-                <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
-                <Input placeholder="Search documents..." className="pl-9" />
+  const renderLibrary = () => {
+    const companies = Array.from(new Set(docs.map(d => d.company).filter(Boolean))).sort();
+    const years = Array.from(new Set(docs.map(d => d.year).filter(y => y > 0))).sort((a, b) => Number(b) - Number(a));
+
+    const q = libSearch.toLowerCase();
+    const filteredDocs = docs.filter(doc => {
+      if (q && !doc.title.toLowerCase().includes(q) && !doc.company.toLowerCase().includes(q)) return false;
+      if (libCompany && doc.company !== libCompany) return false;
+      if (libYear && String(doc.year) !== libYear) return false;
+      return true;
+    });
+
+    return (
+      <div className="flex-1 overflow-auto bg-[var(--bg)] p-6 md:p-10 animate-fade-in pb-20 md:pb-10">
+        {docToDelete && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+            <Card className="w-full max-w-sm p-6 shadow-[var(--shadow-lg)]" variant="elevated">
+              <div className="flex flex-col items-center text-center gap-4">
+                <div className="w-12 h-12 bg-[var(--danger-bg)] rounded-full flex items-center justify-center text-[var(--danger)]">
+                  <AlertTriangle size={24} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-[var(--text)]">Delete Document?</h3>
+                  <p className="text-sm text-[var(--text-muted)] mt-1">This will permanently remove the document and all its data.</p>
+                </div>
+                <div className="flex w-full gap-2 mt-2">
+                  <Button variant="secondary" className="flex-1" onClick={() => setDocToDelete(null)} disabled={docDeleteLoading}>Cancel</Button>
+                  <Button variant="danger" className="flex-1" onClick={confirmDeleteDoc} disabled={docDeleteLoading}>
+                    {docDeleteLoading ? <Loader2 size={15} className="animate-spin" /> : 'Delete'}
+                  </Button>
+                </div>
               </div>
-              <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
-                <option>All Companies</option>
-                {companies.map(c => <option key={c}>{c}</option>)}
-              </select>
-              <select className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer">
-                <option>All Years</option>
-                {years.map(y => <option key={y}>{y}</option>)}
-              </select>
-            </div>
-          );
-        })()}
+            </Card>
+          </div>
+        )}
 
-        <div className="border border-[var(--border)] rounded-xl overflow-hidden bg-[var(--surface-1)] shadow-[var(--shadow-sm)]">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-[var(--surface-2)] border-b border-[var(--border)] text-[var(--text-muted)] text-xs uppercase tracking-wider">
-              <tr>
-                <th className="px-6 py-4 font-medium">Status</th>
-                <th className="px-6 py-4 font-medium">Document Name</th>
-                <th className="px-6 py-4 font-medium">Company</th>
-                <th className="px-6 py-4 font-medium">Year</th>
-                <th className="px-6 py-4 font-medium">Type</th>
-                <th className="px-6 py-4 font-medium">Pages</th>
-                <th className="px-6 py-4 font-medium text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[var(--border)]">
-              {docs.map(doc => (
-                <tr
-                  key={doc.id}
-                  className="hover:bg-[var(--surface-2)] transition-colors group cursor-pointer"
-                  onClick={() => {
-                    setView('ASK');
-                    handleCitationClick({ docId: doc.id, page: 1, excerpt: '' });
-                    handleNewChat();
-                    setScope({ mode: 'thisDoc', docIds: [doc.id], filters: {} });
-                  }}
-                >
-                  <td className="px-6 py-4"><Badge variant={doc.status === 'Ready' ? 'success' : 'warning'}>{doc.status}</Badge></td>
-                  <td className="px-6 py-4 font-medium text-[var(--text)] flex items-center gap-2">
-                    <FileText size={16} className="text-[var(--text-faint)]" />{doc.title}
-                  </td>
-                  <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company}</td>
-                  <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.year}</td>
-                  <td className="px-6 py-4 text-[var(--text-muted)]">{doc.type}</td>
-                  <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.pages}</td>
-                  <td className="px-6 py-4 text-right">
-                    <Button variant="ghost" size="icon" className="opacity-0 group-hover:opacity-100">
-                      <MoreHorizontal size={16} />
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="max-w-6xl mx-auto">
+          <div className="flex items-center justify-between mb-8">
+            <div>
+              <h1 className="text-2xl font-semibold text-[var(--text)] mb-2">Document Library</h1>
+              <p className="text-[var(--text-muted)] text-sm">
+                {docs.length} document{docs.length !== 1 ? 's' : ''} · {docs.filter(d => d.status === 'Ready').length} ready
+              </p>
+            </div>
+            <Button onClick={() => setIsUploadOpen(true)} className="gap-2">
+              <Plus size={16} /> Upload PDFs
+            </Button>
+          </div>
+
+          <div className="flex gap-4 mb-6 flex-wrap">
+            <div className="relative flex-1 min-w-[200px] max-w-md">
+              <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={14} />
+              <Input
+                placeholder="Search documents..."
+                className="pl-9"
+                value={libSearch}
+                onChange={e => setLibSearch(e.target.value)}
+              />
+            </div>
+            <select
+              value={libCompany}
+              onChange={e => setLibCompany(e.target.value)}
+              className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer"
+            >
+              <option value="">All Companies</option>
+              {companies.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <select
+              value={libYear}
+              onChange={e => setLibYear(e.target.value)}
+              className="appearance-none bg-[var(--input-bg)] border border-[var(--input-border)] rounded-md px-3 pr-8 text-sm text-[var(--text)] focus:border-[var(--input-border-focus)] outline-none cursor-pointer"
+            >
+              <option value="">All Years</option>
+              {years.map(y => <option key={y} value={String(y)}>{y}</option>)}
+            </select>
+          </div>
+
+          {docs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center text-center py-24 border border-dashed border-[var(--border)] rounded-xl">
+              <FileText size={40} className="text-[var(--text-faint)] mb-4" />
+              <h3 className="text-base font-semibold text-[var(--text)] mb-1">No documents yet</h3>
+              <p className="text-sm text-[var(--text-muted)] mb-4">Upload PDFs to start analyzing your financial documents.</p>
+              <Button onClick={() => setIsUploadOpen(true)} className="gap-2"><Plus size={16} /> Upload PDFs</Button>
+            </div>
+          ) : filteredDocs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center text-center py-24 border border-dashed border-[var(--border)] rounded-xl">
+              <Search size={40} className="text-[var(--text-faint)] mb-4" />
+              <h3 className="text-base font-semibold text-[var(--text)] mb-1">No results</h3>
+              <p className="text-sm text-[var(--text-muted)]">Try adjusting your search or filters.</p>
+            </div>
+          ) : (
+            <div className="border border-[var(--border)] rounded-xl overflow-hidden bg-[var(--surface-1)] shadow-[var(--shadow-sm)]">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-[var(--surface-2)] border-b border-[var(--border)] text-[var(--text-muted)] text-xs uppercase tracking-wider">
+                  <tr>
+                    <th className="px-6 py-4 font-medium">Status</th>
+                    <th className="px-6 py-4 font-medium">Document Name</th>
+                    <th className="px-6 py-4 font-medium">Company</th>
+                    <th className="px-6 py-4 font-medium">Year</th>
+                    <th className="px-6 py-4 font-medium">Type</th>
+                    <th className="px-6 py-4 font-medium">Pages</th>
+                    <th className="px-6 py-4 font-medium text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--border)]">
+                  {filteredDocs.map(doc => (
+                    <tr
+                      key={doc.id}
+                      className="hover:bg-[var(--surface-2)] transition-colors group cursor-pointer"
+                      onClick={() => {
+                        setView('ASK');
+                        handleCitationClick({ docId: doc.id, page: 1, excerpt: '' });
+                        handleNewChat();
+                        setScope({ mode: 'thisDoc', docIds: [doc.id], filters: {} });
+                      }}
+                    >
+                      <td className="px-6 py-4">
+                        <Badge variant={doc.status === 'Ready' ? 'success' : doc.status === 'Error' ? 'danger' : 'warning'}>
+                          {doc.status}
+                        </Badge>
+                      </td>
+                      <td className="px-6 py-4 font-medium text-[var(--text)]">
+                        <div className="flex items-center gap-2">
+                          <FileText size={16} className="text-[var(--text-faint)] shrink-0" />
+                          <span className="truncate max-w-[280px]">{doc.title}</span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company || '—'}</td>
+                      <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.year || '—'}</td>
+                      <td className="px-6 py-4 text-[var(--text-muted)]">{doc.type || '—'}</td>
+                      <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.pages || '—'}</td>
+                      <td className="px-6 py-4 text-right">
+                        <button
+                          onClick={e => { e.stopPropagation(); setDocToDelete(doc.id); }}
+                          className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-colors opacity-0 group-hover:opacity-100"
+                          title="Delete document"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   if (!authChecked) {
     return (
@@ -1342,6 +1449,9 @@ export default function App() {
                   if (newTabs.length === 0) { setIsEvidenceOpen(false); setMobileTab('CONVERSATION'); }
                   else if (activePdfDocId === id) setActivePdfDocId(newTabs[0].doc.id);
                 }}
+                onPageChange={(docId, page) =>
+                  setOpenPdfTabs(prev => prev.map(t => t.doc.id === docId ? { ...t, page } : t))
+                }
                 highlight={activeHighlight}
               />
               <ControlPane

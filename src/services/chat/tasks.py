@@ -33,6 +33,7 @@ from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery, TransformerInput
 from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
 from src.services.chat.citation_parser import BracketCitationParser
+from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
     ThinkingStripper,
     build_all_references,
@@ -51,7 +52,13 @@ from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.query_transformer import transform_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
-from src.utils.config import get_db_url, get_query_transformer_config, get_redis_app_url
+from src.services.security.injection_detector import InjectionSignal, scan_user_input
+from src.utils.config import (
+    get_db_url,
+    get_injection_scan_user_input_enabled,
+    get_query_transformer_config,
+    get_redis_app_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +192,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     retrieval_trace: RetrievalTrace | None = None
-    stage_total = 8
+    stage_total = 9
     stage_index = 0
     current_stage = "initializing"
 
-    def _log_stage(stage_name: str) -> None:
+    async def _log_stage(stage_name: str) -> None:
         nonlocal stage_index, current_stage, stage_start, _stage_stack
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
@@ -200,6 +207,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
             extra={"request_id": request_id, "stage": stage_name},
+        )
+        await add_event(
+            redis_app,
+            request_id,
+            "stage",
+            {"stage": stage_name, "index": stage_index, "total": stage_total},
         )
         _stage_stack = contextlib.ExitStack()
         if lf:
@@ -236,7 +249,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             conversation_repo = ConversationRepository(session)
 
             # 1. load_and_validate_request
-            _log_stage("load_and_validate_request")
+            await _log_stage("load_and_validate_request")
             llm_request = await llm_request_repo.get_by_id(UUID(request_id))
             if not llm_request:
                 logger.error("llm_request_not_found", extra={"request_id": request_id})
@@ -273,7 +286,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             # 2. build_conversation_context
-            _log_stage("build_conversation_context")
+            await _log_stage("build_conversation_context")
             history = ConversationHistory(redis_app, message_repo)
             state.history = history
             state.context_messages = await history.load(
@@ -288,8 +301,87 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             )
             state.user_query_raw = last_user.content if last_user else ""
 
+            injection_signal: InjectionSignal | None = None
+            # 2.5 scan_user_input (skipped when INJECTION_SCAN_USER_INPUT=false)
+            if get_injection_scan_user_input_enabled():
+                await _log_stage("scan_user_input")
+                injection_signal = scan_user_input(state.user_query_raw)
+                state.user_query_raw = injection_signal.sanitized_text
+
+                logger.info(
+                    "pipeline.injection_scan",
+                    extra={
+                        "request_id": request_id,
+                        "injection_score": injection_signal.score,
+                        "injection_severity": injection_signal.severity,
+                        "matched_rules": injection_signal.matched_rules,
+                        "stripped_chars": injection_signal.stripped_chars,
+                    },
+                )
+
+                if lf:
+                    lf_trace_id = UUID(request_id).hex
+                    lf.create_score(
+                        name="injection_score",
+                        value=float(injection_signal.score),
+                        trace_id=lf_trace_id,
+                    )
+                    lf.create_score(
+                        name="injection_severity",
+                        value=injection_signal.severity,
+                        trace_id=lf_trace_id,
+                    )
+
+                if injection_signal.severity == "block":
+                    refusal_text = (
+                        "I'm sorry, but I can't process that request. "
+                        "Please ask a financial question about your documents."
+                    )
+                    await add_event(redis_app, request_id, "delta", {"text": refusal_text})
+                    await message_repo.update_on_final(
+                        message_id=state.assistant_message_id,
+                        content=refusal_text,
+                        raw_content=refusal_text,
+                        request_id=UUID(request_id),
+                        trace={
+                            "guardrails": {
+                                "injection": {
+                                    "score": injection_signal.score,
+                                    "severity": injection_signal.severity,
+                                    "matched_rules": injection_signal.matched_rules,
+                                    "stripped_chars": injection_signal.stripped_chars,
+                                }
+                            }
+                        },
+                    )
+                    await llm_request_repo.update_status(UUID(request_id), "completed")
+                    await conversation_repo.update_on_message(
+                        conversation_id=state.conversation_id,
+                        message_id=state.assistant_message_id,
+                        new_seq=state.assistant_seq,
+                    )
+                    usage_data = build_usage_event(
+                        refusal_text,
+                        None,
+                        state.assistant_message_id,
+                        state.assistant_seq,
+                        None,
+                    )
+                    await add_event(redis_app, request_id, "usage", usage_data)
+                    await session.commit()
+                    try:
+                        await state.history.append_assistant(
+                            state.conversation_id,
+                            refusal_text,
+                            state.assistant_seq,
+                        )
+                    except Exception:
+                        logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
+                    logger.info("pipeline.injection_blocked", extra={"request_id": request_id})
+                    return
+
             # 3. route_query
-            _log_stage("route_query")
+            await _log_stage("route_query")
             router = _get_router()
 
             user_db_msg = (
@@ -325,6 +417,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 user_intent=state.router_output.user_intent,
                 reason=state.router_output.reasoning,
             )
+            _scope_doc_ids = (
+                [str(d) for d in state.scope_result.doc_ids]
+                if state.scope_result and state.scope_result.doc_ids is not None
+                else None
+            )
+            _scope_per_entity = (
+                {
+                    entity: [str(d) for d in ids]
+                    for entity, ids in state.scope_result.per_entity_doc_ids.items()
+                }
+                if state.scope_result and state.scope_result.per_entity_doc_ids
+                else None
+            )
             logger.info(
                 "rag_route",
                 extra={
@@ -334,8 +439,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     "user_intent": state.router_output.user_intent,
                     "needs_decomposition": state.router_output.needs_decomposition,
                     "scope_source": state.scope_result.source if state.scope_result else None,
+                    "scope_doc_ids": _scope_doc_ids,
+                    "scope_per_entity_doc_ids": _scope_per_entity,
                 },
             )
+            if lf:
+                lf.update_current_span(
+                    metadata={
+                        "scope_source": state.scope_result.source if state.scope_result else None,
+                        "scope_doc_ids": _scope_doc_ids,
+                        "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
+                        "scope_per_entity_doc_ids": _scope_per_entity,
+                    }
+                )
 
             # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
             if state.processed_query.route == "out_of_scope":
@@ -375,7 +491,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             # 3.5 transform_query — retrieval route only
             if state.processed_query.route == "retrieve" and llm_request.user_id:
-                _log_stage("transform_query")
+                await _log_stage("transform_query")
                 doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
                 per_entity = state.scope_result.per_entity_doc_ids if state.scope_result else None
                 known_entity_names: list[str] = list(per_entity.keys()) if per_entity else []
@@ -460,7 +576,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             # 4. build_rag_context
-            _log_stage("build_rag_context")
+            await _log_stage("build_rag_context")
             if state.processed_query.route == "direct_answer" or not llm_request.user_id:
                 state.rag_context_str = "(No document context - general question.)"
             else:
@@ -501,8 +617,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     or "(No document context - general question.)"
                 )
 
+            top_score = (
+                state.rag_context.items[0].score
+                if state.rag_context and state.rag_context.items
+                else None
+            )
+            num_chunks = len(state.rag_context.items) if state.rag_context else 0
+
             # 5. render_prompt
-            _log_stage("render_prompt")
+            await _log_stage("render_prompt")
             # Resolve model + citation_mode before rendering so prompt version is model-aware
             try:
                 llm = router.get(llm_request.model)
@@ -527,7 +650,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             )
 
             # 6. stream_llm_response
-            _log_stage("stream_llm_response")
+            await _log_stage("stream_llm_response")
             if lf:
                 _gen = _lf_stack.enter_context(
                     lf.start_as_current_observation(
@@ -624,7 +747,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             )
 
                     # 7. persist_and_emit
-                    _log_stage("persist_and_emit")
+                    await _log_stage("persist_and_emit")
                     # Build citation metadata for persistence
                     citation_meta: dict = {}
                     if parser is not None:
@@ -649,6 +772,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     # Finalize stage times (stream_llm_response ends here)
                     stage_times[current_stage] = round(perf_counter() - stage_start, 3)
                     total_time = round(perf_counter() - pipeline_started_at, 3)
+
+                    confidence = compute_confidence(top_score, num_chunks)
+                    ungrounded = (
+                        has_ungrounded_claims(state.clean_content)
+                        if citation_mode == "bracket"
+                        else None
+                    )
 
                     # Build pipeline trace
                     trace_payload: dict = {
@@ -679,6 +809,24 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         }
                     if retrieval_trace is not None:
                         trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
+                    trace_payload["guardrails"] = {
+                        "confidence": confidence,
+                        "top_reranker_score": top_score,
+                        "num_chunks": num_chunks,
+                        "ungrounded_claims": ungrounded,
+                        **(
+                            {
+                                "injection": {
+                                    "score": injection_signal.score,
+                                    "severity": injection_signal.severity,
+                                    "matched_rules": injection_signal.matched_rules,
+                                    "stripped_chars": injection_signal.stripped_chars,
+                                }
+                            }
+                            if injection_signal is not None
+                            else {}
+                        ),
+                    }
 
                     lf_trace_id = UUID(request_id).hex if lf else None
                     await message_repo.update_on_final(
@@ -719,6 +867,27 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         conversation_id=state.conversation_id,
                         message_id=state.assistant_message_id,
                         new_seq=state.assistant_seq,
+                    )
+
+                    await add_event(
+                        redis_app,
+                        request_id,
+                        "metadata",
+                        {
+                            "confidence": confidence,
+                            "ungrounded_claims": ungrounded,
+                            "route": state.router_output.route if state.router_output else None,
+                        },
+                    )
+                    logger.info(
+                        "confidence_score",
+                        extra={
+                            "request_id": request_id,
+                            "confidence": confidence,
+                            "top_score": top_score,
+                            "num_chunks": num_chunks,
+                            "ungrounded_claims": ungrounded,
+                        },
                     )
 
                     usage_data = build_usage_event(

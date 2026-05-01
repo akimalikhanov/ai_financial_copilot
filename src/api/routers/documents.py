@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import aioboto3
 from celery import Task
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import text
 
 from src.api.deps import CurrentUserDep
 from src.db import DbSessionDep
@@ -18,8 +22,18 @@ from src.schemas.documents import (
     ListDocumentsResponse,
     UploadDocumentResponse,
 )
+from src.services.ingestion import opensearch_ingest, qdrant_ingest
 from src.services.ingestion.s3_client import upload_pdf
 from src.services.ingestion.tasks import ingest_document
+from src.utils.config import (
+    get_s3_access_key,
+    get_s3_chunks_bucket,
+    get_s3_docling_bucket,
+    get_s3_endpoint_url,
+    get_s3_raw_bucket,
+    get_s3_rendered_bucket,
+    get_s3_secret_key,
+)
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
 
@@ -136,3 +150,102 @@ async def upload_document(
         created_at=doc.created_at,
         metadata=doc.document_metadata,
     )
+
+
+@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_document(
+    document_id: UUID,
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+) -> None:
+    repo = DocumentRepository(session)
+    doc = await repo.get_by_id(document_id)
+    if doc is None or doc.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    qdrant_collection = os.getenv("QDRANT_COLLECTION", "documents")
+    opensearch_index = os.getenv("OPENSEARCH_INDEX", "chunks")
+
+    try:
+        qdrant_ingest.delete_by_document(qdrant_collection, document_id)
+    except Exception:
+        logger.warning("delete_document.qdrant_failed", extra={"document_id": str(document_id)})
+
+    try:
+        opensearch_ingest.delete_by_document(opensearch_index, document_id)
+    except Exception:
+        logger.warning("delete_document.opensearch_failed", extra={"document_id": str(document_id)})
+
+    s3_keys = {
+        get_s3_raw_bucket(): [doc.storage_key],
+        get_s3_docling_bucket(): [f"processed/{doc.user_id}/{document_id}/docling.json"],
+        get_s3_rendered_bucket(): [f"processed/{doc.user_id}/{document_id}/document.md"],
+        get_s3_chunks_bucket(): [f"processed/{doc.user_id}/{document_id}/chunks.jsonl"],
+    }
+    s3_session = aioboto3.Session()
+    async with s3_session.client(  # type: ignore[attr-defined]
+        "s3",
+        endpoint_url=get_s3_endpoint_url(),
+        region_name="garage",
+        aws_access_key_id=get_s3_access_key(),
+        aws_secret_access_key=get_s3_secret_key(),
+    ) as s3:
+        for bucket, keys in s3_keys.items():
+            for key in keys:
+                try:
+                    await s3.delete_object(Bucket=bucket, Key=key)
+                except Exception:
+                    logger.warning(
+                        "delete_document.s3_failed",
+                        extra={"bucket": bucket, "key": key},
+                    )
+
+    await session.execute(text("DELETE FROM chunks WHERE document_id = :id"), {"id": document_id})
+    await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
+    await session.commit()
+    logger.info("document.deleted", extra={"document_id": str(document_id)})
+
+
+@router.get("/{document_id}/pdf")
+async def serve_pdf(
+    document_id: UUID,
+    session: DbSessionDep,
+    current_user: CurrentUserDep,
+) -> StreamingResponse:
+    repo = DocumentRepository(session)
+    doc = await repo.get_by_id(document_id)
+    if doc is None or doc.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    s3_session = aioboto3.Session()
+    client = await s3_session.client(
+        "s3",
+        endpoint_url=get_s3_endpoint_url(),
+        region_name="garage",
+        aws_access_key_id=get_s3_access_key(),
+        aws_secret_access_key=get_s3_secret_key(),
+    ).__aenter__()
+
+    try:
+        resp = await client.get_object(Bucket=get_s3_raw_bucket(), Key=doc.storage_key)
+    except Exception as err:
+        await client.__aexit__(None, None, None)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="File not found in storage"
+        ) from err
+
+    content_length: int | None = resp.get("ContentLength")
+    body = resp["Body"]
+
+    async def _stream():
+        try:
+            async for chunk in body.iter_chunks(1024 * 256):
+                yield chunk
+        finally:
+            await client.__aexit__(None, None, None)
+
+    headers = {
+        "Content-Disposition": f'inline; filename="{doc.original_filename}"',
+        **({"Content-Length": str(content_length)} if content_length else {}),
+    }
+    return StreamingResponse(_stream(), media_type="application/pdf", headers=headers)

@@ -314,13 +314,12 @@ async def run_chat_rag_pipeline(
             interleaved = await reranker.rerank(transformed.semantic_query, capped, fallback_texts)
             payloads = fallback_payloads
 
-        trace = RetrievalTrace(sub_passes=sub_pass_trace)
         with _span(
             lf,
             "assemble_context",
             input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in interleaved],
         ) as obs:
-            ctx = assemble_rag_context(interleaved, payloads, assume_unique=False)
+            ctx, guardrails = assemble_rag_context(interleaved, payloads, assume_unique=False)
             if obs:
                 obs.update(
                     output={
@@ -328,6 +327,11 @@ async def run_chat_rag_pipeline(
                         "context_chars": len(ctx.formatted_context or ""),
                     }
                 )
+        trace = RetrievalTrace(
+            sub_passes=sub_pass_trace,
+            dropped_chunks=guardrails.dropped,
+            flagged_chunks=guardrails.flagged,
+        )
         return ctx, trace
 
     # ---------------------------------------------------------------
@@ -405,7 +409,7 @@ async def run_chat_rag_pipeline(
         "assemble_context",
         input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked],
     ) as obs:
-        ctx = assemble_rag_context(reranked, payloads)
+        ctx, guardrails = assemble_rag_context(reranked, payloads)
         if obs:
             obs.update(
                 output={
@@ -413,4 +417,6 @@ async def run_chat_rag_pipeline(
                     "context_chars": len(ctx.formatted_context or ""),
                 }
             )
+    trace.dropped_chunks = guardrails.dropped
+    trace.flagged_chunks = guardrails.flagged
     return ctx, trace

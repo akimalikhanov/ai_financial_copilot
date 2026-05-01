@@ -217,6 +217,7 @@ def configure_worker_logging() -> None:
                 prefixes=(
                     "src.services.ingestion.tasks",
                     "celery.worker.strategy",
+                    "docling",
                 )
             )
         )

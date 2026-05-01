@@ -16,13 +16,14 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
   const [step, setStep] = useState(1);
   const [file, setFile] = useState<File | null>(null);
   const [company, setCompany] = useState('');
+  const [year, setYear] = useState('');
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
   useEffect(() => {
     if (!isOpen) {
-      setStep(1); setFile(null); setCompany('');
+      setStep(1); setFile(null); setCompany(''); setYear('');
       setUploading(false); setError(null); setIsDragOver(false);
     }
   }, [isOpen]);
@@ -52,6 +53,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
       const formData = new FormData();
       formData.append('file', file);
       if (company.trim()) formData.append('company', company.trim());
+      if (year.trim()) formData.append('year', year.trim());
       const doc = await uploadDocument(formData);
       onUpload({ ...doc, status: mapStatus(doc.status) });
       onClose();
@@ -113,6 +115,10 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
               <div>
                 <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Company</label>
                 <Input placeholder="e.g. Acme Corp" value={company} onChange={e => setCompany(e.target.value)} />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[var(--text-muted)] mb-1.5 uppercase tracking-wide">Year</label>
+                <Input placeholder="e.g. 2024" value={year} onChange={e => setYear(e.target.value)} />
               </div>
               {error && <p className="text-sm text-[var(--danger)]">{error}</p>}
             </div>

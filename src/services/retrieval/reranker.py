@@ -98,14 +98,14 @@ class LocalCrossEncoderReranker:
             data = resp.json()
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             logger.warning("reranker_failed", extra={"error": str(exc) or type(exc).__name__})
-            return list(chunks)
+            return list(chunks[: self._top_k])
         except Exception as exc:
             logger.warning("reranker_failed", extra={"error": str(exc) or type(exc).__name__})
-            return list(chunks)
+            return list(chunks[: self._top_k])
 
         if not isinstance(data, list):
             logger.warning("reranker_invalid_response", extra={"type": type(data).__name__})
-            return list(chunks)
+            return list(chunks[: self._top_k])
 
         score_by_idx: dict[int, float] = {}
         for item in data:
@@ -119,7 +119,7 @@ class LocalCrossEncoderReranker:
                 "reranker_incomplete_scores",
                 extra={"expected": len(to_rerank), "got": len(score_by_idx)},
             )
-            return list(chunks)
+            return list(chunks[: self._top_k])
 
         scored = [(to_rerank[i], score_by_idx.get(i, 0.0)) for i in range(len(to_rerank))]
         scored.sort(key=lambda x: x[1], reverse=True)

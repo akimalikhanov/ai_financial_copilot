@@ -47,6 +47,12 @@ export interface MessageFeedback {
   comment?: string | null;
 }
 
+export interface MessageMetadata {
+  confidence?: 'low' | 'medium' | 'high' | 'none';
+  ungrounded_claims?: boolean | null;
+  route?: string | null;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
@@ -56,6 +62,7 @@ export interface Message {
   references?: ReferenceItem[];
   timestamp: number;
   feedback?: MessageFeedback | null;
+  metadata?: MessageMetadata;
 }
 
 export interface Chat {

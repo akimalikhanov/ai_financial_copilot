@@ -193,6 +193,18 @@ class RetrievalHit(BaseModel):
     keyword_score: float | None = None
 
 
+class DroppedChunk(BaseModel):
+    chunk_id: str
+    matched_rules: list[str]
+    score: int
+
+
+class FlaggedChunk(BaseModel):
+    chunk_id: str
+    matched_rules: list[str]
+    score: int
+
+
 class RetrievalTrace(BaseModel):
     """Per-request retrieval trace stored in message.trace['retrieval']."""
 
@@ -202,3 +214,5 @@ class RetrievalTrace(BaseModel):
     reranked: list[RetrievalHit] = []
     # Multi-pass mode: one entry per sub-query pass; single-pass fields above are absent.
     sub_passes: list[dict] | None = None
+    dropped_chunks: list[DroppedChunk] = []
+    flagged_chunks: list[FlaggedChunk] = []

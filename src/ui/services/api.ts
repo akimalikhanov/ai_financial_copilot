@@ -93,6 +93,12 @@ export interface ReferencesEvent {
   }[];
 }
 
+export interface MetadataEvent {
+  confidence: 'low' | 'medium' | 'high' | 'none';
+  ungrounded_claims: boolean | null;
+  route: string | null;
+}
+
 type ApiErrorOptions = {
   statusCode?: number;
   fallbackMessage?: string;
@@ -425,6 +431,17 @@ export const uploadDocument = async (formData: FormData): Promise<UploadDocument
   return response.json() as Promise<UploadDocumentResponse>;
 };
 
+export const deleteDocument = async (documentId: string): Promise<void> => {
+  const response = await fetchApi(joinUrl(API_BASE_URL, `/v1/documents/${documentId}`), {
+    method: 'DELETE',
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) throw await toApiErrorFromResponse(response);
+};
+
+export const getPdfUrl = (documentId: string): string =>
+  joinUrl(API_BASE_URL, `/v1/documents/${documentId}/pdf`);
+
 // --- Conversations API ---
 
 export interface CreateConversationRequest {
@@ -672,11 +689,12 @@ export const chatStreamSubscribe = async (
   onReferences: (refs: ReferencesEvent) => void,
   onFinal: (chunk: LLMStreamChunk) => void,
   onError: (error: ApiError) => void,
-  afterEventId?: string
+  afterEventId?: string,
+  onMetadata?: (meta: MetadataEvent) => void,
 ): Promise<void> => {
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata
     );
     if (result === 'done' || result === 'server-error') return;
     // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
@@ -703,6 +721,7 @@ async function _doStreamAttempt(
   onFinal: (chunk: LLMStreamChunk) => void,
   onError: (error: ApiError) => void,
   afterEventId?: string,
+  onMetadata?: (meta: MetadataEvent) => void,
 ): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
@@ -772,6 +791,16 @@ async function _doStreamAttempt(
           } catch { /* ignore malformed */ }
           continue;
         }
+        // Handle metadata events
+        if (parsed.event === 'metadata') {
+          try {
+            const meta = JSON.parse(parsed.data) as MetadataEvent;
+            onMetadata?.(meta);
+          } catch { /* ignore malformed */ }
+          continue;
+        }
+        // Skip non-content server events (e.g. "stage" progress events)
+        if (!['delta', 'usage', 'message'].includes(parsed.event)) continue;
         let payload: LLMStreamChunk | null = null;
         try {
           payload = JSON.parse(parsed.data) as LLMStreamChunk;
