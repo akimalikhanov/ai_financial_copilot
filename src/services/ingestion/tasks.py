@@ -14,11 +14,13 @@ from uuid import UUID
 
 from celery.exceptions import Retry, SoftTimeLimitExceeded
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.redis_client import ingestion_stream_key
 from src.services.ingestion.chunker import reset_tokenizer
 from src.services.ingestion.docling_parser import reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
@@ -34,6 +36,7 @@ from src.utils.config import (
     get_db_url,
     get_embedding_dim,
     get_embedding_model,
+    get_redis_app_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_rendered_bucket,
@@ -42,6 +45,7 @@ from src.utils.config import (
 
 logger = logging.getLogger(__name__)
 _worker_loop: asyncio.AbstractEventLoop | None = None
+_redis_ingestion: Redis | None = None
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
@@ -64,7 +68,7 @@ def _on_celery_setup_logging(**_kwargs: object) -> None:
 
 @worker_process_init.connect
 def _on_worker_process_init(**_kwargs: object) -> None:
-    global _worker_loop, _engine, _session_factory
+    global _worker_loop, _redis_ingestion, _engine, _session_factory
     configure_worker_logging()
     reset_converter()
     reset_tokenizer()
@@ -76,6 +80,8 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     reset_opensearch_client()
     if _worker_loop is None or _worker_loop.is_closed():
         _worker_loop = asyncio.new_event_loop()
+    if _redis_ingestion is None:
+        _redis_ingestion = Redis.from_url(get_redis_app_url(), decode_responses=True)
     if _engine is None:
         _engine = create_async_engine(get_db_url(), poolclass=NullPool)
     if _session_factory is None:
@@ -86,11 +92,14 @@ def _on_worker_process_init(**_kwargs: object) -> None:
 
 @worker_process_shutdown.connect
 def _on_worker_process_shutdown(**_kwargs: object) -> None:
-    global _worker_loop, _engine, _session_factory
+    global _worker_loop, _redis_ingestion, _engine, _session_factory
     if _worker_loop is None or _worker_loop.is_closed():
         return
+    if _redis_ingestion is not None:
+        _worker_loop.run_until_complete(_redis_ingestion.aclose())
     if _engine is not None:
         _worker_loop.run_until_complete(_engine.dispose())
+    _redis_ingestion = None
     _engine = None
     _session_factory = None
     _worker_loop.close()
@@ -137,8 +146,18 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
+    stream_key = ingestion_stream_key(document_id)
 
-    def _log_stage(stage_name: str) -> None:
+    async def _emit(event_type: str, data: dict) -> None:
+        if _redis_ingestion is None:
+            return
+        try:
+            payload = json.dumps({"type": event_type, **data})
+            await _redis_ingestion.xadd(stream_key, {"payload": payload}, "*", maxlen=100)
+        except Exception:
+            pass
+
+    async def _log_stage(stage_name: str) -> None:
         nonlocal stage_index, current_stage, stage_start
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
@@ -155,6 +174,9 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "stage_total": stage_total,
             },
         )
+        await _emit(
+            "stage", {"stage": stage_name, "stage_index": stage_index, "stage_total": stage_total}
+        )
 
     def _flush_stage_times() -> None:
         if current_stage != "initializing":
@@ -170,7 +192,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
     try:
         # -- fetch document record, set status -> processing ----------------
-        _log_stage("fetch_document_record")
+        await _log_stage("fetch_document_record")
         async with sf() as session:
             repo = DocumentRepository(session)
             doc = await repo.get_by_id(doc_uuid)
@@ -201,19 +223,19 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             await session.commit()
 
         # -- download raw PDF -----------------------------------------------
-        _log_stage("download_pdf")
+        await _log_stage("download_pdf")
         pdf_path = await s3_client.download_file(storage_key)
 
         # -- parse with Docling (CPU/GPU-bound) -----------------------------
-        _log_stage("parse_pdf_docling")
+        await _log_stage("parse_pdf_docling")
         parse_result = await asyncio.to_thread(docling_parser.parse, pdf_path)
 
         # -- export artifacts (CPU-bound serialization) --------------------
-        _log_stage("export_docling_artifacts")
+        await _log_stage("export_docling_artifacts")
         json_bytes, md_bytes = await asyncio.to_thread(_export_artifacts, parse_result.document)
 
         # -- update metadata + upload artifacts (parallel I/O) --------------
-        _log_stage("save_metadata_and_upload_artifacts")
+        await _log_stage("save_metadata_and_upload_artifacts")
         base_key = f"processed/{user_id}/{document_id}"
 
         async def _save_metadata():
@@ -249,7 +271,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         )
 
         # -- chunk document (CPU-bound) -------------------------------------
-        _log_stage("chunk_document")
+        await _log_stage("chunk_document")
         chunks = await asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
 
         if not chunks:
@@ -257,7 +279,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "pipeline.no_chunks",
                 extra={"document_id": document_id, "stage": "chunk_document"},
             )
-            _log_stage("finalize_ready")
+            await _log_stage("finalize_ready")
             stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
             ingest_times = {
                 "stages": _format_stage_times(),
@@ -268,6 +290,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.update_status(doc_uuid, "ready")
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
+            await _emit("done", {"chunks": 0})
             logger.info(
                 "pipeline.complete",
                 extra={
@@ -280,11 +303,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- summarize table chunks (LLM call, optional) ----------------------
         if get_table_summarizer_enabled():
-            _log_stage("summarize_table_chunks")
+            await _log_stage("summarize_table_chunks")
             chunks = await _summarize_table_chunks(chunks)
 
         # -- persist chunks to Postgres -------------------------------------
-        _log_stage("persist_chunks_postgres")
+        await _log_stage("persist_chunks_postgres")
         embedding_model = get_embedding_model()
         for c in chunks:
             c["embedding_model"] = embedding_model
@@ -301,7 +324,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         # -- generate embeddings (CPU/GPU-bound) ----------------------------
         # When summarizer is enabled, table chunks embed their NL summary;
         # otherwise (or on summarization failure) fall back to enriched_text.
-        _log_stage("embed_chunks")
+        await _log_stage("embed_chunks")
         texts = [c.get("table_nl_summary") or c["enriched_text"] for c in chunks]
         vectors = await asyncio.to_thread(embedder.embed_chunks, texts)
 
@@ -335,7 +358,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         ]
 
         # -- ensure collections/indices exist (parallel) --------------------
-        _log_stage("ensure_vector_and_search_indexes")
+        await _log_stage("ensure_vector_and_search_indexes")
         dim = len(vectors[0]) if vectors else (get_embedding_dim() or 384)
         await asyncio.gather(
             asyncio.to_thread(qdrant_ingest.ensure_collection, "documents", dim),
@@ -343,7 +366,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         )
 
         # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
-        _log_stage("index_and_backup_chunks")
+        await _log_stage("index_and_backup_chunks")
         chunks_jsonl = "\n".join(
             json.dumps(
                 {
@@ -396,7 +419,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         )
 
         # -- finalize -> ready ----------------------------------------------
-        _log_stage("finalize_ready")
+        await _log_stage("finalize_ready")
         stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
         ingest_times = {
             "stages": _format_stage_times(),
@@ -408,6 +431,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
             await session.commit()
 
+        await _emit("done", {"chunks": len(chunks)})
         logger.info(
             "pipeline.complete",
             extra={
@@ -446,6 +470,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.set_failed(doc_uuid, msg)
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
+            await _emit("error", {"message": msg})
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
@@ -470,6 +495,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.set_failed(doc_uuid, str(exc))
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
+            await _emit("error", {"message": str(exc)})
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise

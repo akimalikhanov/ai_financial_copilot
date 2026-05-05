@@ -90,6 +90,14 @@ export interface ReferencesEvent {
     page_numbers: number[];
     heading_path: string[];
     snippet: string | null;
+    bbox_hint?: {
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+      coord_origin: string;
+      page: number;
+    } | null;
   }[];
 }
 
@@ -97,6 +105,12 @@ export interface MetadataEvent {
   confidence: 'low' | 'medium' | 'high' | 'none';
   ungrounded_claims: boolean | null;
   route: string | null;
+}
+
+export interface StageEvent {
+  stage: string;
+  index: number;
+  total: number;
 }
 
 type ApiErrorOptions = {
@@ -113,11 +127,12 @@ const joinUrl = (base: string, path: string) => {
 
 const toApiError = (payload: unknown, options: ApiErrorOptions = {}): ApiError => {
   if (payload && typeof payload === 'object') {
-    const asError = payload as Partial<ErrorResponse>;
+    const asError = payload as Partial<ErrorResponse> & { detail?: string };
     return {
       message:
         asError.user_message ??
         asError.message ??
+        asError.detail ??
         options.fallbackMessage ??
         'Request failed',
       errorType: asError.error_type,
@@ -442,6 +457,66 @@ export const deleteDocument = async (documentId: string): Promise<void> => {
 export const getPdfUrl = (documentId: string): string =>
   joinUrl(API_BASE_URL, `/v1/documents/${documentId}/pdf`);
 
+export interface IngestionStageEvent {
+  stage: string;
+  stage_index: number;
+  stage_total: number;
+}
+
+export const subscribeIngestionStream = (
+  documentId: string,
+  onStage: (event: IngestionStageEvent) => void,
+  onDone: () => void,
+  onError: (message: string) => void,
+): (() => void) => {
+  const url = joinUrl(API_BASE_URL, `/v1/documents/${documentId}/stream`);
+  const token = getAccessTokenValue();
+  const headers: Record<string, string> = { Accept: 'text/event-stream' };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+
+  let cancelled = false;
+  const controller = new AbortController();
+
+  (async () => {
+    try {
+      const response = await fetch(url, { headers, signal: controller.signal });
+      if (!response.ok || !response.body) {
+        onError(`HTTP ${response.status}`);
+        return;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let eventType = 'stage';
+
+      while (!cancelled) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            eventType = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            try {
+              const payload = JSON.parse(line.slice(5).trim());
+              if (eventType === 'stage') onStage(payload as IngestionStageEvent);
+              else if (eventType === 'done') { onDone(); return; }
+              else if (eventType === 'error') { onError(payload.message ?? 'Ingestion failed'); return; }
+            } catch { /* ignore malformed */ }
+            eventType = 'stage';
+          }
+        }
+      }
+    } catch (err) {
+      if (!cancelled) onError(String(err));
+    }
+  })();
+
+  return () => { cancelled = true; controller.abort(); };
+};
+
 // --- Conversations API ---
 
 export interface CreateConversationRequest {
@@ -691,10 +766,11 @@ export const chatStreamSubscribe = async (
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
+  onStage?: (stage: StageEvent) => void,
 ): Promise<void> => {
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage
     );
     if (result === 'done' || result === 'server-error') return;
     // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
@@ -722,6 +798,7 @@ async function _doStreamAttempt(
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
+  onStage?: (stage: StageEvent) => void,
 ): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
@@ -799,7 +876,15 @@ async function _doStreamAttempt(
           } catch { /* ignore malformed */ }
           continue;
         }
-        // Skip non-content server events (e.g. "stage" progress events)
+        // Handle stage progress events
+        if (parsed.event === 'stage') {
+          try {
+            const s = JSON.parse(parsed.data) as StageEvent;
+            onStage?.(s);
+          } catch { /* ignore malformed */ }
+          continue;
+        }
+        // Skip other non-content server events
         if (!['delta', 'usage', 'message'].includes(parsed.event)) continue;
         let payload: LLMStreamChunk | null = null;
         try {

@@ -19,6 +19,7 @@ interface EvidencePanelProps {
   onCloseDoc: (docId: string) => void;
   onPageChange: (docId: string, page: number) => void;
   highlight?: Citation['bboxHint'];
+  highlightLabel?: string;
 }
 
 export const EvidencePanel: React.FC<EvidencePanelProps> = ({
@@ -30,6 +31,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   onCloseDoc,
   onPageChange,
   highlight,
+  highlightLabel,
 }) => {
   const [zoom, setZoom] = useState(100);
   const [numPages, setNumPages] = useState<number | null>(null);
@@ -141,27 +143,61 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
     setZoom(Math.round(e.scale * 100));
   }, []);
 
-  // Citation highlight overlay rendered on each page
+  // Citation highlight overlay rendered on each page.
+  // Backend sends bbox in raw PDF points; we convert to CSS % using each page's
+  // unscaled PDF point dimensions (props.width / props.scale).
   const renderPage = useCallback((props: RenderPageProps) => {
-    const isHighlightPage = highlight && props.pageIndex === currentPageRef.current - 1;
+    const targetPageIndex = highlight ? highlight.page - 1 : -1;
+    const isHighlightPage = highlight && props.pageIndex === targetPageIndex;
+    let style: React.CSSProperties | null = null;
+    if (isHighlightPage && highlight && props.scale > 0) {
+      const pageW = props.width / props.scale;
+      const pageH = props.height / props.scale;
+      const bboxLeft = highlight.left;
+      const bboxRight = highlight.right;
+      let cssTop: number;
+      let cssH: number;
+      if ((highlight.coord_origin || '').toUpperCase() === 'BOTTOMLEFT') {
+        cssTop = pageH - highlight.top;
+        cssH = highlight.top - highlight.bottom;
+      } else {
+        cssTop = highlight.top;
+        cssH = highlight.bottom - highlight.top;
+      }
+      style = {
+        left: `${(bboxLeft / pageW) * 100}%`,
+        top: `${(cssTop / pageH) * 100}%`,
+        width: `${((bboxRight - bboxLeft) / pageW) * 100}%`,
+        height: `${(cssH / pageH) * 100}%`,
+      };
+    }
     return (
       <>
         {props.canvasLayer.children}
         {props.annotationLayer.children}
         {props.textLayer.children}
-        {isHighlightPage && highlight && (
+        {style && (
           <div
-            className="absolute bg-[var(--accent)]/20 border-2 border-[var(--accent)]/50 rounded animate-stream-reveal pointer-events-none"
-            style={{ left: `${highlight.x}%`, top: `${highlight.y}%`, width: `${highlight.w}%`, height: `${highlight.h}%` }}
+            className="absolute rounded animate-stream-reveal pointer-events-none"
+            style={{
+              ...style,
+              background: 'transparent',
+              border: '2px solid rgba(16, 163, 127, 0.85)',
+            }}
           >
-            <div className="absolute -top-6 left-0 bg-[var(--accent)] text-white text-[10px] px-2 py-0.5 font-semibold rounded whitespace-nowrap">
-              CITATION MATCH
-            </div>
+            {highlightLabel && (
+              <div
+                className="absolute -top-5 right-0 text-white text-[10px] px-1.5 py-px font-semibold rounded whitespace-nowrap tracking-wide"
+                style={{ background: 'rgba(16, 163, 127, 0.85)' }}
+              >
+                {highlightLabel}
+              </div>
+            )}
           </div>
         )}
       </>
     );
-  }, [highlight]);
+  }, [highlight, highlightLabel]);
 
   const httpHeaders = useMemo(() => {
     const token = getAccessTokenValue();
@@ -196,10 +232,14 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isOpen, activeDoc, currentPage, numPages, onPageChange, onClose]);
 
-  if (!isOpen) return null;
-
   return (
-    <div ref={panelRef} style={{ width: panelWidth }} className="fixed inset-0 z-40 flex flex-col bg-[var(--surface-1)] border-l border-[var(--border)] transition-transform duration-300 ease-in-out animate-slide-in-right md:relative md:inset-auto md:flex-shrink-0 md:transform-none md:animate-none">
+    <div
+      ref={panelRef}
+      style={{ width: isOpen ? panelWidth : 0 }}
+      className={`fixed inset-y-0 right-0 z-40 flex flex-col bg-[var(--surface-1)] border-l border-[var(--border)] transition-[transform,width] duration-300 ease-out md:relative md:inset-auto md:flex-shrink-0 ${
+        isOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0 md:border-l-0 md:overflow-hidden'
+      }`}
+    >
       {/* Drag-to-resize handle */}
       <div
         onMouseDown={onDragStart}

@@ -21,11 +21,13 @@ import {
   fetchConversations,
   deleteConversation,
   deleteDocument,
+  subscribeIngestionStream,
   ApiError,
   ModelInfo,
   type RequestStatsItem,
   type UserInfo,
   type DocumentListItemResponse,
+  type StageEvent,
 } from './services/api';
 import { useAuth } from './context/AuthContext';
 import { LoginPage } from './components/LoginPage';
@@ -104,6 +106,7 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       pageNumbers: r.page_numbers as number[],
       headingPath: r.heading_path as string[],
       snippet: (r.snippet as string | null),
+      bboxHint: (r.bbox_hint as Citation['bboxHint'] | undefined) ?? undefined,
     })),
     feedback: msg.feedback ? { rating: msg.feedback.rating, comment: msg.feedback.comment ?? null } : null,
   };
@@ -243,6 +246,214 @@ function EvidenceList({
   );
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  load_and_validate_request: 'Loading request',
+  build_conversation_context: 'Building context',
+  scan_user_input: 'Scanning input',
+  route_query: 'Routing query',
+  transform_query: 'Transforming query',
+  build_rag_context: 'Retrieving sources',
+  render_prompt: 'Rendering prompt',
+  stream_llm_response: 'Generating answer',
+  persist_and_emit: 'Finalizing',
+};
+
+const INGEST_STAGE_LABELS: Record<string, string> = {
+  fetch_document_record: 'Starting',
+  download_pdf: 'Downloading',
+  parse_pdf_docling: 'Parsing',
+  export_docling_artifacts: 'Exporting',
+  save_metadata_and_upload_artifacts: 'Saving',
+  chunk_document: 'Chunking',
+  summarize_table_chunks: 'Summarizing',
+  persist_chunks_postgres: 'Persisting',
+  embed_chunks: 'Embedding',
+  ensure_vector_and_search_indexes: 'Indexing',
+  index_and_backup_chunks: 'Indexing',
+  finalize_ready: 'Finalizing',
+};
+const ALL_STAGES = Object.keys(STAGE_LABELS);
+
+interface StageRecord { stage: string; startedAt: number; endedAt?: number; }
+
+interface StageSnapshot {
+  current: StageEvent;
+  records: StageRecord[];
+  done: boolean; // pipeline finished
+}
+
+function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
+  const [expanded, setExpanded] = React.useState(false);
+  const [tick, setTick] = React.useState(0);
+  const prevStageRef = React.useRef(snapshot.current.stage);
+  const [labelKey, setLabelKey] = React.useState(0);
+
+  // Bump labelKey on stage change to retrigger the fade animation
+  React.useEffect(() => {
+    if (snapshot.current.stage !== prevStageRef.current) {
+      prevStageRef.current = snapshot.current.stage;
+      setLabelKey(k => k + 1);
+    }
+  }, [snapshot.current.stage]);
+
+  // Tick every 100ms while active so elapsed timers stay live
+  React.useEffect(() => {
+    if (snapshot.done) return;
+    const id = setInterval(() => setTick(t => t + 1), 100);
+    return () => clearInterval(id);
+  }, [snapshot.done]);
+
+  void tick;
+
+  const first = snapshot.records[0]?.startedAt;
+  const last = snapshot.records[snapshot.records.length - 1]?.endedAt;
+  const totalElapsed = snapshot.done
+    ? (first && last ? ((last - first) / 1000).toFixed(1) : null)
+    : (first ? ((Date.now() - first) / 1000).toFixed(1) : null);
+
+  const label = snapshot.done
+    ? 'Done'
+    : STAGE_LABELS[snapshot.current.stage] ?? snapshot.current.stage.replace(/_/g, ' ');
+
+  return (
+    <div className="pl-4 py-1">
+      {/* Collapsed pill */}
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--surface-1)] hover:bg-[var(--surface-2)] text-xs"
+        style={{ transition: 'background 0.2s, border-color 0.2s' }}
+      >
+        {/* Status dot */}
+        {snapshot.done ? (
+          <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] opacity-60 flex-shrink-0" />
+        ) : (
+          <span className="relative flex h-2 w-2 flex-shrink-0">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--accent)] opacity-40" />
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-[var(--accent)]" />
+          </span>
+        )}
+
+        {/* Label — fades in on each stage change */}
+        <span
+          key={labelKey}
+          className="stage-label-change font-medium text-[var(--text)]"
+          style={{ minWidth: '7rem', textAlign: 'left' }}
+        >
+          {label}
+        </span>
+
+        {/* Progress counter */}
+        {!snapshot.done && (
+          <span className="text-[var(--text-faint)]">{snapshot.current.index}/{snapshot.current.total}</span>
+        )}
+
+        {/* Total elapsed */}
+        {totalElapsed !== null && (
+          <span className="text-[var(--text-faint)]">· {totalElapsed}s</span>
+        )}
+
+        <ChevronDown
+          size={11}
+          className="text-[var(--text-faint)] ml-0.5"
+          style={{ transition: 'transform 0.25s ease', transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
+        />
+      </button>
+
+      {/* Expanded stepper — height + opacity animate on open/close */}
+      <div
+        className="grid"
+        style={{
+          gridTemplateRows: expanded ? '1fr' : '0fr',
+          opacity: expanded ? 1 : 0,
+          transition: 'grid-template-rows 0.3s ease, opacity 0.25s ease',
+        }}
+      >
+        <div className="overflow-hidden">
+          <div className="mt-2.5 ml-1 flex flex-col">
+            {ALL_STAGES.map((s, i) => {
+              const rec = snapshot.records.find(r => r.stage === s);
+              const isDone = !!rec?.endedAt;
+              const isActive = !snapshot.done && s === snapshot.current.stage;
+              const isPending = !rec;
+
+              const dur = rec?.endedAt
+                ? ((rec.endedAt - rec.startedAt) / 1000).toFixed(2) + 's'
+                : isActive
+                  ? ((Date.now() - rec!.startedAt) / 1000).toFixed(1) + 's'
+                  : null;
+
+              return (
+                <div key={s} className="flex items-stretch gap-3">
+                  {/* Track column */}
+                  <div className="flex flex-col items-center flex-shrink-0" style={{ width: 14 }}>
+                    <div
+                      className="w-px flex-1"
+                      style={{
+                        minHeight: i === 0 ? 0 : 6,
+                        background: isDone || isActive ? 'var(--accent)' : 'var(--border)',
+                        transition: 'background 0.4s ease',
+                        visibility: i === 0 ? 'hidden' : 'visible',
+                      }}
+                    />
+                    {/* Dot — filled when done, hollow pulsating when active */}
+                    <div
+                      style={{
+                        width: 12, height: 12,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        border: `2px solid ${isDone || isActive ? 'var(--accent)' : 'var(--border)'}`,
+                        background: isDone ? 'var(--accent)' : 'transparent',
+                        transition: 'border-color 0.4s ease, background 0.4s ease',
+                        animation: isActive ? 'pulse 1.4s ease-in-out infinite' : undefined,
+                      }}
+                    />
+                    <div
+                      className="w-px flex-1"
+                      style={{
+                        minHeight: i === ALL_STAGES.length - 1 ? 0 : 6,
+                        background: isDone ? 'var(--accent)' : 'var(--border)',
+                        transition: 'background 0.4s ease',
+                        visibility: i === ALL_STAGES.length - 1 ? 'hidden' : 'visible',
+                      }}
+                    />
+                  </div>
+
+                  {/* Label + timing — always inline, timing immediately after label */}
+                  <div className="flex items-center gap-2 py-1" style={{ minHeight: 28 }}>
+                    <span
+                      className={`text-xs leading-tight ${isActive ? 'stage-label-change' : ''}`}
+                      style={{
+                        color: isActive ? 'var(--text)' : 'var(--text-faint)',
+                        fontWeight: isActive ? 500 : 400,
+                        opacity: isPending ? 0.4 : 1,
+                        transition: 'color 0.3s, opacity 0.3s',
+                      }}
+                    >
+                      {STAGE_LABELS[s]}
+                    </span>
+                    {dur && (
+                      <span
+                        className="text-[10px] font-mono flex-shrink-0"
+                        style={{
+                          color: 'var(--text-faint)',
+                          opacity: isActive ? 0.65 : 0.45,
+                          transition: 'opacity 0.3s',
+                        }}
+                      >
+                        {dur}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { authChecked, isAuthenticated, setAccessToken, logout } = useAuth();
 
@@ -284,7 +495,7 @@ export default function App() {
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
   const [openPdfTabs, setOpenPdfTabs] = useState<{ doc: Document, page: number }[]>([]);
   const [activePdfDocId, setActivePdfDocId] = useState<string | null>(null);
-  const [activeHighlight, setActiveHighlight] = useState<Citation['bboxHint'] | undefined>(undefined);
+  const [activeHighlight, setActiveHighlight] = useState<{ bbox: Citation['bboxHint']; label: string } | undefined>(undefined);
 
   // UI State
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -295,6 +506,8 @@ export default function App() {
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
+  // keyed by assistant message id — persists the snapshot after streaming ends
+  const [stageSnapshots, setStageSnapshots] = useState<Record<string, StageSnapshot>>({});
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
 
@@ -393,23 +606,80 @@ export default function App() {
     return () => { cancelled = true; };
   }, [isAuthenticated]);
 
-  useEffect(() => {
-    if (!isAuthenticated) { setDocs([]); setFilterOptions({ companies: [], years: [] }); return; }
-    let cancelled = false;
-    (async () => {
-      try {
-        const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
-        if (!cancelled) { setDocs(docsRes.documents.map(toUiDoc)); setFilterOptions(opts); }
-      } catch (err) { console.error('Failed to load documents:', err); }
-    })();
-    return () => { cancelled = true; };
-  }, [isAuthenticated]);
-
   const refreshDocs = useCallback(async () => {
     const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
     setDocs(docsRes.documents.map(toUiDoc));
     setFilterOptions(opts);
   }, []);
+
+  useEffect(() => {
+    if (!isAuthenticated) { setDocs([]); setFilterOptions({ companies: [], years: [] }); return; }
+    let cancelled = false;
+    const unsubs: (() => void)[] = [];
+    (async () => {
+      try {
+        const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
+        if (cancelled) return;
+        const mapped = docsRes.documents.map(toUiDoc);
+        setDocs(mapped);
+        setFilterOptions(opts);
+        for (const doc of mapped) {
+          if (doc.status !== 'Processing') continue;
+          const unsub = subscribeIngestionStream(
+            doc.id,
+            (ev) => {
+              setDocs(prev => prev.map(d =>
+                d.id === doc.id ? { ...d, ingestionStage: ev.stage, ingestionStageIndex: ev.stage_index, ingestionStageTotal: ev.stage_total } : d
+              ));
+            },
+            () => { unsub(); void refreshDocs(); },
+            () => {
+              unsub();
+              setDocs(prev => prev.map(d =>
+                d.id === doc.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
+              ));
+            },
+          );
+          unsubs.push(unsub);
+        }
+      } catch (err) { console.error('Failed to load documents:', err); }
+    })();
+    return () => { cancelled = true; unsubs.forEach(u => u()); };
+  }, [isAuthenticated, refreshDocs]);
+
+  const handleUpload = useCallback((uploaded: { id: string; original_filename: string; status: string; metadata: Record<string, unknown> }) => {
+    const newDoc: Document = {
+      id: uploaded.id,
+      title: (uploaded.metadata?.company as string | undefined) ?? uploaded.original_filename,
+      company: (uploaded.metadata?.company as string | undefined) ?? '',
+      year: toYear(uploaded.metadata?.year),
+      type: (uploaded.metadata?.type as string | undefined) ?? '',
+      pages: 0,
+      status: 'Processing',
+      tags: [],
+      ingestionStage: undefined,
+    };
+    setDocs(prev => [newDoc, ...prev]);
+
+    const unsub = subscribeIngestionStream(
+      uploaded.id,
+      (ev) => {
+        setDocs(prev => prev.map(d =>
+          d.id === uploaded.id ? { ...d, ingestionStage: ev.stage, ingestionStageIndex: ev.stage_index, ingestionStageTotal: ev.stage_total } : d
+        ));
+      },
+      () => {
+        unsub();
+        void refreshDocs();
+      },
+      () => {
+        unsub();
+        setDocs(prev => prev.map(d =>
+          d.id === uploaded.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
+        ));
+      },
+    );
+  }, [refreshDocs]);
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -627,6 +897,7 @@ export default function App() {
               refId: r.ref_id, displayLabel: r.display_label, chunkId: r.chunk_id,
               documentId: r.document_id, documentName: r.document_name, filename: r.filename,
               pageNumbers: r.page_numbers, headingPath: r.heading_path, snippet: r.snippet,
+              bboxHint: r.bbox_hint ?? undefined,
             })),
           }));
         },
@@ -635,6 +906,13 @@ export default function App() {
           if (chunk.stats) fetchStats(conversationId);
           setIsTyping(false);
           setIsAwaitingResponse(false);
+          // Mark snapshot done and clear live state
+          setStageSnapshots(snaps => {
+            const prev = snaps[placeholderId];
+            if (!prev) return snaps;
+            const finalRecs = prev.records.map(r => r.endedAt ? r : { ...r, endedAt: Date.now() });
+            return { ...snaps, [placeholderId]: { ...prev, records: finalRecs, done: true } };
+          });
         },
         (error) => {
           updateMessage(conversationId, placeholderId, m => ({ ...m, content: m.content || `Error: ${error.message}` }));
@@ -647,7 +925,18 @@ export default function App() {
             ...m,
             metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route },
           }));
-        }
+        },
+        (stage) => {
+          const now = Date.now();
+          setStageSnapshots(snaps => {
+            const prev = snaps[placeholderId];
+            const records: StageRecord[] = prev?.records ?? [];
+            const closed = records.map((r: StageRecord) => r.endedAt ? r : { ...r, endedAt: now });
+            const exists = closed.find((r: StageRecord) => r.stage === stage.stage);
+            const next = exists ? closed : [...closed, { stage: stage.stage, startedAt: now }];
+            return { ...snaps, [placeholderId]: { current: stage, records: next, done: false } };
+          });
+        },
       );
     } catch (err) {
       const error = err as ApiError;
@@ -668,7 +957,7 @@ export default function App() {
       return [...prev, { doc, page: citation.page }];
     });
     setActivePdfDocId(doc.id);
-    setActiveHighlight(citation.bboxHint);
+    setActiveHighlight(citation.bboxHint ? { bbox: citation.bboxHint, label: '' } : undefined);
   };
 
   const handleReferenceClick = (ref: ReferenceItem) => {
@@ -682,7 +971,7 @@ export default function App() {
       return [...prev, { doc, page }];
     });
     setActivePdfDocId(doc.id);
-    setActiveHighlight(undefined);
+    setActiveHighlight(ref.bboxHint ? { bbox: ref.bboxHint, label: ref.displayLabel } : undefined);
   };
 
   const handleNewChat = async () => {
@@ -799,44 +1088,25 @@ export default function App() {
         ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
         ${collapsed ? 'w-16' : 'w-[280px]'}
       `}>
-        {/* Logo + collapse toggle */}
-        <div className={`h-14 flex items-center border-b border-[var(--border)] shrink-0 ${collapsed ? 'justify-center px-2' : 'px-4 gap-3'}`}>
-          <div className="h-8 w-8 bg-[var(--accent)] rounded-lg flex items-center justify-center flex-shrink-0">
-            <span className="font-bold text-white font-mono text-sm">AI</span>
-          </div>
-          {!collapsed && (
-            <>
-              <span className="font-semibold text-[var(--text)] tracking-tight flex-1 truncate">Financial Copilot</span>
-              <button
-                onClick={() => setIsSidebarCollapsed(true)}
-                className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors hidden md:flex"
-                title="Collapse sidebar"
-              >
-                <PanelLeft size={16} />
-              </button>
-            </>
-          )}
-          {collapsed && (
-            <button
-              onClick={() => setIsSidebarCollapsed(false)}
-              className="absolute -right-3 top-4 w-6 h-6 bg-[var(--surface-2)] border border-[var(--border)] rounded-full flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--accent)] shadow-sm transition-colors hidden md:flex"
-              title="Expand sidebar"
-            >
-              <ChevronRight size={12} />
-            </button>
-          )}
-        </div>
-
         {/* New Chat button */}
         <div className={`shrink-0 ${collapsed ? 'p-2' : 'p-3'}`}>
           {collapsed ? (
-            <button
-              onClick={handleNewChat}
-              className="w-full flex items-center justify-center p-2 rounded-lg bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
-              title="New Chat"
-            >
-              <Plus size={16} />
-            </button>
+            <>
+              <button
+                onClick={handleNewChat}
+                className="w-full flex items-center justify-center p-2 rounded-lg bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
+                title="New Chat"
+              >
+                <Plus size={16} />
+              </button>
+              <button
+                onClick={() => setIsSidebarCollapsed(false)}
+                className="w-full flex items-center justify-center p-2 mt-1 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors hidden md:flex"
+                title="Expand sidebar"
+              >
+                <ChevronRight size={16} />
+              </button>
+            </>
           ) : (
             <Button className="w-full justify-start gap-2" onClick={handleNewChat}>
               <Plus size={16} /> New Chat
@@ -845,11 +1115,18 @@ export default function App() {
         </div>
 
         {!collapsed && (
-          <div className="px-3 pb-2 shrink-0">
-            <div className="relative">
+          <div className="px-3 pb-2 shrink-0 flex items-center gap-2">
+            <div className="relative flex-1">
               <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={13} />
               <Input placeholder="Search chats..." className="pl-8 h-9 text-xs" />
             </div>
+            <button
+              onClick={() => setIsSidebarCollapsed(true)}
+              className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors hidden md:flex shrink-0"
+              title="Collapse sidebar"
+            >
+              <PanelLeft size={16} />
+            </button>
           </div>
         )}
 
@@ -993,6 +1270,9 @@ export default function App() {
                     )}
 
                     <div className={`space-y-2 ${msg.role === 'user' ? 'flex flex-col items-end ml-[15%] max-w-[85%]' : 'flex-1 min-w-0'}`}>
+                      {msg.role === 'assistant' && stageSnapshots[msg.id] && (
+                        <AgentTimeline snapshot={stageSnapshots[msg.id]} />
+                      )}
                       {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieve' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
                         <div className="pl-4 mb-1">
                           <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
@@ -1079,19 +1359,18 @@ export default function App() {
                 );
               })}
 
-              {/* Typing indicator */}
-              {isTyping && activeMessages[activeMessages.length - 1]?.content === '' && (
-                <div className="flex gap-3 items-start max-w-[var(--content-max)] mx-auto">
-                  <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0">
-                    <Bot size={16} className="text-[var(--accent)]" />
+              {/* Typing indicator — shown while placeholder message has no content yet */}
+              {isTyping && activeMessages[activeMessages.length - 1]?.content === '' && (() => {
+                const placeholderSnap = stageSnapshots[activeMessages[activeMessages.length - 1]?.id ?? ''];
+                return (
+                  <div className="flex gap-3 items-start max-w-[var(--content-max)] mx-auto">
+                    <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0">
+                      <Bot size={16} className="text-[var(--accent)]" />
+                    </div>
+                    {placeholderSnap && <AgentTimeline snapshot={placeholderSnap} />}
                   </div>
-                  <div className="flex items-center gap-1 h-8 pl-4">
-                    <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full typing-dot" />
-                    <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full typing-dot" />
-                    <span className="w-2 h-2 bg-[var(--text-faint)] rounded-full typing-dot" />
-                  </div>
-                </div>
-              )}
+                );
+              })()}
             </div>
           )}
           <div ref={messagesEndRef} />
@@ -1273,11 +1552,10 @@ export default function App() {
               <table className="w-full text-left text-sm">
                 <thead className="bg-[var(--surface-2)] border-b border-[var(--border)] text-[var(--text-muted)] text-xs uppercase tracking-wider">
                   <tr>
-                    <th className="px-6 py-4 font-medium">Status</th>
+                    <th className="px-6 py-4 font-medium w-48">Status</th>
                     <th className="px-6 py-4 font-medium">Document Name</th>
                     <th className="px-6 py-4 font-medium">Company</th>
                     <th className="px-6 py-4 font-medium">Year</th>
-                    <th className="px-6 py-4 font-medium">Type</th>
                     <th className="px-6 py-4 font-medium">Pages</th>
                     <th className="px-6 py-4 font-medium text-right">Actions</th>
                   </tr>
@@ -1294,9 +1572,11 @@ export default function App() {
                         setScope({ mode: 'thisDoc', docIds: [doc.id], filters: {} });
                       }}
                     >
-                      <td className="px-6 py-4">
+                      <td className="px-6 py-4 w-40">
                         <Badge variant={doc.status === 'Ready' ? 'success' : doc.status === 'Error' ? 'danger' : 'warning'}>
-                          {doc.status}
+                          {doc.status === 'Processing' && doc.ingestionStage
+                            ? `${INGEST_STAGE_LABELS[doc.ingestionStage] ?? doc.ingestionStage.replace(/_/g, ' ')}${doc.ingestionStageIndex != null && doc.ingestionStageTotal != null ? ` ${doc.ingestionStageIndex}/${doc.ingestionStageTotal}` : ''}`
+                            : doc.status}
                         </Badge>
                       </td>
                       <td className="px-6 py-4 font-medium text-[var(--text)]">
@@ -1307,7 +1587,6 @@ export default function App() {
                       </td>
                       <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company || '—'}</td>
                       <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.year || '—'}</td>
-                      <td className="px-6 py-4 text-[var(--text-muted)]">{doc.type || '—'}</td>
                       <td className="px-6 py-4 font-mono text-[var(--text-faint)]">{doc.pages || '—'}</td>
                       <td className="px-6 py-4 text-right">
                         <button
@@ -1342,7 +1621,7 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-[var(--bg)] text-[var(--text)] overflow-hidden font-sans">
-      <UploadModal isOpen={isUploadOpen} onClose={() => setIsUploadOpen(false)} onUpload={() => { void refreshDocs(); }} />
+      <UploadModal isOpen={isUploadOpen} onClose={() => setIsUploadOpen(false)} onUpload={handleUpload} />
       <DocPickerModal
         isOpen={isDocPickerOpen}
         onClose={() => setIsDocPickerOpen(false)}
@@ -1372,6 +1651,70 @@ export default function App() {
         </div>
       )}
 
+      {/* Global Header — spans full width regardless of view */}
+      <header className="h-14 border-b border-[var(--border)] flex items-end justify-between bg-[var(--surface-1)] z-10 shrink-0">
+        <div className="flex items-end">
+          {/* Logo */}
+          <div className="flex items-center gap-2.5 self-center px-4">
+            <Button variant="ghost" size="icon" className="md:hidden" onClick={() => setIsSidebarOpen(!isSidebarOpen)}>
+              <Layers size={18} />
+            </Button>
+            <div className="h-7 w-7 bg-[var(--accent)] rounded-lg flex items-center justify-center flex-shrink-0">
+              <span className="font-bold text-white font-mono text-xs">AI</span>
+            </div>
+            <span className="font-semibold text-[var(--text)] tracking-tight text-sm hidden md:block">Financial Copilot</span>
+          </div>
+
+          {/* Divider */}
+          <div className="w-px h-6 bg-[var(--border)] self-center mx-1" />
+
+          {/* View switcher — tab style with underline */}
+          {([
+            { id: 'ASK' as ViewMode, label: 'Ask', Icon: MessageSquare },
+            { id: 'LIBRARY' as ViewMode, label: 'Library', Icon: BookOpen },
+          ]).map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              onClick={() => setView(id)}
+              className={`flex items-center gap-2 px-4 h-14 text-sm font-semibold transition-colors relative ${
+                view === id
+                  ? 'text-[var(--accent)]'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text)]'
+              }`}
+            >
+              <Icon size={16} />
+              {label}
+              {view === id && (
+                <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-[var(--accent)] rounded-t-full" />
+              )}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 self-center">
+          <button
+            onClick={() => setIsControlPaneOpen(!isControlPaneOpen)}
+            className={`p-2 rounded-lg transition-colors ${
+              isControlPaneOpen
+                ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
+                : 'text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]'
+            }`}
+            title="Control Pane"
+          >
+            <SlidersHorizontal size={18} />
+          </button>
+          <button
+            onClick={cycleTheme}
+            className="p-2 rounded-lg text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+            title={themeLabel}
+            aria-label={themeLabel}
+          >
+            {themeIcon}
+          </button>
+          <Badge variant="outline" className="h-7 px-3">v2.4.0</Badge>
+        </div>
+      </header>
+
       {/* Main Layout */}
       <div className="flex flex-1 overflow-hidden relative">
         {view === 'ASK' && renderSidebar()}
@@ -1383,54 +1726,6 @@ export default function App() {
 
         {/* Center Workspace */}
         <div className="flex-1 flex flex-col min-w-0 bg-[var(--bg)] relative">
-          {/* Header */}
-          <header className="h-14 border-b border-[var(--border)] flex items-center justify-between px-4 bg-[var(--surface-1)] z-10">
-            <div className="flex items-center gap-3">
-              <Button variant="ghost" size="icon" className="md:hidden" onClick={() => setIsSidebarOpen(!isSidebarOpen)}>
-                <Layers size={18} />
-              </Button>
-              {/* View switcher */}
-              <div className="flex bg-[var(--surface-2)] p-1 rounded-lg border border-[var(--border)]">
-                {(['ASK', 'LIBRARY'] as ViewMode[]).map(v => (
-                  <button
-                    key={v}
-                    onClick={() => setView(v)}
-                    className={`px-4 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                      view === v
-                        ? 'bg-[var(--surface-3)] text-[var(--text)] shadow-sm'
-                        : 'text-[var(--text-muted)] hover:text-[var(--text)]'
-                    }`}
-                  >
-                    {v}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setIsControlPaneOpen(!isControlPaneOpen)}
-                className={`p-2 rounded-lg transition-colors ${
-                  isControlPaneOpen
-                    ? 'text-[var(--accent)] bg-[var(--accent-subtle)]'
-                    : 'text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]'
-                }`}
-                title="Control Pane"
-              >
-                <SlidersHorizontal size={18} />
-              </button>
-              <button
-                onClick={cycleTheme}
-                className="p-2 rounded-lg text-[var(--icon)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
-                title={themeLabel}
-                aria-label={themeLabel}
-              >
-                {themeIcon}
-              </button>
-              <Badge variant="outline" className="h-7 px-3">v2.4.0</Badge>
-            </div>
-          </header>
-
           {/* Main Views */}
           {view === 'LIBRARY' ? renderLibrary() : (
             <div className="flex-1 flex overflow-hidden">
@@ -1452,7 +1747,8 @@ export default function App() {
                 onPageChange={(docId, page) =>
                   setOpenPdfTabs(prev => prev.map(t => t.doc.id === docId ? { ...t, page } : t))
                 }
-                highlight={activeHighlight}
+                highlight={activeHighlight?.bbox}
+                highlightLabel={activeHighlight?.label}
               />
               <ControlPane
                 isOpen={isControlPaneOpen}

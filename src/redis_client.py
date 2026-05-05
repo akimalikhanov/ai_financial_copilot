@@ -18,11 +18,17 @@ from src.utils.config import (
 
 CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
 CHAT_TAIL_KEY_PREFIX = "chat:tail:"
+INGESTION_STREAM_PREFIX = "ingestion:events:"
 
 
 def events_stream_key(request_id: str) -> str:
     """Return Redis stream key for request events."""
     return f"{CHAT_EVENTS_STREAM_PREFIX}{request_id}"
+
+
+def ingestion_stream_key(document_id: str) -> str:
+    """Return Redis stream key for ingestion events."""
+    return f"{INGESTION_STREAM_PREFIX}{document_id}"
 
 
 async def create_redis_app_client() -> Redis:

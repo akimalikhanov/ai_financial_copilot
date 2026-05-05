@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
+from collections.abc import AsyncGenerator
 from typing import cast
 from uuid import UUID, uuid4
 
 import aioboto3
 from celery import Task
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
-from src.api.deps import CurrentUserDep
+from src.api.deps import CurrentUserDep, RedisDep
+from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
+from src.redis_client import ingestion_stream_key
 from src.repository import DocumentRepository
 from src.schemas.documents import (
     DocumentFilterOptionsResponse,
@@ -204,6 +209,102 @@ async def delete_document(
     await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
     await session.commit()
     logger.info("document.deleted", extra={"document_id": str(document_id)})
+
+
+@router.get("/{document_id}/stream")
+async def ingestion_stream(
+    document_id: UUID,
+    request: Request,  # noqa: ARG001
+    session: DbSessionDep,
+    redis: RedisDep,
+    current_user: CurrentUserDep,
+) -> StreamingResponse:
+    """SSE stream for ingestion progress of a document."""
+    repo = DocumentRepository(session)
+    doc = await repo.get_by_id(document_id)
+    if doc is None or doc.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Already terminal — return a synthetic done/error immediately.
+    if doc.status == "ready":
+
+        async def _immediate_done() -> AsyncGenerator[str, None]:
+            yield _sse_event("done", {})
+
+        return StreamingResponse(
+            _immediate_done(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    if doc.status == "failed":
+
+        async def _immediate_error() -> AsyncGenerator[str, None]:
+            yield _sse_event("error", {"message": doc.processing_error or "Ingestion failed"})
+
+        return StreamingResponse(
+            _immediate_error(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    stream_key = ingestion_stream_key(str(document_id))
+    last_id = "0-0"
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        nonlocal last_id
+        empty_polls = 0
+        yield ": ok\n\n"
+        try:
+            while True:
+                result = await redis.xread({stream_key: last_id}, block=15000, count=20)
+                if not result:
+                    empty_polls += 1
+                    if empty_polls >= 4:
+                        # Worker may have died — check DB status
+                        fresh = await repo.get_by_id(document_id)
+                        if fresh and fresh.status == "ready":
+                            yield _sse_event("done", {})
+                            return
+                        if fresh and fresh.status == "failed":
+                            yield _sse_event(
+                                "error", {"message": fresh.processing_error or "Ingestion failed"}
+                            )
+                            return
+                    yield ": keepalive\n\n"
+                    continue
+
+                empty_polls = 0
+                for _, events in result:
+                    for eid, raw_data in events:
+                        last_id = eid
+                        payload_str = (
+                            raw_data.get("payload") if isinstance(raw_data, dict) else None
+                        )
+                        if not payload_str:
+                            continue
+                        try:
+                            data = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = data.get("type", "stage")
+                        sse_data = {k: v for k, v in data.items() if k != "type"}
+                        yield _sse_event(event_type, sse_data)
+                        if event_type in ("done", "error"):
+                            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            yield _sse_event("error", {"message": "Stream read failed"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{document_id}/pdf")

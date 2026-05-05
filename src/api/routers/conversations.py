@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -12,6 +13,7 @@ from src.models.user import User
 from src.repository.conversation_repository import ConversationRepository
 from src.repository.message_repository import MessageRepository
 from src.schemas import chat as schemas
+from src.services.chat.events import hydrate_bbox_hints
 
 router = APIRouter(prefix="/v1/conversations", tags=["conversations"])
 
@@ -179,6 +181,12 @@ async def get_messages(
         )
         feedback_map = {fb.message_id: fb for fb in result.scalars().all()}
 
+    # Deep-copy metadata so bbox_hint backfill doesn't mutate ORM-tracked JSONB
+    # (which would re-persist on commit). Backfill is response-only; we keep the
+    # DB clean and recompute on read until a real migration lands.
+    metadatas: list[dict] = [copy.deepcopy(msg.message_metadata or {}) for msg in messages]
+    await hydrate_bbox_hints(session, metadatas)
+
     return {
         "messages": [
             {
@@ -187,7 +195,7 @@ async def get_messages(
                 "content": msg.content,
                 "seq": msg.seq,
                 "created_at": msg.created_at.isoformat(),
-                "metadata": msg.message_metadata,
+                "metadata": metadatas[i],
                 "feedback": (
                     {
                         "rating": feedback_map[msg.id].rating.value,
@@ -197,7 +205,7 @@ async def get_messages(
                     else None
                 ),
             }
-            for msg in messages
+            for i, msg in enumerate(messages)
         ],
         "has_more": has_more,
     }

@@ -7,13 +7,18 @@ export interface Document {
   pages: number;
   status: 'Ready' | 'Processing' | 'Error';
   tags: string[];
+  ingestionStage?: string;
+  ingestionStageIndex?: number;
+  ingestionStageTotal?: number;
 }
 
 export interface BoundingBox {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  coord_origin: string;
+  page: number;
 }
 
 export interface Citation {
@@ -40,6 +45,7 @@ export interface ReferenceItem {
   pageNumbers: number[];
   headingPath: string[];
   snippet: string | null;
+  bboxHint?: BoundingBox | null;
 }
 
 export interface MessageFeedback {

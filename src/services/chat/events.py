@@ -5,8 +5,18 @@ from __future__ import annotations
 import re
 from uuid import UUID
 
-from src.schemas.retrieval import AnswerCitationSpan, Citation, DisplayLabelMap, RAGContext
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.repository.chunk_repository import ChunkRepository
+from src.schemas.retrieval import (
+    AnswerCitationSpan,
+    ChunkProvenance,
+    Citation,
+    DisplayLabelMap,
+    RAGContext,
+)
 from src.services.llm_adapters.base_adapter import LLMResponseStats
+from src.services.retrieval.payload_hydrator import _parse_provenance
 
 
 class ThinkingStripper:
@@ -64,9 +74,33 @@ def error_event(exc: Exception, user_message: str | None = None) -> dict:
     }
 
 
-def citation_to_dict(c: Citation) -> dict:
+def _provenance_bbox_hint(provenance: ChunkProvenance | None) -> dict | None:
+    """Extract the first bbox from provenance in raw PDF points.
+
+    Docling stores bbox in absolute PDF points (typically BOTTOMLEFT origin).
+    The frontend converts to CSS percentages using the actual page dimensions
+    from pdf.js, since page width/height isn't stored alongside the bbox.
+    """
+    if not provenance:
+        return None
+    for item in provenance.items:
+        b = item.bbox
+        if b is None:
+            continue
+        return {
+            "left": b.left,
+            "top": b.top,
+            "right": b.right,
+            "bottom": b.bottom,
+            "coord_origin": b.coord_origin,
+            "page": item.page_no,
+        }
+    return None
+
+
+def citation_to_dict(c: Citation, provenance: ChunkProvenance | None = None) -> dict:
     """Serialize Citation for JSON event payload."""
-    return {
+    d: dict = {
         "ref_id": c.ref_id,
         "ref_index": c.ref_index,
         "chunk_id": str(c.chunk_id),
@@ -77,6 +111,10 @@ def citation_to_dict(c: Citation) -> dict:
         "heading_path": list(c.heading_path),
         "snippet": c.snippet,
     }
+    bbox_hint = _provenance_bbox_hint(provenance)
+    if bbox_hint is not None:
+        d["bbox_hint"] = bbox_hint
+    return d
 
 
 def extract_used_citations(text: str, rag_context: RAGContext) -> list[Citation]:
@@ -109,15 +147,15 @@ def build_references_list(
     Returns references sorted by display label (C1, C2, ...).
     Only includes sources that were actually cited in the answer.
     """
-    ref_by_id = {item.ref_id: item.citation for item in rag_context.items}
+    item_by_id = {item.ref_id: item for item in rag_context.items}
     result: list[dict] = []
     for source_id, display_label in sorted(
         label_map.mapping.items(),
         key=lambda x: int(x[1][1:]),  # sort by numeric part of "C1", "C2", ...
     ):
-        citation = ref_by_id.get(source_id)
-        if citation:
-            entry = citation_to_dict(citation)
+        ctx_item = item_by_id.get(source_id)
+        if ctx_item:
+            entry = citation_to_dict(ctx_item.citation, ctx_item.provenance)
             entry["display_label"] = display_label
             result.append(entry)
     return result
@@ -144,7 +182,7 @@ def build_all_references(rag_context: RAGContext) -> list[dict]:
     sorted_items = sorted(rag_context.items, key=lambda i: i.score, reverse=True)
     result = []
     for item in sorted_items:
-        entry = citation_to_dict(item.citation)
+        entry = citation_to_dict(item.citation, item.provenance)
         entry["display_label"] = item.citation.ref_id  # S1, S2, ... by relevance order
         result.append(entry)
     return result
@@ -195,3 +233,52 @@ def build_usage_event(
             usage_data["citations"] = [citation_to_dict(c) for c in used]
 
     return usage_data
+
+
+async def hydrate_bbox_hints(
+    session: AsyncSession,
+    messages_metadata: list[dict],
+) -> None:
+    """Backfill ``bbox_hint`` on persisted message references for old messages.
+
+    Mutates each metadata dict in place. Looks at ``references`` and ``citations``
+    arrays, collects chunk_ids missing ``bbox_hint``, batch-fetches chunks, and
+    injects bbox_hint computed from chunk provenance.
+    """
+    needed: set[UUID] = set()
+    targets: list[dict] = []
+    for meta in messages_metadata:
+        if not isinstance(meta, dict):
+            continue
+        for key in ("references", "citations"):
+            arr = meta.get(key)
+            if not isinstance(arr, list):
+                continue
+            for entry in arr:
+                if not isinstance(entry, dict) or "bbox_hint" in entry:
+                    continue
+                cid = entry.get("chunk_id")
+                if not cid:
+                    continue
+                try:
+                    needed.add(UUID(cid))
+                    targets.append(entry)
+                except (ValueError, AttributeError, TypeError):
+                    continue
+
+    if not needed:
+        return
+
+    chunk_repo = ChunkRepository(session)
+    chunks = await chunk_repo.get_by_ids(list(needed))
+    bbox_by_chunk: dict[str, dict] = {}
+    for chunk in chunks:
+        prov = _parse_provenance(chunk.provenance if isinstance(chunk.provenance, list) else None)
+        hint = _provenance_bbox_hint(prov)
+        if hint is not None:
+            bbox_by_chunk[str(chunk.id)] = hint
+
+    for entry in targets:
+        cid = entry.get("chunk_id")
+        if isinstance(cid, str) and cid in bbox_by_chunk:
+            entry["bbox_hint"] = bbox_by_chunk[cid]
