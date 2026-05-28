@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from src.schemas.query_router import DocumentScopeResult, RouterOutput
     from src.schemas.query_transform import TransformedQuery
     from src.schemas.retrieval import ProcessedQuery, RAGContext
+    from src.services.chat.agent_loop import AgentLoopMeta
     from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
 
@@ -61,6 +62,8 @@ class ChatPipelineState:
     accumulated_content: str = ""
     clean_content: str = ""
     params: dict = field(default_factory=dict)
+    used_agent_loop: bool = False
+    agent_meta: AgentLoopMeta | None = None
 
 
 class LLMResponseStats(BaseModel):

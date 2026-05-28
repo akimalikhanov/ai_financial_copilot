@@ -20,6 +20,23 @@ _REFUSAL_RE = re.compile(
 
 _NUM_RE = re.compile(r"-?[$£€]?\s*(\d[\d,]*(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*%?")
 
+# Matches "406.1 million", "2.5 billion", "350K", "1.2B", "500M" etc.
+_PROSE_NUM_RE = re.compile(
+    r"-?\$?(\d[\d,]*(?:\.\d+)?)\s*"
+    r"(trillion|billion|million|thousand|[tbmk])\b",
+    re.IGNORECASE,
+)
+_PROSE_SCALE = {
+    "t": 1_000_000_000_000,
+    "trillion": 1_000_000_000_000,
+    "b": 1_000_000_000,
+    "billion": 1_000_000_000,
+    "m": 1_000_000,
+    "million": 1_000_000,
+    "k": 1_000,
+    "thousand": 1_000,
+}
+
 _BOOL_RE = re.compile(r"\b(true|false|yes|no)\b", re.IGNORECASE)
 
 _BOOL_MAP = {"yes": "true", "no": "false", "true": "true", "false": "false"}
@@ -34,9 +51,16 @@ FUZZY_NAME_THRESHOLD = 85
 
 
 def _parse_all_numbers(text: str) -> list[float]:
-    text = text.replace(",", "")
-    results = []
-    for m in _NUM_RE.finditer(text):
+    results: list[float] = []
+    # First pass: prose numbers with scale suffixes ("406.1 million", "2.5B")
+    for m in _PROSE_NUM_RE.finditer(text):
+        with contextlib.suppress(ValueError):
+            base = float(m.group(1).replace(",", ""))
+            scale = _PROSE_SCALE[m.group(2).lower()]
+            results.append(base * scale)
+    # Second pass: bare numbers (strip commas first)
+    clean = _PROSE_NUM_RE.sub(" ", text).replace(",", "")
+    for m in _NUM_RE.finditer(clean):
         with contextlib.suppress(ValueError):
             results.append(float(m.group(1)))
     return results

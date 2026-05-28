@@ -98,6 +98,9 @@ class Message(Base):
     # Pipeline trace (assistant messages only)
     trace: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # Structured agent findings; None for non-agentic messages
+    agent_findings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # Observability
     trace_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
 

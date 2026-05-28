@@ -108,6 +108,7 @@ class MessageRepository:
         metadata_updates: dict | None = None,
         trace: dict | None = None,
         trace_id: str | None = None,
+        agent_findings: dict | None = None,
     ) -> Message | None:
         """Update message content and status on stream completion."""
         result = await self.session.execute(select(Message).where(Message.id == message_id))
@@ -127,6 +128,8 @@ class MessageRepository:
             message.trace = trace
         if trace_id is not None:
             message.trace_id = trace_id
+        if agent_findings is not None:
+            message.agent_findings = agent_findings
 
         await self.session.flush()
         return message

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +23,6 @@ from src.services.retrieval.reranker import Reranker, get_reranker
 from src.utils.config import (
     get_chat_retrieval_timeout,
     get_keyword_search_top_k,
-    get_multi_pass_chunks_per_sub,
     get_reranker_max_input,
     get_vector_search_top_k,
 )
@@ -75,32 +74,6 @@ async def _retrieve_with_timeout(coro, timeout: float | None = None) -> list:
         return []
 
 
-def _round_robin_interleave(
-    ranked_lists: list[list[RetrievedChunk]],
-    cap: int,
-) -> list[RetrievedChunk]:
-    """Take one chunk per sub-pass in turn, skipping already-seen chunk_ids."""
-    seen: set[UUID] = set()
-    result: list[RetrievedChunk] = []
-    iters = [iter(lst) for lst in ranked_lists]
-    while len(result) < cap:
-        advanced = False
-        for it in iters:
-            if len(result) >= cap:
-                break
-            try:
-                chunk = next(it)
-                if chunk.chunk_id not in seen:
-                    result.append(chunk)
-                    seen.add(chunk.chunk_id)
-                    advanced = True
-            except StopIteration:
-                pass
-        if not advanced:
-            break
-    return result
-
-
 async def _run_single_pass(
     semantic_vector: list[float],
     keyword_query: str,
@@ -109,8 +82,26 @@ async def _run_single_pass(
     timeout: float,
     vector_top_k: int,
     keyword_top_k: int,
+    search_mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
 ) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk]]:
-    """Run Qdrant + OpenSearch in parallel, fuse. Returns (vector, keyword, fused)."""
+    """Run retrieval backends in parallel (skipping one when search_mode is single-backend).
+
+    Returns (vector_results, keyword_results, fused).
+    For single-backend modes, fused == the single backend's results (no RRF).
+    """
+    if search_mode == "vector":
+        vector_results = await _retrieve_with_timeout(
+            qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
+            timeout,
+        )
+        return vector_results, [], vector_results
+    if search_mode == "keyword":
+        keyword_results = await _retrieve_with_timeout(
+            opensearch_retrieve(keyword_query, user_id, doc_ids=doc_ids, top_k=keyword_top_k),
+            timeout,
+        )
+        return [], keyword_results, keyword_results
+
     vector_results, keyword_results = await asyncio.gather(
         _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
@@ -131,36 +122,30 @@ async def run_chat_rag_pipeline(
     transformed: TransformedQuery,
     user_id: UUID,
     doc_ids: list[UUID] | None,
-    sub_doc_ids: list[list[UUID] | None] | None = None,
     timeout: float | None = None,
     reranker: Reranker | None = None,
-) -> tuple[RAGContext, RetrievalTrace]:
-    """Embed queries, run hybrid retrieval, rerank, assemble RAGContext.
+    search_mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+    top_k_override: int | None = None,
+) -> tuple[RAGContext, RetrievalTrace, list[RetrievedChunk]]:
+    """Embed query, run retrieval (single-pass), rerank, assemble RAGContext.
 
-    Multi-pass mode (when transformed.sub_queries is non-empty):
-      - sub_doc_ids must have the same length as transformed.sub_queries
-      - Each sub-pass is scoped to its own doc_ids, reranked with sub.semantic_query
-      - Results are round-robin interleaved and capped to reranker_top_k
-      - All-empty fallback: runs single pass with top-level queries over doc_ids
-    Single-pass mode: fuse_rrf → rerank(transformed.semantic_query) → assemble
+    search_mode controls which backends run:
+      - "hybrid": Qdrant + OpenSearch in parallel, fused via RRF (default)
+      - "vector":  Qdrant only, no OpenSearch, no RRF
+      - "keyword": OpenSearch only, no Qdrant, no RRF
     """
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
-    vector_top_k = get_vector_search_top_k()
-    keyword_top_k = get_keyword_search_top_k()
+    vector_top_k = top_k_override if top_k_override is not None else get_vector_search_top_k()
+    keyword_top_k = top_k_override if top_k_override is not None else get_keyword_search_top_k()
     reranker_max_input = get_reranker_max_input()
-    chunks_per_sub = get_multi_pass_chunks_per_sub()
 
     if reranker is None:
         reranker = get_reranker()
 
     lf = lf_client.get_client()
-    sub_queries = transformed.sub_queries
 
-    # --- Batch embed: top-level + all sub semantic queries, dedup ---
-    all_semantic_texts = [transformed.semantic_query] + [s.semantic_query for s in sub_queries]
-    unique_texts = list(dict.fromkeys(all_semantic_texts))  # preserve order, dedup
-    with _span(lf, "embed_query", as_type="embedding", input=unique_texts) as obs:
-        vectors_list = await asyncio.to_thread(embed_chunks, unique_texts)
+    with _span(lf, "embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
+        vectors_list = await asyncio.to_thread(embed_chunks, [transformed.semantic_query])
         if obs:
             obs.update(
                 output={
@@ -168,175 +153,8 @@ async def run_chat_rag_pipeline(
                     "dims": len(vectors_list[0]) if vectors_list else 0,
                 }
             )
-    text_to_vector: dict[str, list[float]] = dict(zip(unique_texts, vectors_list, strict=True))
-    top_level_vector = text_to_vector[transformed.semantic_query]
+    semantic_vector = vectors_list[0]
 
-    # ---------------------------------------------------------------
-    # MULTI-PASS MODE
-    # ---------------------------------------------------------------
-    if sub_queries and sub_doc_ids is not None and len(sub_doc_ids) == len(sub_queries):
-
-        async def _sub_pass(
-            idx: int,
-        ) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk]]:
-            sub = sub_queries[idx]
-            vec = text_to_vector[sub.semantic_query]
-            sdoc = sub_doc_ids[idx]
-            return await _run_single_pass(
-                vec, sub.keyword_query, user_id, sdoc, timeout, vector_top_k, keyword_top_k
-            )
-
-        with _span(
-            lf,
-            "hybrid_retrieve",
-            as_type="retriever",
-            input=[
-                {"entity": s.focus_entity, "semantic": s.semantic_query, "keyword": s.keyword_query}
-                for s in sub_queries
-            ],
-            mode="multi_pass",
-        ) as obs:
-            pass_results = await asyncio.gather(*[_sub_pass(i) for i in range(len(sub_queries))])
-            if obs:
-                obs.update(
-                    output=[
-                        {
-                            "entity": sub_queries[i].focus_entity,
-                            "counts": {"vector": len(v), "keyword": len(k), "fused": len(f)},
-                            "vector": [_to_hit(c).model_dump(exclude_none=True) for c in v],
-                            "keyword": [_to_hit(c).model_dump(exclude_none=True) for c in k],
-                            "fused": [_to_hit(c).model_dump(exclude_none=True) for c in f],
-                        }
-                        for i, (v, k, f) in enumerate(pass_results)
-                    ]
-                )
-
-        # Collect all chunk_ids across passes for bulk hydration
-        all_chunk_ids: list[UUID] = []
-        for _, _, fused in pass_results:
-            capped = fused[:reranker_max_input]
-            all_chunk_ids.extend(c.chunk_id for c in capped)
-        # Dedup preserving order for single DB call
-        seen_ids: set[UUID] = set()
-        unique_chunk_ids = [
-            cid for cid in all_chunk_ids if not (cid in seen_ids or seen_ids.add(cid))
-        ]  # type: ignore[func-returns-value]
-        payloads = await get_chunk_prompt_payloads(session, unique_chunk_ids)
-        texts_map: dict[UUID, str] = {
-            cid: payloads[cid].prompt_text for cid in unique_chunk_ids if cid in payloads
-        }
-
-        # Per-sub rerank
-        sub_pass_trace: list[dict] = []
-        reranked_per_sub: list[list[RetrievedChunk]] = []
-
-        async def _rerank_sub(idx: int) -> list[RetrievedChunk]:
-            sub = sub_queries[idx]
-            _, _, fused = pass_results[idx]
-            capped = fused[:reranker_max_input]
-            if not capped:
-                return []
-            reranked = await reranker.rerank(sub.semantic_query, capped, texts_map)
-            return reranked[:chunks_per_sub]
-
-        with _span(
-            lf,
-            "rerank",
-            as_type="retriever",
-            input=[
-                {
-                    "entity": sub_queries[i].focus_entity,
-                    "input_count": len(pass_results[i][2][:reranker_max_input]),
-                }
-                for i in range(len(sub_queries))
-            ],
-            mode="multi_pass",
-        ) as obs:
-            reranked_per_sub = list(
-                await asyncio.gather(*[_rerank_sub(i) for i in range(len(sub_queries))])
-            )
-            if obs:
-                obs.update(
-                    output=[
-                        {
-                            "entity": sub_queries[i].focus_entity,
-                            "output_count": len(reranked_per_sub[i]),
-                            "top_scores": [round(c.score, 4) for c in reranked_per_sub[i][:5]],
-                        }
-                        for i in range(len(sub_queries))
-                    ]
-                )
-
-        for i, (sub, (vec_r, kw_r, fused_r)) in enumerate(
-            zip(sub_queries, pass_results, strict=True)
-        ):
-            sub_pass_trace.append(
-                {
-                    "focus_entity": sub.focus_entity,
-                    "entity_match_quality": sub.entity_match_quality,
-                    "qdrant_hits": len(vec_r),
-                    "opensearch_hits": len(kw_r),
-                    "fused_hits": len(fused_r),
-                    "reranked_hits": len(reranked_per_sub[i]),
-                }
-            )
-
-        # Round-robin interleave, dedup, cap
-        context_max = chunks_per_sub * len(sub_queries)
-        interleaved = _round_robin_interleave(reranked_per_sub, cap=context_max)
-
-        # All-empty fallback: every sub-pass returned nothing
-        if not interleaved:
-            logger.warning(
-                "multi_pass_all_empty_fallback",
-                extra={"user_id": str(user_id), "sub_count": len(sub_queries)},
-            )
-            vec_r, kw_r, fused = await _run_single_pass(
-                top_level_vector,
-                transformed.keyword_query,
-                user_id,
-                doc_ids,
-                timeout,
-                vector_top_k,
-                keyword_top_k,
-            )
-            capped = fused[:reranker_max_input]
-            if not capped:
-                trace = RetrievalTrace(sub_passes=sub_pass_trace)
-                return RAGContext(formatted_context="", items=(), chunk_count=0), trace
-            fallback_ids = [c.chunk_id for c in capped]
-            fallback_payloads = await get_chunk_prompt_payloads(session, fallback_ids)
-            fallback_texts = {
-                cid: fallback_payloads[cid].prompt_text
-                for cid in fallback_ids
-                if cid in fallback_payloads
-            }
-            interleaved = await reranker.rerank(transformed.semantic_query, capped, fallback_texts)
-            payloads = fallback_payloads
-
-        with _span(
-            lf,
-            "assemble_context",
-            input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in interleaved],
-        ) as obs:
-            ctx, guardrails = assemble_rag_context(interleaved, payloads, assume_unique=False)
-            if obs:
-                obs.update(
-                    output={
-                        "chunk_count": ctx.chunk_count,
-                        "context_chars": len(ctx.formatted_context or ""),
-                    }
-                )
-        trace = RetrievalTrace(
-            sub_passes=sub_pass_trace,
-            dropped_chunks=guardrails.dropped,
-            flagged_chunks=guardrails.flagged,
-        )
-        return ctx, trace
-
-    # ---------------------------------------------------------------
-    # SINGLE-PASS MODE
-    # ---------------------------------------------------------------
     with _span(
         lf,
         "hybrid_retrieve",
@@ -344,17 +162,19 @@ async def run_chat_rag_pipeline(
         input={
             "semantic_query": transformed.semantic_query,
             "keyword_query": transformed.keyword_query,
+            "search_mode": search_mode,
         },
         mode="single_pass",
     ) as obs:
         vec_r, kw_r, fused = await _run_single_pass(
-            top_level_vector,
+            semantic_vector,
             transformed.keyword_query,
             user_id,
             doc_ids,
             timeout,
             vector_top_k,
             keyword_top_k,
+            search_mode=search_mode,
         )
         if obs:
             obs.update(
@@ -371,7 +191,7 @@ async def run_chat_rag_pipeline(
             qdrant=[_to_hit(c) for c in vec_r],
             opensearch=[_to_hit(c) for c in kw_r],
         )
-        return RAGContext(formatted_context="", items=(), chunk_count=0), trace
+        return RAGContext(formatted_context="", items=(), chunk_count=0), trace, []
 
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
@@ -419,4 +239,4 @@ async def run_chat_rag_pipeline(
             )
     trace.dropped_chunks = guardrails.dropped
     trace.flagged_chunks = guardrails.flagged
-    return ctx, trace
+    return ctx, trace, reranked

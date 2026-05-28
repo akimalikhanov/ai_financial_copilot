@@ -388,13 +388,26 @@ def get_chunking_max_merge_multiplier() -> float:
 
 
 def get_embedding_provider() -> str:
-    """EMBEDDING_PROVIDER (default: local). Use 'openai' for OpenAI API."""
+    """EMBEDDING_PROVIDER (default: local). Supported: 'tei', 'openai', 'local'."""
     return os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
 
 
 def get_embedding_model() -> str:
     """EMBEDDING_MODEL or EMBED_MODEL_ID (default: all-MiniLM-L6-v2)."""
     return os.getenv("EMBEDDING_MODEL") or os.getenv("EMBED_MODEL_ID") or "all-MiniLM-L6-v2"
+
+
+def get_embedder_base_url() -> str:
+    """EMBEDDER_BASE_URL — TEI embedder HTTP endpoint (default: http://localhost:8082)."""
+    return os.getenv("EMBEDDER_BASE_URL", "http://localhost:8082")
+
+
+def get_embedder_timeout_seconds() -> float:
+    """EMBEDDER_TIMEOUT_SECONDS (default: 30.0)."""
+    try:
+        return float(os.getenv("EMBEDDER_TIMEOUT_SECONDS", "30.0"))
+    except ValueError:
+        return 30.0
 
 
 def get_embedding_dim() -> int | None:
@@ -426,6 +439,18 @@ def get_query_transformer_config() -> dict:
         "timeout": float(os.getenv("QUERY_TRANSFORMER_TIMEOUT", "10.0")),
         "max_scope_docs": int(os.getenv("QUERY_TRANSFORMER_MAX_SCOPE_DOCS", "10")),
         "conv_history_tokens": int(os.getenv("QUERY_TRANSFORMER_CONV_HISTORY_TOKENS", "1200")),
+    }
+
+
+def get_agent_config() -> dict:
+    return {
+        "enabled": os.getenv("AGENT_LOOP_ENABLED", "false").strip().lower()
+        not in {"0", "false", "no", "off"},
+        "tool_model": os.getenv("AGENT_TOOL_MODEL", get_query_transformer_model()),
+        "max_iterations": int(os.getenv("AGENT_MAX_ITERATIONS", "6")),
+        "token_budget": int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
+        "max_concurrent_searches": int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
+        "max_chunks_per_entity": int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "8")),
     }
 
 

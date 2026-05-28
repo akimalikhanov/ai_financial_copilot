@@ -113,6 +113,16 @@ export interface StageEvent {
   total: number;
 }
 
+export interface ToolCallStartedEvent {
+  entity: string;
+}
+
+export interface ToolCallCompletedEvent {
+  entity: string;
+  chunks_returned: number;
+  new_chunks_added: number;
+}
+
 type ApiErrorOptions = {
   statusCode?: number;
   fallbackMessage?: string;
@@ -767,10 +777,12 @@ export const chatStreamSubscribe = async (
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
   onStage?: (stage: StageEvent) => void,
+  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
+  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
 ): Promise<void> => {
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage, onToolCallStarted, onToolCallCompleted
     );
     if (result === 'done' || result === 'server-error') return;
     // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
@@ -799,6 +811,8 @@ async function _doStreamAttempt(
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
   onStage?: (stage: StageEvent) => void,
+  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
+  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
 ): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
@@ -882,6 +896,14 @@ async function _doStreamAttempt(
             const s = JSON.parse(parsed.data) as StageEvent;
             onStage?.(s);
           } catch { /* ignore malformed */ }
+          continue;
+        }
+        if (parsed.event === 'tool_call_started') {
+          try { onToolCallStarted?.(JSON.parse(parsed.data) as ToolCallStartedEvent); } catch { /* ignore */ }
+          continue;
+        }
+        if (parsed.event === 'tool_call_completed') {
+          try { onToolCallCompleted?.(JSON.parse(parsed.data) as ToolCallCompletedEvent); } catch { /* ignore */ }
           continue;
         }
         // Skip other non-content server events

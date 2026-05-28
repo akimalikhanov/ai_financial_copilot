@@ -282,3 +282,23 @@ async def hydrate_bbox_hints(
         cid = entry.get("chunk_id")
         if isinstance(cid, str) and cid in bbox_by_chunk:
             entry["bbox_hint"] = bbox_by_chunk[cid]
+
+
+def agent_turn_started_event(iteration: int) -> dict:
+    return {"iteration": iteration}
+
+
+def tool_call_started_event(entity: str, search_mode: str) -> dict:
+    return {"entity": entity, "search_mode": search_mode}
+
+
+def tool_call_completed_event(entity: str, chunks_returned: int, new_chunks_added: int) -> dict:
+    return {
+        "entity": entity,
+        "chunks_returned": chunks_returned,
+        "new_chunks_added": new_chunks_added,
+    }
+
+
+def agent_synthesis_starting_event(total_chunks: int, iterations: int) -> dict:
+    return {"total_chunks": total_chunks, "iterations": iterations}

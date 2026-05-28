@@ -302,6 +302,41 @@ services:
     <<: *default-logging
     networks: [backend]
 
+  tei-embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0
+    container_name: tei-embedder
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model-id
+      - ${EMBEDDER_MODEL_NAME:-BAAI/bge-m3}
+      - --dtype
+      - float16
+      - --max-batch-tokens
+      - "16384"
+      - --max-batch-requests
+      - "16"
+      - --max-client-batch-size
+      - "64"
+      - --payload-limit
+      - "10000000"
+    ports:
+      - "${EMBEDDER_BIND_HOST:-127.0.0.1}:${EMBEDDER_PORT:-8082}:80"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - tei_data:/data
+    cpus: "2.00"
+    mem_limit: 4g
+    <<: *default-logging
+    networks: [backend]
+
   qdrant:
     image: qdrant/qdrant:v1.16.3
     container_name: qdrant

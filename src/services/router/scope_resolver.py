@@ -25,11 +25,14 @@ async def resolve_scope(
     has_entities = bool(router_output.entities)
 
     # --- selectedDocs / thisDoc: use doc_ids directly, skip Layer 2 ---
-    if scope is not None and scope.mode in ("selectedDocs", "thisDoc"):
+    # If the user picked this mode but selected zero docs (e.g. clicked "Selected" without
+    # actually choosing), fall through to entity resolution rather than searching everything.
+    if scope is not None and scope.mode in ("selectedDocs", "thisDoc") and scope.doc_ids:
         return DocumentScopeResult(
-            doc_ids=scope.doc_ids or None,
+            doc_ids=scope.doc_ids,
             source="explicit",
         )
+    # Empty selection — treat as allDocs and let entity resolution narrow it down below
 
     # --- filteredByMetadata: resolve filters (Layer 1), then optionally narrow (Layer 2) ---
     if scope is not None and scope.mode == "filteredByMetadata":

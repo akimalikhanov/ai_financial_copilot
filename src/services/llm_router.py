@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+from src.observability import langfuse as _lf_mod
 from src.services.llm_adapters.base_adapter import (
+    AssistantTurnResult,
     ChatMessage,
     LLMAdapter,
     LLMResponse,
@@ -16,6 +18,10 @@ from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
 from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
 from src.utils.config import load_models_config
+
+
+def _role_str(role: Any) -> str:
+    return role.value if hasattr(role, "value") else role
 
 
 def _merge_params(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -104,8 +110,6 @@ class RoutedLLM:
     async def complete(
         self, messages: Sequence[ChatMessage], *, _lf_name: str = "llm.complete", **params: Any
     ) -> LLMResponse:
-        from src.observability import langfuse as _lf_mod
-
         lf = _lf_mod.get_client()
         merged = _merge_params(self.default_params, params)
         if lf is None:
@@ -114,7 +118,7 @@ class RoutedLLM:
             as_type="generation",
             name=_lf_name,
             model=self.model_id,
-            input=[{"role": m.role.value, "content": m.content} for m in messages],
+            input=[{"role": _role_str(m.role), "content": m.content or ""} for m in messages],
         ) as gen:
             response = await self.adapter.complete(messages=messages, **merged)
             update_kwargs: dict = {"output": response.text}
@@ -134,6 +138,51 @@ class RoutedLLM:
                     update_kwargs["cost_details"] = {"total": s.cost_usd}
             gen.update(**update_kwargs)
             return response
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: list[dict],
+        **params: Any,
+    ) -> AssistantTurnResult:
+        if not hasattr(self.adapter, "complete_with_tools"):
+            raise NotImplementedError(f"{self.model_id} adapter does not support tool calling")
+        lf = _lf_mod.get_client()
+        merged = _merge_params(self.default_params, params)
+        if lf is None:
+            return await self.adapter.complete_with_tools(messages=messages, tools=tools, **merged)  # type: ignore[union-attr]
+        with lf.start_as_current_observation(
+            as_type="generation",
+            name="llm.complete_with_tools",
+            model=self.model_id,
+            input=[{"role": _role_str(m.role), "content": m.content or ""} for m in messages],
+            metadata={"tools": [t["function"]["name"] for t in tools if "function" in t]},
+        ) as gen:
+            result = await self.adapter.complete_with_tools(
+                messages=messages, tools=tools, **merged
+            )  # type: ignore[union-attr]
+            update_kwargs: dict = {
+                "output": [
+                    {"name": tc.name, "arguments": tc.arguments} for tc in (result.tool_calls or [])
+                ]
+                or result.text,
+            }
+            if result.stats:
+                s = result.stats
+                update_kwargs["usage_details"] = {
+                    k: v
+                    for k, v in {
+                        "input": s.input_tokens,
+                        "output": s.output_tokens,
+                        "cache_read_input_tokens": s.cached_input_tokens,
+                        "total": s.total_tokens,
+                    }.items()
+                    if v is not None
+                }
+                if s.cost_usd is not None:
+                    update_kwargs["cost_details"] = {"total": s.cost_usd}
+            gen.update(**update_kwargs)
+            return result
 
     def stream(
         self, messages: Sequence[ChatMessage], **params: Any

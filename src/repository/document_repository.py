@@ -64,23 +64,72 @@ _CORP_SUFFIXES = (
     "kk",
     "gk",
 )
+
+# Generic industry/sector words that appear in many company names and reduce
+# discriminative power when doing trigram similarity matching.
+_INDUSTRY_WORDS = (
+    "pharmaceuticals",
+    "pharmaceutical",
+    "pharma",
+    "biosciences",
+    "bioscience",
+    "biotechnology",
+    "biotech",
+    "therapeutics",
+    "therapies",
+    "sciences",
+    "science",
+    "laboratories",
+    "laboratory",
+    "labs",
+    "technologies",
+    "technology",
+    "solutions",
+    "services",
+    "systems",
+    "industries",
+    "international",
+    "global",
+    "national",
+    "enterprises",
+    "partners",
+    "capital",
+    "ventures",
+    "financial",
+    "investments",
+    "management",
+    "resources",
+)
+
 _CORP_SUFFIX_RE = re.compile(
     r"\b(" + "|".join(_CORP_SUFFIXES) + r")\b\.?\s*$",
     re.IGNORECASE,
 )
+_INDUSTRY_RE = re.compile(
+    r"\b(" + "|".join(_INDUSTRY_WORDS) + r")\b",
+    re.IGNORECASE,
+)
 # \m is PostgreSQL's start-of-word anchor; pattern interpolated into SQL literals.
 _CORP_SUFFIX_SQL_RE = r"\m(" + "|".join(_CORP_SUFFIXES) + r")\.?\s*$"
+_INDUSTRY_SQL_RE = r"\m(" + "|".join(_INDUSTRY_WORDS) + r")\M"
 _MIN_NORMALIZED_LEN = 3
 
 
 def _normalize_company(name: str) -> str:
-    """Strip trailing corporate suffixes for tighter trigram comparison.
+    """Strip trailing corp suffixes, punctuation, and generic industry words.
 
     Falls back to the original (lowercased) string when stripping would leave
     fewer than _MIN_NORMALIZED_LEN characters (e.g. "The Limited" → "the").
     """
     lowered = name.lower().strip()
+    # Strip trailing corp suffix first
     stripped = _CORP_SUFFIX_RE.sub("", lowered).strip()
+    # Strip trailing punctuation (commas, periods left behind by "Ltd., Inc." etc.)
+    stripped = stripped.rstrip(".,;").strip()
+    # Remove generic industry words that inflate cross-company similarity
+    stripped = _INDUSTRY_RE.sub("", stripped).strip()
+    # Collapse multiple spaces
+    stripped = re.sub(r"\s+", " ", stripped).strip()
     return stripped if len(stripped) >= _MIN_NORMALIZED_LEN else lowered
 
 
@@ -357,18 +406,26 @@ class DocumentRepository:
               AND metadata->>'company' IS NOT NULL
               AND similarity(
                     trim(regexp_replace(
-                        lower(metadata->>'company'),
-                        '{_CORP_SUFFIX_SQL_RE}',
-                        '', 'i'
+                        regexp_replace(
+                            lower(metadata->>'company'),
+                            '{_CORP_SUFFIX_SQL_RE}',
+                            '', 'i'
+                        ),
+                        '{_INDUSTRY_SQL_RE}',
+                        '', 'gi'
                     )),
                     :name
                   ) > :threshold
               {constrain_clause}
             ORDER BY similarity(
                 trim(regexp_replace(
-                    lower(metadata->>'company'),
-                    '{_CORP_SUFFIX_SQL_RE}',
-                    '', 'i'
+                    regexp_replace(
+                        lower(metadata->>'company'),
+                        '{_CORP_SUFFIX_SQL_RE}',
+                        '', 'i'
+                    ),
+                    '{_INDUSTRY_SQL_RE}',
+                    '', 'gi'
                 )),
                 :name
             ) DESC

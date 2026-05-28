@@ -14,12 +14,14 @@ from src.utils.llm_utils import (
 )
 
 from .base_adapter import (
+    AssistantTurnResult,
     ChatMessage,
     ChatRequest,
     LLMAdapter,
     LLMResponse,
     LLMResponseStats,
     LLMStreamChunk,
+    ToolCallRef,
 )
 
 
@@ -125,8 +127,27 @@ class OpenAIAdapter(LLMAdapter):
             extra_params=kwargs,
         )
 
+    @staticmethod
+    def _serialize_msg(m: ChatMessage) -> dict[str, Any]:
+        d: dict[str, Any] = {"role": m.role}
+        d["content"] = m.content if m.content is not None else ""
+        if m.name:
+            d["name"] = m.name
+        if m.tool_call_id:
+            d["tool_call_id"] = m.tool_call_id
+        if m.tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                for tc in m.tool_calls
+            ]
+        return d
+
     def _build_kwargs(self, req: ChatRequest) -> dict[str, Any]:
-        messages = [{"role": m.role, "content": m.content} for m in req.messages]
+        messages = [self._serialize_msg(m) for m in req.messages]
         is_gpt_5 = self._is_gpt_5_model(req.model)
 
         kwargs: dict[str, Any] = {
@@ -227,6 +248,32 @@ class OpenAIAdapter(LLMAdapter):
         )
 
         return LLMResponse(text=text, raw=resp, stats=stats)
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> AssistantTurnResult:
+        req = self._build_request(messages, **kwargs)
+        kw = self._build_kwargs(req)
+        kw["tools"] = tools
+        kw["tool_choice"] = "auto"
+        start_ms = now_ms()
+        try:
+            resp = await self._client.chat.completions.create(**cast(Any, kw))
+        except Exception as e:
+            raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
+        latency_ms = elapsed_ms(start_ms)
+        msg = resp.choices[0].message
+        tool_calls = [
+            ToolCallRef(id=tc.id, name=tc.function.name, arguments=tc.function.arguments)
+            for tc in (msg.tool_calls or [])
+        ]
+        stats = self._build_stats_from_usage(
+            getattr(resp, "usage", None), model=req.model, latency_ms=latency_ms
+        )
+        return AssistantTurnResult(text=msg.content or "", tool_calls=tool_calls, stats=stats)
 
     async def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         kwargs = self._build_kwargs(req)

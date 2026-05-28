@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 import src.services.llm_router as llm_router_mod
-from src.services.llm_adapters.base_adapter import ChatMessage, Role
+from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponse, Role
 from src.services.llm_router import (
     LLMRouter,
     RoutedLLM,
@@ -92,7 +92,7 @@ class RecordingAdapter:
 
     async def complete(self, messages, **params):
         self.last_complete = {"messages": messages, "params": params}
-        return {"ok": True}
+        return LLMResponse(text="ok")
 
     def stream(self, messages, **params):
         self.last_stream = {"messages": messages, "params": params}

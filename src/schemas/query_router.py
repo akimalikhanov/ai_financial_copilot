@@ -34,11 +34,17 @@ class RouterOutput(BaseModel):
     route: Literal["direct_answer", "retrieval", "out_of_scope"]
     entities: list[ExtractedEntity] = []
     user_intent: str
-    needs_decomposition: bool
     reasoning: str
+    query_shape: Literal["extraction", "comparison", "analytical"] | None = None
+
+
+class EntityManifestItem(BaseModel):
+    entity_name: str
+    doc_summaries: list[dict]  # [{doc_id, name, year}]
 
 
 class DocumentScopeResult(BaseModel):
     doc_ids: list[UUID] | None  # None = no pre-filter (search all user docs)
     source: Literal["explicit", "filtered", "entity_resolved", "all"]
     per_entity_doc_ids: dict[str, list[UUID]] | None = None  # keyed by ExtractedEntity.name
+    entity_manifest: list[EntityManifestItem] | None = None

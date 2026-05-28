@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses as _dc
+import json as _json
 import logging
 from time import perf_counter
 from uuid import UUID
@@ -28,10 +30,18 @@ from src.repository import (
 )
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
+from src.schemas.agent_findings import AgentFindings as _AgentFindings
+from src.schemas.agent_findings import AnalyticalFindings as _AnalyticalFindings
+from src.schemas.agent_findings import EntityFinding as _EntityFinding
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.query_transform import ScopeDocSummary, TransformedQuery, TransformerInput
+from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept for kill-switch path)
+    ScopeDocSummary,
+    TransformedQuery,
+    TransformerInput,
+)
 from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
+from src.services.chat.agent_loop import _order_chunks, run_agent_loop
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
@@ -43,17 +53,26 @@ from src.services.chat.events import (
     out_of_scope_response,
     span_to_dict,
 )
+from src.services.chat.findings_processor import (
+    ProcessedFindings,
+    _render_findings_block,
+    _render_observations_block,
+    process_findings,
+)
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
+from src.services.retrieval.context_assembler import assemble_rag_context
 
 # from src.services.retrieval.query_processor import process_query
-from src.services.retrieval.query_transformer import transform_query
+from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
+from src.services.retrieval.query_transformer import rewrite_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
+    get_agent_config,
     get_db_url,
     get_injection_scan_user_input_enabled,
     get_query_transformer_config,
@@ -64,6 +83,7 @@ logger = logging.getLogger(__name__)
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
+    "agent_loop": "chain",
     "transform_query": "chain",
     "build_rag_context": "retriever",
 }
@@ -192,7 +212,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     retrieval_trace: RetrievalTrace | None = None
-    stage_total = 9
+    agent_findings_json: str | None = None  # set by agent branch; used in persist
+    _agent_answer_entity: str | None = None
+    _agent_fx_rates: dict = {}
+    stage_total = 8
     stage_index = 0
     current_stage = "initializing"
 
@@ -300,6 +323,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 None,
             )
             state.user_query_raw = last_user.content if last_user else ""
+            if lf:
+                lf.update_current_span(
+                    input={"request_id": request_id, "query": state.user_query_raw}
+                )
 
             injection_signal: InjectionSignal | None = None
             # 2.5 scan_user_input (skipped when INJECTION_SCAN_USER_INPUT=false)
@@ -430,6 +457,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 if state.scope_result and state.scope_result.per_entity_doc_ids
                 else None
             )
+            _scope_entity_manifest = (
+                [item.model_dump() for item in state.scope_result.entity_manifest]
+                if state.scope_result and state.scope_result.entity_manifest
+                else None
+            )
             logger.info(
                 "rag_route",
                 extra={
@@ -437,7 +469,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     "route": state.router_output.route,
                     "entities": [e.model_dump() for e in state.router_output.entities],
                     "user_intent": state.router_output.user_intent,
-                    "needs_decomposition": state.router_output.needs_decomposition,
                     "scope_source": state.scope_result.source if state.scope_result else None,
                     "scope_doc_ids": _scope_doc_ids,
                     "scope_per_entity_doc_ids": _scope_per_entity,
@@ -445,12 +476,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             )
             if lf:
                 lf.update_current_span(
+                    input={"query": state.user_query_raw},
+                    output={
+                        "route": state.router_output.route,
+                        "query_shape": getattr(state.router_output, "query_shape", None),
+                        "entities": [e.model_dump() for e in state.router_output.entities],
+                        "user_intent": state.router_output.user_intent,
+                    },
                     metadata={
                         "scope_source": state.scope_result.source if state.scope_result else None,
                         "scope_doc_ids": _scope_doc_ids,
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
                         "scope_per_entity_doc_ids": _scope_per_entity,
-                    }
+                        "scope_entity_manifest": _scope_entity_manifest,
+                    },
                 )
 
             # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
@@ -489,133 +528,265 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
                 return
 
-            # 3.5 transform_query — retrieval route only
-            if state.processed_query.route == "retrieve" and llm_request.user_id:
-                await _log_stage("transform_query")
-                doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
-                per_entity = state.scope_result.per_entity_doc_ids if state.scope_result else None
-                known_entity_names: list[str] = list(per_entity.keys()) if per_entity else []
+            agent_cfg = get_agent_config()
+            _use_agent = (
+                agent_cfg["enabled"]
+                and state.processed_query.route == "retrieve"
+                and llm_request.user_id is not None
+            )
 
-                # Decomposition guard: disable when fewer than 2 resolved entities
-                needs_decomp = state.router_output.needs_decomposition
-                decomp_overridden = False
-                if needs_decomp and (not per_entity or len(per_entity) < 2):
-                    needs_decomp = False
-                    decomp_overridden = True
+            # 3.5 / 4 — agent branch or classic single-pass
+            if _use_agent:
+                _tool_model_id: str = agent_cfg["tool_model"]
+                _tool_llm = router.get(_tool_model_id)
+                if not _tool_llm.capabilities.get("tool_calling", False):
+                    raise RuntimeError(
+                        f"AGENT_TOOL_MODEL={_tool_model_id!r} does not have tool_calling: true in models.yaml"
+                    )
+
+                # Step 25: mark this request as agentic for DB queries/dashboards
+                llm_request.request_type = "chat_agent"
+                await session.flush()
+
+                await _log_stage("agent_loop")
+
+                _agent_lf_stack = contextlib.ExitStack()
+                if lf:
+                    _agent_lf_stack.enter_context(
+                        lf.start_as_current_observation(
+                            as_type="chain",
+                            name="agent_loop",
+                            input={
+                                "query": state.user_query_raw,
+                                "query_shape": getattr(state.router_output, "query_shape", None),
+                                "tool_model": _tool_model_id,
+                            },
+                        )
+                    )
+                try:
+                    chunk_registry, agent_findings, agent_meta = await run_agent_loop(
+                        state, _tool_llm, session, redis_app, request_id, _get_reranker()
+                    )
+                    if lf:
+                        lf.update_current_span(
+                            output={
+                                "iterations": agent_meta.iterations,
+                                "tool_calls_total": agent_meta.tool_calls_total,
+                                "convergence_reason": agent_meta.convergence_reason,
+                                "chunks_collected": len(chunk_registry),
+                            },
+                            metadata={
+                                "input_tokens_total": agent_meta.input_tokens_total,
+                                "output_tokens_total": agent_meta.output_tokens_total,
+                                "cost_usd_total": agent_meta.cost_usd_total,
+                            },
+                        )
+                finally:
+                    _agent_lf_stack.close()
+
+                state.agent_meta = agent_meta
+                state.used_agent_loop = True
+
+                ordered = _order_chunks(chunk_registry)
+
+                processed: ProcessedFindings | None = None
+                if agent_findings is not None:
+                    # Step 3: defence-in-depth — inject stubs for entities the agent never searched
+                    if (
+                        isinstance(agent_findings, _AgentFindings)
+                        and state.scope_result
+                        and state.scope_result.per_entity_doc_ids
+                    ):
+                        covered = {f.entity for f in agent_findings.findings}
+                        missing_stubs = tuple(
+                            _EntityFinding(
+                                entity=name, available=False, reason="not searched by agent"
+                            )
+                            for name in sorted(state.scope_result.per_entity_doc_ids.keys())
+                            if name not in covered
+                        )
+                        if missing_stubs:
+                            agent_findings = _dc.replace(
+                                agent_findings,
+                                findings=agent_findings.findings + missing_stubs,
+                            )
+
+                    agent_findings_json = _json.dumps(_dc.asdict(agent_findings))
+
+                    _fp_lf_stack = contextlib.ExitStack()
+                    if lf:
+                        _fp_lf_stack.enter_context(
+                            lf.start_as_current_observation(
+                                as_type="span",
+                                name="findings_processor",
+                                input={
+                                    "type": type(agent_findings).__name__,
+                                    "findings_count": len(agent_findings.findings)
+                                    if isinstance(agent_findings, _AgentFindings)
+                                    else None,
+                                },
+                            )
+                        )
+                    try:
+                        processed = await process_findings(agent_findings)
+                        if lf:
+                            lf.update_current_span(
+                                metadata={
+                                    "currency_converted": processed.currency_converted,
+                                    "answer_entity": processed.answer_entity,
+                                    "fx_rates_used": processed.fx_rates_used,
+                                    "agent_findings": agent_findings_json,
+                                }
+                            )
+                    finally:
+                        _fp_lf_stack.close()
+
+                    agent_meta.currency_normalized = processed.currency_converted
+                    _agent_answer_entity = processed.answer_entity
+                    _agent_fx_rates = processed.fx_rates_used
+
+                    # Step 11: narrow synthesis context to cited chunks + top-3-per-doc-id floor.
+                    cited_ids: set[UUID] = set()
+                    if isinstance(agent_findings, _AgentFindings):
+                        for _f in agent_findings.findings:
+                            for _sc in _f.source_chunks or []:
+                                with contextlib.suppress(Exception):
+                                    cited_ids.add(UUID(_sc))
+                    elif isinstance(agent_findings, _AnalyticalFindings):
+                        for _obs in agent_findings.observations:
+                            for _ec in _obs.evidence_chunks or []:
+                                with contextlib.suppress(Exception):
+                                    cited_ids.add(UUID(_ec))
+
+                    _doc_floor_counts: dict[UUID, int] = {}
+                    _floor_ids: set[UUID] = set()
+                    for _c in ordered:
+                        if _doc_floor_counts.get(_c.document_id, 0) < 3:
+                            _floor_ids.add(_c.chunk_id)
+                            _doc_floor_counts[_c.document_id] = (
+                                _doc_floor_counts.get(_c.document_id, 0) + 1
+                            )
+
+                    keep_ids = cited_ids | _floor_ids
+                    synthesis_chunks = [c for c in ordered if c.chunk_id in keep_ids]
+                else:
+                    synthesis_chunks = ordered
+
+                chunk_ids = [c.chunk_id for c in synthesis_chunks]
+                payloads = await get_chunk_prompt_payloads(session, chunk_ids)
+                state.rag_context, _ = assemble_rag_context(
+                    synthesis_chunks, payloads, assume_unique=True
+                )
+
+                # Step 6: UUID→ref_id map (follows assemble_rag_context — ref_ids assigned there)
+                _chunk_id_to_ref: dict[str, str] = {
+                    str(item.chunk_id): item.ref_id for item in state.rag_context.items
+                }
+
+                if processed is not None:
+                    if processed.analytical_findings is not None:
+                        findings_block = _render_observations_block(
+                            processed.analytical_findings, chunk_id_to_ref=_chunk_id_to_ref
+                        )
+                    else:
+                        findings_block = _render_findings_block(
+                            processed, chunk_id_to_ref=_chunk_id_to_ref
+                        )
+
+                    state.rag_context_str = (
+                        findings_block + "\n\n" + (state.rag_context.formatted_context or "")
+                    )
+                else:
+                    state.rag_context_str = (
+                        state.rag_context.formatted_context or "(No document context.)"
+                    )
+
+                logger.info(
+                    "agent_loop_complete",
+                    extra={
+                        "request_id": request_id,
+                        "iterations": agent_meta.iterations,
+                        "tool_calls_total": agent_meta.tool_calls_total,
+                        "convergence_reason": agent_meta.convergence_reason,
+                        "chunks_collected": len(chunk_registry),
+                        "findings_set": agent_findings is not None,
+                    },
+                )
+
+            else:
+                # 3.5 rewrite_query — retrieval route only
+                if state.processed_query.route == "retrieve" and llm_request.user_id:
+                    await _log_stage("transform_query")
+                    doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
+
+                    scope_docs: list[ScopeDocSummary] = []
+                    if doc_ids_scope:
+                        cfg = get_query_transformer_config()
+                        doc_repo = DocumentRepository(session)
+                        rows = await doc_repo.get_scope_doc_summaries(
+                            llm_request.user_id, doc_ids_scope, limit=cfg["max_scope_docs"]
+                        )
+                        scope_docs = [
+                            ScopeDocSummary(document_id=r[0], company=r[1], year=r[2]) for r in rows
+                        ]
+
+                    try:
+                        state.transformed_query, _ = await rewrite_query(
+                            state.user_query_raw,
+                            conversation_history=[
+                                {"role": m.role.value, "content": m.content}
+                                for m in (state.context_messages or [])
+                            ],
+                            user_intent=state.router_output.user_intent,
+                            scope_docs=scope_docs,
+                            llm_router=router,
+                            session=session,
+                            parent_request_id=llm_request.id,
+                            conversation_id=state.conversation_id,
+                            user_id=llm_request.user_id,
+                        )
+                    except Exception:
+                        logger.exception("query_rewrite_failed", extra={"request_id": request_id})
+                        state.transformed_query = TransformedQuery(
+                            semantic_query=state.user_query_raw,
+                            keyword_query=state.user_query_raw,
+                            fallback=True,
+                        )
+
+                    tq = state.transformed_query
                     logger.info(
-                        "decomposition_overridden",
+                        "query_rewrite_result",
                         extra={
                             "request_id": request_id,
-                            "reason": "insufficient_entities",
-                            "entity_count": len(per_entity) if per_entity else 0,
+                            "semantic_query": tq.semantic_query,
+                            "keyword_query": tq.keyword_query,
+                            "fallback": tq.fallback,
                         },
                     )
 
-                scope_docs: list[ScopeDocSummary] = []
-                if doc_ids_scope:
-                    cfg = get_query_transformer_config()
-                    doc_repo = DocumentRepository(session)
-                    rows = await doc_repo.get_scope_doc_summaries(
-                        llm_request.user_id, doc_ids_scope, limit=cfg["max_scope_docs"]
-                    )
-                    scope_docs = [
-                        ScopeDocSummary(document_id=r[0], company=r[1], year=r[2]) for r in rows
-                    ]
-
-                transformer_input = TransformerInput(
-                    user_query_raw=state.user_query_raw,
-                    conversation_history=[
-                        {"role": m.role.value, "content": m.content}
-                        for m in (state.context_messages or [])
-                    ],
-                    router_entities=state.router_output.entities,
-                    user_intent=state.router_output.user_intent,
-                    needs_decomposition=needs_decomp,
-                    scope_docs=scope_docs,
-                    known_entity_names=known_entity_names,
-                )
-                try:
-                    state.transformed_query = await transform_query(
-                        transformer_input,
-                        llm_router=router,
-                        session=session,
-                        parent_request_id=llm_request.id,
-                        conversation_id=state.conversation_id,
-                        user_id=llm_request.user_id,
-                    )
-                    if decomp_overridden:
-                        state.transformed_query.decomposition_overridden = True
-                except Exception:
-                    logger.exception("query_transform_failed", extra={"request_id": request_id})
-                    state.transformed_query = TransformedQuery(
+                # 4. build_rag_context
+                await _log_stage("build_rag_context")
+                if state.processed_query.route == "direct_answer" or not llm_request.user_id:
+                    state.rag_context_str = "(No document context - general question.)"
+                else:
+                    doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
+                    transformed = state.transformed_query or TransformedQuery(
                         semantic_query=state.user_query_raw,
                         keyword_query=state.user_query_raw,
                         fallback=True,
                     )
 
-                tq = state.transformed_query
-                logger.info(
-                    "query_transform_result",
-                    extra={
-                        "request_id": request_id,
-                        "semantic_query": tq.semantic_query,
-                        "keyword_query": tq.keyword_query,
-                        "fallback": tq.fallback,
-                        "decomposition_overridden": tq.decomposition_overridden,
-                        "sub_query_count": len(tq.sub_queries),
-                        "sub_queries": [
-                            {
-                                "focus_entity": s.focus_entity,
-                                "semantic_query": s.semantic_query,
-                                "keyword_query": s.keyword_query,
-                                "entity_match_quality": s.entity_match_quality,
-                            }
-                            for s in tq.sub_queries
-                        ],
-                    },
-                )
-
-            # 4. build_rag_context
-            await _log_stage("build_rag_context")
-            if state.processed_query.route == "direct_answer" or not llm_request.user_id:
-                state.rag_context_str = "(No document context - general question.)"
-            else:
-                doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
-                transformed = state.transformed_query or TransformedQuery(
-                    semantic_query=state.user_query_raw,
-                    keyword_query=state.user_query_raw,
-                    fallback=True,
-                )
-                per_entity = state.scope_result.per_entity_doc_ids if state.scope_result else None
-                sub_doc_ids: list[list[UUID] | None] | None = None
-                if transformed.sub_queries and per_entity:
-                    sub_doc_ids = []
-                    for sub in transformed.sub_queries:
-                        ids = per_entity.get(sub.focus_entity)
-                        if not ids:
-                            logger.warning(
-                                "subquery_entity_unresolved",
-                                extra={
-                                    "request_id": request_id,
-                                    "focus_entity": sub.focus_entity,
-                                    "match_quality": sub.entity_match_quality,
-                                },
-                            )
-                        if ids:
-                            sub_doc_ids.append(ids)
-
-                state.rag_context, retrieval_trace = await run_chat_rag_pipeline(
-                    session,
-                    transformed=transformed,
-                    user_id=llm_request.user_id,
-                    doc_ids=doc_ids,
-                    sub_doc_ids=sub_doc_ids,
-                    reranker=_get_reranker(),
-                )
-                state.rag_context_str = (
-                    state.rag_context.formatted_context
-                    or "(No document context - general question.)"
-                )
+                    state.rag_context, retrieval_trace, _ = await run_chat_rag_pipeline(
+                        session,
+                        transformed=transformed,
+                        user_id=llm_request.user_id,
+                        doc_ids=doc_ids,
+                        reranker=_get_reranker(),
+                    )
+                    state.rag_context_str = (
+                        state.rag_context.formatted_context
+                        or "(No document context - general question.)"
+                    )
 
             top_score = (
                 state.rag_context.items[0].score
@@ -637,7 +808,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 return
 
             citation_mode = llm.capabilities.get("citation_mode", "none")
-            prompt_version = "v3_bracket" if citation_mode == "bracket" else "v3_none"
+            if citation_mode == "bracket":
+                prompt_version = "v3_agent_synthesis" if state.used_agent_loop else "v3_bracket"
+            else:
+                prompt_version = "v3_none"
 
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})
@@ -769,6 +943,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             for item in state.rag_context.items
                         ]
 
+                    if agent_findings_json is not None:
+                        citation_meta["agent_findings"] = agent_findings_json
+
                     # Finalize stage times (stream_llm_response ends here)
                     stage_times[current_stage] = round(perf_counter() - stage_start, 3)
                     total_time = round(perf_counter() - pipeline_started_at, 3)
@@ -791,7 +968,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             if state.router_output.reasoning
                             else None,
                             "user_intent": state.router_output.user_intent,
-                            "needs_decomposition": state.router_output.needs_decomposition,
                             "entities": [e.model_dump() for e in state.router_output.entities],
                             "scope_source": state.scope_result.source
                             if state.scope_result
@@ -803,12 +979,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         trace_payload["query_transform"] = {
                             "semantic_query": tq.semantic_query,
                             "keyword_query": tq.keyword_query,
-                            "sub_queries": [sq.model_dump() for sq in tq.sub_queries],
                             "fallback": tq.fallback,
-                            "decomposition_overridden": tq.decomposition_overridden,
                         }
                     if retrieval_trace is not None:
                         trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
+                    if state.agent_meta is not None:
+                        m = state.agent_meta
+                        trace_payload["agent"] = {
+                            "iterations": m.iterations,
+                            "tool_calls_total": m.tool_calls_total,
+                            "convergence_reason": m.convergence_reason,
+                            "currency_normalized": m.currency_normalized,
+                            "answer_entity": _agent_answer_entity,
+                            "fx_rates_used": _agent_fx_rates,
+                        }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,
                         "top_reranker_score": top_score,
@@ -837,6 +1021,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         metadata_updates=citation_meta or None,
                         trace=trace_payload,
                         trace_id=lf_trace_id,
+                        agent_findings=_json.loads(agent_findings_json)
+                        if agent_findings_json
+                        else None,
                     )
                     if chunk.stats:
                         await llm_request_repo.update_on_final(

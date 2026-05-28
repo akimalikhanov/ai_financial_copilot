@@ -8,14 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.eval.schemas import EvalQuestion
 from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.query_transform import ScopeDocSummary, TransformerInput
+from src.schemas.query_transform import ScopeDocSummary
 from src.schemas.retrieval import AnswerCitationSpan, RAGContext, RetrievalTrace
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
-from src.services.retrieval.query_transformer import transform_query
+from src.services.retrieval.query_transformer import rewrite_query
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
 from src.utils.config import get_chat_retrieval_timeout
@@ -81,37 +81,21 @@ async def run_one(
             usage=stats,
         )
 
-    # Build transformer input — no conversation history, no scope decomposition
     doc_ids = scope_result.doc_ids if scope_result else None
-    known_entity_names: list[str] = []
-    if scope_result and scope_result.per_entity_doc_ids:
-        known_entity_names = list(scope_result.per_entity_doc_ids.keys())
-
     scope_docs: list[ScopeDocSummary] = []
 
-    transformer_inp = TransformerInput(
-        user_query_raw=question.question,
-        router_entities=router_out.entities,
+    transformed, _ = await rewrite_query(
+        question.question,
         user_intent=router_out.user_intent,
-        needs_decomposition=router_out.needs_decomposition,
         scope_docs=scope_docs,
-        known_entity_names=known_entity_names,
+        llm_router=router,
     )
-    transformed = await transform_query(transformer_inp, llm_router=router)
 
-    # Compute sub_doc_ids for multi-pass if entities resolved to per_entity_doc_ids
-    sub_doc_ids: list[list[UUID] | None] | None = None
-    if transformed.sub_queries and scope_result and scope_result.per_entity_doc_ids:
-        sub_doc_ids = [
-            scope_result.per_entity_doc_ids.get(sq.focus_entity) for sq in transformed.sub_queries
-        ]
-
-    rag_context, retrieval_trace = await run_chat_rag_pipeline(
+    rag_context, retrieval_trace, _ = await run_chat_rag_pipeline(
         session,
         transformed=transformed,
         user_id=user_id,
         doc_ids=doc_ids,
-        sub_doc_ids=sub_doc_ids,
         timeout=get_chat_retrieval_timeout(),
         reranker=get_reranker(),
     )

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Literal
 from uuid import UUID
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.query_transform import SubQuery, TransformedQuery, TransformerInput
-from src.services.llm_adapters.base_adapter import ChatMessage, Role
+from src.schemas.query_transform import ScopeDocSummary, TransformedQuery, TransformerInput
+from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
 from src.services.prompts.prompt_renderer import get_prompt_renderer
@@ -36,16 +37,11 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[: max_tokens * 4].rstrip() + "..."
 
 
-def _transformer_response_format() -> dict:
-    # Build schema with only LLM-facing fields — runtime-only fields (fallback,
-    # decomposition_overridden) are stripped by _parse_transformer_response and must
-    # not appear in required[], which was causing OpenAI to truncate after sub_queries=[].
+def _rewriter_response_format() -> dict:
     schema = TransformedQuery.model_json_schema()
-    runtime_fields = {"fallback", "decomposition_overridden"}
-    for field in runtime_fields:
-        schema.get("properties", {}).pop(field, None)
+    schema.get("properties", {}).pop("fallback", None)
     if "required" in schema:
-        schema["required"] = [f for f in schema["required"] if f not in runtime_fields]
+        schema["required"] = [f for f in schema["required"] if f != "fallback"]
     return build_response_format("query_transformer", schema)
 
 
@@ -63,12 +59,6 @@ def _build_messages(inp: TransformerInput, system: str) -> list[ChatMessage]:
             lines.append(meta)
         parts.append("\n".join(lines))
 
-    if inp.known_entity_names:
-        lines = ["Known entities (use these EXACTLY as focus_entity values):"]
-        for i, name in enumerate(inp.known_entity_names):
-            lines.append(f"  [{i}] {name}")
-        parts.append("\n".join(lines))
-
     if inp.conversation_history:
         turns = []
         for turn in inp.conversation_history:
@@ -79,13 +69,7 @@ def _build_messages(inp: TransformerInput, system: str) -> list[ChatMessage]:
             turns.append(f"{role}: {content}")
         parts.append("Recent conversation:\n" + "\n".join(turns))
 
-    router_signals = (
-        f"Router signals:\n"
-        f"  user_intent: {inp.user_intent}\n"
-        f"  needs_decomposition: {inp.needs_decomposition}\n"
-        f"  entities: {[e.name for e in inp.router_entities]}"
-    )
-    parts.append(router_signals)
+    parts.append(f"Router signals:\n  user_intent: {inp.user_intent}")
     parts.append(f"User query: {inp.user_query_raw}")
 
     return [
@@ -94,8 +78,7 @@ def _build_messages(inp: TransformerInput, system: str) -> list[ChatMessage]:
     ]
 
 
-def _parse_transformer_response(raw: str) -> tuple[TransformedQuery | None, str | None]:
-    """Returns (TransformedQuery, None) on success, (None, error_msg) on failure."""
+def _parse_response(raw: str) -> tuple[TransformedQuery | None, str | None]:
     text = (raw or "").strip()
     if not text:
         return None, "Empty response"
@@ -103,75 +86,47 @@ def _parse_transformer_response(raw: str) -> tuple[TransformedQuery | None, str 
         data = json.loads(text)
     except json.JSONDecodeError as e:
         return None, f"Invalid JSON: {e}"
-    # Strip runtime-only fields before validation so the LLM output validates cleanly
     data.pop("fallback", None)
-    data.pop("decomposition_overridden", None)
-    for sub in data.get("sub_queries", []):
-        sub.pop("entity_match_quality", None)
     try:
         return TransformedQuery.model_validate(data), None
     except ValidationError as e:
         return None, f"Schema validation failed: {e}"
 
 
-def _resolve_focus_entity(focus: str, known: list[str]) -> tuple[str | None, str]:
-    """Exact-match-or-drop. Returns (resolved_name, match_quality)."""
-    if focus in known:
-        return focus, "exact"
-    return None, "dropped"
-
-
-def _normalize_transformed(
-    raw: TransformedQuery,
-    inp: TransformerInput,
-    known_entities: list[str],
-) -> TransformedQuery:
-    """Deterministic post-LLM corrections. Returns fallback on fatal issues."""
-    # Empty-string guard
+def _normalize(raw: TransformedQuery, user_query_raw: str) -> TransformedQuery:
     if not raw.semantic_query.strip() or not raw.keyword_query.strip():
-        logger.warning("transformer_empty_rewrite")
-        return _fallback(inp.user_query_raw)
-
-    # Decomposition enforcement
-    sub_queries = raw.sub_queries
-    if not inp.needs_decomposition and sub_queries:
-        logger.info("sub_queries_stripped", extra={"count": len(sub_queries)})
-        sub_queries = []
-
-    # Sub-query cap
-    if len(sub_queries) > 5:
-        logger.warning("sub_queries_capped", extra={"original": len(sub_queries)})
-        sub_queries = sub_queries[:5]
-
-    # Focus entity resolution — drop unresolved sub-queries
-    resolved_subs: list[SubQuery] = []
-    for sub in sub_queries:
-        name, quality = _resolve_focus_entity(sub.focus_entity, known_entities)
-        if quality == "dropped":
-            logger.warning(
-                "sub_query_dropped_unresolved_entity",
-                extra={"focus_entity": sub.focus_entity},
-            )
-            continue
-        resolved_subs.append(sub.model_copy(update={"entity_match_quality": quality}))
-
-    return raw.model_copy(update={"sub_queries": resolved_subs})
+        logger.warning("rewrite_query_empty_rewrite")
+        return _fallback(user_query_raw)
+    return raw
 
 
-async def transform_query(
-    inp: TransformerInput,
+def _modes_for(search_mode: Literal["hybrid", "vector", "keyword"]) -> dict:
+    """Return prompt hints for which queries are needed given the search mode."""
+    return {
+        "hybrid": {},
+        "vector": {"skip_keyword": True},
+        "keyword": {"skip_semantic_embed": True},
+    }[search_mode]
+
+
+async def rewrite_query(
+    raw_query: str,
     *,
+    scope_docs: list[ScopeDocSummary] | None = None,
+    conversation_history: list[dict] | None = None,
+    user_intent: str = "retrieval",
     llm_router: LLMRouter | None = None,
     session: AsyncSession | None = None,
     parent_request_id: UUID | None = None,
     conversation_id: UUID | None = None,
     user_id: UUID | None = None,
-) -> TransformedQuery:
-    """Transform a raw user query into asymmetric semantic + keyword rewrites.
+    extra_request_params: dict | None = None,
+) -> tuple[TransformedQuery, LLMResponseStats | None]:
+    """Rewrite a raw query into semantic + keyword forms for hybrid RAG.
 
-    Degrades gracefully: on any error returns fallback with raw query repeated.
-    When session/parent_request_id/conversation_id are provided, each LLM call
-    is logged to llm_requests as a sub-request for cost/token aggregation.
+    Replaces transform_query(). No decomposition — the agent loop handles multi-entity
+    by issuing one rewrite_query call per search_documents tool call.
+    Degrades gracefully: any error returns fallback with raw query repeated.
     """
     router = llm_router if llm_router is not None else get_router()
     model_id = get_query_transformer_model()
@@ -179,41 +134,50 @@ async def transform_query(
     should_log_subrequest = (
         session is not None and parent_request_id is not None and conversation_id is not None
     )
-    request_params = {
+    request_params: dict = {
         "temperature": cfg["temperature"],
         "max_tokens": int(cfg["max_tokens"]),
+        **(extra_request_params or {}),
     }
 
     try:
         llm = router.get(model_id)
     except Exception:
-        logger.warning("transform_query_model_unavailable", extra={"model": model_id})
-        return _fallback(inp.user_query_raw)
+        logger.warning("rewrite_query_model_unavailable", extra={"model": model_id})
+        return _fallback(raw_query), None
 
     try:
         prompt = get_prompt_loader().load("query_transformer", "v2")
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
-        logger.warning("transform_query_prompt_missing")
-        return _fallback(inp.user_query_raw)
+        logger.warning("rewrite_query_prompt_missing")
+        return _fallback(raw_query), None
 
-    response_format = _transformer_response_format()
+    inp = TransformerInput(
+        user_query_raw=raw_query,
+        conversation_history=conversation_history or [],
+        user_intent=user_intent,
+        scope_docs=scope_docs or [],
+    )
+    response_format = _rewriter_response_format()
     messages = _build_messages(inp, system)
-    known_entities = inp.known_entity_names
 
     output: TransformedQuery | None = None
+    last_stats: LLMResponseStats | None = None
     for attempt in range(2):
         try:
             resp = await llm.complete(
                 messages=messages,
-                _lf_name="query_transformer",
+                _lf_name="rewrite_query",
                 temperature=cfg["temperature"],
                 max_tokens=int(cfg["max_tokens"]),
                 response_format=response_format,
             )
         except Exception as e:
-            logger.exception("transform_query_llm_error", extra={"error": str(e)})
-            return _fallback(inp.user_query_raw)
+            logger.exception("rewrite_query_llm_error", extra={"error": str(e)})
+            return _fallback(raw_query), last_stats
+
+        last_stats = resp.stats
 
         if should_log_subrequest:
             await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
@@ -222,28 +186,27 @@ async def transform_query(
                 user_id=user_id,
                 provider=llm.provider,
                 model=model_id,
-                request_type="query_transformer",
+                request_type="rewrite_query",
                 request_params=request_params,
                 status="completed",
                 **stats_to_request_kwargs(resp.stats),
             )
 
-        raw_text = resp.text or ""
-        result, error = _parse_transformer_response(raw_text)
+        result, error = _parse_response(resp.text or "")
         if result is not None:
             output = result
             break
 
         logger.warning(
-            "transform_query_parse_failed attempt=%d error=%s raw=%r",
+            "rewrite_query_parse_failed attempt=%d error=%s raw=%r",
             attempt,
             error,
-            raw_text[:300],
+            (resp.text or "")[:300],
         )
         if attempt == 0:
             retry_content = (
-                f"User query: {inp.user_query_raw}\n\n"
-                f"Previous response: {raw_text[:300]}\n"
+                f"User query: {raw_query}\n\n"
+                f"Previous response: {(resp.text or '')[:300]}\n"
                 f"Error: {error}\n\n"
                 "Fix the error. Return ONLY valid JSON matching the required schema."
             )
@@ -253,12 +216,8 @@ async def transform_query(
             ]
 
     if output is None:
-        return _fallback(inp.user_query_raw)
+        return _fallback(raw_query), last_stats
 
-    normalized = _normalize_transformed(output, inp, known_entities)
-    logger.info(
-        "transform_query_done fallback=%s sub_queries=%d",
-        normalized.fallback,
-        len(normalized.sub_queries),
-    )
-    return normalized
+    normalized = _normalize(output, raw_query)
+    logger.info("rewrite_query_done fallback=%s", normalized.fallback)
+    return normalized, last_stats

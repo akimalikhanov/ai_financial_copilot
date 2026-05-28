@@ -458,6 +458,9 @@ CREATE TABLE IF NOT EXISTS messages (
   trace              jsonb,
   -- Pipeline trace: stage timings, router decision, retrieval hits (IDs+scores). NULL for user messages.
 
+  agent_findings     jsonb,
+  -- Structured agent findings (AgentFindings or AnalyticalFindings) serialised as JSON. NULL for non-agentic messages.
+
   client_msg_id      text,
   -- Optional idempotency key from client. Unique per conversation to prevent duplicates on retries.
 

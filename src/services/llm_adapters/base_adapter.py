@@ -16,11 +16,26 @@ class Role(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolCallRef:
+    id: str
+    name: str
+    arguments: str  # raw JSON
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantTurnResult:
+    text: str
+    tool_calls: list[ToolCallRef]
+    stats: LLMResponseStats | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Role
-    content: str
+    content: str | None = None  # None valid for assistant tool-call turns
     name: str | None = None  # tool name (or function name)
     tool_call_id: str | None = None  # ties tool result to assistant tool call
+    tool_calls: tuple[ToolCallRef, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +124,14 @@ class LLMAdapter(ABC):
             extra_params=kwargs,
         )
         return self._stream(req)
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: list[dict],
+        **kwargs: Any,
+    ) -> AssistantTurnResult:
+        raise NotImplementedError(f"{self.__class__.__name__} does not support tool calling")
 
     @abstractmethod
     async def _complete(self, req: ChatRequest) -> LLMResponse:

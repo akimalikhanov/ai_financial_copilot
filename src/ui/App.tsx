@@ -251,12 +251,39 @@ const STAGE_LABELS: Record<string, string> = {
   build_conversation_context: 'Building context',
   scan_user_input: 'Scanning input',
   route_query: 'Routing query',
+  agent_loop: 'Searching documents',
+  // classic (non-agent) fallback stages — shown if agent loop is disabled
   transform_query: 'Transforming query',
   build_rag_context: 'Retrieving sources',
   render_prompt: 'Rendering prompt',
   stream_llm_response: 'Generating answer',
   persist_and_emit: 'Finalizing',
 };
+
+// Ordered stages as seen by the agent path (used for the stepper)
+const AGENT_STAGES = [
+  'load_and_validate_request',
+  'build_conversation_context',
+  'scan_user_input',
+  'route_query',
+  'agent_loop',
+  'render_prompt',
+  'stream_llm_response',
+  'persist_and_emit',
+];
+
+// Ordered stages for classic (non-agent) path
+const CLASSIC_STAGES = [
+  'load_and_validate_request',
+  'build_conversation_context',
+  'scan_user_input',
+  'route_query',
+  'transform_query',
+  'build_rag_context',
+  'render_prompt',
+  'stream_llm_response',
+  'persist_and_emit',
+];
 
 const INGEST_STAGE_LABELS: Record<string, string> = {
   fetch_document_record: 'Starting',
@@ -272,14 +299,15 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   index_and_backup_chunks: 'Indexing',
   finalize_ready: 'Finalizing',
 };
-const ALL_STAGES = Object.keys(STAGE_LABELS);
-
 interface StageRecord { stage: string; startedAt: number; endedAt?: number; }
+
+interface ToolCallRecord { entity: string; startedAt: number; endedAt?: number; chunksReturned?: number; }
 
 interface StageSnapshot {
   current: StageEvent;
   records: StageRecord[];
-  done: boolean; // pipeline finished
+  toolCalls: ToolCallRecord[];
+  done: boolean;
 }
 
 function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
@@ -288,7 +316,6 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
   const prevStageRef = React.useRef(snapshot.current.stage);
   const [labelKey, setLabelKey] = React.useState(0);
 
-  // Bump labelKey on stage change to retrigger the fade animation
   React.useEffect(() => {
     if (snapshot.current.stage !== prevStageRef.current) {
       prevStageRef.current = snapshot.current.stage;
@@ -296,7 +323,6 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
     }
   }, [snapshot.current.stage]);
 
-  // Tick every 100ms while active so elapsed timers stay live
   React.useEffect(() => {
     if (snapshot.done) return;
     const id = setInterval(() => setTick(t => t + 1), 100);
@@ -304,6 +330,11 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
   }, [snapshot.done]);
 
   void tick;
+
+  // Default to agent path; only switch to classic if transform_query is seen
+  const isClassicPath = snapshot.records.some(r => r.stage === 'transform_query') ||
+    snapshot.current.stage === 'transform_query';
+  const stages = isClassicPath ? CLASSIC_STAGES : AGENT_STAGES;
 
   const first = snapshot.records[0]?.startedAt;
   const last = snapshot.records[snapshot.records.length - 1]?.endedAt;
@@ -323,7 +354,6 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
         className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--surface-1)] hover:bg-[var(--surface-2)] text-xs"
         style={{ transition: 'background 0.2s, border-color 0.2s' }}
       >
-        {/* Status dot */}
         {snapshot.done ? (
           <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] opacity-60 flex-shrink-0" />
         ) : (
@@ -333,7 +363,6 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
           </span>
         )}
 
-        {/* Label — fades in on each stage change */}
         <span
           key={labelKey}
           className="stage-label-change font-medium text-[var(--text)]"
@@ -342,12 +371,10 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
           {label}
         </span>
 
-        {/* Progress counter */}
         {!snapshot.done && (
           <span className="text-[var(--text-faint)]">{snapshot.current.index}/{snapshot.current.total}</span>
         )}
 
-        {/* Total elapsed */}
         {totalElapsed !== null && (
           <span className="text-[var(--text-faint)]">· {totalElapsed}s</span>
         )}
@@ -359,7 +386,7 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
         />
       </button>
 
-      {/* Expanded stepper — height + opacity animate on open/close */}
+      {/* Expanded stepper */}
       <div
         className="grid"
         style={{
@@ -370,7 +397,7 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
       >
         <div className="overflow-hidden">
           <div className="mt-2.5 ml-1 flex flex-col">
-            {ALL_STAGES.map((s, i) => {
+            {stages.map((s, i) => {
               const rec = snapshot.records.find(r => r.stage === s);
               const isDone = !!rec?.endedAt;
               const isActive = !snapshot.done && s === snapshot.current.stage;
@@ -382,69 +409,141 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
                   ? ((Date.now() - rec!.startedAt) / 1000).toFixed(1) + 's'
                   : null;
 
-              return (
-                <div key={s} className="flex items-stretch gap-3">
-                  {/* Track column */}
-                  <div className="flex flex-col items-center flex-shrink-0" style={{ width: 14 }}>
-                    <div
-                      className="w-px flex-1"
-                      style={{
-                        minHeight: i === 0 ? 0 : 6,
-                        background: isDone || isActive ? 'var(--accent)' : 'var(--border)',
-                        transition: 'background 0.4s ease',
-                        visibility: i === 0 ? 'hidden' : 'visible',
-                      }}
-                    />
-                    {/* Dot — filled when done, hollow pulsating when active */}
-                    <div
-                      style={{
-                        width: 12, height: 12,
-                        borderRadius: '50%',
-                        flexShrink: 0,
-                        border: `2px solid ${isDone || isActive ? 'var(--accent)' : 'var(--border)'}`,
-                        background: isDone ? 'var(--accent)' : 'transparent',
-                        transition: 'border-color 0.4s ease, background 0.4s ease',
-                        animation: isActive ? 'pulse 1.4s ease-in-out infinite' : undefined,
-                      }}
-                    />
-                    <div
-                      className="w-px flex-1"
-                      style={{
-                        minHeight: i === ALL_STAGES.length - 1 ? 0 : 6,
-                        background: isDone ? 'var(--accent)' : 'var(--border)',
-                        transition: 'background 0.4s ease',
-                        visibility: i === ALL_STAGES.length - 1 ? 'hidden' : 'visible',
-                      }}
-                    />
-                  </div>
+              // Skip optional scan_user_input if it never ran
+              if (s === 'scan_user_input' && isPending) return null;
 
-                  {/* Label + timing — always inline, timing immediately after label */}
-                  <div className="flex items-center gap-2 py-1" style={{ minHeight: 28 }}>
-                    <span
-                      className={`text-xs leading-tight ${isActive ? 'stage-label-change' : ''}`}
-                      style={{
-                        color: isActive ? 'var(--text)' : 'var(--text-faint)',
-                        fontWeight: isActive ? 500 : 400,
-                        opacity: isPending ? 0.4 : 1,
-                        transition: 'color 0.3s, opacity 0.3s',
-                      }}
-                    >
-                      {STAGE_LABELS[s]}
-                    </span>
-                    {dur && (
-                      <span
-                        className="text-[10px] font-mono flex-shrink-0"
+              return (
+                <React.Fragment key={s}>
+                  <div className="flex items-stretch gap-3">
+                    {/* Track column */}
+                    <div className="flex flex-col items-center flex-shrink-0" style={{ width: 14 }}>
+                      <div
+                        className="w-px flex-1"
                         style={{
-                          color: 'var(--text-faint)',
-                          opacity: isActive ? 0.65 : 0.45,
-                          transition: 'opacity 0.3s',
+                          minHeight: i === 0 ? 0 : 6,
+                          background: isDone || isActive ? 'var(--accent)' : 'var(--border)',
+                          transition: 'background 0.4s ease',
+                          visibility: i === 0 ? 'hidden' : 'visible',
+                        }}
+                      />
+                      <div
+                        style={{
+                          width: 12, height: 12,
+                          borderRadius: '50%',
+                          flexShrink: 0,
+                          border: `2px solid ${isDone || isActive ? 'var(--accent)' : 'var(--border)'}`,
+                          background: isDone ? 'var(--accent)' : 'transparent',
+                          transition: 'border-color 0.4s ease, background 0.4s ease',
+                          animation: isActive ? 'pulse 1.4s ease-in-out infinite' : undefined,
+                        }}
+                      />
+                      <div
+                        className="w-px flex-1"
+                        style={{
+                          minHeight: i === stages.length - 1 ? 0 : 6,
+                          background: isDone ? 'var(--accent)' : 'var(--border)',
+                          transition: 'background 0.4s ease',
+                          visibility: i === stages.length - 1 ? 'hidden' : 'visible',
+                        }}
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-2 py-1" style={{ minHeight: 28 }}>
+                      <span
+                        className={`text-xs leading-tight ${isActive ? 'stage-label-change' : ''}`}
+                        style={{
+                          color: isActive ? 'var(--text)' : 'var(--text-faint)',
+                          fontWeight: isActive ? 500 : 400,
+                          opacity: isPending ? 0.4 : 1,
+                          transition: 'color 0.3s, opacity 0.3s',
                         }}
                       >
-                        {dur}
+                        {STAGE_LABELS[s]}
                       </span>
-                    )}
+                      {dur && (
+                        <span
+                          className="text-[10px] font-mono flex-shrink-0 ml-1"
+                          style={{
+                            color: 'var(--text-faint)',
+                            opacity: isActive ? 0.65 : 0.45,
+                            transition: 'opacity 0.3s',
+                          }}
+                        >
+                          {dur}
+                        </span>
+                      )}
+                    </div>
                   </div>
-                </div>
+
+                  {/* Tool call sub-items under agent_loop */}
+                  {s === 'agent_loop' && snapshot.toolCalls.length > 0 && (
+                    <div className="ml-8 mb-1 flex flex-col gap-1">
+                      {snapshot.toolCalls.map((tc, ti) => {
+                        const tcDone = !!tc.endedAt;
+                        const tcDur = tc.endedAt
+                          ? ((tc.endedAt - tc.startedAt) / 1000).toFixed(2) + 's'
+                          : ((Date.now() - tc.startedAt) / 1000).toFixed(1) + 's';
+                        return (
+                          <div
+                            key={`${tc.entity}-${ti}`}
+                            className="tc-row-enter flex items-center gap-2"
+                            style={{ animationDelay: `${ti * 40}ms` }}
+                          >
+                            {/* Status dot */}
+                            <span
+                              className={tcDone ? 'tc-dot-pop' : ''}
+                              style={{
+                                display: 'inline-block',
+                                width: 6, height: 6,
+                                borderRadius: '50%',
+                                flexShrink: 0,
+                                background: tcDone ? 'var(--accent)' : 'var(--text-faint)',
+                                opacity: tcDone ? 0.8 : 0.35,
+                                transition: 'background 0.3s ease, opacity 0.3s ease',
+                              }}
+                            />
+
+                            {/* Entity name — shimmer while running, solid when done */}
+                            <span
+                              className={`text-[10px] leading-none ${!tcDone ? 'tc-shimmer' : ''}`}
+                              style={tcDone ? { color: 'var(--text-faint)' } : {}}
+                            >
+                              {tc.entity}
+                            </span>
+
+                            {/* Chunk count badge — fades in on completion */}
+                            {tc.chunksReturned !== undefined && (
+                              <span
+                                className="text-[9px] px-1 py-px rounded-full"
+                                style={{
+                                  background: 'var(--surface-2)',
+                                  color: 'var(--text-faint)',
+                                  border: '1px solid var(--border)',
+                                  opacity: tcDone ? 0.75 : 0,
+                                  transition: 'opacity 0.4s ease',
+                                }}
+                              >
+                                {tc.chunksReturned} chunks
+                              </span>
+                            )}
+
+                            {/* Elapsed time */}
+                            <span
+                              className="text-[9px] font-mono ml-1"
+                              style={{
+                                color: 'var(--text-faint)',
+                                opacity: tcDone ? 0.45 : 0.3,
+                                transition: 'opacity 0.3s ease',
+                              }}
+                            >
+                              {tcDur}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </React.Fragment>
               );
             })}
           </div>
@@ -934,7 +1033,32 @@ export default function App() {
             const closed = records.map((r: StageRecord) => r.endedAt ? r : { ...r, endedAt: now });
             const exists = closed.find((r: StageRecord) => r.stage === stage.stage);
             const next = exists ? closed : [...closed, { stage: stage.stage, startedAt: now }];
-            return { ...snaps, [placeholderId]: { current: stage, records: next, done: false } };
+            return { ...snaps, [placeholderId]: { current: stage, records: next, toolCalls: prev?.toolCalls ?? [], done: false } };
+          });
+        },
+        (ev) => {
+          // tool_call_started: add a new in-flight entry
+          setStageSnapshots(snaps => {
+            const prev = snaps[placeholderId];
+            if (!prev) return snaps;
+            const tc: ToolCallRecord = { entity: ev.entity, startedAt: Date.now() };
+            return { ...snaps, [placeholderId]: { ...prev, toolCalls: [...prev.toolCalls, tc] } };
+          });
+        },
+        (ev) => {
+          // tool_call_completed: close the most recent entry for this entity
+          setStageSnapshots(snaps => {
+            const prev = snaps[placeholderId];
+            if (!prev) return snaps;
+            let found = false;
+            const updated = [...prev.toolCalls].reverse().map(tc => {
+              if (!found && tc.entity === ev.entity && !tc.endedAt) {
+                found = true;
+                return { ...tc, endedAt: Date.now(), chunksReturned: ev.chunks_returned };
+              }
+              return tc;
+            }).reverse();
+            return { ...snaps, [placeholderId]: { ...prev, toolCalls: updated } };
           });
         },
       );

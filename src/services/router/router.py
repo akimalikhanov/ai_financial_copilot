@@ -6,9 +6,11 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.repository.document_repository import DocumentRepository
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_router import (
     DocumentScopeResult,
+    EntityManifestItem,
     RouterInput,
     RouterOutput,
 )
@@ -27,7 +29,6 @@ _FALLBACK = RouterOutput(
     route="retrieval",
     entities=[],
     user_intent="fallback",
-    needs_decomposition=False,
     reasoning="router_fallback",
 )
 
@@ -128,7 +129,7 @@ async def route_query(
         return _FALLBACK, None
 
     try:
-        prompt = get_prompt_loader().load("query_router", "v2")
+        prompt = get_prompt_loader().load("query_router", "v3")
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("route_query_prompt_missing", extra={"model": model_id})
@@ -216,6 +217,35 @@ async def route_query(
 
     if session is not None and user_id is not None and output.route == "retrieval":
         scope_result = await resolve_scope(session, user_id, inp.scope, output)
+        scope_result = await _attach_entity_manifest(session, user_id, scope_result)
         return output, scope_result
 
     return output, None
+
+
+async def _attach_entity_manifest(
+    session: AsyncSession,
+    user_id: UUID,
+    scope_result: DocumentScopeResult,
+) -> DocumentScopeResult:
+    """Fetch doc summaries for each entity and attach as entity_manifest.
+
+    One batched DB query regardless of entity count.
+    No-op when per_entity_doc_ids is absent.
+    """
+    if not scope_result.per_entity_doc_ids:
+        return scope_result
+
+    all_ids = list({d for ids in scope_result.per_entity_doc_ids.values() for d in ids})
+    rows = await DocumentRepository(session).get_scope_doc_summaries(user_id, all_ids, limit=50)
+    id_to_summary = {
+        row[0]: {"doc_id": str(row[0]), "name": row[1], "year": row[2]} for row in rows
+    }
+    manifest = [
+        EntityManifestItem(
+            entity_name=entity,
+            doc_summaries=[id_to_summary[d] for d in ids if d in id_to_summary],
+        )
+        for entity, ids in scope_result.per_entity_doc_ids.items()
+    ]
+    return scope_result.model_copy(update={"entity_manifest": manifest})

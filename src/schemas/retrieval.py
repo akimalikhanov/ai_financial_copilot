@@ -52,6 +52,7 @@ class RetrievedChunk:
     vector_score: float | None = None
     keyword_rank: int | None = None
     keyword_score: float | None = None
+    turn_index: int = 0  # agent loop turn that produced this chunk; 0 for non-agent paths
 
 
 @dataclass(slots=True, frozen=True)

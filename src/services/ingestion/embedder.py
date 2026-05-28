@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 
-from src.utils.config import get_embedding_dim, get_embedding_model, get_embedding_provider
+import httpx
+
+from src.utils.config import (
+    get_embedder_base_url,
+    get_embedder_timeout_seconds,
+    get_embedding_dim,
+    get_embedding_model,
+    get_embedding_provider,
+)
+
+_st_lock = threading.Lock()
 
 
 @lru_cache(maxsize=1)
@@ -16,7 +27,7 @@ def _get_sentence_transformer(model_name: str):
             "sentence-transformers is required for local embeddings. "
             "Install it with `.venv/bin/python -m pip install sentence-transformers`."
         ) from exc
-    return SentenceTransformer(model_name)
+    return SentenceTransformer(model_name, device="cpu")
 
 
 @lru_cache(maxsize=1)
@@ -37,8 +48,21 @@ def reset_clients() -> None:
     _get_openai_client.cache_clear()
 
 
+def _embed_tei(chunks: list[str]) -> list[list[float]]:
+    base_url = get_embedder_base_url().rstrip("/")
+    timeout = get_embedder_timeout_seconds()
+    response = httpx.post(
+        f"{base_url}/embed",
+        json={"inputs": chunks, "normalize": True},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def _embed_local(chunks: list[str], model_name: str) -> list[list[float]]:
-    model = _get_sentence_transformer(model_name)
+    with _st_lock:
+        model = _get_sentence_transformer(model_name)
     vectors = model.encode(chunks, batch_size=32, convert_to_numpy=True, show_progress_bar=False)
     return vectors.tolist()
 
@@ -50,14 +74,16 @@ def _embed_openai(chunks: list[str], model_name: str) -> list[list[float]]:
 
 
 def embed_chunks(chunks: list[str]) -> list[list[float]]:
-    """Batch-embed chunk texts using local model or OpenAI API."""
+    """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer."""
     if not chunks:
         return []
 
     provider = get_embedding_provider()
     model_name = get_embedding_model()
 
-    if provider == "openai":
+    if provider == "tei":
+        vectors = _embed_tei(chunks)
+    elif provider == "openai":
         vectors = _embed_openai(chunks, model_name)
     else:
         vectors = _embed_local(chunks, model_name)
@@ -66,7 +92,7 @@ def embed_chunks(chunks: list[str]) -> list[list[float]]:
     if expected_dim is not None and any(len(v) != expected_dim for v in vectors):
         actual = len(vectors[0]) if vectors else 0
         raise RuntimeError(
-            f"Embedding dimension mismatch: expected {expected_dim}, got {actual} from model '{model_name}'"
+            f"Embedding dimension mismatch: expected {expected_dim}, got {actual} from provider '{provider}'"
         )
 
     return vectors
