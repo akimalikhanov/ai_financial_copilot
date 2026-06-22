@@ -19,7 +19,7 @@ from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
-from src.schemas.retrieval import RetrievedChunk
+from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -29,6 +29,8 @@ from src.services.llm_adapters.base_adapter import (
 )
 from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
+from src.services.retrieval.context_assembler import assemble_rag_context
+from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.query_transformer import rewrite_query
 from src.utils.config import get_agent_config
 
@@ -72,7 +74,10 @@ _REPORT_FINDINGS_TOOL: dict = {
             "required": ["metric_requested", "findings"],
             "properties": {
                 "metric_requested": {"type": "string"},
-                "target_currency": {"type": ["string", "null"]},
+                "target_currency": {
+                    "type": ["string", "null"],
+                    "description": "ISO code (e.g. 'USD') the reported values should be expressed in. Set this whenever the user asked for results in a specific currency — for a single entity or across a comparison. The system converts every finding deterministically; do NOT pre-convert values yourself. Leave null if no target currency was requested.",
+                },
                 "comparison_op": {
                     "type": ["string", "null"],
                     "enum": ["argmin", "argmax", "list", "none", None],
@@ -87,7 +92,11 @@ _REPORT_FINDINGS_TOOL: dict = {
                             "value": {"type": ["number", "null"]},
                             "currency": {"type": ["string", "null"]},
                             "period_end": {"type": ["string", "null"]},
-                            "source_chunks": {"type": "array", "items": {"type": "string"}},
+                            "source_chunks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": 'Excerpt IDs from search results that contain the value, exactly as shown (e.g. ["S3", "S7"]).',
+                            },
                             "available": {"type": "boolean"},
                             "reason": {"type": ["string", "null"]},
                             "unit": {
@@ -123,9 +132,17 @@ _REPORT_ANALYTICAL_TOOL: dict = {
                         "required": ["claim", "evidence_chunks", "confidence"],
                         "properties": {
                             "claim": {"type": "string"},
-                            "evidence_chunks": {"type": "array", "items": {"type": "string"}},
+                            "evidence_chunks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": 'Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',
+                            },
                             "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                            "refuted_by": {"type": ["array", "null"], "items": {"type": "string"}},
+                            "refuted_by": {
+                                "type": ["array", "null"],
+                                "items": {"type": "string"},
+                                "description": "Excerpt IDs that contradict this claim, exactly as shown in search results.",
+                            },
                         },
                         "additionalProperties": False,
                     },
@@ -159,7 +176,10 @@ _CONVERT_CURRENCY_TOOL: dict = {
     },
 }
 
-TOOLS_EXTRACTION_COMPARISON = [_SEARCH_TOOL, _CONVERT_CURRENCY_TOOL, _REPORT_FINDINGS_TOOL]
+# All FX runs through report_findings.target_currency → deterministic conversion in
+# findings_processor. _CONVERT_CURRENCY_TOOL / _execute_convert_currency are intentionally
+# kept but NOT exposed to the agent: add _CONVERT_CURRENCY_TOOL to the list below to revive.
+TOOLS_EXTRACTION_COMPARISON = [_SEARCH_TOOL, _REPORT_FINDINGS_TOOL]
 TOOLS_ANALYTICAL = [_SEARCH_TOOL, _REPORT_ANALYTICAL_TOOL]
 
 _FINALIZER_NAMES = frozenset({"report_findings", "report_analytical_findings"})
@@ -184,7 +204,10 @@ class AgentLoopMeta:
 @dataclass
 class _SearchResult:
     chunks: list[RetrievedChunk]
-    formatted_str: str
+    # Hydrated payloads for chunks — context is assembled later, sequentially, so
+    # S-labels can be numbered globally across all searches in the request.
+    payloads: dict[UUID, ChunkPromptPayload]
+    error_str: str | None = None
     rewrite_stats: LLMResponseStats | None = None
 
 
@@ -294,7 +317,15 @@ async def _execute_search(
             lf.start_as_current_observation(
                 as_type="retriever",
                 name=f"tool_search_{entity}_{iteration}",
-                input={"entity": entity, "query": raw_query},
+                input={
+                    "entity": entity,
+                    "query": raw_query,
+                    # Show the resolved scope this search was constrained to, so the
+                    # trace makes clear which docs the agent could actually see.
+                    "scope_doc_ids": [str(d) for d in doc_ids] if doc_ids else "all",
+                    "scope_doc_count": len(doc_ids) if doc_ids else "all",
+                    "scoped_via_entity": entity in per_entity,
+                },
             )
         )
 
@@ -317,7 +348,7 @@ async def _execute_search(
             fallback=True,
         )
     try:
-        rag_ctx, _, raw_chunks = await run_chat_rag_pipeline(
+        _, _, raw_chunks = await run_chat_rag_pipeline(
             session,
             transformed=transformed,
             user_id=state.llm_request.user_id,  # type: ignore[union-attr]
@@ -333,16 +364,16 @@ async def _execute_search(
             lf.update_current_span(output={"chunks_returned": 0, "error": True})
         return _SearchResult(
             chunks=[],
-            formatted_str=f"Search failed for entity: {entity}",
+            payloads={},
+            error_str=f"Search failed for entity: {entity}",
             rewrite_stats=rewrite_stats,
         )
     finally:
         _search_lf_stack.close()
 
     chunks = [replace(c, turn_index=iteration) for c in raw_chunks]
-    return _SearchResult(
-        chunks=chunks, formatted_str=rag_ctx.formatted_context or "", rewrite_stats=rewrite_stats
-    )
+    payloads = await get_chunk_prompt_payloads(session, [c.chunk_id for c in chunks])
+    return _SearchResult(chunks=chunks, payloads=payloads, rewrite_stats=rewrite_stats)
 
 
 async def _execute_convert_currency(
@@ -417,6 +448,86 @@ def _parse_findings(tc: ToolCallRef) -> AgentFindings | AnalyticalFindings:
         conclusion=data.get("conclusion"),
         gaps=data.get("gaps"),
     )
+
+
+def _resolve_chunk_refs(
+    refs: list[str] | None,
+    ref_registry: dict[str, UUID],
+) -> tuple[list[str], list[str]]:
+    """Map agent-reported chunk refs to chunk UUID strings.
+
+    The agent only ever sees excerpts labeled S1..Sn in tool results, so it reports
+    those labels (not UUIDs). Resolve labels via the per-request registry; pass
+    through anything that is already a UUID. Returns (resolved, unresolved).
+    """
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for ref in refs or []:
+        candidate = ref.strip()
+        try:
+            UUID(candidate)
+        except ValueError:
+            chunk_id = ref_registry.get(candidate.upper())
+            if chunk_id is not None:
+                resolved.append(str(chunk_id))
+            else:
+                unresolved.append(candidate)
+        else:
+            resolved.append(candidate)
+    return resolved, unresolved
+
+
+def _resolve_finding_refs(
+    findings: AgentFindings | AnalyticalFindings,
+    ref_registry: dict[str, UUID],
+    request_id: str,
+) -> AgentFindings | AnalyticalFindings:
+    """Rewrite source_chunks / evidence_chunks / refuted_by S-labels into chunk UUIDs.
+
+    Unresolvable refs are dropped (never propagated downstream — a leaked label would
+    surface in the synthesis prompt as a citable ID that has no matching excerpt).
+    """
+    all_unresolved: list[str] = []
+    result: AgentFindings | AnalyticalFindings
+
+    if isinstance(findings, AgentFindings):
+        new_findings: list[EntityFinding] = []
+        for f in findings.findings:
+            resolved, unresolved = _resolve_chunk_refs(f.source_chunks, ref_registry)
+            all_unresolved.extend(unresolved)
+            new_findings.append(replace(f, source_chunks=resolved))
+        result = replace(findings, findings=tuple(new_findings))
+    else:
+        new_obs: list[Observation] = []
+        for o in findings.observations:
+            evidence, unresolved = _resolve_chunk_refs(o.evidence_chunks, ref_registry)
+            all_unresolved.extend(unresolved)
+            refuted: list[str] | None = o.refuted_by
+            if o.refuted_by is not None:
+                refuted, unresolved = _resolve_chunk_refs(o.refuted_by, ref_registry)
+                all_unresolved.extend(unresolved)
+            new_obs.append(replace(o, evidence_chunks=evidence, refuted_by=refuted))
+        result = replace(findings, observations=tuple(new_obs))
+
+    if all_unresolved:
+        logger.warning(
+            "agent_chunk_refs_unresolved",
+            extra={"request_id": request_id, "unresolved_refs": all_unresolved},
+        )
+    return result
+
+
+def _finding_chunk_ids(findings: AgentFindings | AnalyticalFindings) -> set[str]:
+    """All chunk-id strings referenced by the findings."""
+    ids: set[str] = set()
+    if isinstance(findings, AgentFindings):
+        for f in findings.findings:
+            ids.update(f.source_chunks or [])
+    else:
+        for o in findings.observations:
+            ids.update(o.evidence_chunks or [])
+            ids.update(o.refuted_by or [])
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +624,19 @@ async def run_agent_loop(
     agent_messages.append(ChatMessage(role=Role.user, content=state.user_query_raw))
 
     chunk_registry: dict[UUID, RetrievedChunk] = {}
-    entity_chunk_counts: dict[str, int] = {}
+    # Globally unique S-labels across all searches in this request: tool results are
+    # numbered S1..Sn continuously, and ref_registry maps each label back to its chunk
+    # so labels the agent reports in findings can be resolved to UUIDs.
+    ref_registry: dict[str, UUID] = {}
+    next_ref = 1
+    # Every chunk shown to the agent in tool results, regardless of registry admission —
+    # used to force-admit cited chunks that the per-entity cap excluded.
+    # Per-lookup grouping of the chunks each search first admitted to the registry,
+    # used by the post-loop context-window cap (Step 10). Each search_documents call
+    # gets a distinct lookup_id; capping is deferred to loop end because we cannot tell
+    # whether more lookups will follow until the agent stops searching.
+    lookup_chunks: dict[int, list[UUID]] = {}
+    lookup_count = 0
     searched_entities: set[str] = set()
     token_spend = 0
     output_tokens_total = 0
@@ -560,7 +683,7 @@ async def run_agent_loop(
                 cost_usd_total += turn.stats.cost_usd or 0.0
 
                 # Step 23: log each tool-calling turn as a subrequest row
-                if state.llm_request:
+                if state.llm_request and state.llm_request.conversation_id is not None:
                     with contextlib.suppress(Exception):
                         await LLMRequestRepository(session).create_subrequest(
                             parent_request_id=state.llm_request.id,
@@ -604,24 +727,71 @@ async def run_agent_loop(
 
                 _fin_lf_stack = contextlib.ExitStack()
                 if lf:
+                    try:
+                        _fin_input = json.loads(finalizer_tc.arguments)
+                    except Exception:
+                        _fin_input = {"raw": finalizer_tc.arguments[:500]}
                     _fin_lf_stack.enter_context(
                         lf.start_as_current_observation(
                             as_type="span",
                             name=finalizer_tc.name,
-                            input={"tool": finalizer_tc.name},
+                            input=_fin_input,
                         )
                     )
                 try:
-                    agent_findings = _parse_findings(finalizer_tc)
+                    agent_findings = _resolve_finding_refs(
+                        _parse_findings(finalizer_tc), ref_registry, request_id
+                    )
+                    # All chunks shown to the agent are admitted to the registry at search
+                    # time; the post-loop per-lookup cap explicitly preserves cited chunks
+                    # (see _finding_chunk_ids below), so no force-admit is needed here.
                     if lf:
-                        lf.update_current_span(
-                            output={
-                                "findings_count": len(agent_findings.findings)
-                                if isinstance(agent_findings, AgentFindings)
-                                else None
-                            },
-                            metadata={"parse_ok": True},
-                        )
+                        if isinstance(agent_findings, AgentFindings):
+                            _findings_summary = [
+                                {
+                                    "entity": f.entity,
+                                    "available": f.available,
+                                    "value": f.value,
+                                    "currency": f.currency,
+                                    "unit": f.unit,
+                                    "period_end": f.period_end,
+                                    "source_chunks": f.source_chunks,
+                                    "reason": f.reason,
+                                }
+                                for f in agent_findings.findings
+                            ]
+                            lf.update_current_span(
+                                output={
+                                    "metric_requested": agent_findings.metric_requested,
+                                    "comparison_op": agent_findings.comparison_op,
+                                    "target_currency": agent_findings.target_currency,
+                                    "findings": _findings_summary,
+                                },
+                                metadata={
+                                    "parse_ok": True,
+                                    "findings_count": len(agent_findings.findings),
+                                },
+                            )
+                        else:
+                            lf.update_current_span(
+                                output={
+                                    "question": agent_findings.question,
+                                    "conclusion": agent_findings.conclusion,
+                                    "gaps": agent_findings.gaps,
+                                    "observations": [
+                                        {
+                                            "claim": o.claim,
+                                            "confidence": o.confidence,
+                                            "evidence_chunks": o.evidence_chunks,
+                                        }
+                                        for o in agent_findings.observations
+                                    ],
+                                },
+                                metadata={
+                                    "parse_ok": True,
+                                    "observations_count": len(agent_findings.observations),
+                                },
+                            )
                 except Exception:
                     logger.warning(
                         "agent_findings_parse_failed",
@@ -647,26 +817,10 @@ async def run_agent_loop(
                 convergence_reason = "natural"
                 break
 
-            # Partition tool calls: convert_currency is handled inline; others are search_documents
-            search_tcs = [tc for tc in turn.tool_calls if tc.name != "convert_currency"]
-            convert_tcs = [tc for tc in turn.tool_calls if tc.name == "convert_currency"]
+            search_tcs = turn.tool_calls
 
             tool_calls_total += len(turn.tool_calls)
             agent_messages.append(_assistant_msg_with_tool_calls(turn.tool_calls))
-
-            # Handle convert_currency calls inline (thin FX wrapper, no retrieval)
-            for tc in convert_tcs:
-                args = json.loads(tc.arguments)
-                fx_result = await _execute_convert_currency(
-                    args["amount"], args["from_currency"], args["to_currency"], args["date"]
-                )
-                logger.debug(
-                    "convert_currency",
-                    extra={"request_id": request_id, "iteration": iteration, "result": fx_result},
-                )
-                agent_messages.append(
-                    ChatMessage(role=Role.tool, tool_call_id=tc.id, content=fx_result)
-                )
 
             async def _guarded_search(tc: ToolCallRef, _iter: int = iteration) -> _SearchResult:
                 async with _search_sem:
@@ -684,16 +838,21 @@ async def run_agent_loop(
                     cost_usd_total += result.rewrite_stats.cost_usd or 0.0
                 entity_new = 0
                 entity = json.loads(tc.arguments).get("entity", "")
-                entity_count = entity_chunk_counts.get(entity, 0)
-                # Step 10: per-entity chunk cap — admit top-N by reranker score (chunks already ranked)
+                # Step 10: admit every chunk uncapped here; the per-lookup context-window
+                # cap is applied once after the loop ends. Chunks are tracked by the lookup
+                # that first admitted them so the cap can keep the top-N of each lookup
+                # without discarding a single-lookup query's full set.
+                lookup_id = lookup_count
+                lookup_count += 1
+                this_lookup: list[UUID] = []
                 for chunk in result.chunks:
                     chunk_id = chunk.chunk_id
-                    if chunk_id not in chunk_registry and entity_count < max_chunks_per_entity:
+                    if chunk_id not in chunk_registry:
                         chunk_registry[chunk_id] = chunk
-                        entity_count += 1
+                        this_lookup.append(chunk_id)
                         new_chunks += 1
                         entity_new += 1
-                entity_chunk_counts[entity] = entity_count
+                lookup_chunks[lookup_id] = this_lookup
                 if entity:
                     searched_entities.add(entity)
                 logger.debug(
@@ -716,11 +875,26 @@ async def run_agent_loop(
                         "new_chunks_added": entity_new,
                     },
                 )
+                # Assemble the tool-result context here (sequentially) so S-labels
+                # continue across searches instead of restarting at S1 each time.
+                if result.error_str is not None:
+                    tool_content = result.error_str
+                else:
+                    ctx, _ = assemble_rag_context(
+                        result.chunks,
+                        result.payloads,
+                        assume_unique=True,
+                        ref_start=next_ref,
+                    )
+                    for item in ctx.items:
+                        ref_registry[item.ref_id] = item.chunk_id
+                    next_ref += len(ctx.items)
+                    tool_content = ctx.formatted_context or "(no results)"
                 agent_messages.append(
                     ChatMessage(
                         role=Role.tool,
                         tool_call_id=tc.id,
-                        content=result.formatted_str or "(no results)",
+                        content=tool_content,
                     )
                 )
 
@@ -761,6 +935,23 @@ async def run_agent_loop(
                     metadata={"token_spend_cumulative": token_spend, "new_chunks": new_chunks},
                 )
             _turn_lf_stack.close()
+
+    # Step 10: per-lookup context-window cap. A single lookup keeps its full result set
+    # (≤ retrieval top_k, safe for the synthesis context). With more than one lookup the
+    # combined volume can overflow the synthesis context, so each lookup is trimmed to its
+    # top-N chunks (already in reranker order within lookup_chunks).
+    if lookup_count > 1:
+        keep_ids: set[UUID] = set()
+        for cids in lookup_chunks.values():
+            keep_ids.update(cids[:max_chunks_per_entity])
+        # Never evict a chunk the agent cited in its findings — those must stay citable
+        # in the synthesis context regardless of where they fell in the per-lookup ranking.
+        if agent_findings is not None:
+            for cid_str in _finding_chunk_ids(agent_findings):
+                with contextlib.suppress(ValueError):
+                    keep_ids.add(UUID(cid_str))
+        if len(keep_ids) < len(chunk_registry):
+            chunk_registry = {cid: chunk_registry[cid] for cid in keep_ids}
 
     await add_event(
         redis_app,

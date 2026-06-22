@@ -73,6 +73,7 @@ from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
     get_agent_config,
+    get_conversation_naming_config,
     get_db_url,
     get_injection_scan_user_input_enabled,
     get_query_transformer_config,
@@ -110,6 +111,66 @@ def _parse_scope(raw: object) -> ChatScope | None:
     except Exception:
         logger.warning("scope_parse_failed", extra={"raw": str(raw)[:200]})
         return None
+
+
+_SCOPE_MODE_LABELS = {
+    "allDocs": "All documents",
+    "selectedDocs": "Selected documents",
+    "thisDoc": "Single document",
+    "filteredByMetadata": "Filtered by metadata",
+}
+
+
+def _scope_summary(
+    chat_scope: ChatScope | None,
+    scope_result: object,
+) -> dict[str, object]:
+    """Build a clear, human-readable scope summary for Langfuse traces.
+
+    Combines what the user selected (mode + filters) with how it resolved
+    (source, doc count, per-entity companies) into a flat, glanceable dict.
+    """
+    from src.schemas.query_router import DocumentScopeResult
+
+    requested_mode = chat_scope.mode if chat_scope else "allDocs"
+    summary: dict[str, object] = {
+        "requested_mode": requested_mode,
+        "requested_mode_label": _SCOPE_MODE_LABELS.get(requested_mode, requested_mode),
+    }
+    if chat_scope and chat_scope.mode == "filteredByMetadata":
+        f = chat_scope.filters
+        filters: dict[str, object] = {}
+        if f.company:
+            filters["company"] = f.company
+        if f.year:
+            filters["year"] = f.year
+        if f.type:
+            filters["type"] = f.type
+        if filters:
+            summary["requested_filters"] = filters
+    elif chat_scope and chat_scope.mode in ("selectedDocs", "thisDoc"):
+        summary["requested_doc_count"] = len(chat_scope.doc_ids)
+
+    if isinstance(scope_result, DocumentScopeResult):
+        doc_ids = scope_result.doc_ids
+        companies = (
+            sorted(scope_result.per_entity_doc_ids.keys())
+            if scope_result.per_entity_doc_ids
+            else []
+        )
+        summary["resolved_source"] = scope_result.source
+        summary["resolved_doc_count"] = len(doc_ids) if doc_ids is not None else "all"
+        summary["resolved_companies"] = companies
+        # One-line headline so the scope is legible at a glance in the trace.
+        count = summary["resolved_doc_count"]
+        co = f" · {', '.join(companies)}" if companies else ""
+        summary["headline"] = (
+            f"{summary['requested_mode_label']} → {count} doc(s){co} [{scope_result.source}]"
+        )
+    else:
+        summary["resolved_source"] = None
+        summary["headline"] = f"{summary['requested_mode_label']} (no resolution)"
+    return summary
 
 
 def _initialize_worker_resources() -> None:
@@ -249,9 +310,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     lf = lf_client.get_client()
     _lf_stack = contextlib.ExitStack()
     _stage_stack: contextlib.ExitStack = contextlib.ExitStack()
+    _gen_stack: contextlib.ExitStack = contextlib.ExitStack()
     _gen: object = None
+    _root_span: object = None
     if lf:
-        _lf_stack.enter_context(
+        _root_span = _lf_stack.enter_context(
             lf.start_as_current_observation(
                 as_type="chain",
                 name="chat_pipeline",
@@ -475,6 +538,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 },
             )
             if lf:
+                scope_summary = _scope_summary(chat_scope, state.scope_result)
                 lf.update_current_span(
                     input={"query": state.user_query_raw},
                     output={
@@ -482,8 +546,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "query_shape": getattr(state.router_output, "query_shape", None),
                         "entities": [e.model_dump() for e in state.router_output.entities],
                         "user_intent": state.router_output.user_intent,
+                        "scope": scope_summary,
                     },
                     metadata={
+                        "scope": scope_summary,
                         "scope_source": state.scope_result.source if state.scope_result else None,
                         "scope_doc_ids": _scope_doc_ids,
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
@@ -491,6 +557,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "scope_entity_manifest": _scope_entity_manifest,
                     },
                 )
+                # Surface scope at the trace root so it's visible without drilling into
+                # the route stage. The root span owns trace-level IO in langfuse v3.
+                if _root_span is not None:
+                    with contextlib.suppress(Exception):
+                        _root_span.set_trace_io(  # type: ignore[attr-defined]
+                            output={"scope": scope_summary["headline"]}
+                        )
+                        _root_span.update(metadata={"scope": scope_summary})  # type: ignore[attr-defined]
 
             # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
             if state.processed_query.route == "out_of_scope":
@@ -631,12 +705,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         processed = await process_findings(agent_findings)
                         if lf:
                             lf.update_current_span(
-                                metadata={
+                                output={
                                     "currency_converted": processed.currency_converted,
                                     "answer_entity": processed.answer_entity,
                                     "fx_rates_used": processed.fx_rates_used,
-                                    "agent_findings": agent_findings_json,
-                                }
+                                    "answer_note": processed.answer_note,
+                                    "comparison_op": processed.comparison_op,
+                                },
+                                metadata={"agent_findings": agent_findings_json},
                             )
                     finally:
                         _fp_lf_stack.close()
@@ -645,7 +721,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     _agent_answer_entity = processed.answer_entity
                     _agent_fx_rates = processed.fx_rates_used
 
-                    # Step 11: narrow synthesis context to cited chunks + top-3-per-doc-id floor.
+                    # Step 11: narrow the synthesis context to the chunks the agent actually
+                    # cited in its findings — those are the evidence it reasoned over, and the
+                    # registry is already volume-capped per lookup in run_agent_loop. When the
+                    # findings cite nothing (e.g. a weak tool model that omits source_chunks),
+                    # fall back to the full capped registry rather than starving synthesis.
                     cited_ids: set[UUID] = set()
                     if isinstance(agent_findings, _AgentFindings):
                         for _f in agent_findings.findings:
@@ -658,17 +738,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 with contextlib.suppress(Exception):
                                     cited_ids.add(UUID(_ec))
 
-                    _doc_floor_counts: dict[UUID, int] = {}
-                    _floor_ids: set[UUID] = set()
-                    for _c in ordered:
-                        if _doc_floor_counts.get(_c.document_id, 0) < 3:
-                            _floor_ids.add(_c.chunk_id)
-                            _doc_floor_counts[_c.document_id] = (
-                                _doc_floor_counts.get(_c.document_id, 0) + 1
-                            )
-
-                    keep_ids = cited_ids | _floor_ids
-                    synthesis_chunks = [c for c in ordered if c.chunk_id in keep_ids]
+                    if cited_ids:
+                        synthesis_chunks = [c for c in ordered if c.chunk_id in cited_ids]
+                    else:
+                        synthesis_chunks = ordered
                 else:
                     synthesis_chunks = ordered
 
@@ -822,11 +895,28 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 user_query=state.user_query_raw,
                 renderer=renderer,
             )
+            if lf:
+                lf.update_current_span(
+                    input={
+                        "prompt_version": prompt_version,
+                        "citation_mode": citation_mode,
+                        "num_chunks": num_chunks,
+                        "context_messages": len(state.context_messages),
+                        "used_agent_loop": state.used_agent_loop,
+                    },
+                    output={
+                        "num_messages": len(state.adapter_messages),
+                        "system_prompt_chars": len(state.adapter_messages[0].content or "")
+                        if state.adapter_messages
+                        else 0,
+                        "rag_context_chars": len(state.rag_context_str or ""),
+                    },
+                )
 
             # 6. stream_llm_response
             await _log_stage("stream_llm_response")
             if lf:
-                _gen = _lf_stack.enter_context(
+                _gen = _gen_stack.enter_context(
                     lf.start_as_current_observation(
                         as_type="generation",
                         name="chat_model",
@@ -859,23 +949,26 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     visible_chunk = think_stripper.feed(chunk.text)
 
                     if parser is not None:
-                        # Bracket-citation mode: strip [S1] markers, track spans
+                        # Bracket-citation mode: strip [S1] markers, track spans.
+                        # Emitted for every chunk, including the final one — a final
+                        # chunk can carry text, and skipping it would drop that text
+                        # and any spans it completed from the SSE stream.
                         result = parser.feed(visible_chunk)
                         state.clean_content += result.visible_text
+                        if result.visible_text:
+                            await add_event(
+                                redis_app, request_id, "delta", {"text": result.visible_text}
+                            )
+                        for span in result.completed_spans:
+                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
+                            await add_event(
+                                redis_app,
+                                request_id,
+                                "citation_span",
+                                span_to_dict(span, labels),
+                            )
 
                         if not chunk.is_final:
-                            if result.visible_text:
-                                await add_event(
-                                    redis_app, request_id, "delta", {"text": result.visible_text}
-                                )
-                            for span in result.completed_spans:
-                                labels = parser.label_map.get_labels_for_refs(span.ref_ids)
-                                await add_event(
-                                    redis_app,
-                                    request_id,
-                                    "citation_span",
-                                    span_to_dict(span, labels),
-                                )
                             continue
 
                         # ── Final chunk (bracket mode) ──
@@ -894,22 +987,29 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 span_to_dict(span, labels),
                             )
 
-                        # Emit references: only cited sources
-                        if state.rag_context and parser.label_map.mapping:
-                            ref_items = build_references_list(state.rag_context, parser.label_map)
+                        # Emit references: cited sources only, or all sources as fallback
+                        if state.rag_context:
+                            if parser.label_map.mapping:
+                                ref_items = build_references_list(
+                                    state.rag_context, parser.label_map
+                                )
+                            else:
+                                # Model produced no bracket citations (e.g. bare number answer) —
+                                # fall back to emitting all retrieved sources so the evidence panel
+                                # still populates.
+                                ref_items = build_all_references(state.rag_context)
                             await add_event(
                                 redis_app, request_id, "references", {"items": ref_items}
                             )
 
                     else:
-                        # No-citation mode: raw text = clean text, no span parsing
+                        # No-citation mode: raw text = clean text, no span parsing.
+                        # Delta emitted for the final chunk too — it can carry text.
                         state.clean_content += visible_chunk
+                        if visible_chunk:
+                            await add_event(redis_app, request_id, "delta", {"text": visible_chunk})
 
                         if not chunk.is_final:
-                            if visible_chunk:
-                                await add_event(
-                                    redis_app, request_id, "delta", {"text": visible_chunk}
-                                )
                             continue
 
                         # ── Final chunk (no-citation mode) ──
@@ -930,10 +1030,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 span_to_dict(s, parser.label_map.get_labels_for_refs(s.ref_ids))
                                 for s in parser.all_spans
                             ]
-                        if state.rag_context and parser.label_map.mapping:
-                            citation_meta["references"] = build_references_list(
-                                state.rag_context, parser.label_map
-                            )
+                        if state.rag_context:
+                            if parser.label_map.mapping:
+                                citation_meta["references"] = build_references_list(
+                                    state.rag_context, parser.label_map
+                                )
+                            elif state.rag_context.items:
+                                citation_meta["references"] = build_all_references(
+                                    state.rag_context
+                                )
                     elif state.rag_context and state.rag_context.items:
                         citation_meta["references"] = build_all_references(state.rag_context)
 
@@ -1049,6 +1154,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 if s.cost_usd is not None
                                 else None,
                             )
+                    # Close chat_model generation while still inside stream_llm_response's
+                    # contextvar scope — prevents contextvar corruption when persist_and_emit
+                    # stage span was opened by _log_stage (which reset stream's token).
+                    _gen_stack.close()
                     await llm_request_repo.update_status(UUID(request_id), "completed")
                     await conversation_repo.update_on_message(
                         conversation_id=state.conversation_id,
@@ -1098,6 +1207,50 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     except Exception:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
 
+                    # Auto-name conversation on the first exchange (seq 2 = first assistant reply)
+                    naming_cfg = get_conversation_naming_config()
+                    if naming_cfg["enabled"] and state.assistant_seq == 2 and state.user_query_raw:
+                        try:
+                            from src.services.chat.naming import generate_conversation_title
+
+                            # Use a fresh session so the naming sub-request + title update
+                            # commit together, independent of the main pipeline session.
+                            async with sf() as naming_session:
+                                title = await generate_conversation_title(
+                                    query=state.user_query_raw,
+                                    llm_router=router,
+                                    model=naming_cfg["model"],
+                                    max_len=naming_cfg["max_len"],
+                                    session=naming_session,
+                                    parent_request_id=UUID(request_id),
+                                    conversation_id=state.conversation_id,
+                                    user_id=llm_request.user_id,
+                                )
+                                if title:
+                                    await ConversationRepository(naming_session).update(
+                                        state.conversation_id, title=title
+                                    )
+                                await naming_session.commit()
+                            if title:
+                                await add_event(
+                                    redis_app,
+                                    request_id,
+                                    "conversation_title",
+                                    {"title": title, "conversation_id": str(state.conversation_id)},
+                                )
+                                logger.info(
+                                    "conversation_named",
+                                    extra={
+                                        "request_id": request_id,
+                                        "conversation_id": str(state.conversation_id),
+                                        "title": title,
+                                    },
+                                )
+                        except Exception:
+                            logger.warning(
+                                "conversation_naming_error", extra={"request_id": request_id}
+                            )
+
             except Exception as e:
                 logger.exception("llm_stream_error", extra={"request_id": request_id})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
@@ -1140,6 +1293,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         raise
     finally:
         _stage_stack.close()
+        _gen_stack.close()
         _lf_stack.close()
 
 
@@ -1148,4 +1302,7 @@ def process_chat(_self, request_id: str) -> None:
     """Celery task: process chat request."""
     _initialize_worker_resources()
     loop = _get_worker_loop()
-    loop.run_until_complete(_run_chat_pipeline(request_id))
+    try:
+        loop.run_until_complete(_run_chat_pipeline(request_id))
+    finally:
+        lf_client.flush()

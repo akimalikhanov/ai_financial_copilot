@@ -145,6 +145,7 @@ class DocumentRepository:
         original_filename: str,
         storage_key: str,
         *,
+        id: UUID | None = None,
         conversation_id: UUID | None = None,
         content_type: str = "application/pdf",
         file_size_bytes: int | None = None,
@@ -160,6 +161,8 @@ class DocumentRepository:
             file_size_bytes=file_size_bytes,
             document_metadata=metadata or {},
         )
+        if id is not None:
+            doc.id = id
         self.session.add(doc)
         await self.session.flush()
         return doc

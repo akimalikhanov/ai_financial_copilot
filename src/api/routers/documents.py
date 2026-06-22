@@ -28,7 +28,7 @@ from src.schemas.documents import (
     UploadDocumentResponse,
 )
 from src.services.ingestion import opensearch_ingest, qdrant_ingest
-from src.services.ingestion.s3_client import upload_pdf
+from src.services.ingestion.s3_client import build_raw_storage_key, upload_pdf
 from src.services.ingestion.tasks import ingest_document
 from src.utils.config import (
     get_s3_access_key,
@@ -113,13 +113,8 @@ async def upload_document(
         )
 
     doc_id = uuid4()
-    storage_key = await upload_pdf(
-        user_id=current_user.id,
-        doc_id=doc_id,
-        filename=file.filename or "document.pdf",
-        fileobj=file.file,
-        content_length=file_size,
-    )
+    filename = file.filename or "document.pdf"
+    storage_key = build_raw_storage_key(current_user.id, doc_id, filename)
 
     metadata: dict = {}
     if company:
@@ -129,20 +124,37 @@ async def upload_document(
     if doc_type:
         metadata["type"] = doc_type
 
+    # Create the DB row before touching S3: the storage key is deterministic,
+    # so if the upload fails we can just delete this row instead of leaving
+    # an orphaned PDF in S3 with no DB record pointing to it.
     repo = DocumentRepository(session)
     doc = await repo.create(
+        id=doc_id,
         user_id=current_user.id,
-        original_filename=file.filename or "document.pdf",
+        original_filename=filename,
         storage_key=storage_key,
         content_type=ALLOWED_CONTENT_TYPE,
         file_size_bytes=file_size,
         metadata=metadata if metadata else None,
     )
-
-    # Commit the new document row before enqueueing the task.
-    # Otherwise the worker can run before the transaction commits and "update 0 rows",
-    # leaving the document stuck in `pending`.
     await session.commit()
+
+    try:
+        await upload_pdf(
+            user_id=current_user.id,
+            doc_id=doc_id,
+            filename=filename,
+            fileobj=file.file,
+            content_length=file_size,
+        )
+    except Exception:
+        await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": doc_id})
+        await session.commit()
+        logger.exception("document.upload_failed", extra={"document_id": str(doc_id)})
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to store document",
+        ) from None
 
     cast(Task, ingest_document).delay(str(doc.id))
     logger.info("document.ingestion_enqueued", extra={"document_id": str(doc.id)})

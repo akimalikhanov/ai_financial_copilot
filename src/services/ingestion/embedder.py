@@ -48,16 +48,23 @@ def reset_clients() -> None:
     _get_openai_client.cache_clear()
 
 
+_TEI_BATCH_SIZE = 64
+
+
 def _embed_tei(chunks: list[str]) -> list[list[float]]:
     base_url = get_embedder_base_url().rstrip("/")
     timeout = get_embedder_timeout_seconds()
-    response = httpx.post(
-        f"{base_url}/embed",
-        json={"inputs": chunks, "normalize": True},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    return response.json()
+    results: list[list[float]] = []
+    for i in range(0, len(chunks), _TEI_BATCH_SIZE):
+        batch = chunks[i : i + _TEI_BATCH_SIZE]
+        response = httpx.post(
+            f"{base_url}/embed",
+            json={"inputs": batch, "normalize": True},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        results.extend(response.json())
+    return results
 
 
 def _embed_local(chunks: list[str], model_name: str) -> list[list[float]]:

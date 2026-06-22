@@ -162,10 +162,17 @@ async def run_one(
     if agent_findings is not None:
         processed_findings = await process_findings(agent_findings)
 
+        # Mirror the prod path: map finding chunk UUIDs to the synthesis context's
+        # S-labels so the synthesis model only ever sees citable excerpt IDs.
+        chunk_id_to_ref = {str(item.chunk_id): item.ref_id for item in rag_context.items}
         if processed_findings.analytical_findings is not None:
-            findings_block = _render_observations_block(processed_findings.analytical_findings)
+            findings_block = _render_observations_block(
+                processed_findings.analytical_findings, chunk_id_to_ref=chunk_id_to_ref
+            )
         else:
-            findings_block = _render_findings_block(processed_findings)
+            findings_block = _render_findings_block(
+                processed_findings, chunk_id_to_ref=chunk_id_to_ref
+            )
 
         rag_context_str = findings_block + "\n\n" + (rag_context.formatted_context or "")
     else:

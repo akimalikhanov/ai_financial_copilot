@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import type { Components } from 'react-markdown';
 import {
   MessageSquare, BookOpen, Plus, Send, Search,
   LogOut, User, FileText, Trash2, Layers, AlertTriangle,
@@ -284,6 +287,39 @@ const CLASSIC_STAGES = [
   'stream_llm_response',
   'persist_and_emit',
 ];
+
+const MD_COMPONENTS: Components = {
+  p: ({ children }) => <p className="mb-3 last:mb-0 leading-relaxed">{children}</p>,
+  strong: ({ children }) => <strong className="font-semibold text-[var(--text)]">{children}</strong>,
+  em: ({ children }) => <em>{children}</em>,
+  code: ({ children }) => (
+    <code className="px-1 py-0.5 rounded text-xs bg-[var(--surface-2)] font-mono">{children}</code>
+  ),
+  pre: ({ children }) => (
+    <pre className="p-3 rounded-lg bg-[var(--surface-2)] overflow-x-auto text-xs font-mono mb-3">{children}</pre>
+  ),
+  ul: ({ children }) => <ul className="list-disc list-inside mb-3 space-y-1">{children}</ul>,
+  ol: ({ children }) => <ol className="list-decimal list-inside mb-3 space-y-1">{children}</ol>,
+  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+  h1: ({ children }) => <h1 className="text-lg font-semibold mb-2 mt-4 first:mt-0">{children}</h1>,
+  h2: ({ children }) => <h2 className="text-base font-semibold mb-2 mt-3 first:mt-0">{children}</h2>,
+  h3: ({ children }) => <h3 className="text-sm font-semibold mb-1.5 mt-3 first:mt-0">{children}</h3>,
+  table: ({ children }) => (
+    <div className="overflow-x-auto mb-3">
+      <table className="text-xs border-collapse w-full">{children}</table>
+    </div>
+  ),
+  th: ({ children }) => (
+    <th className="px-3 py-1.5 text-left border border-[var(--border)] bg-[var(--surface-2)] font-medium">{children}</th>
+  ),
+  td: ({ children }) => <td className="px-3 py-1.5 border border-[var(--border)]">{children}</td>,
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-2 border-[var(--accent)] pl-3 italic text-[var(--text-muted)] mb-3">{children}</blockquote>
+  ),
+  a: ({ href, children }) => (
+    <a href={href} className="text-[var(--accent)] underline" target="_blank" rel="noopener noreferrer">{children}</a>
+  ),
+};
 
 const INGEST_STAGE_LABELS: Record<string, string> = {
   fetch_document_record: 'Starting',
@@ -623,6 +659,9 @@ export default function App() {
 
   // Current user
   const [currentUser, setCurrentUser] = useState<UserInfo | null>(null);
+
+  // Chat search
+  const [chatSearch, setChatSearch] = useState('');
 
   // Delete / Rename state
   const [chatToDelete, setChatToDelete] = useState<string | null>(null);
@@ -1061,6 +1100,11 @@ export default function App() {
             return { ...snaps, [placeholderId]: { ...prev, toolCalls: updated } };
           });
         },
+        (ev) => {
+          setChats(prev => prev.map(c =>
+            c.conversationId === ev.conversation_id ? { ...c, title: ev.title } : c
+          ));
+        },
       );
     } catch (err) {
       const error = err as ApiError;
@@ -1085,8 +1129,16 @@ export default function App() {
   };
 
   const handleReferenceClick = (ref: ReferenceItem) => {
-    const doc = docs.find(d => d.id === ref.documentId);
-    if (!doc) return;
+    const doc = docs.find(d => d.id === ref.documentId) ?? {
+      id: ref.documentId,
+      title: ref.documentName || ref.filename || 'Unknown document',
+      company: '',
+      year: 0,
+      type: '',
+      pages: 0,
+      status: 'Ready' as const,
+      tags: [],
+    };
     setIsEvidenceOpen(true); setMobileTab('EVIDENCE');
     const page = ref.pageNumbers[0] || 1;
     setOpenPdfTabs(prev => {
@@ -1163,7 +1215,9 @@ export default function App() {
   // --- Renderers ---
 
   const renderSidebar = () => {
-    const chatGroups = groupChatsByDate(chats);
+    const q = chatSearch.toLowerCase();
+    const filteredChats = q ? chats.filter(c => c.title.toLowerCase().includes(q)) : chats;
+    const chatGroups = groupChatsByDate(filteredChats);
     const collapsed = isSidebarCollapsed;
 
     const renderChatItem = (chat: Chat) => (
@@ -1242,7 +1296,7 @@ export default function App() {
           <div className="px-3 pb-2 shrink-0 flex items-center gap-2">
             <div className="relative flex-1">
               <Search className="absolute left-3 top-2.5 text-[var(--text-faint)]" size={13} />
-              <Input placeholder="Search chats..." className="pl-8 h-9 text-xs" />
+              <Input placeholder="Search chats..." className="pl-8 h-9 text-xs" value={chatSearch} onChange={e => setChatSearch(e.target.value)} />
             </div>
             <button
               onClick={() => setIsSidebarCollapsed(true)}
@@ -1258,7 +1312,9 @@ export default function App() {
         {!collapsed && (
           <div className="flex-1 overflow-y-auto px-2 min-h-0 pb-2">
             {chatGroups.length === 0 && (
-              <div className="text-xs text-[var(--text-faint)] text-center py-6">No conversations yet</div>
+              <div className="text-xs text-[var(--text-faint)] text-center py-6">
+                {chatSearch ? 'No matching chats' : 'No conversations yet'}
+              </div>
             )}
             {chatGroups.map(group => (
               <div key={group.label}>
@@ -1414,12 +1470,14 @@ export default function App() {
                               onCitationClick={handleReferenceClick}
                             />
                           ) : (
-                            <div className="whitespace-pre-wrap break-words">
-                              {msg.content}
+                            <>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                                {msg.content}
+                              </ReactMarkdown>
                               {isStreaming && (
-                                <span className="animate-caret-blink ml-0.5 font-mono text-[var(--accent)] opacity-80">▊</span>
+                                <span className="animate-caret-blink font-mono text-[var(--accent)] opacity-80">▊</span>
                               )}
-                            </div>
+                            </>
                           )}
                         </div>
                       ) : (
@@ -1434,7 +1492,9 @@ export default function App() {
                               onCitationClick={handleReferenceClick}
                             />
                           ) : (
-                            <div className="whitespace-pre-wrap break-words">{msg.content}</div>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+                              {msg.content}
+                            </ReactMarkdown>
                           )}
                         </div>
                       )}

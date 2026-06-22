@@ -56,6 +56,20 @@ class ProcessedFindings:
     analytical_findings: AnalyticalFindings | None = None
 
 
+_UNIT_TO_MILLIONS: dict[str | None, float] = {
+    "B": 1_000.0,
+    "M": 1.0,
+    "K": 0.001,
+    "": 0.000_001,  # absolute / units
+    None: 1.0,  # assume millions when unspecified
+}
+
+
+def _to_millions(value: float, unit: str | None) -> float:
+    """Scale value to millions for unit-safe comparison."""
+    return value * _UNIT_TO_MILLIONS.get(unit, 1.0)
+
+
 def _normalizer_enabled() -> bool:
     return os.getenv("CURRENCY_NORMALIZER_ENABLED", "true").lower() not in {
         "0",
@@ -99,6 +113,9 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
     available = [f for f in findings.findings if f.available and f.value is not None]
     target = findings.target_currency
 
+    # Deterministic FX normalization fires whenever the agent reported a target
+    # currency — for extraction (report values in USD) and comparison (normalize
+    # before argmin/argmax) alike. This is the only FX path.
     needs_fx = (
         target is not None
         and _normalizer_enabled()
@@ -135,19 +152,36 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
                 results = await asyncio.gather(
                     *[_fetch_rate(client, cur, target, date) for cur, date in pairs]
                 )
+
+            rate_map: dict[tuple[str, str | None], float | None] = {}
+            failed: list[str] = []
+            for (cur, date), (key, rate) in zip(pairs, results, strict=False):
+                rate_map[(cur, date)] = rate
+                if rate is not None:
+                    fx_rates_used[key] = rate
+                else:
+                    failed.append(key)
+
             if lf:
-                lf.update_current_span(output={"pairs_fetched": len(results)})
+                if failed:
+                    lf.update_current_span(
+                        level="ERROR",
+                        status_message=f"FX fetch failed for: {', '.join(failed)}",
+                        output={
+                            "pairs_fetched": len(results),
+                            "rates_ok": dict(fx_rates_used),
+                            "rates_failed": failed,
+                        },
+                    )
+                else:
+                    lf.update_current_span(
+                        output={
+                            "pairs_fetched": len(results),
+                            "rates_ok": fx_rates_used,
+                        }
+                    )
         finally:
             _fx_lf_stack.close()
-
-        rate_map: dict[tuple[str, str | None], float | None] = {}
-        failed: list[str] = []
-        for (cur, date), (key, rate) in zip(pairs, results, strict=False):
-            rate_map[(cur, date)] = rate
-            if rate is not None:
-                fx_rates_used[key] = rate
-            else:
-                failed.append(key)
 
         if failed:
             return ProcessedFindings(
@@ -199,7 +233,7 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
         if candidates:
 
             def key_fn(n: NormalizedFinding) -> float:
-                return n.normalized_value  # type: ignore[return-value]
+                return _to_millions(n.normalized_value, n.finding.unit)  # type: ignore[arg-type]
 
             best = min(candidates, key=key_fn) if op == "argmin" else max(candidates, key=key_fn)
             answer_entity = best.finding.entity
@@ -217,6 +251,12 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
         target_currency=target,
         comparison_op=findings.comparison_op,
     )
+
+
+def _map_refs(raw_refs: list[str], chunk_id_to_ref: dict[str, str]) -> str:
+    """Map chunk UUIDs to S-labels, silently dropping any without a context excerpt."""
+    mapped = [chunk_id_to_ref[c] for c in raw_refs if c in chunk_id_to_ref]
+    return ", ".join(mapped) or "—"
 
 
 def _render_findings_block(
@@ -261,8 +301,10 @@ def _render_findings_block(
         f = nf.finding
         unit_str = f.unit if f.unit is not None else "M"
         raw_chunks = f.source_chunks or []
-        if chunk_id_to_ref:
-            chunks_str = ", ".join(chunk_id_to_ref.get(c, c) for c in raw_chunks) or "—"
+        if chunk_id_to_ref is not None:
+            # Drop refs with no excerpt in the synthesis context — leaking a raw ref
+            # here would let the model cite an ID the citation pipeline can't resolve.
+            chunks_str = _map_refs(raw_chunks, chunk_id_to_ref)
         else:
             chunks_str = ", ".join(raw_chunks) or "—"
         if not f.available or f.value is None:
@@ -295,11 +337,9 @@ def _render_observations_block(
     lines = ["[AGENT OBSERVATIONS]", f"Question: {findings.question}", ""]
 
     for i, obs in enumerate(findings.observations, 1):
-        if chunk_id_to_ref:
-            chunks_str = ", ".join(chunk_id_to_ref.get(c, c) for c in obs.evidence_chunks) or "—"
-            refuted_str = (
-                ", ".join(chunk_id_to_ref.get(c, c) for c in (obs.refuted_by or [])) or "—"
-            )
+        if chunk_id_to_ref is not None:
+            chunks_str = _map_refs(obs.evidence_chunks, chunk_id_to_ref)
+            refuted_str = _map_refs(obs.refuted_by or [], chunk_id_to_ref)
         else:
             chunks_str = ", ".join(obs.evidence_chunks) if obs.evidence_chunks else "—"
             refuted_str = ", ".join(obs.refuted_by) if obs.refuted_by else "—"

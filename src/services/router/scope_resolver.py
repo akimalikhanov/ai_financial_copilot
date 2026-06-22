@@ -10,6 +10,37 @@ from src.services.router.entity_resolver import _resolve_all_entities
 from src.utils.config import get_router_config
 
 
+async def _group_docs_by_company(
+    session: AsyncSession,
+    user_id: UUID,
+    doc_ids: list[UUID],
+) -> dict[str, list[UUID]] | None:
+    """Group explicitly-scoped doc_ids by their company metadata.
+
+    The agent loop identifies which company each search targets via per_entity_doc_ids.
+    When the user scopes by selecting documents (rather than naming a company in the
+    query), the company names live in document metadata — derive per-entity grouping
+    from there so the agent knows the entity name (e.g. answering "this company").
+
+    Docs without a company value are grouped under a single "Selected documents" bucket
+    so they remain searchable. Returns None when there are no docs.
+    """
+    if not doc_ids:
+        return None
+    repo = DocumentRepository(session)
+    summaries = await repo.get_scope_doc_summaries(user_id, doc_ids, limit=len(doc_ids))
+    per_entity: dict[str, list[UUID]] = {}
+    unnamed: list[UUID] = []
+    for doc_id, company, _year in summaries:
+        if company:
+            per_entity.setdefault(company, []).append(doc_id)
+        else:
+            unnamed.append(doc_id)
+    if unnamed:
+        per_entity.setdefault("Selected documents", []).extend(unnamed)
+    return per_entity or None
+
+
 async def resolve_scope(
     session: AsyncSession,
     user_id: UUID,
@@ -31,6 +62,7 @@ async def resolve_scope(
         return DocumentScopeResult(
             doc_ids=scope.doc_ids,
             source="explicit",
+            per_entity_doc_ids=await _group_docs_by_company(session, user_id, scope.doc_ids),
         )
     # Empty selection — treat as allDocs and let entity resolution narrow it down below
 
@@ -49,6 +81,7 @@ async def resolve_scope(
             return DocumentScopeResult(
                 doc_ids=layer1_ids or None,
                 source="filtered",
+                per_entity_doc_ids=await _group_docs_by_company(session, user_id, layer1_ids),
             )
 
         # Large result set + entities → intersect with entity resolution
@@ -68,10 +101,12 @@ async def resolve_scope(
                 per_entity_doc_ids=per_entity if per_entity else None,
             )
 
-        # Large result set, no entities → return Layer 1 as-is
+        # Large result set, no entities → return Layer 1, grouped by company so the
+        # agent still knows the entity names of the filtered documents.
         return DocumentScopeResult(
             doc_ids=layer1_ids,
             source="filtered",
+            per_entity_doc_ids=await _group_docs_by_company(session, user_id, layer1_ids),
         )
 
     # --- allDocs / None → Layer 2 does the heavy lifting ---

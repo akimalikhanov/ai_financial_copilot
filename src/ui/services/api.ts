@@ -123,6 +123,11 @@ export interface ToolCallCompletedEvent {
   new_chunks_added: number;
 }
 
+export interface ConversationTitleEvent {
+  title: string;
+  conversation_id: string;
+}
+
 type ApiErrorOptions = {
   statusCode?: number;
   fallbackMessage?: string;
@@ -779,10 +784,11 @@ export const chatStreamSubscribe = async (
   onStage?: (stage: StageEvent) => void,
   onToolCallStarted?: (event: ToolCallStartedEvent) => void,
   onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onConversationTitle?: (event: ConversationTitleEvent) => void,
 ): Promise<void> => {
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage, onToolCallStarted, onToolCallCompleted
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage, onToolCallStarted, onToolCallCompleted, onConversationTitle
     );
     if (result === 'done' || result === 'server-error') return;
     // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
@@ -813,6 +819,7 @@ async function _doStreamAttempt(
   onStage?: (stage: StageEvent) => void,
   onToolCallStarted?: (event: ToolCallStartedEvent) => void,
   onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onConversationTitle?: (event: ConversationTitleEvent) => void,
 ): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
@@ -904,6 +911,10 @@ async function _doStreamAttempt(
         }
         if (parsed.event === 'tool_call_completed') {
           try { onToolCallCompleted?.(JSON.parse(parsed.data) as ToolCallCompletedEvent); } catch { /* ignore */ }
+          continue;
+        }
+        if (parsed.event === 'conversation_title') {
+          try { onConversationTitle?.(JSON.parse(parsed.data) as ConversationTitleEvent); } catch { /* ignore */ }
           continue;
         }
         // Skip other non-content server events

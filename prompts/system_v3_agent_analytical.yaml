@@ -45,9 +45,9 @@ template: |
 
   Each `Observation` corresponds to one confirmed or refuted hypothesis:
   - `claim`: A direct, assertive sentence stating what the evidence shows. Be specific — include numbers if available.
-  - `evidence_chunks`: Chunk IDs from tool results that support this claim. Never invent IDs.
+  - `evidence_chunks`: Excerpt IDs that support this claim, copied exactly from the `id` attribute of the `<retrieved_excerpt>` tags in tool results (e.g. `["S3", "S12"]`). Excerpt IDs are unique across all your searches. Never invent IDs.
   - `confidence`: `"high"` if multiple chunks agree; `"medium"` if one chunk or indirect evidence; `"low"` if inferred or weakly supported.
-  - `refuted_by`: Chunk IDs that contradict this claim. `null` if uncontested.
+  - `refuted_by`: Excerpt IDs that contradict this claim. `null` if uncontested.
 
   ---
 
@@ -77,19 +77,19 @@ template: |
     observations=[
       {
         claim: "Input costs rose 12% YoY in H2 2023, compressing gross margin by approximately 4pp.",
-        evidence_chunks: ["<id1>", "<id2>"],
+        evidence_chunks: ["S1", "S7"],
         confidence: "high",
         refuted_by: null
       },
       {
         claim: "Management noted pricing pressure from competitors in H2 2023 commentary.",
-        evidence_chunks: ["<id3>"],
+        evidence_chunks: ["S14"],
         confidence: "medium",
-        refuted_by: ["<id4>"]
+        refuted_by: ["S22"]
       },
       {
         claim: "Product mix shifted toward lower-margin hardware segments in H2.",
-        evidence_chunks: ["<id5>"],
+        evidence_chunks: ["S30"],
         confidence: "low",
         refuted_by: null
       }
@@ -104,7 +104,7 @@ template: |
   - **Entity scoping:** If the question is about a specific named company, pass that company name as `entity` in every `search_documents` call — even for causal/analytical queries. Use `entity=""` only when the question spans all companies in scope (e.g., "compare why margins fell across all three companies"). Passing the correct entity name ensures search is scoped to that company's documents; `entity=""` searches the entire corpus, which can mix results from unrelated companies.
   - Search by aspect/hypothesis in the `query` field, not by entity name.
   - Never call `report_analytical_findings` after only one search turn unless it is clearly sufficient.
-  - Never invent chunk IDs — use only IDs returned in tool results.
+  - Never invent excerpt IDs — `evidence_chunks` and `refuted_by` must contain only `id` values copied from `<retrieved_excerpt>` tags in tool results.
   - Never add commentary or prose outside tool calls. Your only output is tool calls.
   - `conclusion` is a draft — the synthesis model expands it. Keep it one sentence.
   - `gaps` lists aspects you searched for but found no supporting evidence. Use an empty array if nothing is missing.

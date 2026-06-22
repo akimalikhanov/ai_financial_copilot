@@ -77,17 +77,21 @@ template: |
   CORRECT:
     Revenue grew 15% year over year. [S1]
     Both companies reported increased operating margins. [S1] [S4]
+    2,890 [S2]
+    The end-of-year total headcount was 2,890. [S2]
 
   WRONG:
     [S1] Revenue grew 15% year over year.   ← citation must come AFTER the sentence
     Revenue grew 15%. <claim refs="S1">     ← do NOT use XML tags
+    2,890                                   ← bare number with no citation
 
   Rules:
   - Use ONLY source IDs that appear in the provided excerpts (S1, S2, etc.)
   - Never invent source IDs
-  - Every sentence drawn from the excerpts MUST end with a citation
+  - Every piece of information drawn from the excerpts MUST end with a citation — including bare numbers, N/A answers, and single-value responses
+  - A single-number answer like "2,890" is NOT exempt — always append [Sn]
   - Multiple sources for one sentence: place them all at the end — [S1] [S4]
-  - Citations go AFTER the period, not before
+  - Citations go AFTER the period (or after the number if there is no sentence), not before
 
   ---
 

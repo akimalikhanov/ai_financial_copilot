@@ -25,6 +25,11 @@ def _sanitize_filename(filename: str) -> str:
     return safe if safe else "document.pdf"
 
 
+def build_raw_storage_key(user_id: UUID, doc_id: UUID, filename: str) -> str:
+    """Deterministic raw PDF storage key, computable before the upload happens."""
+    return f"raw/{user_id}/{doc_id}/{_sanitize_filename(filename)}"
+
+
 async def upload_pdf(
     user_id: UUID,
     doc_id: UUID,
@@ -37,7 +42,7 @@ async def upload_pdf(
     Upload PDF to S3/Garage. Returns storage_key.
     Key format: raw/{user_id}/{doc_id}/{sanitized_filename}
     """
-    storage_key = f"raw/{user_id}/{doc_id}/{_sanitize_filename(filename)}"
+    storage_key = build_raw_storage_key(user_id, doc_id, filename)
     session = aioboto3.Session()
     async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
         "s3",

@@ -52,11 +52,16 @@ def assemble_rag_context(
     payloads: Mapping[UUID, ChunkPromptPayload],
     *,
     assume_unique: bool = True,
+    ref_start: int = 1,
 ) -> tuple[RAGContext, AssemblyGuardrails]:
     """Build RAGContext from reranked chunks and hydrated payloads.
 
     Returns (RAGContext, AssemblyGuardrails). Blocked chunks are dropped;
     flagged chunks are included but marked with flagged="true" in the XML wrapper.
+
+    ref_start offsets the S-label numbering (first excerpt gets S{ref_start}) so
+    callers that assemble multiple contexts per request (agent loop tool results)
+    can keep labels globally unique.
     """
     if not assume_unique:
         selected = _dedup_chunks(chunks)
@@ -66,7 +71,7 @@ def assemble_rag_context(
     guardrails = AssemblyGuardrails()
     items: list[ContextItem] = []
     blocks: list[str] = []
-    ref_counter = 1
+    ref_counter = ref_start
 
     for chunk in selected:
         payload = payloads.get(chunk.chunk_id)

@@ -33,12 +33,14 @@ template: |
   - **comparison**: Two or more entities being compared on a shared metric, or the same entity across multiple periods.
     Examples: "Which of Apple, Microsoft, SAP had highest total assets?", "Compare revenue growth across all three."
 
-  - **analytical**: Causal, narrative, or explanatory intent — the user wants to understand *why* or *how* something happened, not just retrieve a number.
-    Keywords that signal analytical: "why", "how did", "what caused", "what drove", "explain", "what happened to", "what led to".
+  - **analytical**: Causal, narrative, or explanatory intent — the user wants to understand *why* or *how* something happened, not just retrieve numbers.
+    Requires explicit causal/explanatory language: "why", "how did", "what caused", "what drove", "explain", "what happened to", "what led to".
+    "Analyze" or "get indicators" alone does NOT make a query analytical — if the result is a set of retrieved numbers (even with currency conversion), use `extraction` or `comparison`.
     Examples: "Why did gross margin compress in H2 2023?", "What drove the revenue decline?", "Explain the restructuring impact."
 
   When uncertain between `extraction` and `comparison`, choose `comparison`.
-  When uncertain between `comparison` and `analytical`, choose `analytical`.
+  When uncertain between `extraction` and `analytical`, choose `extraction`.
+  When uncertain between `comparison` and `analytical`, choose `comparison`.
   Default to `extraction` if query_shape cannot be determined for a retrieval query.
 
   ## Output Schema
@@ -115,6 +117,18 @@ template: |
     "user_intent": "comparison",
     "query_shape": "comparison",
     "reasoning": "Three-entity argmax comparison with currency conversion."
+  }
+  ```
+
+  **Query:** "Analyze the document of Duni Group, get 3 main financial indicators, if they are not in USD convert using exchange rate for 31-12-2022"
+  **recent_turns:** []
+  ```json
+  {
+    "route": "retrieval",
+    "entities": [{"name": "Duni Group", "entity_type": "company", "raw_span": "Duni Group"}],
+    "user_intent": "single_lookup",
+    "query_shape": "extraction",
+    "reasoning": "Single entity, requesting specific numeric metrics with currency conversion — extraction despite the word 'analyze'."
   }
   ```
 

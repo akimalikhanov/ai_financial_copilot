@@ -450,7 +450,7 @@ def get_agent_config() -> dict:
         "max_iterations": int(os.getenv("AGENT_MAX_ITERATIONS", "6")),
         "token_budget": int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
         "max_concurrent_searches": int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
-        "max_chunks_per_entity": int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "8")),
+        "max_chunks_per_entity": int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
     }
 
 
@@ -644,3 +644,18 @@ def get_eval_judge_model() -> str:
 
 def get_eval_output_dir() -> Path:
     return Path(os.getenv("EVAL_OUTPUT_DIR", "data/eval/runs"))
+
+
+def get_conversation_naming_config() -> dict:
+    """Auto-naming config: generates a short chat title from the first user query.
+
+    Env vars:
+      CONVERSATION_NAMING_ENABLED  — 1/true/yes/on to enable (default: true)
+      CONVERSATION_NAMING_MODEL    — model ID from models.yaml (default: gpt-4o-mini)
+      CONVERSATION_NAMING_MAX_LEN  — max title chars (default: 60)
+    """
+    return {
+        "enabled": _parse_bool(os.getenv("CONVERSATION_NAMING_ENABLED"), True),
+        "model": os.getenv("CONVERSATION_NAMING_MODEL", "gpt-4o-mini"),
+        "max_len": int(os.getenv("CONVERSATION_NAMING_MAX_LEN", "60")),
+    }

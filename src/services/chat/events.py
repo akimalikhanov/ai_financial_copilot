@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from uuid import UUID
 
@@ -17,6 +18,8 @@ from src.schemas.retrieval import (
 )
 from src.services.llm_adapters.base_adapter import LLMResponseStats
 from src.services.retrieval.payload_hydrator import _parse_provenance
+
+logger = logging.getLogger(__name__)
 
 
 class ThinkingStripper:
@@ -75,27 +78,33 @@ def error_event(exc: Exception, user_message: str | None = None) -> dict:
 
 
 def _provenance_bbox_hint(provenance: ChunkProvenance | None) -> dict | None:
-    """Extract the first bbox from provenance in raw PDF points.
+    """Compute a union bounding box across all provenance items on the first page.
 
-    Docling stores bbox in absolute PDF points (typically BOTTOMLEFT origin).
-    The frontend converts to CSS percentages using the actual page dimensions
-    from pdf.js, since page width/height isn't stored alongside the bbox.
+    A chunk may span multiple text blocks; merging them into one rect gives a
+    highlight that covers the whole chunk without multiple overlapping overlays.
+    Docling bbox coordinates are in absolute PDF points (typically BOTTOMLEFT origin).
     """
     if not provenance:
         return None
-    for item in provenance.items:
-        b = item.bbox
-        if b is None:
-            continue
-        return {
-            "left": b.left,
-            "top": b.top,
-            "right": b.right,
-            "bottom": b.bottom,
-            "coord_origin": b.coord_origin,
-            "page": item.page_no,
-        }
-    return None
+    items_with_bbox = [item for item in provenance.items if item.bbox is not None]
+    if not items_with_bbox:
+        return None
+    first_page = items_with_bbox[0].page_no
+    page_items = [item for item in items_with_bbox if item.page_no == first_page]
+    coord_origin = page_items[0].bbox.coord_origin  # type: ignore[union-attr]
+    left = min(item.bbox.left for item in page_items)  # type: ignore[union-attr]
+    right = max(item.bbox.right for item in page_items)  # type: ignore[union-attr]
+    # For BOTTOMLEFT: bottom < top numerically; union keeps the lower bottom and higher top
+    bottom = min(item.bbox.bottom for item in page_items)  # type: ignore[union-attr]
+    top = max(item.bbox.top for item in page_items)  # type: ignore[union-attr]
+    return {
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "coord_origin": coord_origin,
+        "page": first_page,
+    }
 
 
 def citation_to_dict(c: Citation, provenance: ChunkProvenance | None = None) -> dict:
@@ -149,6 +158,7 @@ def build_references_list(
     """
     item_by_id = {item.ref_id: item for item in rag_context.items}
     result: list[dict] = []
+    unresolved: list[str] = []
     for source_id, display_label in sorted(
         label_map.mapping.items(),
         key=lambda x: int(x[1][1:]),  # sort by numeric part of "C1", "C2", ...
@@ -158,6 +168,18 @@ def build_references_list(
             entry = citation_to_dict(ctx_item.citation, ctx_item.provenance)
             entry["display_label"] = display_label
             result.append(entry)
+        else:
+            unresolved.append(f"{source_id}->{display_label}")
+    if unresolved:
+        # The model cited a source ID with no matching context item — the citation
+        # pill for it will render but won't resolve to an evidence entry.
+        logger.warning(
+            "cited_refs_missing_from_context",
+            extra={
+                "unresolved_refs": unresolved,
+                "context_ref_ids": sorted(item_by_id),
+            },
+        )
     return result
 
 
