@@ -702,7 +702,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             )
                         )
                     try:
-                        processed = await process_findings(agent_findings)
+                        processed = await process_findings(
+                            agent_findings,
+                            requested_currency=getattr(
+                                state.router_output, "requested_currency", None
+                            ),
+                        )
                         if lf:
                             lf.update_current_span(
                                 output={

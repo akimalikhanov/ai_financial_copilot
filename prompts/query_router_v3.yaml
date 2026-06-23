@@ -43,6 +43,12 @@ template: |
   When uncertain between `comparison` and `analytical`, choose `comparison`.
   Default to `extraction` if query_shape cannot be determined for a retrieval query.
 
+  ## requested_currency
+
+  If the user explicitly names an output currency in the query (e.g. "in USD", "in dollars", "convert to EUR", "express in euros"), set `requested_currency` to the ISO 4217 code (e.g. "USD", "EUR", "GBP"). Set `null` if no output currency is named.
+
+  Do NOT infer a currency from document context, entity nationality, or default assumptions. Only extract what the user explicitly states.
+
   ## Output Schema
 
   Return exactly this JSON structure. No preamble, no markdown, no explanation.
@@ -59,6 +65,7 @@ template: |
     ],
     "user_intent": "single_lookup | comparison | trend_analysis | definition | other",
     "query_shape": "extraction | comparison | analytical | null",
+    "requested_currency": "USD | null",
     "reasoning": "brief internal trace"
   }
   ```
@@ -73,7 +80,8 @@ template: |
     "entities": [{"name": "Apple Inc.", "entity_type": "company", "raw_span": "Apple"}],
     "user_intent": "single_lookup",
     "query_shape": "extraction",
-    "reasoning": "Single company, single metric, single quarter — extraction."
+    "requested_currency": null,
+    "reasoning": "Single company, single metric, single quarter — extraction. No output currency named."
   }
   ```
 
@@ -88,7 +96,8 @@ template: |
     ],
     "user_intent": "comparison",
     "query_shape": "comparison",
-    "reasoning": "Multi-entity comparison across multiple years."
+    "requested_currency": null,
+    "reasoning": "Multi-entity comparison across multiple years. No output currency named."
   }
   ```
 
@@ -100,6 +109,7 @@ template: |
     "entities": [],
     "user_intent": "trend_analysis",
     "query_shape": "analytical",
+    "requested_currency": null,
     "reasoning": "Causal question about margin compression — analytical path."
   }
   ```
@@ -116,7 +126,8 @@ template: |
     ],
     "user_intent": "comparison",
     "query_shape": "comparison",
-    "reasoning": "Three-entity argmax comparison with currency conversion."
+    "requested_currency": "EUR",
+    "reasoning": "Three-entity argmax comparison. User said 'Convert to EUR'."
   }
   ```
 
@@ -128,7 +139,8 @@ template: |
     "entities": [{"name": "Duni Group", "entity_type": "company", "raw_span": "Duni Group"}],
     "user_intent": "single_lookup",
     "query_shape": "extraction",
-    "reasoning": "Single entity, requesting specific numeric metrics with currency conversion — extraction despite the word 'analyze'."
+    "requested_currency": "USD",
+    "reasoning": "Single entity, numeric metrics. User explicitly said 'if not in USD convert' — requested_currency is USD."
   }
   ```
 
@@ -140,7 +152,8 @@ template: |
     "entities": [{"name": "ACME Corp.", "entity_type": "company", "raw_span": "their"}],
     "user_intent": "single_lookup",
     "query_shape": "extraction",
-    "reasoning": "Coreference resolved to ACME Corp. Single metric lookup."
+    "requested_currency": null,
+    "reasoning": "Coreference resolved to ACME Corp. Single metric lookup. No output currency named."
   }
   ```
 
@@ -152,6 +165,7 @@ template: |
     "entities": [],
     "user_intent": "trend_analysis",
     "query_shape": "analytical",
+    "requested_currency": null,
     "reasoning": "Causal question about revenue decline — analytical."
   }
   ```
@@ -164,6 +178,7 @@ template: |
     "entities": [],
     "user_intent": "other",
     "query_shape": null,
+    "requested_currency": null,
     "reasoning": "Greeting and capability question — no retrieval needed."
   }
   ```
@@ -176,6 +191,7 @@ template: |
     "entities": [],
     "user_intent": "definition",
     "query_shape": null,
+    "requested_currency": null,
     "reasoning": "General financial definition — no document retrieval needed."
   }
   ```
@@ -188,6 +204,7 @@ template: |
     "entities": [],
     "user_intent": "other",
     "query_shape": null,
+    "requested_currency": null,
     "reasoning": "Weather query — outside financial document scope."
   }
   ```

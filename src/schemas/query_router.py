@@ -36,6 +36,9 @@ class RouterOutput(BaseModel):
     user_intent: str
     reasoning: str
     query_shape: Literal["extraction", "comparison", "analytical"] | None = None
+    requested_currency: str | None = (
+        None  # ISO code extracted from query ("...in USD"); None if not stated
+    )
 
 
 class EntityManifestItem(BaseModel):

@@ -16,11 +16,11 @@ template: |
   ## Your tools
 
   - **search_documents(entity, query)** — Search financial documents for a specific entity. Call once per entity per turn. Returns retrieved text excerpts.
-  - **report_findings(metric_requested, findings, target_currency, comparison_op)** — Call this ONCE when you have finished searching. Reports extracted values for all entities. This ends the search phase.
+  - **report_findings(metric_requested, findings, comparison_op)** — Call this ONCE when you have finished searching. Reports extracted values for all entities. This ends the search phase.
 
-  ## Currency conversion
+  ## Currency reporting
 
-  When the user wants reported values in a specific currency (single entity OR comparison), report each finding in its NATIVE currency and set `target_currency` on `report_findings`. The system converts every finding deterministically at the correct rate and date — do NOT pre-convert values yourself.
+  Always report each finding in its NATIVE currency as stated in the document. Do NOT pre-convert values yourself. The system handles any required currency conversion automatically.
 
   ---
 
@@ -76,7 +76,6 @@ template: |
   report_findings(
     metric_requested="EBITDA",
     comparison_op=null,
-    target_currency=null,
     findings=[
       {entity: "Apple Inc.", value: 123456, unit: "M", currency: "USD", period_end: "2023-09-30",
        source_chunks: ["S2"], available: true}
@@ -93,12 +92,11 @@ template: |
   search_documents(entity="Duni Group", query="revenue net income total assets 2022")
   ```
 
-  Turn 2 (after results — report NATIVE currency, set target_currency; do NOT pre-convert):
+  Turn 2 (after results — report NATIVE currency; system handles conversion):
   ```
   report_findings(
     metric_requested="revenue, net income, total assets",
     comparison_op="none",
-    target_currency="USD",
     findings=[
       {entity: "Duni Group", value: 6976, unit: "M", currency: "SEK", period_end: "2022-12-31", source_chunks: ["S1", "S4"], available: true}
     ]
@@ -116,12 +114,11 @@ template: |
   search_documents(entity="SAP SE", query="total assets 2023")
   ```
 
-  Turn 2 (after all three return results):
+  Turn 2 (after all three return results — report native currencies; system handles EUR conversion):
   ```
   report_findings(
     metric_requested="total_assets",
     comparison_op="argmax",
-    target_currency="EUR",
     findings=[
       {entity: "Apple Inc.", value: 352583, unit: "M", currency: "USD", period_end: "2023-09-30", source_chunks: ["S2"], available: true},
       {entity: "Microsoft", value: 411976, unit: "M", currency: "USD", period_end: "2023-06-30", source_chunks: ["S13"], available: true},

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import random
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -87,19 +88,30 @@ async def _fetch_rate(
 ) -> tuple[str, float | None]:
     date_str = date or "latest"
     key = f"{from_cur}->{to_cur}@{date_str}"
-    try:
-        r = await client.get(
-            f"{_FRANKFURTER_BASE}/{date_str}", params={"from": from_cur, "to": to_cur}
-        )
-        r.raise_for_status()
-        rate = r.json()["rates"].get(to_cur)
-        return key, rate
-    except Exception as exc:
-        logger.warning("FX fetch failed %s: %s", key, exc)
-        return key, None
+    for attempt in range(2):
+        try:
+            r = await client.get(
+                f"{_FRANKFURTER_BASE}/{date_str}", params={"from": from_cur, "to": to_cur}
+            )
+            r.raise_for_status()
+            rate = r.json()["rates"].get(to_cur)
+            return key, rate
+        except Exception as exc:
+            if attempt == 0:
+                await asyncio.sleep(0.1 + random.uniform(0, 0.15))
+                logger.debug("FX fetch retry %s: %s", key, exc)
+            else:
+                logger.warning("FX fetch failed %s: %s", key, exc)
+    return key, None
 
 
-async def process_findings(findings: AgentFindings | AnalyticalFindings) -> ProcessedFindings:
+_DEFAULT_COMPARISON_CURRENCY = "USD"
+
+
+async def process_findings(
+    findings: AgentFindings | AnalyticalFindings,
+    requested_currency: str | None = None,
+) -> ProcessedFindings:
     if isinstance(findings, AnalyticalFindings):
         return ProcessedFindings(
             findings=(),
@@ -111,29 +123,46 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
         )
 
     available = [f for f in findings.findings if f.available and f.value is not None]
-    target = findings.target_currency
+    op = findings.comparison_op
+    is_comparison = op in ("argmin", "argmax")
 
-    # Deterministic FX normalization fires whenever the agent reported a target
-    # currency — for extraction (report values in USD) and comparison (normalize
-    # before argmin/argmax) alike. This is the only FX path.
+    # Currency resolution — pure code, no LLM decision:
+    # 1. If the user named a currency in the query, use it.
+    # 2. If findings span multiple currencies and we need to rank, fall back to the
+    #    product default and disclose it in answer_note.
+    # 3. Otherwise no conversion target — render native values.
+    currencies = {f.currency for f in available if f.currency}
+    multi_ccy = len(currencies) > 1
+    answer_note: str | None = None
+
+    if requested_currency:
+        resolved_target: str | None = requested_currency
+    elif multi_ccy and is_comparison:
+        resolved_target = _DEFAULT_COMPARISON_CURRENCY
+        answer_note = (
+            f"no target currency specified — compared in {resolved_target} "
+            f"(findings span {', '.join(sorted(currencies))})"
+        )
+    else:
+        resolved_target = None
+
     needs_fx = (
-        target is not None
+        resolved_target is not None
         and _normalizer_enabled()
-        and any(f.currency and f.currency != target for f in available)
+        and any(f.currency and f.currency != resolved_target for f in available)
     )
 
     fx_rates_used: dict[str, float] = {}
     currency_converted = False
-    answer_note: str | None = None
 
     if needs_fx:
-        assert target is not None  # narrowed above
+        assert resolved_target is not None  # narrowed above
         # Unique (from_currency, date) pairs requiring conversion
         pairs: list[tuple[str, str | None]] = list(
             {
                 (f.currency, _normalize_date(f.period_end))
                 for f in available
-                if f.currency and f.currency != target
+                if f.currency and f.currency != resolved_target
             }
         )
 
@@ -144,13 +173,13 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
                 lf.start_as_current_observation(
                     as_type="span",
                     name="fx_conversion",
-                    input={"pairs": list(pairs), "target_currency": target},
+                    input={"pairs": list(pairs), "target_currency": resolved_target},
                 )
             )
         try:
             async with httpx.AsyncClient(timeout=_FX_TIMEOUT) as client:
                 results = await asyncio.gather(
-                    *[_fetch_rate(client, cur, target, date) for cur, date in pairs]
+                    *[_fetch_rate(client, cur, resolved_target, date) for cur, date in pairs]
                 )
 
             rate_map: dict[tuple[str, str | None], float | None] = {}
@@ -184,25 +213,31 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
             _fx_lf_stack.close()
 
         if failed:
-            return ProcessedFindings(
-                findings=tuple(
-                    NormalizedFinding(finding=f, normalized_value=None, fx_rate=None)
-                    for f in findings.findings
-                ),
-                answer_entity=None,
-                fx_rates_used=fx_rates_used,
-                currency_converted=False,
-                answer_note=f"comparison not possible — FX conversion failed for: {', '.join(failed)}",
-                metric_requested=findings.metric_requested,
-                target_currency=target,
-                comparison_op=findings.comparison_op,
-            )
+            # For argmin/argmax we can't rank with a hole — abort the whole result.
+            # For list/none, render what converted successfully; mark failed entities N/A.
+            if is_comparison:
+                return ProcessedFindings(
+                    findings=tuple(
+                        NormalizedFinding(finding=f, normalized_value=None, fx_rate=None)
+                        for f in findings.findings
+                    ),
+                    answer_entity=None,
+                    fx_rates_used=fx_rates_used,
+                    currency_converted=False,
+                    answer_note=f"comparison not possible — FX conversion failed for: {', '.join(failed)}",
+                    metric_requested=findings.metric_requested,
+                    target_currency=resolved_target,
+                    comparison_op=findings.comparison_op,
+                )
+            # list/none: proceed with partial conversion; failed pairs produce
+            # normalized_value=None (handled in the loop below) and render as N/A.
+            answer_note = f"FX conversion failed for: {', '.join(failed)} — shown as N/A"
 
         normalized: list[NormalizedFinding] = []
         for f in findings.findings:
             if not f.available or f.value is None:
                 normalized.append(NormalizedFinding(finding=f, normalized_value=None, fx_rate=None))
-            elif f.currency and f.currency != target:
+            elif f.currency and f.currency != resolved_target:
                 rate = rate_map[(f.currency, _normalize_date(f.period_end))]
                 norm_val = f.value * rate if rate is not None else None
                 normalized.append(
@@ -225,20 +260,34 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
             for f in findings.findings
         ]
 
-    # Apply comparison op over available normalized values
+    # Apply comparison op over available normalized values.
+    # Null-currency candidates are excluded from ranking — they can't be safely compared
+    # against converted values (unknown denomination) and are flagged in answer_note.
     answer_entity: str | None = None
-    op = findings.comparison_op
-    if op in ("argmin", "argmax"):
-        candidates = [n for n in normalized if n.normalized_value is not None]
-        if candidates:
+    if is_comparison:
+        assert resolved_target is not None or not multi_ccy, (
+            "argmin/argmax reached comparator with multi-currency findings and no resolved_target"
+        )
+        rankable = [
+            n
+            for n in normalized
+            if n.normalized_value is not None and n.finding.currency is not None
+        ]
+        null_ccy_excluded = [
+            n for n in normalized if n.normalized_value is not None and n.finding.currency is None
+        ]
+        if null_ccy_excluded and answer_note is None:
+            excluded_names = ", ".join(n.finding.entity for n in null_ccy_excluded)
+            answer_note = f"excluded from ranking (unknown currency): {excluded_names}"
+        if rankable:
 
             def key_fn(n: NormalizedFinding) -> float:
                 return _to_millions(n.normalized_value, n.finding.unit)  # type: ignore[arg-type]
 
-            best = min(candidates, key=key_fn) if op == "argmin" else max(candidates, key=key_fn)
+            best = min(rankable, key=key_fn) if op == "argmin" else max(rankable, key=key_fn)
             answer_entity = best.finding.entity
 
-    if len(available) == 1 and len(findings.findings) > 1:
+    if len(available) == 1 and len(findings.findings) > 1 and answer_note is None:
         answer_note = "only one entity had available data"
 
     return ProcessedFindings(
@@ -248,7 +297,7 @@ async def process_findings(findings: AgentFindings | AnalyticalFindings) -> Proc
         currency_converted=currency_converted,
         answer_note=answer_note,
         metric_requested=findings.metric_requested,
-        target_currency=target,
+        target_currency=resolved_target,
         comparison_op=findings.comparison_op,
     )
 
@@ -314,8 +363,10 @@ def _render_findings_block(
             to_cur = processed.target_currency or ""
             native = f"{f.currency} {f.value:,.1f}{unit_str}"
             converted = f"{to_cur} {nf.normalized_value:,.1f}{unit_str}"
+            date_used = _normalize_date(f.period_end) or "latest"
+            rate_note = " (approx — date unavailable)" if date_used == "latest" else ""
             lines.append(
-                f"{f.entity:<22} | {converted:<14} | from {native:<16} | rate: {nf.fx_rate:.4f}"
+                f"{f.entity:<22} | {converted:<14} | from {native:<16} | rate: {nf.fx_rate:.4f}{rate_note}"
                 f" | period: {f.period_end or '—'} | chunks: {chunks_str}"
             )
         else:

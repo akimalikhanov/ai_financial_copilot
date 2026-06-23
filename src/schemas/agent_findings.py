@@ -20,7 +20,6 @@ class EntityFinding:
 class AgentFindings:
     metric_requested: str
     findings: tuple[EntityFinding, ...]
-    target_currency: str | None = None
     comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
 
 

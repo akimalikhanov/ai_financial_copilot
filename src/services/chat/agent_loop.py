@@ -74,10 +74,6 @@ _REPORT_FINDINGS_TOOL: dict = {
             "required": ["metric_requested", "findings"],
             "properties": {
                 "metric_requested": {"type": "string"},
-                "target_currency": {
-                    "type": ["string", "null"],
-                    "description": "ISO code (e.g. 'USD') the reported values should be expressed in. Set this whenever the user asked for results in a specific currency — for a single entity or across a comparison. The system converts every finding deterministically; do NOT pre-convert values yourself. Leave null if no target currency was requested.",
-                },
                 "comparison_op": {
                     "type": ["string", "null"],
                     "enum": ["argmin", "argmax", "list", "none", None],
@@ -176,7 +172,7 @@ _CONVERT_CURRENCY_TOOL: dict = {
     },
 }
 
-# All FX runs through report_findings.target_currency → deterministic conversion in
+# All FX runs through router-extracted requested_currency → deterministic trigger in
 # findings_processor. _CONVERT_CURRENCY_TOOL / _execute_convert_currency are intentionally
 # kept but NOT exposed to the agent: add _CONVERT_CURRENCY_TOOL to the list below to revive.
 TOOLS_EXTRACTION_COMPARISON = [_SEARCH_TOOL, _REPORT_FINDINGS_TOOL]
@@ -429,7 +425,6 @@ def _parse_findings(tc: ToolCallRef) -> AgentFindings | AnalyticalFindings:
         return AgentFindings(
             metric_requested=data.get("metric_requested", ""),
             findings=findings,
-            target_currency=data.get("target_currency"),
             comparison_op=data.get("comparison_op"),
         )
     # report_analytical_findings
@@ -764,7 +759,6 @@ async def run_agent_loop(
                                 output={
                                     "metric_requested": agent_findings.metric_requested,
                                     "comparison_op": agent_findings.comparison_op,
-                                    "target_currency": agent_findings.target_currency,
                                     "findings": _findings_summary,
                                 },
                                 metadata={
