@@ -1,0 +1,27 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    url: http://prometheus:9090
+    access: proxy
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+
+  - name: PostgreSQL
+    type: postgres
+    uid: postgres
+    url: ${PGB_APP_DB_HOST}:${PGB_APP_DB_PORT}
+    user: ${APP_DB_USER}
+    secureJsonData:
+      password: ${APP_DB_PASSWORD}
+    jsonData:
+      database: ${APP_DB}
+      sslmode: disable
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+      postgresVersion: 1600
+      timescaledb: false

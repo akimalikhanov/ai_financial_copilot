@@ -14,6 +14,7 @@ from celery.signals import worker_process_init
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.observability.worker_metrics import start_worker_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ if __name__ == "__main__":
     argv = ["worker", "--loglevel=info", "--pool", pool, "-n", nodename, "-Q", "ingestion"]
     if concurrency:
         argv.extend(["--concurrency", concurrency])
+
+    start_worker_metrics(port=9101, queues=("ingestion",))
 
     logger.info(
         "ingestion_worker.starting",

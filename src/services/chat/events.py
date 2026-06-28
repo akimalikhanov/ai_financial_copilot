@@ -68,12 +68,22 @@ def out_of_scope_response() -> str:
     )
 
 
+_GENERIC_USER_ERROR = "Something went wrong. Please try again."
+
+
 def error_event(exc: Exception, user_message: str | None = None) -> dict:
     """Structured error event for frontend display."""
+    from src.services.llm_runtime.exceptions import LLMError
+
+    if user_message is None and isinstance(exc, LLMError):
+        payload = exc.to_dict(as_json=False)
+        if isinstance(payload, dict):
+            user_message = payload.get("user_message")
+
     return {
         "error_type": type(exc).__name__,
         "message": str(exc),
-        "user_message": user_message or str(exc),
+        "user_message": user_message or _GENERIC_USER_ERROR,
     }
 
 

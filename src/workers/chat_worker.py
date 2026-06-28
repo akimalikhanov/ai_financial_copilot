@@ -13,6 +13,7 @@ from celery.signals import worker_process_init
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.observability.worker_metrics import start_worker_metrics
 
 
 @worker_process_init.connect
@@ -24,4 +25,5 @@ if __name__ == "__main__":
     configure_worker_logging()
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    start_worker_metrics(port=9100, queues=("chat",))
     celery_app.worker_main(argv=["worker", "-Q", "chat", "--pool=prefork"])

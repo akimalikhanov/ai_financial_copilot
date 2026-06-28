@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.observability import langfuse as lf_client
+from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
 from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
 from src.services.ingestion.embedder import embed_chunks
@@ -145,7 +147,9 @@ async def run_chat_rag_pipeline(
     lf = lf_client.get_client()
 
     with _span(lf, "embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
+        _t = perf_counter()
         vectors_list = await asyncio.to_thread(embed_chunks, [transformed.semantic_query])
+        RAG_RETRIEVAL.labels("embed").observe(perf_counter() - _t)
         if obs:
             obs.update(
                 output={
@@ -166,6 +170,7 @@ async def run_chat_rag_pipeline(
         },
         mode="single_pass",
     ) as obs:
+        _t = perf_counter()
         vec_r, kw_r, fused = await _run_single_pass(
             semantic_vector,
             transformed.keyword_query,
@@ -176,6 +181,10 @@ async def run_chat_rag_pipeline(
             keyword_top_k,
             search_mode=search_mode,
         )
+        RAG_RETRIEVAL.labels("hybrid_retrieve").observe(perf_counter() - _t)
+        RAG_CHUNKS.labels("vector").observe(len(vec_r))
+        RAG_CHUNKS.labels("keyword").observe(len(kw_r))
+        RAG_CHUNKS.labels("fused").observe(len(fused))
         if obs:
             obs.update(
                 output={
@@ -207,7 +216,10 @@ async def run_chat_rag_pipeline(
         },
         mode="single_pass",
     ) as obs:
+        _t = perf_counter()
         reranked = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        RAG_RETRIEVAL.labels("rerank").observe(perf_counter() - _t)
+        RAG_CHUNKS.labels("reranked").observe(len(reranked))
         if obs:
             obs.update(
                 output={

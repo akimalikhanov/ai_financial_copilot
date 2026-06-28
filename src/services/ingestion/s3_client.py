@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 import aioboto3
+from botocore.config import Config
 
 from src.utils.config import (
     get_s3_access_key,
@@ -50,6 +51,7 @@ async def upload_pdf(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
+        config=Config(response_checksum_validation="when_required"),
     ) as client:
         with contextlib.suppress(Exception):
             fileobj.seek(0)
@@ -77,6 +79,7 @@ async def download_file(storage_key: str, *, bucket: str | None = None) -> Path:
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
+        config=Config(response_checksum_validation="when_required"),
     ) as client:
         resp = await client.get_object(Bucket=target_bucket, Key=storage_key)
         body = resp["Body"]
@@ -107,6 +110,7 @@ async def upload_bytes(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
+        config=Config(response_checksum_validation="when_required"),
     ) as client:
         await client.put_object(
             Bucket=target_bucket,

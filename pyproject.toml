@@ -16,6 +16,7 @@ dependencies = [
     "langfuse>=4.5.1",
     "opensearch-py>=3.1.0",
     "passlib[bcrypt]>=1.7.4",
+    "prometheus-client>=0.24.1",
     "pydantic>=2.12.5",
     "pyjwt[crypto]>=2.10.1",
     "python-dotenv>=1.2.1",

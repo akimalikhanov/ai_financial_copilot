@@ -47,3 +47,8 @@ celery_app.conf.update(
         "ingest_document": {"queue": "ingestion"},
     },
 )
+
+# Import for side effect: registers Celery task-metric signal handlers in every
+# process that loads the app (parent + prefork children). The metrics HTTP server
+# itself is started only in the worker parent (see start_worker_metrics).
+from src.observability import worker_metrics as _worker_metrics  # noqa: E402,F401

@@ -16,6 +16,8 @@ from uuid import UUID, uuid4
 from fastapi import Request
 from starlette.responses import Response
 
+from src.observability.metrics import HTTP_DURATION, HTTP_IN_PROGRESS, HTTP_REQUESTS
+
 # ---------------------------------------------------------------------------
 # Request Context (ContextVar-based, accumulates data during request lifecycle)
 # ---------------------------------------------------------------------------
@@ -256,6 +258,11 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
     token: Token[RequestContext | None] = _request_ctx.set(ctx)
     request.state.request_id = request_id
 
+    # Resolve the route template once up front so metric labels stay low-cardinality
+    # (and so increment/decrement of the in-progress gauge use the same label set).
+    endpoint = _route_template(request)
+    HTTP_IN_PROGRESS.labels(ctx.method, endpoint).inc()
+
     try:
         response = await call_next(request)
         ctx.http_status = response.status_code
@@ -267,14 +274,39 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
         ctx.status = "error"
         ctx.error_type = type(exc).__name__
         ctx.error_msg = str(exc)
+        _record_http_metrics(ctx, endpoint)
         _log_request(ctx, exc_info=True)
         _request_ctx.reset(token)
+        HTTP_IN_PROGRESS.labels(ctx.method, endpoint).dec()
         raise
 
     response.headers[REQUEST_ID_HEADER] = request_id
+    _record_http_metrics(ctx, endpoint)
     _log_request(ctx)
     _request_ctx.reset(token)
+    HTTP_IN_PROGRESS.labels(ctx.method, endpoint).dec()
     return response
+
+
+def _route_template(request: Request) -> str:
+    """Best-effort match of the request to its route template (low-cardinality label).
+
+    Falls back to "unmatched" for paths with no matching route (404s, /metrics, etc.),
+    which keeps raw paths out of metric labels.
+    """
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        if route.matches(request.scope)[0] == Match.FULL:
+            return getattr(route, "path", "unmatched")
+    return "unmatched"
+
+
+def _record_http_metrics(ctx: RequestContext, endpoint: str) -> None:
+    HTTP_REQUESTS.labels(ctx.method, endpoint, str(ctx.http_status)).inc()
+    if ctx.duration_ms is None:
+        ctx.duration_ms = round((perf_counter() - ctx.start_time) * 1000, 3)
+    HTTP_DURATION.labels(ctx.method, endpoint).observe(ctx.duration_ms / 1000.0)
 
 
 def _log_request(ctx: RequestContext, exc_info: bool = False) -> None:

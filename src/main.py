@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import make_asgi_app
 
 from src.api.exceptions import llm_error_handler
 from src.api.logging import configure_logging, request_logging_middleware
@@ -60,6 +61,9 @@ def create_app() -> FastAPI:
     logger.info("cors.configured", extra={"origins": cors_origins})
 
     app.middleware("http")(request_logging_middleware)
+
+    # Expose Prometheus metrics (scraped by Prometheus locally / Operator in K8s)
+    app.mount("/metrics", make_asgi_app())
 
     # Register global exception handler for LLM errors
     app.add_exception_handler(LLMError, llm_error_handler)

@@ -9,14 +9,18 @@ api:
 	.venv/bin/uvicorn src.main:app --reload --host 0.0.0.0
 
 # Run only the chat worker (Celery worker, queue: chat)
+# PROMETHEUS_MULTIPROC_DIR lets prefork children share metrics with the parent's
+# :9100 metrics server. Must be set before Python imports prometheus_client.
 .PHONY: worker
 worker:
-	.venv/bin/python -m src.workers.chat_worker
+	rm -rf /tmp/prom_chat && mkdir -p /tmp/prom_chat && \
+	PROMETHEUS_MULTIPROC_DIR=/tmp/prom_chat .venv/bin/python -m src.workers.chat_worker
 
 # Run only the ingestion (Celery) worker
 .PHONY: worker-ingestion
 worker-ingestion:
-	.venv/bin/python -m src.workers.ingestion_worker
+	rm -rf /tmp/prom_ingestion && mkdir -p /tmp/prom_ingestion && \
+	PROMETHEUS_MULTIPROC_DIR=/tmp/prom_ingestion .venv/bin/python -m src.workers.ingestion_worker
 
 # Run only the frontend
 .PHONY: ui

@@ -41,9 +41,14 @@ trap cleanup SIGINT SIGTERM
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
+# PROMETHEUS_MULTIPROC_DIR lets Celery prefork children share metrics with the
+# parent's metrics server (:9100 chat, :9101 ingestion).
+rm -rf /tmp/prom_chat /tmp/prom_ingestion
+mkdir -p /tmp/prom_chat /tmp/prom_ingestion
+
 start .venv/bin/uvicorn src.main:app --reload --reload-dir src --host 0.0.0.0
-start .venv/bin/python -m src.workers.chat_worker
-start .venv/bin/python -m src.workers.ingestion_worker
+start env PROMETHEUS_MULTIPROC_DIR=/tmp/prom_chat .venv/bin/python -m src.workers.chat_worker
+start env PROMETHEUS_MULTIPROC_DIR=/tmp/prom_ingestion .venv/bin/python -m src.workers.ingestion_worker
 start bash -c 'cd src/ui && exec npm run dev'
 
 # Wait for all children. Note: no `set -e` — a single worker crashing must NOT

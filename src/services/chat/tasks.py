@@ -21,6 +21,17 @@ from src.api.logging import configure_worker_logging, worker_request_context
 from src.celery_app import celery_app
 from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
+from src.observability.metrics import (
+    AGENT_ITERATIONS,
+    GUARDRAIL_BLOCKS,
+    LLM_CACHE_HIT_TOKENS,
+    LLM_COST,
+    LLM_TOKENS,
+    PIPELINE_ERRORS,
+    RAG_CITATIONS,
+    RAG_CONTEXT_TOKENS,
+    ROUTER_DECISIONS,
+)
 from src.redis_client import add_event
 from src.repository import (
     ConversationRepository,
@@ -423,6 +434,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     )
 
                 if injection_signal.severity == "block":
+                    GUARDRAIL_BLOCKS.labels("injection").inc()
                     refusal_text = (
                         "I'm sorry, but I can't process that request. "
                         "Please ask a financial question about your documents."
@@ -498,6 +510,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 parent_request_id=llm_request.id,
                 conversation_id=state.conversation_id,
             )
+            ROUTER_DECISIONS.labels(state.router_output.route).inc()
             # Shim for downstream stages that still read processed_query.route
             state.processed_query = ProcessedQuery(
                 normalized_text=state.user_query_raw.strip(),
@@ -658,6 +671,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 finally:
                     _agent_lf_stack.close()
 
+                AGENT_ITERATIONS.observe(agent_meta.iterations)
                 state.agent_meta = agent_meta
                 state.used_agent_loop = True
 
@@ -695,7 +709,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 name="findings_processor",
                                 input={
                                     "type": type(agent_findings).__name__,
-                                    "findings_count": len(agent_findings.findings)
+                                    "metric_requested": getattr(
+                                        agent_findings, "metric_requested", None
+                                    ),
+                                    "comparison_op": getattr(agent_findings, "comparison_op", None),
+                                    "findings": [_dc.asdict(f) for f in agent_findings.findings]
                                     if isinstance(agent_findings, _AgentFindings)
                                     else None,
                                 },
@@ -716,8 +734,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                     "fx_rates_used": processed.fx_rates_used,
                                     "answer_note": processed.answer_note,
                                     "comparison_op": processed.comparison_op,
+                                    "findings": [
+                                        {
+                                            "entity": nf.finding.entity,
+                                            "normalized_value": nf.normalized_value,
+                                            "fx_rate": nf.fx_rate,
+                                            "native_value": nf.finding.value,
+                                            "currency": nf.finding.currency,
+                                            "unit": nf.finding.unit,
+                                            "period_end": nf.finding.period_end,
+                                            "available": nf.finding.available,
+                                        }
+                                        for nf in processed.findings
+                                    ],
                                 },
-                                metadata={"agent_findings": agent_findings_json},
                             )
                     finally:
                         _fp_lf_stack.close()
@@ -875,6 +905,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             # 5. render_prompt
             await _log_stage("render_prompt")
+            # ~4 chars/token heuristic — a cheap, bounded proxy for synthesis context size.
+            RAG_CONTEXT_TOKENS.observe(len(state.rag_context_str or "") / 4)
             # Resolve model + citation_mode before rendering so prompt version is model-aware
             try:
                 llm = router.get(llm_request.model)
@@ -1135,7 +1167,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         if agent_findings_json
                         else None,
                     )
+                    if parser is not None:
+                        RAG_CITATIONS.observe(len(parser.all_spans))
+
                     if chunk.stats:
+                        _model = llm_request.model
+                        if chunk.stats.input_tokens:
+                            LLM_TOKENS.labels("input", _model).inc(chunk.stats.input_tokens)
+                        if chunk.stats.output_tokens:
+                            LLM_TOKENS.labels("output", _model).inc(chunk.stats.output_tokens)
+                        if chunk.stats.cached_input_tokens:
+                            LLM_CACHE_HIT_TOKENS.labels(_model).inc(chunk.stats.cached_input_tokens)
+                        if chunk.stats.cost_usd:
+                            LLM_COST.labels(_model).inc(chunk.stats.cost_usd)
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),
@@ -1200,7 +1244,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         citation_spans=parser.all_spans if parser is not None else None,
                         label_map=parser.label_map if parser is not None else None,
                     )
-                    await add_event(redis_app, request_id, "usage", usage_data)
                     await session.commit()
 
                     try:
@@ -1213,6 +1256,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
 
                     # Auto-name conversation on the first exchange (seq 2 = first assistant reply)
+                    # Must emit conversation_title BEFORE the usage event, since the frontend
+                    # stops reading the stream as soon as it receives usage (the final sentinel).
                     naming_cfg = get_conversation_naming_config()
                     if naming_cfg["enabled"] and state.assistant_seq == 2 and state.user_query_raw:
                         try:
@@ -1256,6 +1301,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "conversation_naming_error", extra={"request_id": request_id}
                             )
 
+                    await add_event(redis_app, request_id, "usage", usage_data)
+
             except Exception as e:
                 logger.exception("llm_stream_error", extra={"request_id": request_id})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
@@ -1270,7 +1317,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 msg = result.scalar_one_or_none()
                 if msg:
                     msg.status = MessageStatus.error
-                await add_event(redis_app, request_id, "error", error_event(e, str(e)))
+                await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
 
         logger.info(
@@ -1283,6 +1330,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         )
 
     except Exception as exc:
+        # current_stage is "NN_stage_name" (or "initializing") — strip the ordinal
+        # prefix so the label stays stable across stage reordering.
+        PIPELINE_ERRORS.labels(current_stage.split("_", 1)[-1]).inc()
         logger.exception(
             "pipeline.failed_at_stage",
             extra={"request_id": request_id, "stage": current_stage},

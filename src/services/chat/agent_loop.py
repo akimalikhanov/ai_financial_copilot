@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
@@ -15,6 +16,13 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.observability import langfuse as lf_client
+from src.observability.metrics import (
+    AGENT_TOOL_CALLS,
+    AGENT_TOOL_DURATION,
+    LLM_CACHE_HIT_TOKENS,
+    LLM_COST,
+    LLM_TOKENS,
+)
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
@@ -278,6 +286,7 @@ async def _execute_search(
     entity: str = args.get("entity", "unknown")
     raw_query: str = args.get("query", "")
 
+    _tool_started = perf_counter()
     await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
 
     # Resolve doc_ids for this entity
@@ -358,6 +367,8 @@ async def _execute_search(
         logger.warning("agent_search_failed", extra={"entity": entity})
         if lf:
             lf.update_current_span(output={"chunks_returned": 0, "error": True})
+        AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+        AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
         return _SearchResult(
             chunks=[],
             payloads={},
@@ -369,6 +380,8 @@ async def _execute_search(
 
     chunks = [replace(c, turn_index=iteration) for c in raw_chunks]
     payloads = await get_chunk_prompt_payloads(session, [c.chunk_id for c in chunks])
+    AGENT_TOOL_CALLS.labels("search_documents", "ok").inc()
+    AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
     return _SearchResult(chunks=chunks, payloads=payloads, rewrite_stats=rewrite_stats)
 
 
@@ -676,6 +689,14 @@ async def run_agent_loop(
                 token_spend += turn.stats.input_tokens or 0
                 output_tokens_total += turn.stats.output_tokens or 0
                 cost_usd_total += turn.stats.cost_usd or 0.0
+                if turn.stats.input_tokens:
+                    LLM_TOKENS.labels("input", llm.model_id).inc(turn.stats.input_tokens)
+                if turn.stats.output_tokens:
+                    LLM_TOKENS.labels("output", llm.model_id).inc(turn.stats.output_tokens)
+                if turn.stats.cached_input_tokens:
+                    LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(turn.stats.cached_input_tokens)
+                if turn.stats.cost_usd:
+                    LLM_COST.labels(llm.model_id).inc(turn.stats.cost_usd)
 
                 # Step 23: log each tool-calling turn as a subrequest row
                 if state.llm_request and state.llm_request.conversation_id is not None:
@@ -737,6 +758,7 @@ async def run_agent_loop(
                     agent_findings = _resolve_finding_refs(
                         _parse_findings(finalizer_tc), ref_registry, request_id
                     )
+                    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
                     # All chunks shown to the agent are admitted to the registry at search
                     # time; the post-loop per-lookup cap explicitly preserves cited chunks
                     # (see _finding_chunk_ids below), so no force-admit is needed here.
@@ -787,6 +809,7 @@ async def run_agent_loop(
                                 },
                             )
                 except Exception:
+                    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "error").inc()
                     logger.warning(
                         "agent_findings_parse_failed",
                         extra={"request_id": request_id, "raw_args": finalizer_tc.arguments[:500]},

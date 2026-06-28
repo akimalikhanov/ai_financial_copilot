@@ -160,7 +160,10 @@ async def run_one(
     rag_context_str: str
 
     if agent_findings is not None:
-        processed_findings = await process_findings(agent_findings)
+        processed_findings = await process_findings(
+            agent_findings,
+            requested_currency=getattr(router_out, "requested_currency", None),
+        )
 
         # Mirror the prod path: map finding chunk UUIDs to the synthesis context's
         # S-labels so the synthesis model only ever sees citable excerpt IDs.

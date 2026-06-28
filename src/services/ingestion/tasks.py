@@ -20,6 +20,11 @@ from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.observability.metrics import (
+    INGESTION_CHUNKS,
+    INGESTION_DOCUMENTS,
+    INGESTION_DURATION,
+)
 from src.redis_client import ingestion_stream_key
 from src.services.ingestion.chunker import reset_tokenizer
 from src.services.ingestion.docling_parser import reset_converter
@@ -190,6 +195,14 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 formatted[f"{idx:02d}. {name}"] = stage_times[name]
         return dict(sorted(formatted.items()))
 
+    async def _timed(stage: str, coro):
+        """Await coro, recording its latency under INGESTION_DURATION[stage]."""
+        t = perf_counter()
+        try:
+            return await coro
+        finally:
+            INGESTION_DURATION.labels(stage).observe(perf_counter() - t)
+
     try:
         # -- fetch document record, set status -> processing ----------------
         await _log_stage("fetch_document_record")
@@ -206,6 +219,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                     f"Exceeded max ingestion attempts ({INGEST_MAX_ATTEMPTS})",
                 )
                 await session.commit()
+                INGESTION_DOCUMENTS.labels("failed").inc()
                 logger.warning(
                     "pipeline.max_attempts_exceeded",
                     extra={
@@ -228,7 +242,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- parse with Docling (CPU/GPU-bound) -----------------------------
         await _log_stage("parse_pdf_docling")
-        parse_result = await asyncio.to_thread(docling_parser.parse, pdf_path)
+        parse_result = await _timed("parse", asyncio.to_thread(docling_parser.parse, pdf_path))
 
         # -- export artifacts (CPU-bound serialization) --------------------
         await _log_stage("export_docling_artifacts")
@@ -272,7 +286,10 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- chunk document (CPU-bound) -------------------------------------
         await _log_stage("chunk_document")
-        chunks = await asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
+        chunks = await _timed(
+            "chunk", asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
+        )
+        INGESTION_CHUNKS.observe(len(chunks))
 
         if not chunks:
             logger.info(
@@ -290,6 +307,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.update_status(doc_uuid, "ready")
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
+            INGESTION_DOCUMENTS.labels("success").inc()
             await _emit("done", {"chunks": 0})
             logger.info(
                 "pipeline.complete",
@@ -326,7 +344,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         # otherwise (or on summarization failure) fall back to enriched_text.
         await _log_stage("embed_chunks")
         texts = [c.get("table_nl_summary") or c["enriched_text"] for c in chunks]
-        vectors = await asyncio.to_thread(embedder.embed_chunks, texts)
+        vectors = await _timed("embed", asyncio.to_thread(embedder.embed_chunks, texts))
 
         # -- prepare Qdrant payload -----------------------------------------
         chunks_with_vectors = [
@@ -391,19 +409,25 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         ).encode()
 
         await asyncio.gather(
-            asyncio.to_thread(
-                qdrant_ingest.upsert_chunks,
-                "documents",
-                document_id,
-                chunks_with_vectors,
-                user_id=user_id,
+            _timed(
+                "upsert_qdrant",
+                asyncio.to_thread(
+                    qdrant_ingest.upsert_chunks,
+                    "documents",
+                    document_id,
+                    chunks_with_vectors,
+                    user_id=user_id,
+                ),
             ),
-            asyncio.to_thread(
-                opensearch_ingest.bulk_index,
-                "chunks",
-                document_id,
-                os_chunks,
-                user_id=user_id,
+            _timed(
+                "upsert_opensearch",
+                asyncio.to_thread(
+                    opensearch_ingest.bulk_index,
+                    "chunks",
+                    document_id,
+                    os_chunks,
+                    user_id=user_id,
+                ),
             ),
             s3_client.upload_bytes(
                 f"{base_key}/chunks.jsonl",
@@ -431,6 +455,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
             await session.commit()
 
+        INGESTION_DOCUMENTS.labels("success").inc()
         await _emit("done", {"chunks": len(chunks)})
         logger.info(
             "pipeline.complete",
@@ -444,6 +469,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     except LookupError:
         raise
     except SoftTimeLimitExceeded:
+        INGESTION_DOCUMENTS.labels("failed").inc()
         _flush_stage_times()
         elapsed = round(perf_counter() - pipeline_started_at, 1)
         msg = (
@@ -475,6 +501,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
     except Exception as exc:
+        INGESTION_DOCUMENTS.labels("failed").inc()
         _flush_stage_times()
         ingest_times = {
             "stages": _format_stage_times(),
@@ -495,7 +522,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.set_failed(doc_uuid, str(exc))
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
-            await _emit("error", {"message": str(exc)})
+            await _emit("error", {"message": "Document processing failed. Please try again."})
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise

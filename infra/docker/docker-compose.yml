@@ -78,6 +78,8 @@ volumes:
   garage_meta:
   tei_data:
   clickhouse_data:
+  prometheus_data:
+  grafana_data:
 
 services:
   postgres:
@@ -521,5 +523,73 @@ services:
       <<: *langfuse-env
     cpus: "1.00"
     mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-admin-api
+    environment:
+      PROMETHEUS_PORT: ${PROMETHEUS_PORT:-9090}
+    ports:
+      - "${PROMETHEUS_BIND_HOST:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    cpus: "1.00"
+    mem_limit: 2g
+    mem_reservation: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:${PROMETHEUS_PORT:-9090}/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    <<: *default-logging
+    networks: [backend]
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_MAX_REQUEST_SIZE: 50MB
+      GF_SERVER_MAX_QUERY_RESULT_SIZE: 50MB
+      GRAFANA_PORT: ${GRAFANA_PORT:-3004}
+      APP_DB_USER: ${APP_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      APP_DB: ${APP_DB}
+      PGB_APP_DB_HOST: ${PGB_APP_DB_HOST:-pgbouncer}
+      PGB_APP_DB_PORT: ${PGB_APP_DB_PORT:-6432}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3004}:3000"
+    cpus: "0.50"
+    mem_limit: 768m
+    mem_reservation: 192m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     <<: *default-logging
     networks: [backend]

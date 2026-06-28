@@ -11,6 +11,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import aioboto3
+from botocore.config import Config
 from celery import Task
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -206,6 +207,7 @@ async def delete_document(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
+        config=Config(response_checksum_validation="when_required"),
     ) as s3:
         for bucket, keys in s3_keys.items():
             for key in keys:
@@ -337,6 +339,7 @@ async def serve_pdf(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
+        config=Config(response_checksum_validation="when_required"),
     ).__aenter__()
 
     try:
