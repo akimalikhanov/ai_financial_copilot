@@ -25,3 +25,15 @@ datasources:
       connMaxLifetime: 14400
       postgresVersion: 1600
       timescaledb: false
+
+  - name: Elasticsearch
+    type: elasticsearch
+    uid: elasticsearch
+    url: http://elasticsearch:9200
+    access: proxy
+    jsonData:
+      index: copilot-logs
+      timeField: timestamp
+      esVersion: "8.0.0"
+      logMessageField: message
+      logLevelField: level

@@ -204,8 +204,17 @@ def configure_worker_logging() -> None:
     """Configure JSON logging for workers (same format as API, with flush for non-TTY)."""
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
+    formatter = JsonFormatter()
     handler = FlushingStreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter())
+    handler.setFormatter(formatter)
+    handlers: list[logging.Handler] = [handler]
+
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+
     # For ingestion worker logs, keep output focused to pipeline stage/task logs.
     only_ingestion_logs = os.getenv("INGESTION_LOG_ONLY_PIPELINE", "0").strip().lower() in {
         "1",
@@ -214,23 +223,19 @@ def configure_worker_logging() -> None:
         "on",
     }
     if only_ingestion_logs:
-        handler.addFilter(
-            IncludeLoggerPrefixFilter(
-                prefixes=(
-                    "src.services.ingestion.tasks",
-                    "celery.worker.strategy",
-                    "docling",
-                )
+        pipeline_filter = IncludeLoggerPrefixFilter(
+            prefixes=(
+                "src.services.ingestion.tasks",
+                "celery.worker.strategy",
+                "docling",
             )
         )
-        # RapidOCR installs its own non-propagating stream handler; mute it explicitly.
-        # rapidocr_logger = logging.getLogger("RapidOCR")
-        # rapidocr_logger.handlers.clear()
-        # rapidocr_logger.propagate = False
-        # rapidocr_logger.disabled = True
+        for h in handlers:
+            h.addFilter(pipeline_filter)
     root = logging.getLogger()
     root.handlers.clear()
-    root.addHandler(handler)
+    for h in handlers:
+        root.addHandler(h)
     root.setLevel(level)
 
 
@@ -351,21 +356,32 @@ def configure_logging(level: str | int | None = None) -> None:
     if level is None:
         level = os.getenv("LOG_LEVEL", "INFO")
 
-    # Create shared JSON handler
+    formatter = JsonFormatter()
     json_handler = logging.StreamHandler(sys.stdout)
-    json_handler.setFormatter(JsonFormatter())
+    json_handler.setFormatter(formatter)
+    handlers: list[logging.Handler] = [json_handler]
+
+    # When LOG_FILE is set (host-process dev mode), tee JSON logs to a file so
+    # Fluent Bit can tail it. Unset in Docker: stdout is enough (fluentd driver picks it up).
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
 
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.addHandler(json_handler)
+    for h in handlers:
+        root_logger.addHandler(h)
     root_logger.setLevel(level)
 
     # Hijack uvicorn loggers to use our JSON format
     for uvicorn_logger_name in ("uvicorn", "uvicorn.error"):
         uvicorn_logger = logging.getLogger(uvicorn_logger_name)
         uvicorn_logger.handlers.clear()
-        uvicorn_logger.addHandler(json_handler)
+        for h in handlers:
+            uvicorn_logger.addHandler(h)
         uvicorn_logger.propagate = False  # Don't double-log to root
 
     # Silence noisy third-party loggers (we have our own unified request logging)

@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from '../services/api';
 
 type AuthContextValue = {
@@ -41,7 +41,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     api.setOnRefreshFailure(() => setAccessToken(null));
   }, [accessToken]);
 
+  const didInitRef = useRef(false);
   useEffect(() => {
+    if (didInitRef.current) return;
+    didInitRef.current = true;
     if (accessToken !== null) {
       setAuthChecked(true);
       return;

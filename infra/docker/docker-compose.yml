@@ -80,6 +80,7 @@ volumes:
   clickhouse_data:
   prometheus_data:
   grafana_data:
+  es_data:
 
 services:
   postgres:
@@ -556,6 +557,72 @@ services:
     <<: *default-logging
     networks: [backend]
 
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.1
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "${ES_BIND_HOST:-127.0.0.1}:${ES_BIND_PORT:-9201}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    cpus: "1.00"
+    mem_limit: 1g
+    mem_reservation: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  es-bootstrap:
+    image: curlimages/curl:8.14.1
+    container_name: es-bootstrap
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./elasticsearch/ilm-policy.json:/bootstrap/ilm-policy.json:ro
+      - ./elasticsearch/index-template.json:/bootstrap/index-template.json:ro
+      - ./elasticsearch/bootstrap.sh:/bootstrap/bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      ES_URL: "http://elasticsearch:9200"
+    restart: "no"
+    networks: [backend]
+
+  fluent-bit:
+    image: fluent/fluent-bit:4.0.3
+    container_name: fluent-bit
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      # Host-process dev mode: mount the parent directory of LOG_FILE so Fluent Bit
+      # can tail the file once the app creates it. LOG_FILE_DIR must be set alongside
+      # LOG_FILE (e.g. LOG_FILE_DIR=/tmp/ai_copilot LOG_FILE=/tmp/ai_copilot/app.log).
+      # When unset, falls back to /dev/null (no-op).
+      - ${LOG_FILE_DIR:-/dev/null}:${LOG_FILE_DIR:-/dev/null}:ro
+    ports:
+      - "${FLUENT_BIT_BIND_HOST:-127.0.0.1}:${FLUENT_BIT_PORT:-24224}:24224"
+    environment:
+      ES_HOST: "elasticsearch"
+      ES_PORT: "9200"
+      LOG_FILE: "${LOG_FILE:-}"
+    cpus: "0.25"
+    mem_limit: 128m
+    <<: *default-logging
+    networks: [backend]
+
   grafana:
     image: grafana/grafana:12.2.0
     container_name: grafana
@@ -563,6 +630,8 @@ services:
     depends_on:
       prometheus:
         condition: service_healthy
+      es-bootstrap:
+        condition: service_completed_successfully
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS}
