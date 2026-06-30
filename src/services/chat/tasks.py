@@ -8,6 +8,7 @@ import dataclasses as _dc
 import json as _json
 import logging
 from time import perf_counter
+from typing import Any
 from uuid import UUID
 
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -291,7 +292,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     stage_index = 0
     current_stage = "initializing"
 
-    async def _log_stage(stage_name: str) -> None:
+    async def _log_stage(stage_name: str, **extra_fields: Any) -> None:
         nonlocal stage_index, current_stage, stage_start, _stage_stack
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
@@ -301,7 +302,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
-            extra={"request_id": request_id, "stage": stage_name},
+            extra={"request_id": request_id, "stage": stage_name, **extra_fields},
         )
         await add_event(
             redis_app,
@@ -635,7 +636,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 llm_request.request_type = "chat_agent"
                 await session.flush()
 
-                await _log_stage("agent_loop")
+                await _log_stage(
+                    "agent_loop", model=_tool_llm.model_id, provider=_tool_llm.provider
+                )
 
                 _agent_lf_stack = contextlib.ExitStack()
                 if lf:
@@ -951,7 +954,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             # 6. stream_llm_response
-            await _log_stage("stream_llm_response")
+            await _log_stage("stream_llm_response", model=llm.model_id, provider=llm.provider)
             if lf:
                 _gen = _gen_stack.enter_context(
                     lf.start_as_current_observation(

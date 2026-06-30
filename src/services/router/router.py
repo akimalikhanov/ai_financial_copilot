@@ -213,6 +213,7 @@ async def route_query(
         "route_query_done route=%s entities=%d",
         output.route,
         len(output.entities),
+        extra={"model": model_id, "provider": llm.provider},
     )
 
     if session is not None and user_id is not None and output.route == "retrieval":

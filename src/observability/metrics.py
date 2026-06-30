@@ -30,11 +30,23 @@ HTTP_IN_PROGRESS = Gauge(
 
 # --- Celery ---
 CELERY_TASKS = Counter("celery_tasks_total", "Celery tasks", ["task_name", "state"])
-CELERY_DURATION = Histogram("celery_task_duration_seconds", "Task duration", ["task_name"])
+CELERY_DURATION = Histogram(
+    "celery_task_duration_seconds",
+    "Task duration",
+    ["task_name"],
+    # ingest_document runs minute-scale; default buckets cap at 10s and dump
+    # every ingestion into +Inf, breaking histogram_quantile (NaN).
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
+)
 CELERY_QUEUE = Gauge("celery_queue_length", "Queue depth", ["queue_name"])
 
 # --- Agentic RAG ---
-RAG_RETRIEVAL = Histogram("rag_retrieval_duration_seconds", "Retrieval latency", ["stage"])
+RAG_RETRIEVAL = Histogram(
+    "rag_retrieval_duration_seconds",
+    "Retrieval latency",
+    ["stage"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+)
 RAG_CHUNKS = Histogram("rag_chunks_retrieved", "Chunks per query", ["retriever"])
 RAG_CONTEXT_TOKENS = Histogram(
     "rag_context_tokens",
@@ -52,7 +64,13 @@ AGENT_ITERATIONS = Histogram(
     buckets=(1, 2, 3, 4, 5, 8),
 )
 AGENT_TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["tool", "status"])
-AGENT_TOOL_DURATION = Histogram("agent_tool_duration_seconds", "Tool latency", ["tool"])
+AGENT_TOOL_DURATION = Histogram(
+    "agent_tool_duration_seconds",
+    "Tool latency",
+    ["tool"],
+    # search_documents wraps full RAG retrieve+rerank and can exceed 10s.
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+)
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
 GUARDRAIL_BLOCKS = Counter("guardrail_blocks_total", "Guardrail blocks", ["type"])
 PIPELINE_ERRORS = Counter("chat_pipeline_errors_total", "Chat pipeline failures", ["stage"])
@@ -73,4 +91,7 @@ INGESTION_DURATION = Histogram(
     "ingestion_stage_duration_seconds",
     "Ingestion stage latency",
     ["stage"],  # parse | chunk | embed | upsert_qdrant | upsert_opensearch
+    # Stages span ms-scale upserts to minute-scale Docling parses; default
+    # buckets top out at 10s and dump every parse into +Inf (breaks quantiles).
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
 )

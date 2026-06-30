@@ -219,5 +219,9 @@ async def rewrite_query(
         return _fallback(raw_query), last_stats
 
     normalized = _normalize(output, raw_query)
-    logger.info("rewrite_query_done fallback=%s", normalized.fallback)
+    logger.info(
+        "rewrite_query_done fallback=%s",
+        normalized.fallback,
+        extra={"model": model_id, "provider": llm.provider},
+    )
     return normalized, last_stats

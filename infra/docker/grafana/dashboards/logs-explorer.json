@@ -1,0 +1,143 @@
+{
+  "title": "Logs Explorer",
+  "uid": "logs-explorer",
+  "description": "Pivot tool — full-text log search by request_id / trace_id / level / endpoint. Linked from all domain dashboards.",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "filters",
+        "label": "Filters",
+        "type": "adhoc",
+        "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+        "description": "Add key=value filters (e.g. request_id=abc, trace_id=xyz, level=ERROR, path=/v1/chat). Filters are ANDed together."
+      },
+      {
+        "name": "level",
+        "label": "Level",
+        "type": "custom",
+        "query": "DEBUG,INFO,WARNING,ERROR,CRITICAL",
+        "includeAll": true,
+        "allValue": "*",
+        "multi": false,
+        "current": { "value": "$__all", "text": "All" }
+      },
+      {
+        "name": "langfuse_url",
+        "label": "Langfuse base URL",
+        "type": "textbox",
+        "description": "Browser-reachable Langfuse base URL for trace deep-links (override per environment).",
+        "query": "http://localhost:3003",
+        "current": { "value": "http://localhost:3003", "text": "http://localhost:3003" },
+        "options": [{ "value": "http://localhost:3003", "text": "http://localhost:3003", "selected": true }]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Log Stream",
+      "type": "logs",
+      "description": "Full narrative of what happened. Use the Level dropdown and the Filters bar (+ Add filter) to drill into request_id, trace_id, path, or any other field.",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 16 },
+      "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+      "targets": [
+        {
+          "query": "level:${level}",
+          "metrics": [{ "id": "1", "type": "logs", "settings": { "limit": "1000" } }],
+          "bucketAggs": [],
+          "timeField": "timestamp"
+        }
+      ],
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showTime": true,
+        "showLabels": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": false
+      }
+    },
+    {
+      "id": 2,
+      "title": "Error Log Count over Time",
+      "type": "timeseries",
+      "description": "Correlate with metric panels on other dashboards — error spikes align with latency or error-rate anomalies.",
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 8 },
+      "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+      "targets": [
+        {
+          "query": "level:ERROR",
+          "metrics": [{ "id": "1", "type": "count" }],
+          "bucketAggs": [
+            {
+              "id": "2",
+              "type": "date_histogram",
+              "field": "timestamp",
+              "settings": { "interval": "1m", "min_doc_count": "0" }
+            }
+          ],
+          "timeField": "timestamp"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "fixedColor": "red", "mode": "fixed" },
+          "custom": { "lineWidth": 2, "fillOpacity": 20 }
+        }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 3,
+      "title": "Langfuse Trace Links",
+      "type": "table",
+      "description": "Recent traces — click a trace_id to open it in Langfuse.",
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 8 },
+      "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+      "targets": [
+        {
+          "query": "trace_id:*",
+          "metrics": [
+            { "id": "1", "type": "count", "hide": true }
+          ],
+          "bucketAggs": [
+            {
+              "id": "2",
+              "type": "terms",
+              "field": "trace_id",
+              "settings": { "size": "50", "order": "desc", "orderBy": "_count", "min_doc_count": "1" }
+            }
+          ],
+          "timeField": "timestamp"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "trace_id" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Open in Langfuse",
+                    "url": "${langfuse_url}/trace/${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": { "sortBy": [] }
+    }
+  ]
+}

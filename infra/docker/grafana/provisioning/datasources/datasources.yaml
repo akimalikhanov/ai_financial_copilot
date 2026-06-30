@@ -32,7 +32,7 @@ datasources:
     url: http://elasticsearch:9200
     access: proxy
     jsonData:
-      index: copilot-logs
+      index: copilot-logs-*
       timeField: timestamp
       esVersion: "8.0.0"
       logMessageField: message
