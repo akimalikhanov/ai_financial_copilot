@@ -1,0 +1,44 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+.venv
+venv
+*.egg-info
+dist
+build
+.mypy_cache
+.ruff_cache
+.pytest_cache
+
+# Frontend build artifacts and deps (not needed for API/worker images)
+src/ui/node_modules
+src/ui/dist
+
+# Secrets — never bake into images
+.env
+.env.*
+!.env.example
+infra/langfuse/secrets/
+
+# Data / large assets
+data/
+*.pdf
+
+# Docs and experiments
+docs/
+experiments/
+eval/
+
+# Editor / OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Test files
+tests/

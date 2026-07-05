@@ -5,6 +5,25 @@ x-logging: &default-logging
       mode: non-blocking
       max-buffer-size: 12m
 
+# App-tier logging: ship container stdout (JSON) to Fluent Bit's forward input
+# via the fluentd log driver, instead of tailing a host file.
+# IMPORTANT: the fluentd log driver runs in the Docker DAEMON (on the host), not
+# inside the compose network — so it cannot resolve the service DNS name
+# "fluent-bit". It must use the host-published address 127.0.0.1:24224 (see the
+# fluent-bit service `ports:` mapping). fluentd-async keeps container startup from
+# blocking when fluent-bit isn't up yet, buffering/retrying in the background.
+# Tag "app" matches the [FILTER]/[INPUT] rules in fluent-bit.conf. Trade-off:
+# `docker compose logs` won't show these services — their logs live in ES/Grafana.
+x-app-logging: &app-logging
+  logging:
+    driver: fluentd
+    options:
+      fluentd-address: "127.0.0.1:24224"
+      tag: "app"
+      fluentd-async: "true"
+      fluentd-retry-wait: "1s"
+      fluentd-max-retries: "30"
+
 # Shared env block for both Langfuse services.
 # Required new vars in .env:
 #   CLICKHOUSE_PASSWORD, LANGFUSE_NEXTAUTH_SECRET, LANGFUSE_SALT,
@@ -65,6 +84,38 @@ x-langfuse-env: &langfuse-env
   LANGFUSE_INIT_USER_NAME: "${LANGFUSE_INIT_USER_NAME:-}"
   LANGFUSE_INIT_USER_PASSWORD: "${LANGFUSE_INIT_USER_PASSWORD:-}"
 
+# Host/endpoint overrides for the application tier (api + workers).
+# The full .env is injected via `env_file`, but it holds connection targets tuned
+# for host-process dev: `127.0.0.1` + the host-PUBLISHED ports. Inside the compose
+# network the app must instead reach dependencies by their service DNS names and
+# their *in-container* ports (which differ from published ports for redis-broker,
+# tei, and langfuse). Both facts are real topology differences between the two run
+# modes, so a single .env cannot satisfy both — these `environment:` values win
+# over env_file and supply the container-correct targets, leaving .env valid for
+# `make dev`. (Port-publish bind IPs are a separate concern, handled by dedicated
+# *_BIND_HOST / *_PUBLISH_HOST vars on each service — not overloaded here.)
+x-app-env: &app-env
+  # Postgres via PgBouncer
+  APP_DB_HOST: pgbouncer
+  APP_DB_PORT: "6432"
+  # Redis: app cache/SSE and Celery broker (both listen on 6379 in-container)
+  REDIS_APP_HOST: redis-app
+  REDIS_APP_PORT: "6379"
+  REDIS_BROKER_HOST: redis-broker
+  REDIS_BROKER_PORT: "6379"
+  # Vector + keyword search
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: "6333"
+  OPENSEARCH_HOST: opensearch
+  OPENSEARCH_HTTP_PORT: "9200"
+  # Object storage (Garage S3)
+  AWS_ENDPOINT_URL: "http://garage:3900"
+  # TEI inference (containers listen on :80 internally)
+  EMBEDDER_BASE_URL: "http://tei-embedder:80"
+  RERANKER_BASE_URL: "http://tei:80"
+  # Langfuse (web container listens on :3000 internally)
+  LANGFUSE_HOST: "http://langfuse-web:3000"
+
 networks:
   backend:
 
@@ -81,6 +132,7 @@ volumes:
   prometheus_data:
   grafana_data:
   es_data:
+  hf-model-cache:
 
 services:
   postgres:
@@ -177,7 +229,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
     ports:
-      - "${REDIS_APP_HOST:-127.0.0.1}:${REDIS_APP_PORT:-6379}:6379"
+      - "${REDIS_APP_BIND_HOST:-127.0.0.1}:${REDIS_APP_PORT:-6379}:6379"
     volumes:
       - redis_app_data:/data
     healthcheck:
@@ -199,7 +251,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
     ports:
-      - "${REDIS_BROKER_HOST:-127.0.0.1}:${REDIS_BROKER_PORT:-6380}:6379"
+      - "${REDIS_BROKER_BIND_HOST:-127.0.0.1}:${REDIS_BROKER_PORT:-6380}:6379"
     volumes:
       - redis_broker_data:/data
     healthcheck:
@@ -233,8 +285,8 @@ services:
     volumes:
       - opensearch_data:/usr/share/opensearch/data
     ports:
-      - "${OPENSEARCH_BIND_HOST:-127.0.0.1}:${OPENSEARCH_HTTP_PORT:-9200}:9200"
-      - "${OPENSEARCH_BIND_HOST:-127.0.0.1}:${OPENSEARCH_MANAGEMENT_PORT:-9600}:9600"
+      - "${OPENSEARCH_PUBLISH_HOST:-127.0.0.1}:${OPENSEARCH_HTTP_PORT:-9200}:9200"
+      - "${OPENSEARCH_PUBLISH_HOST:-127.0.0.1}:${OPENSEARCH_MANAGEMENT_PORT:-9600}:9600"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -q '\"status\"' || exit 1"]
       interval: 20s
@@ -346,8 +398,8 @@ services:
     restart: unless-stopped
     networks: [backend]
     ports:
-      - "${QDRANT_HOST:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
-      - "${QDRANT_HOST:-127.0.0.1}:${QDRANT_GRPC_PORT:-6334}:6334"
+      - "${QDRANT_BIND_HOST:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_BIND_HOST:-127.0.0.1}:${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -531,8 +583,6 @@ services:
     image: prom/prometheus:v3.7.3
     container_name: prometheus
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -607,17 +657,165 @@ services:
     volumes:
       - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
       - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
-      # Host-process dev mode: mount the parent directory of LOG_FILE so Fluent Bit
-      # can tail the file once the app creates it. LOG_FILE_DIR must be set alongside
-      # LOG_FILE (e.g. LOG_FILE_DIR=/tmp/ai_copilot LOG_FILE=/tmp/ai_copilot/app.log).
-      # When unset, falls back to /dev/null (no-op).
-      - ${LOG_FILE_DIR:-/dev/null}:${LOG_FILE_DIR:-/dev/null}:ro
     ports:
+      # App containers ship logs over the backend network to fluent-bit:24224;
+      # the published binding is only for host-side inspection.
       - "${FLUENT_BIT_BIND_HOST:-127.0.0.1}:${FLUENT_BIT_PORT:-24224}:24224"
     environment:
       ES_HOST: "elasticsearch"
       ES_PORT: "9200"
-      LOG_FILE: "${LOG_FILE:-}"
+    cpus: "0.25"
+    mem_limit: 128m
+    <<: *default-logging
+    networks: [backend]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    container_name: api
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      # Container logs go to stdout only; Fluent Bit collects via fluentd driver.
+      LOG_FILE: ""
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    cpus: "2.00"
+    mem_limit: 2g
+    <<: *app-logging
+    networks: [backend]
+
+  worker-chat:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.worker
+    container_name: worker-chat
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom_chat
+      LOG_FILE: ""
+    command: ["python", "-m", "src.workers.chat_worker"]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    cpus: "2.00"
+    mem_limit: 3g
+    <<: *app-logging
+    networks: [backend]
+
+  worker-ingestion:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.worker
+    container_name: worker-ingestion
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom_ingestion
+      LOG_FILE: ""
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - hf-model-cache:/root/.cache/huggingface
+    command: ["python", "-m", "src.workers.ingestion_worker"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    cpus: "4.00"
+    mem_limit: 6g
+    <<: *app-logging
+    networks: [backend]
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.frontend
+    container_name: frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      API_HOST: ${API_HOST:-api}
+      API_PORT: ${API_PORT:-8000}
+    ports:
+      - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     cpus: "0.25"
     mem_limit: 128m
     <<: *default-logging

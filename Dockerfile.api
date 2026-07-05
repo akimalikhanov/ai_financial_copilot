@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+# ── Stage 1: dependency builder ────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+# Install uv
+RUN pip install --no-cache-dir uv==0.8.19
+
+# Copy only the files uv needs to resolve/install deps (cache-friendly layer)
+COPY pyproject.toml uv.lock ./
+
+# Install production deps (no dev extras) into /build/.venv
+RUN uv sync --frozen --no-dev --group llm-engine --link-mode=copy
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+# Non-root user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --no-create-home appuser
+
+WORKDIR /app
+
+# Runtime system deps (curl for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy virtualenv from builder
+COPY --from=builder /build/.venv /app/.venv
+
+# Copy application source
+COPY src/ ./src/
+COPY prompts/ ./prompts/
+COPY infra/config/ ./infra/config/
+
+# Prometheus multiprocess dir (workers share it via emptyDir in K8s)
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prom_api
+RUN mkdir -p /tmp/prom_api && chown appuser /tmp/prom_api
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # pyproject.toml is not copied into the image, so config.get_project_root()
+    # can't discover the root by walking parents — pin it explicitly.
+    PROJECT_ROOT="/app"
+
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fs http://localhost:8000/healthz || exit 1
+
+# Invoke uvicorn as a module: the console script may be absent when uvicorn is a
+# transitive dep, but `python -m uvicorn` always works if the package imports.
+CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

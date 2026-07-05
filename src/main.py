@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from src.api.exceptions import llm_error_handler
@@ -70,6 +71,10 @@ def create_app() -> FastAPI:
 
     for router in get_routers():
         app.include_router(router)
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"status": "ok"})
 
     return app
 

@@ -16,7 +16,7 @@ def get_client():
             "Install it with `.venv/bin/python -m pip install opensearch-py`."
         ) from exc
 
-    host = os.getenv("OPENSEARCH_BIND_HOST", "localhost")
+    host = os.getenv("OPENSEARCH_HOST", "localhost")
     port = int(os.getenv("OPENSEARCH_HTTP_PORT", "9200"))
     return OpenSearch(
         hosts=[{"host": host, "port": port}],

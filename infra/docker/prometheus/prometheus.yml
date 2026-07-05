@@ -6,15 +6,15 @@ scrape_configs:
   # FastAPI – exposed via make_asgi_app() on the main port
   - job_name: api
     static_configs:
-      - targets: ["host.docker.internal:8000"]
+      - targets: ["api:8000"]
     metrics_path: /metrics
 
   # Celery chat worker – starts its own HTTP server on :9100
   - job_name: chat_worker
     static_configs:
-      - targets: ["host.docker.internal:9100"]
+      - targets: ["worker-chat:9100"]
 
   # Celery ingestion worker – starts its own HTTP server on :9101
   - job_name: ingestion_worker
     static_configs:
-      - targets: ["host.docker.internal:9101"]
+      - targets: ["worker-ingestion:9101"]

@@ -173,18 +173,12 @@ const toApiError = (payload: unknown, options: ApiErrorOptions = {}): ApiError =
 
 const toApiErrorFromResponse = async (response: Response): Promise<ApiError> => {
   const fallbackMessage = `Request failed with status ${response.status}`;
+  const text = await response.text();
   try {
-    const payload = await response.json();
-    return toApiError(payload, {
-      statusCode: response.status,
-      fallbackMessage,
-    });
+    const payload = JSON.parse(text) as unknown;
+    return toApiError(payload, { statusCode: response.status, fallbackMessage });
   } catch {
-    const payload = await response.text();
-    return toApiError(payload, {
-      statusCode: response.status,
-      fallbackMessage,
-    });
+    return toApiError(text, { statusCode: response.status, fallbackMessage });
   }
 };
 

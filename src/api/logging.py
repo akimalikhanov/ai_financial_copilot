@@ -339,9 +339,12 @@ def _log_request(ctx: RequestContext, exc_info: bool = False) -> None:
         extra.update(ctx.extra)
 
     level = logging.ERROR if ctx.status == "error" else logging.INFO
+    message = f"{ctx.method} {ctx.path} -> {ctx.http_status} ({ctx.duration_ms}ms)"
+    if ctx.status == "error":
+        message += f" [{ctx.error_type}]" if ctx.error_type else " [error]"
     _request_logger.log(
         level,
-        "request.completed",
+        message,
         extra=extra,
         exc_info=exc_info,
     )

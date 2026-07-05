@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+# Shared image for chat worker and ingestion worker.
+# Differentiated at runtime by CMD / entrypoint override in docker-compose.
+#
+# ── Stage 1: dependency builder ────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN pip install --no-cache-dir uv==0.8.19
+
+COPY pyproject.toml uv.lock ./
+
+RUN uv sync --frozen --no-dev --group llm-engine --link-mode=copy
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+WORKDIR /app
+
+# procps: celery inspect uses ps
+# libxcb1 + libgl1: required by opencv-python (used by EasyOCR)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        procps \
+        libxcb1 \
+        libgl1 \
+        libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/.venv /app/.venv
+
+COPY src/ ./src/
+COPY prompts/ ./prompts/
+COPY infra/config/ ./infra/config/
+
+RUN mkdir -p /tmp/prom_chat /tmp/prom_ingestion
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PROJECT_ROOT="/app" \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# ── Chat worker (default) ───────────────────────────────────────────────────────
+# Override with: python -m src.workers.ingestion_worker
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prom_chat
+CMD ["python", "-m", "src.workers.chat_worker"]
