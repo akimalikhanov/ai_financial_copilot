@@ -10,6 +10,7 @@ dependencies = [
     "celery[redis]>=5.3.1",
     "docling>=2.74.0",
     "easyocr>=1.7.2",
+    "fastapi>=0.128.0",
     "google-api-core>=2.29.0",
     "httpx>=0.28.1",
     "jinja2>=3.1.6",
@@ -37,6 +38,8 @@ dev = [
     "pyright>=1.1.408",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=7.1.0",
+    "respx>=0.23.1",
     "ruff>=0.14.13",
 ]
 llm-engine = [
@@ -45,6 +48,10 @@ llm-engine = [
     "vllm>=0.17.0",
 ]
 
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
 # Line length (matches common Python style)

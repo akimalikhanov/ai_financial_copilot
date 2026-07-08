@@ -57,13 +57,14 @@ class GeminiAdapter(LLMAdapter):
         contents: list[types.Content] = []
 
         for m in req.messages:
+            content = m.content or ""
             if m.role in ("system", "developer"):
-                sys_parts.append(m.content)
+                sys_parts.append(content)
                 continue
 
             # Gemini uses "user" and "model" roles for chat history
             role = "user" if m.role == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=m.content)]))
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=content)]))
 
         config_kwargs: dict[str, Any] = {}
         if sys_parts:

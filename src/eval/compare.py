@@ -9,7 +9,7 @@ def _load(path: str | Path) -> dict:
         return json.load(f)
 
 
-def compare(prev_path: str | Path, curr_path: str | Path) -> None:
+def compare(prev_path: str | Path, curr_path: str | Path) -> list[str]:
     prev = _load(prev_path)
     curr = _load(curr_path)
 
@@ -79,6 +79,8 @@ def compare(prev_path: str | Path, curr_path: str | Path) -> None:
     else:
         print("\nNo regressions detected.")
     print()
+
+    return regressions
 
 
 def _flatten_by_kind(correctness: dict) -> dict:

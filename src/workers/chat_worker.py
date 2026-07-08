@@ -7,6 +7,7 @@ Run as: .venv/bin/python -m src.workers.chat_worker
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from celery.signals import worker_process_init
@@ -25,5 +26,11 @@ if __name__ == "__main__":
     configure_worker_logging()
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    concurrency = os.getenv("CELERY_CHAT_WORKER_CONCURRENCY")
+    argv = ["worker", "-Q", "chat", "--pool=prefork"]
+    if concurrency:
+        argv.extend(["--concurrency", concurrency])
+
     start_worker_metrics(port=9100, queues=("chat",))
-    celery_app.worker_main(argv=["worker", "-Q", "chat", "--pool=prefork"])
+    celery_app.worker_main(argv=argv)

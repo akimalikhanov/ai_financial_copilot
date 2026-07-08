@@ -1,0 +1,43 @@
+{
+  "What was the value of Number of hotels at year-end of MGM Resorts International at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "N/A"
+    ],
+    "reference_pools": []
+  },
+  "According to the annual report, what is the Cash flow from operations (in GBP) for James Halstead plc  (within the last period or at the end of the last period)? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "6535000.0"
+    ],
+    "reference_pools": [
+      [
+        "James Halstead plc:p36"
+      ]
+    ]
+  },
+  "For HCA Healthcare, Inc., what was the value of Number of healthcare professionals on staff at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "294000.0"
+    ],
+    "reference_pools": [
+      [
+        "HCA Healthcare, Inc.:p1",
+        "HCA Healthcare, Inc.:p2"
+      ]
+    ]
+  },
+  "What was the value of Total power generation capacity (GW) of RWE AG at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "39.3"
+    ],
+    "reference_pools": [
+      [
+        "RWE AG:p46"
+      ]
+    ]
+  }
+}

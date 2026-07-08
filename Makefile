@@ -26,3 +26,27 @@ worker-ingestion:
 .PHONY: ui
 ui:
 	cd src/ui && npm run dev
+
+.PHONY: lint
+lint:
+	.venv/bin/ruff check .
+	.venv/bin/ruff format --check .
+
+.PHONY: typecheck
+typecheck:
+	.venv/bin/pyright --level error
+
+.PHONY: test-unit
+test-unit:
+	.venv/bin/python -m pytest tests/unit/
+
+.PHONY: test-integration
+test-integration:
+	.venv/bin/python -m pytest -m integration tests/integration/
+
+.PHONY: test
+test: test-unit test-integration
+
+.PHONY: test-cov
+test-cov:
+	.venv/bin/python -m pytest tests/unit/ --cov=src --cov-report=term --cov-report=html

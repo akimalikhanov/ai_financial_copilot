@@ -1,0 +1,414 @@
+{
+  "manifest": {
+    "timestamp": "2026-07-06T17:10:38.591014+00:00",
+    "git_sha": "5b19aed",
+    "test_set": "data/canary_eval.json",
+    "test_set_hash": "a2a5103f0bcc0a85c396f631ce8bf132a0eaf61f3fd7486954f9f2fad9c399f5",
+    "model": "gpt-5.2",
+    "judge_model": "gpt-4o-mini",
+    "k_values": [
+      5,
+      10
+    ],
+    "total_questions": 4,
+    "evaluated": 4,
+    "excluded": []
+  },
+  "aggregate": {
+    "retrieval": {
+      "precision@5": 0.3333,
+      "recall@5": 1.0,
+      "ndcg@5": 0.4713,
+      "precision@10": 0.3,
+      "recall@10": 1.0,
+      "ndcg@10": 0.6176,
+      "mrr": 1.0
+    },
+    "correctness": {
+      "overall": 1.0,
+      "by_kind": {
+        "number": {
+          "n": 4,
+          "acc": 1.0
+        }
+      }
+    },
+    "judge": {
+      "faithfulness_mean": 5.0,
+      "relevance_mean": 5.0,
+      "citation_accuracy_mean": 5.0,
+      "completeness_mean": 5.0
+    },
+    "hallucination": {
+      "rate_mean": 0.0,
+      "questions_with_any_unsupported": 0
+    }
+  },
+  "per_question": [
+    {
+      "qid": "q000",
+      "question": "What was the value of Number of hotels at year-end of MGM Resorts International at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "N/A"
+      ],
+      "reference_pools": [],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p11",
+        "mgm resorts international:p11"
+      ],
+      "metrics": {},
+      "answer": "N/A\n\nThe retrieved excerpts from MGM Resorts International’s annual report do not state the “Number of hotels at year-end,” so the value at the end of the reported period cannot be determined from the provided content.        ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 219,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 219,
+          "end": 220,
+          "ref_ids": [
+            "S2"
+          ]
+        },
+        {
+          "start": 220,
+          "end": 221,
+          "ref_ids": [
+            "S3"
+          ]
+        },
+        {
+          "start": 221,
+          "end": 222,
+          "ref_ids": [
+            "S4"
+          ]
+        },
+        {
+          "start": 222,
+          "end": 223,
+          "ref_ids": [
+            "S5"
+          ]
+        },
+        {
+          "start": 223,
+          "end": 224,
+          "ref_ids": [
+            "S6"
+          ]
+        },
+        {
+          "start": 224,
+          "end": 225,
+          "ref_ids": [
+            "S7"
+          ]
+        },
+        {
+          "start": 225,
+          "end": 226,
+          "ref_ids": [
+            "S8"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "na_refusal"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model answer correctly states 'N/A' as the data is not available in the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question by indicating that the information is not available."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "There are no factual claims that require citations, as the answer is a refusal."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer fully aligns with the gold answer, which is also 'N/A'."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 25.328,
+      "usage": {
+        "input_tokens": 4807,
+        "output_tokens": 912,
+        "cost_usd": 0.021180250000000005
+      }
+    },
+    {
+      "qid": "q001",
+      "question": "According to the annual report, what is the Cash flow from operations (in GBP) for James Halstead plc  (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "6535000.0"
+      ],
+      "reference_pools": [
+        [
+          "James Halstead plc:p36"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "james halstead plc:p37",
+        "james halstead plc:p12",
+        "james halstead plc:p13",
+        "james halstead plc:p55",
+        "james halstead plc:p51",
+        "james halstead plc:p6",
+        "james halstead plc:p54",
+        "james halstead plc:p35",
+        "james halstead plc:p64"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3391602052736161,
+        "precision@10": 0.2,
+        "recall@10": 1.0,
+        "ndcg@10": 0.44615333764087994,
+        "mrr": 1.0
+      },
+      "answer": "£6,535K (i.e., £6.535M) cash flow from operations / operating activities for the year ended 30 June 2022. ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 106,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The claim about the cash flow from operations being £6,535K is directly supported by the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding cash flow from operations for James Halstead plc."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The model answer does not include citations, but the claim is supported by the context, which is acceptable in this case."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the key fact of cash flow from operations as stated in the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 14.406,
+      "usage": {
+        "input_tokens": 6718,
+        "output_tokens": 100,
+        "cost_usd": 0.0131565
+      }
+    },
+    {
+      "qid": "q002",
+      "question": "For HCA Healthcare, Inc., what was the value of Number of healthcare professionals on staff at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "294000.0"
+      ],
+      "reference_pools": [
+        [
+          "HCA Healthcare, Inc.:p1",
+          "HCA Healthcare, Inc.:p2"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "hca healthcare inc:p3",
+        "hca healthcare inc:p73",
+        "hca healthcare inc:p37",
+        "hca healthcare inc:p5",
+        "hca healthcare inc:p6",
+        "hca healthcare inc:p38",
+        "hca healthcare inc:p39",
+        "hca healthcare inc:p35",
+        "hca healthcare inc:p36",
+        "hca healthcare inc:p35",
+        "hca healthcare inc:p3",
+        "hca healthcare inc:p4",
+        "hca healthcare inc:p5"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3903800499921017,
+        "precision@10": 0.1,
+        "recall@10": 1.0,
+        "ndcg@10": 0.3903800499921017,
+        "mrr": 1.0
+      },
+      "answer": "Approximately **294,000** healthcare professionals/colleagues (employees) on staff as of **December 31, 2022**.   ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 112,
+          "ref_ids": [
+            "S7"
+          ]
+        },
+        {
+          "start": 112,
+          "end": 113,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 113,
+          "end": 114,
+          "ref_ids": [
+            "S8"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The claim about the number of healthcare professionals is directly supported by the context provided."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the number of healthcare professionals at HCA Healthcare."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The citation is accurate as it supports the claim made in the model answer."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the exact number requested in the question."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 15.304,
+      "usage": {
+        "input_tokens": 7091,
+        "output_tokens": 138,
+        "cost_usd": 0.01434125
+      }
+    },
+    {
+      "qid": "q003",
+      "question": "What was the value of Total power generation capacity (GW) of RWE AG at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "39.3"
+      ],
+      "reference_pools": [
+        [
+          "RWE AG:p46"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "rwe ag:p47",
+        "rwe ag:p48",
+        "rwe ag:p23",
+        "rwe ag:p24",
+        "rwe ag:p47",
+        "rwe ag:p46",
+        "rwe ag:p48",
+        "rwe ag:p82",
+        "rwe ag:p83",
+        "rwe ag:p48",
+        "rwe ag:p49",
+        "rwe ag:p39"
+      ],
+      "metrics": {
+        "precision@5": 0.6,
+        "recall@5": 1.0,
+        "ndcg@5": 0.6843515475204855,
+        "precision@10": 0.6,
+        "recall@10": 1.0,
+        "ndcg@10": 1.0162555378092089,
+        "mrr": 1.0
+      },
+      "answer": "RWE AG’s total installed power generation capacity was **39.3 GW as of 31 December 2022** (year-end), as reported in the annual report.  ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 136,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 136,
+          "end": 137,
+          "ref_ids": [
+            "S5"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model answer accurately states the total installed power generation capacity of RWE AG as of the specified date, which is supported by the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the total power generation capacity of RWE AG."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The model answer does not include citations, but the claim is factual and supported by the context provided."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the exact value requested in the question, matching the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 17.926,
+      "usage": {
+        "input_tokens": 7821,
+        "output_tokens": 106,
+        "cost_usd": 0.01315475
+      }
+    }
+  ]
+}

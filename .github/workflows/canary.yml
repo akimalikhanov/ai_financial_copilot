@@ -1,0 +1,51 @@
+name: Canary
+
+# Manual only: the eval environment (seeded DB, Qdrant/OpenSearch, GPU-backed TEI
+# embedder + reranker) lives on a local self-hosted machine, so this runs on a
+# self-hosted runner registered on that machine and is triggered on demand when it
+# is up — not on a schedule that would fire while the machine is off.
+on:
+  workflow_dispatch:
+
+jobs:
+  canary:
+    runs-on: self-hosted
+    environment: eval
+    env:
+      OPENAI_API_KEY: ${{ secrets.EVAL_OPENAI_API_KEY }}
+      # DB is read via APP_DB_* (see config.py get_database_url); pgbouncer on :6432.
+      APP_DB_HOST: ${{ secrets.EVAL_APP_DB_HOST }}
+      APP_DB_PORT: ${{ secrets.EVAL_APP_DB_PORT }}
+      APP_DB_USER: ${{ secrets.EVAL_APP_DB_USER }}
+      APP_DB_PASSWORD: ${{ secrets.EVAL_APP_DB_PASSWORD }}
+      APP_DB_NAME: ${{ secrets.EVAL_APP_DB_NAME }}
+      QDRANT_HOST: ${{ secrets.EVAL_QDRANT_HOST }}
+      QDRANT_PORT: ${{ secrets.EVAL_QDRANT_PORT }}
+      OPENSEARCH_HOST: ${{ secrets.EVAL_OPENSEARCH_HOST }}
+      OPENSEARCH_HTTP_PORT: ${{ secrets.EVAL_OPENSEARCH_HTTP_PORT }}
+      EMBEDDER_BASE_URL: ${{ secrets.EVAL_EMBEDDER_BASE_URL }}
+      RERANKER_BASE_URL: ${{ secrets.EVAL_RERANKER_BASE_URL }}
+      EVAL_USER_ID: ${{ secrets.EVAL_USER_ID }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-python-env
+        with:
+          groups: dev llm-engine
+      - name: Run canary eval
+        run: |
+          uv run python -m src.eval.run \
+            --test-set src/eval/fixtures/canary_eval.json \
+            --output src/eval/fixtures/runs/canary_latest.json
+      - name: Compare against baseline
+        run: |
+          uv run python -c "
+          import sys
+          from src.eval.compare import compare
+          regressions = compare('src/eval/fixtures/runs/canary_baseline.json', 'src/eval/fixtures/runs/canary_latest.json')
+          sys.exit(1 if regressions else 0)
+          "
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: canary-run
+          path: src/eval/fixtures/runs/canary_latest.json
