@@ -1,0 +1,189 @@
+{
+  "compared_at": "2026-07-09T08:38:04.986073+00:00",
+  "prev_run": "src/eval/fixtures/runs/canary_baseline.json",
+  "curr_run": "src/eval/fixtures/runs/canary_gpt4o_mini.json",
+  "prev_manifest": {
+    "timestamp": "2026-07-09T07:31:37.362607+00:00",
+    "git_sha": "bcecabb",
+    "test_set": "src/eval/fixtures/canary_eval.json",
+    "test_set_hash": "681ecca5eabd8e381a1f5f364211a2eecf14ee4e83a0edf6f00a47cf44266231",
+    "model": "gpt-5.2",
+    "judge_model": "gpt-4o-mini",
+    "k_values": [
+      5,
+      10
+    ],
+    "total_questions": 13,
+    "evaluated": 13,
+    "excluded": []
+  },
+  "curr_manifest": {
+    "timestamp": "2026-07-09T08:38:04.982402+00:00",
+    "git_sha": "bcecabb",
+    "test_set": "src/eval/fixtures/canary_eval.json",
+    "test_set_hash": "681ecca5eabd8e381a1f5f364211a2eecf14ee4e83a0edf6f00a47cf44266231",
+    "model": "gpt-4o-mini",
+    "judge_model": "gpt-4o-mini",
+    "k_values": [
+      5,
+      10
+    ],
+    "total_questions": 13,
+    "evaluated": 13,
+    "excluded": []
+  },
+  "sections": {
+    "retrieval": [
+      {
+        "metric": "mrr",
+        "prev": 0.9333,
+        "curr": 0.95,
+        "delta": 0.016699999999999937
+      },
+      {
+        "metric": "ndcg@10",
+        "prev": 0.5346,
+        "curr": 0.5269,
+        "delta": -0.007699999999999929
+      },
+      {
+        "metric": "ndcg@5",
+        "prev": 0.5513,
+        "curr": 0.5752,
+        "delta": 0.023900000000000032
+      },
+      {
+        "metric": "precision@10",
+        "prev": 0.34,
+        "curr": 0.33,
+        "delta": -0.010000000000000009
+      },
+      {
+        "metric": "precision@5",
+        "prev": 0.44,
+        "curr": 0.48,
+        "delta": 0.03999999999999998
+      },
+      {
+        "metric": "recall@10",
+        "prev": 1.0,
+        "curr": 1.0,
+        "delta": 0.0
+      },
+      {
+        "metric": "recall@5",
+        "prev": 1.0,
+        "curr": 1.0,
+        "delta": 0.0
+      }
+    ],
+    "correctness.by_kind": [
+      {
+        "metric": "boolean.acc",
+        "prev": 1.0,
+        "curr": 1.0,
+        "delta": 0.0
+      },
+      {
+        "metric": "names.acc",
+        "prev": 1.0,
+        "curr": 0.5,
+        "delta": -0.5
+      },
+      {
+        "metric": "number.acc",
+        "prev": 0.6667,
+        "curr": 0.8889,
+        "delta": 0.22220000000000006
+      },
+      {
+        "metric": "overall",
+        "prev": 0.7692,
+        "curr": 0.8462,
+        "delta": 0.07699999999999996
+      }
+    ],
+    "judge": [
+      {
+        "metric": "citation_accuracy_mean",
+        "prev": 3.5385,
+        "curr": 3.3846,
+        "delta": -0.15390000000000015
+      },
+      {
+        "metric": "completeness_mean",
+        "prev": 4.0,
+        "curr": 4.2308,
+        "delta": 0.23080000000000034
+      },
+      {
+        "metric": "faithfulness_mean",
+        "prev": 4.2308,
+        "curr": 4.3846,
+        "delta": 0.1537999999999995
+      },
+      {
+        "metric": "relevance_mean",
+        "prev": 5.0,
+        "curr": 5.0,
+        "delta": 0.0
+      }
+    ],
+    "hallucination": [
+      {
+        "metric": "questions_with_any_unsupported",
+        "prev": 5,
+        "curr": 3,
+        "delta": null
+      },
+      {
+        "metric": "rate_mean",
+        "prev": 0.2244,
+        "curr": 0.141,
+        "delta": -0.0834
+      }
+    ]
+  },
+  "regressions": [
+    {
+      "qid": "q006",
+      "question": "Did Bionano Genomics, Inc. mention any mergers or acquisitions in the annual report? If there is no mention, return False.",
+      "issues": [
+        "page_key_lost@5: {'bionano genomics inc:p33', 'bionano genomics inc:p34'}"
+      ]
+    },
+    {
+      "qid": "q008",
+      "question": "Which leadership positions changed at Crombie REIT in the reporting period? If data is not available, return 'N/A'. Give me the title of the position.",
+      "issues": [
+        "correctness_flip: correct\u2192wrong",
+        "judge_completeness_drop: 4\u21921",
+        "page_key_lost@5: {'crombie reit:p81'}"
+      ]
+    },
+    {
+      "qid": "q009",
+      "question": "For Aurora Innovation, Inc., what was the value of Number of patents at year-end at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "issues": [
+        "judge_faithfulness_drop: 5\u21921",
+        "new_unsupported_claims: 0\u21921",
+        "page_key_lost@5: {'aurora innovation inc:p80'}"
+      ]
+    },
+    {
+      "qid": "q010",
+      "question": "What is the total number of employees let go by Commerzbank according to the annual report? If data is not available, return 'N/A'.",
+      "issues": [
+        "judge_citation_accuracy_drop: 5\u21921",
+        "page_key_lost@5: {'commerzbank:p102'}"
+      ]
+    },
+    {
+      "qid": "q012",
+      "question": "What was the Dividend per share (in USD) for Ritchie Bros. Auctioneers Incorporated according to the annual report (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "issues": [
+        "page_key_lost@5: {'ritchie bros auctioneers incorporated:p8'}"
+      ]
+    }
+  ]
+}

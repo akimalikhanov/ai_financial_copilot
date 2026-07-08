@@ -309,10 +309,12 @@ class DocumentRepository:
                 params[key] = f"%{t}%"
             conditions.append(f"({' OR '.join(clauses)})")
 
+        # `where` interpolates only column names/bind-param placeholders built from
+        # enumerate(); all filter values are passed via `params`, not string-formatted.
         where = " AND ".join(conditions)
-        rows = (
-            await self.session.execute(text(f"SELECT id FROM documents WHERE {where}"), params)
-        ).fetchall()  # noqa: S608
+        sql = f"SELECT id FROM documents WHERE {where}"
+        stmt = text(sql)  # nosemgrep
+        rows = (await self.session.execute(stmt, params)).fetchall()  # noqa: S608
         return [row[0] for row in rows]
 
     async def get_filter_options(self, user_id: UUID) -> dict[str, list]:
@@ -402,7 +404,9 @@ class DocumentRepository:
             params["constrain_to"] = [str(d) for d in constrain_to]
             constrain_clause = "AND id = ANY(CAST(:constrain_to AS uuid[]))"
 
-        stmt = text(f"""
+        # Only hardcoded regex constants and a fixed clause literal are interpolated;
+        # all filter values (:name, :threshold, :user_id, :constrain_to) are bind params.
+        sql = f"""
             SELECT id FROM documents
             WHERE user_id = CAST(:user_id AS uuid)
               AND status = 'ready'
@@ -433,7 +437,8 @@ class DocumentRepository:
                 :name
             ) DESC
             LIMIT :limit
-        """)
+        """
+        stmt = text(sql)  # nosemgrep
 
         rows = (await self.session.execute(stmt, params)).fetchall()
         return [row[0] for row in rows]

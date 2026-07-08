@@ -16,6 +16,7 @@ from src.db import init_db, shutdown_db
 from src.redis_client import close_redis_client, create_redis_app_client
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
 from src.services.llm_router import LLMRouter, RoutedLLM
+from src.utils.config import get_agent_config
 
 # Distinctive mock response to verify mock is used (avoids real LLM calls)
 MOCK_RESPONSE = "[INTEGRATION-TEST-MOCK-RESPONSE]"
@@ -52,12 +53,25 @@ def _create_mock_router(response_text: str = MOCK_RESPONSE) -> LLMRouter:
         default_stream=True,
         capabilities={},
     )
+    # Agent tool-calling loop is enabled via .env(.example) (AGENT_LOOP_ENABLED=True,
+    # AGENT_TOOL_MODEL=gpt-5-mini) — register it too so router.get() finds it.
+    agent_tool_model_id = get_agent_config()["tool_model"]
+    agent_tool_llm = MockStreamingLLM(response_text=response_text)
+    agent_tool_routed = RoutedLLM(
+        adapter=agent_tool_llm,  # type: ignore[arg-type]
+        provider="mock",
+        model_id=agent_tool_model_id,
+        default_params={"temperature": 0.2, "max_tokens": 2000},
+        default_stream=True,
+        capabilities={"tool_calling": True},
+    )
     config = {
         "defaults": {"stream": True, "params": {"temperature": 0.2, "max_tokens": 2000}},
         "models": [],
     }
     router = LLMRouter(config)
     router._models["gpt-4o-mini"] = routed
+    router._models[agent_tool_model_id] = agent_tool_routed
     return router
 
 
@@ -112,6 +126,18 @@ def _patch_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
     mock_router = _create_mock_router()
     monkeypatch.setattr("src.services.llm_router.get_router", lambda *_args, **_kwargs: mock_router)
     monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_args, **_kwargs: mock_router)
+    # MockStreamingLLM only simulates a single-pass streaming completion, not a
+    # multi-turn tool-calling conversation, so force the classic (non-agent) path.
+    monkeypatch.setenv("AGENT_LOOP_ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
+def _patch_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub out embedding calls (no TEI/OpenAI service available in these tests)."""
+    monkeypatch.setattr(
+        "src.services.retrieval.chat_rag.embed_chunks",
+        lambda chunks: [[0.0] * 8 for _ in chunks],
+    )
 
 
 @pytest.fixture(autouse=True)

@@ -1,0 +1,1075 @@
+{
+  "manifest": {
+    "timestamp": "2026-07-09T08:38:04.982402+00:00",
+    "git_sha": "bcecabb",
+    "test_set": "src/eval/fixtures/canary_eval.json",
+    "test_set_hash": "681ecca5eabd8e381a1f5f364211a2eecf14ee4e83a0edf6f00a47cf44266231",
+    "model": "gpt-4o-mini",
+    "judge_model": "gpt-4o-mini",
+    "k_values": [
+      5,
+      10
+    ],
+    "total_questions": 13,
+    "evaluated": 13,
+    "excluded": []
+  },
+  "aggregate": {
+    "retrieval": {
+      "precision@5": 0.48,
+      "recall@5": 1.0,
+      "ndcg@5": 0.5752,
+      "precision@10": 0.33,
+      "recall@10": 1.0,
+      "ndcg@10": 0.5269,
+      "mrr": 0.95
+    },
+    "correctness": {
+      "overall": 0.8462,
+      "by_kind": {
+        "number": {
+          "n": 9,
+          "acc": 0.8889
+        },
+        "boolean": {
+          "n": 2,
+          "acc": 1.0
+        },
+        "names": {
+          "n": 2,
+          "acc": 0.5
+        }
+      }
+    },
+    "judge": {
+      "faithfulness_mean": 4.3846,
+      "relevance_mean": 5.0,
+      "citation_accuracy_mean": 3.3846,
+      "completeness_mean": 4.2308
+    },
+    "hallucination": {
+      "rate_mean": 0.141,
+      "questions_with_any_unsupported": 3
+    }
+  },
+  "per_question": [
+    {
+      "qid": "q000",
+      "question": "What was the value of Number of hotels at year-end of MGM Resorts International at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "N/A"
+      ],
+      "reference_pools": [],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p10",
+        "mgm resorts international:p11",
+        "mgm resorts international:p11"
+      ],
+      "metrics": {},
+      "answer": "N/A\n\nThe number of hotels at year-end for MGM Resorts International was not found in the retrieved excerpts.",
+      "citation_spans": [],
+      "correctness": {
+        "correct": true,
+        "reason": "na_refusal"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model answer correctly states 'N/A' as the information is not available in the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question by stating 'N/A'."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "There are no factual claims that require citations, as the answer is a refusal."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer fully aligns with the gold answer, which is also 'N/A'."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 10.657,
+      "usage": {
+        "input_tokens": 4813,
+        "output_tokens": 22,
+        "cost_usd": 0.00065835
+      }
+    },
+    {
+      "qid": "q001",
+      "question": "According to the annual report, what is the Cash flow from operations (in GBP) for James Halstead plc  (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "6535000.0"
+      ],
+      "reference_pools": [
+        [
+          "James Halstead plc:p36"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "james halstead plc:p37",
+        "james halstead plc:p55",
+        "james halstead plc:p6",
+        "james halstead plc:p12",
+        "james halstead plc:p13",
+        "james halstead plc:p51",
+        "james halstead plc:p64",
+        "james halstead plc:p61",
+        "james halstead plc:p27"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3391602052736161,
+        "precision@10": 0.1,
+        "recall@10": 1.0,
+        "ndcg@10": 0.3391602052736161,
+        "mrr": 1.0
+      },
+      "answer": "The cash flow from operations for James Halstead plc for the year ended 30 June 2022 is GBP 16,414.0K .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 102,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": false,
+        "reason": "number_mismatch"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 2,
+          "justification": "The model states a cash flow from operations figure of GBP 16,414.0K, which is not supported by the retrieved context. The actual figure in the gold answer is GBP 6,535,000.0."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model directly answers the question regarding the cash flow from operations for James Halstead plc."
+        },
+        "citation_accuracy": {
+          "score": 1,
+          "justification": "The model does not provide any citations to support the claim about the cash flow from operations."
+        },
+        "completeness": {
+          "score": 1,
+          "justification": "The model fails to convey the correct cash flow figure as per the gold answer, which is a significant omission."
+        },
+        "unsupported_claims": [
+          {
+            "claim": "The cash flow from operations for James Halstead plc for the year ended 30 June 2022 is GBP 16,414.0K.",
+            "cited_refs": [],
+            "reason": "This claim is not supported by any of the retrieved context and is factually incorrect."
+          }
+        ],
+        "hallucination_rate": 1.0
+      },
+      "latency_s": 9.109,
+      "usage": {
+        "input_tokens": 5822,
+        "output_tokens": 33,
+        "cost_usd": 0.0008163000000000001
+      }
+    },
+    {
+      "qid": "q002",
+      "question": "For HCA Healthcare, Inc., what was the value of Number of healthcare professionals on staff at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "294000.0"
+      ],
+      "reference_pools": [
+        [
+          "HCA Healthcare, Inc.:p1",
+          "HCA Healthcare, Inc.:p2"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "hca healthcare inc:p3",
+        "hca healthcare inc:p73",
+        "hca healthcare inc:p37",
+        "hca healthcare inc:p5",
+        "hca healthcare inc:p6",
+        "hca healthcare inc:p38",
+        "hca healthcare inc:p39",
+        "hca healthcare inc:p35",
+        "hca healthcare inc:p36",
+        "hca healthcare inc:p35",
+        "hca healthcare inc:p3",
+        "hca healthcare inc:p4",
+        "hca healthcare inc:p5"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3903800499921017,
+        "precision@10": 0.1,
+        "recall@10": 1.0,
+        "ndcg@10": 0.3903800499921017,
+        "mrr": 1.0
+      },
+      "answer": "The number of healthcare professionals on staff at HCA Healthcare, Inc. at the end of the period was 294,000.0 .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 111,
+          "ref_ids": [
+            "S7"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model answer accurately states the number of healthcare professionals on staff, which is supported by the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the number of healthcare professionals on staff."
+        },
+        "citation_accuracy": {
+          "score": 1,
+          "justification": "The model answer does not include any citations to support the claim about the number of healthcare professionals."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the exact figure requested in the question, matching the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 11.383,
+      "usage": {
+        "input_tokens": 7089,
+        "output_tokens": 31,
+        "cost_usd": 0.0010051499999999998
+      }
+    },
+    {
+      "qid": "q003",
+      "question": "What was the value of Total power generation capacity (GW) of RWE AG at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "39.3"
+      ],
+      "reference_pools": [
+        [
+          "RWE AG:p46"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "rwe ag:p47",
+        "rwe ag:p48",
+        "rwe ag:p23",
+        "rwe ag:p24",
+        "rwe ag:p47",
+        "rwe ag:p46",
+        "rwe ag:p48",
+        "rwe ag:p82",
+        "rwe ag:p83",
+        "rwe ag:p48",
+        "rwe ag:p49",
+        "rwe ag:p39"
+      ],
+      "metrics": {
+        "precision@5": 0.6,
+        "recall@5": 1.0,
+        "ndcg@5": 0.6843515475204855,
+        "precision@10": 0.6,
+        "recall@10": 1.0,
+        "ndcg@10": 1.0162555378092089,
+        "mrr": 1.0
+      },
+      "answer": "The total power generation capacity of RWE AG at the end of the period listed (December 31, 2022) was 39.3 GW .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 110,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The claim about the total power generation capacity of RWE AG is directly supported by the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the total power generation capacity."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The model answer does not include citations, but the claim is factual and supported by the context."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the exact value requested in the question."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 10.468,
+      "usage": {
+        "input_tokens": 7827,
+        "output_tokens": 35,
+        "cost_usd": 0.0011182499999999999
+      }
+    },
+    {
+      "qid": "q004",
+      "question": "What was the Gross margin (%) for Armadale Capital Plc according to the annual report (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "N/A"
+      ],
+      "reference_pools": [],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "armadale capital plc:p43",
+        "armadale capital plc:p44",
+        "armadale capital plc:p6",
+        "armadale capital plc:p7",
+        "armadale capital plc:p26",
+        "armadale capital plc:p11",
+        "armadale capital plc:p25",
+        "armadale capital plc:p3",
+        "armadale capital plc:p4",
+        "armadale capital plc:p24",
+        "armadale capital plc:p46"
+      ],
+      "metrics": {},
+      "answer": "N/A  \nThe gross margin (%) was not reported in the 2022 annual report for Armadale Capital Plc. ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 96,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "na_refusal"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model answer correctly states that the gross margin was not reported, aligning with the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question about the gross margin for Armadale Capital Plc."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "There are no factual claims that require citations, as the answer is a refusal."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer fully meets the requirements of the gold answer by stating 'N/A'."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 8.449,
+      "usage": {
+        "input_tokens": 6318,
+        "output_tokens": 28,
+        "cost_usd": 0.0008876999999999998
+      }
+    },
+    {
+      "qid": "q005",
+      "question": "Did Franklin Covey Co. outline any new ESG initiatives in the annual report? If there is no mention, return False.",
+      "kind": "boolean",
+      "expected_answers": [
+        "True"
+      ],
+      "reference_pools": [
+        [
+          "Franklin Covey Co.:p14"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "franklin covey co:p15",
+        "franklin covey co:p30",
+        "franklin covey co:p18",
+        "franklin covey co:p19",
+        "franklin covey co:p104",
+        "franklin covey co:p105",
+        "franklin covey co:p20",
+        "franklin covey co:p21",
+        "franklin covey co:p30",
+        "franklin covey co:p90",
+        "franklin covey co:p91",
+        "franklin covey co:p30"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3391602052736161,
+        "precision@10": 0.1,
+        "recall@10": 1.0,
+        "ndcg@10": 0.3391602052736161,
+        "mrr": 1.0
+      },
+      "answer": "True. Franklin Covey Co. outlined new and expanded ESG initiatives in their annual report, including the establishment of a Director of Learning, Development, and Inclusion, the expansion of Employee Resource Groups (ERGs), and the implementation of diversity initiatives. They also highlighted their commitment to environmental sustainability by reducing air travel and increasing virtual meetings, which reflects their ongoing efforts to enhance their ESG programs  .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 467,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 467,
+          "end": 468,
+          "ref_ids": [
+            "S2"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "boolean_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "All claims in the model answer about new ESG initiatives are supported by the retrieved context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question about ESG initiatives in the annual report."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "All claims made in the model answer are supported by the context, and citations are appropriately used."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes all key facts present in the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 10.014,
+      "usage": {
+        "input_tokens": 5882,
+        "output_tokens": 84,
+        "cost_usd": 0.0008558999999999999
+      }
+    },
+    {
+      "qid": "q006",
+      "question": "Did Bionano Genomics, Inc. mention any mergers or acquisitions in the annual report? If there is no mention, return False.",
+      "kind": "boolean",
+      "expected_answers": [
+        "True"
+      ],
+      "reference_pools": [
+        [
+          "Bionano Genomics, Inc.:p6",
+          "Bionano Genomics, Inc.:p110",
+          "Bionano Genomics, Inc.:p112"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "bionano genomics inc:p76",
+        "bionano genomics inc:p111",
+        "bionano genomics inc:p112",
+        "bionano genomics inc:p113",
+        "bionano genomics inc:p13",
+        "bionano genomics inc:p37",
+        "bionano genomics inc:p33",
+        "bionano genomics inc:p34",
+        "bionano genomics inc:p111",
+        "bionano genomics inc:p18"
+      ],
+      "metrics": {
+        "precision@5": 0.6,
+        "recall@5": 1.0,
+        "ndcg@5": 0.5296347172140421,
+        "precision@10": 0.4,
+        "recall@10": 1.0,
+        "ndcg@10": 0.40995091484653445,
+        "mrr": 0.5
+      },
+      "answer": "True. Bionano Genomics, Inc. mentioned acquisitions in their annual report, specifically including Purigen (November 2022) and BioDiscovery (October 2021) along with details about contingent consideration and purchase price allocations .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 236,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "boolean_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "All claims in the model answer are directly supported by the retrieved context, specifically mentioning the acquisitions of Purigen and BioDiscovery."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question about mergers or acquisitions mentioned in the annual report."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "Every claim in the model answer is supported by the appropriate citations from the retrieved context."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes all key facts present in the gold answer, confirming the mention of acquisitions."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 9.886,
+      "usage": {
+        "input_tokens": 6488,
+        "output_tokens": 50,
+        "cost_usd": 0.0009264
+      }
+    },
+    {
+      "qid": "q007",
+      "question": "What are the names of new products launched by Albany International Corp. as mentioned in the annual report?",
+      "kind": "names",
+      "expected_answers": [
+        "N/A"
+      ],
+      "reference_pools": [],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "albany international corp:p16",
+        "albany international corp:p41",
+        "albany international corp:p42",
+        "albany international corp:p17",
+        "albany international corp:p37",
+        "albany international corp:p24",
+        "albany international corp:p25",
+        "albany international corp:p21",
+        "albany international corp:p20",
+        "albany international corp:p27"
+      ],
+      "metrics": {},
+      "answer": "N/A\n\nThe annual report discusses new product development and mentions \"new MC products and/or enhancements\" but does not list specific new product names. ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 154,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "na_refusal"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model accurately reflects that the annual report does not provide specific names of new products, only mentioning new MC products and enhancements."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model directly addresses the question about new products launched by Albany International Corp."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The model does not include citations as it is a refusal, which is appropriate given the context."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model correctly states that the annual report does not provide specific product names, aligning with the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 9.538,
+      "usage": {
+        "input_tokens": 6506,
+        "output_tokens": 33,
+        "cost_usd": 0.0009189000000000001
+      }
+    },
+    {
+      "qid": "q008",
+      "question": "Which leadership positions changed at Crombie REIT in the reporting period? If data is not available, return 'N/A'. Give me the title of the position.",
+      "kind": "names",
+      "expected_answers": [
+        "President and Chief Executive Officer"
+      ],
+      "reference_pools": [
+        [
+          "Crombie REIT:p5"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "crombie reit:p6",
+        "crombie reit:p132",
+        "crombie reit:p24",
+        "crombie reit:p79",
+        "crombie reit:p89",
+        "crombie reit:p111",
+        "crombie reit:p96",
+        "crombie reit:p4"
+      ],
+      "metrics": {
+        "precision@5": 0.2,
+        "recall@5": 1.0,
+        "ndcg@5": 0.3391602052736161,
+        "precision@10": 0.2,
+        "recall@10": 1.0,
+        "ndcg@10": 0.44615333764087994,
+        "mrr": 1.0
+      },
+      "answer": "N/A\n\nThe data regarding leadership position changes at Crombie REIT during the reporting period is not available, as it specifically notes that the CEO change occurred on March 1, 2023, which is outside the reporting period. Additionally, the only available information mentions Board of Trustees additions in 2022, but does not specify any changes in leadership positions during the reporting period itself. ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 409,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": false,
+        "reason": "names_recall=0.00"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The model accurately states that there is no available data on leadership changes during the reporting period."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model directly addresses the question by stating that the data is not available."
+        },
+        "citation_accuracy": {
+          "score": 5,
+          "justification": "The model does not include any citations, which is appropriate given the refusal."
+        },
+        "completeness": {
+          "score": 1,
+          "justification": "The model fails to mention the key fact from the gold answer regarding the President and Chief Executive Officer position."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 11.551,
+      "usage": {
+        "input_tokens": 6274,
+        "output_tokens": 82,
+        "cost_usd": 0.0009134999999999999
+      }
+    },
+    {
+      "qid": "q009",
+      "question": "For Aurora Innovation, Inc., what was the value of Number of patents at year-end at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "1300.0"
+      ],
+      "reference_pools": [
+        [
+          "Aurora Innovation, Inc.:p8",
+          "Aurora Innovation, Inc.:p13"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "aurora innovation inc:p14",
+        "aurora innovation inc:p9",
+        "aurora innovation inc:p81",
+        "aurora innovation inc:p82",
+        "aurora innovation inc:p32",
+        "aurora innovation inc:p43",
+        "aurora innovation inc:p102",
+        "aurora innovation inc:p28",
+        "aurora innovation inc:p34"
+      ],
+      "metrics": {
+        "precision@5": 0.4,
+        "recall@5": 1.0,
+        "ndcg@5": 0.5531464700081437,
+        "precision@10": 0.2,
+        "recall@10": 1.0,
+        "ndcg@10": 0.3589542101716347,
+        "mrr": 1.0
+      },
+      "answer": "The number of patents at year-end for Aurora Innovation, Inc. as of December 31, 2022, was 1,300.0  .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 99,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 99,
+          "end": 100,
+          "ref_ids": [
+            "S2"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 1,
+          "justification": "The model answer claims a specific number of patents (1,300.0) without any supporting evidence from the retrieved context, which does not mention the number of patents."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the number of patents for Aurora Innovation, Inc."
+        },
+        "citation_accuracy": {
+          "score": 1,
+          "justification": "There are no citations in the model answer to support the claim about the number of patents."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer provides the exact number of patents as stated in the gold answer."
+        },
+        "unsupported_claims": [
+          {
+            "claim": "The number of patents at year-end for Aurora Innovation, Inc. as of December 31, 2022, was 1,300.0.",
+            "cited_refs": [],
+            "reason": "This claim is not supported by any of the retrieved context sources."
+          }
+        ],
+        "hallucination_rate": 0.5
+      },
+      "latency_s": 9.174,
+      "usage": {
+        "input_tokens": 6115,
+        "output_tokens": 38,
+        "cost_usd": 0.00077685
+      }
+    },
+    {
+      "qid": "q010",
+      "question": "What is the total number of employees let go by Commerzbank according to the annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "9000.0"
+      ],
+      "reference_pools": [
+        [
+          "Commerzbank:p3",
+          "Commerzbank:p77",
+          "Commerzbank:p90"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "commerzbank:p77",
+        "commerzbank:p78",
+        "commerzbank:p4",
+        "commerzbank:p5",
+        "commerzbank:p91",
+        "commerzbank:p102",
+        "commerzbank:p103",
+        "commerzbank:p255",
+        "commerzbank:p182",
+        "commerzbank:p65",
+        "commerzbank:p95"
+      ],
+      "metrics": {
+        "precision@5": 1.0,
+        "recall@5": 1.0,
+        "ndcg@5": 1.0,
+        "precision@10": 0.5,
+        "recall@10": 1.0,
+        "ndcg@10": 0.6489315753318465,
+        "mrr": 1.0
+      },
+      "answer": "The total number of employees let go by Commerzbank is 9,000 as of December 31, 2022   .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 85,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 85,
+          "end": 86,
+          "ref_ids": [
+            "S2"
+          ]
+        },
+        {
+          "start": 86,
+          "end": 87,
+          "ref_ids": [
+            "S3"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The claim about the total number of employees let go by Commerzbank is directly supported by the context."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the total number of employees let go."
+        },
+        "citation_accuracy": {
+          "score": 1,
+          "justification": "The model answer does not provide any citations to support the claim about the number of employees let go."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes the key fact from the gold answer, which is the total number of employees let go."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 13.277,
+      "usage": {
+        "input_tokens": 6788,
+        "output_tokens": 37,
+        "cost_usd": 0.0010404
+      }
+    },
+    {
+      "qid": "q011",
+      "question": "For FNCB Bancorp, Inc., what was the value of Non-performing loan ratio (NPL) at year-end at the end of the period listed in annual report? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "0.25"
+      ],
+      "reference_pools": [
+        [
+          "FNCB Bancorp, Inc.:p1",
+          "FNCB Bancorp, Inc.:p3",
+          "FNCB Bancorp, Inc.:p20",
+          "FNCB Bancorp, Inc.:p51"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "fncb bancorp inc:p52",
+        "fncb bancorp inc:p21",
+        "fncb bancorp inc:p53",
+        "fncb bancorp inc:p54",
+        "fncb bancorp inc:p54",
+        "fncb bancorp inc:p22",
+        "fncb bancorp inc:p53",
+        "fncb bancorp inc:p92",
+        "fncb bancorp inc:p39",
+        "fncb bancorp inc:p40"
+      ],
+      "metrics": {
+        "precision@5": 0.6,
+        "recall@5": 1.0,
+        "ndcg@5": 0.7227265726449519,
+        "precision@10": 0.5,
+        "recall@10": 1.0,
+        "ndcg@10": 0.6207622843987103,
+        "mrr": 1.0
+      },
+      "answer": "The Non-performing loan ratio (NPL) for FNCB Bancorp, Inc. at year-end December 31, 2022, was 0.25% .",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 100,
+          "ref_ids": [
+            "S1"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 5,
+          "justification": "The claim about the Non-performing loan ratio (NPL) being 0.25% is directly supported by the context provided."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model answer directly addresses the question regarding the NPL ratio for FNCB Bancorp, Inc."
+        },
+        "citation_accuracy": {
+          "score": 1,
+          "justification": "The model answer does not include any citations to support the claim about the NPL ratio."
+        },
+        "completeness": {
+          "score": 5,
+          "justification": "The model answer includes all key facts present in the gold answer."
+        },
+        "unsupported_claims": [],
+        "hallucination_rate": 0.0
+      },
+      "latency_s": 12.301,
+      "usage": {
+        "input_tokens": 6770,
+        "output_tokens": 39,
+        "cost_usd": 0.0005396999999999999
+      }
+    },
+    {
+      "qid": "q012",
+      "question": "What was the Dividend per share (in USD) for Ritchie Bros. Auctioneers Incorporated according to the annual report (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "expected_answers": [
+        "0.27"
+      ],
+      "reference_pools": [
+        [
+          "Ritchie Bros. Auctioneers Incorporated:p37",
+          "Ritchie Bros. Auctioneers Incorporated:p56",
+          "Ritchie Bros. Auctioneers Incorporated:p116",
+          "Ritchie Bros. Auctioneers Incorporated:p117"
+        ]
+      ],
+      "route": "retrieval",
+      "excluded_reason": null,
+      "retrieved_page_keys": [
+        "ritchie bros auctioneers incorporated:p57",
+        "ritchie bros auctioneers incorporated:p117",
+        "ritchie bros auctioneers incorporated:p118",
+        "ritchie bros auctioneers incorporated:p43",
+        "ritchie bros auctioneers incorporated:p55",
+        "ritchie bros auctioneers incorporated:p56",
+        "ritchie bros auctioneers incorporated:p79",
+        "ritchie bros auctioneers incorporated:p8",
+        "ritchie bros auctioneers incorporated:p116"
+      ],
+      "metrics": {
+        "precision@5": 0.8,
+        "recall@5": 1.0,
+        "ndcg@5": 0.8539316501572937,
+        "precision@10": 0.6,
+        "recall@10": 1.0,
+        "ndcg@10": 0.6987957033953602,
+        "mrr": 1.0
+      },
+      "answer": "The Dividend per share for Ritchie Bros. Auctioneers Incorporated at the end of the last period (December 31, 2022) was USD 0.3. This figure is based on the declaration of a final dividend of $0.27 per common share, which was recommended but not yet paid, along with previously declared dividends for the year.   ",
+      "citation_spans": [
+        {
+          "start": 0,
+          "end": 311,
+          "ref_ids": [
+            "S1"
+          ]
+        },
+        {
+          "start": 311,
+          "end": 312,
+          "ref_ids": [
+            "S2"
+          ]
+        },
+        {
+          "start": 312,
+          "end": 313,
+          "ref_ids": [
+            "S3"
+          ]
+        }
+      ],
+      "correctness": {
+        "correct": true,
+        "reason": "number_match"
+      },
+      "judge": {
+        "faithfulness": {
+          "score": 4,
+          "justification": "The model correctly identifies the final dividend of $0.27 per share but inaccurately states the total as USD 0.3, which is not supported by the sources."
+        },
+        "relevance": {
+          "score": 5,
+          "justification": "The model directly answers the question regarding the dividend per share for Ritchie Bros. Auctioneers Incorporated."
+        },
+        "citation_accuracy": {
+          "score": 4,
+          "justification": "The model cites the source for the final dividend recommendation but does not cite the source for the previously declared dividends."
+        },
+        "completeness": {
+          "score": 3,
+          "justification": "The model provides the final dividend amount but does not clarify that it is the only relevant figure, missing the exact figure from the gold answer."
+        },
+        "unsupported_claims": [
+          {
+            "claim": "The Dividend per share was USD 0.3.",
+            "cited_refs": [],
+            "reason": "The claim of USD 0.3 is unsupported as the final dividend cited is $0.27."
+          }
+        ],
+        "hallucination_rate": 0.3333333333333333
+      },
+      "latency_s": 12.075,
+      "usage": {
+        "input_tokens": 4993,
+        "output_tokens": 85,
+        "cost_usd": 0.00072315
+      }
+    }
+  ]
+}

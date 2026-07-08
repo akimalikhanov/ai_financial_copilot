@@ -45,3 +45,5 @@ test.sh
 scripts/bulk_ingest.py
 scripts/eval_qa.py
 infra/scripts/langfuse_reset.sh
+
+actions-runner

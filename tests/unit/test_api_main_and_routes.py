@@ -6,7 +6,6 @@ from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 import src.main as main
@@ -20,11 +19,12 @@ def test_create_app_registers_routes_and_handler():
 
     app = main.create_app()
 
-    routes = [r for r in app.router.routes if isinstance(r, APIRoute)]
-    paths = {(r.path, tuple(sorted(r.methods or []))) for r in routes}
+    # app.openapi() builds the schema from registered routes without running
+    # the lifespan (which would construct real LLM adapters needing API keys).
+    paths = app.openapi()["paths"]
 
-    assert ("/v1/chat", ("POST",)) in paths
-    assert ("/v1/chat/stream", ("GET",)) in paths
+    assert "post" in paths["/v1/chat"]
+    assert "get" in paths["/v1/chat/stream"]
     assert app.exception_handlers.get(LLMError) is llm_error_handler
 
 

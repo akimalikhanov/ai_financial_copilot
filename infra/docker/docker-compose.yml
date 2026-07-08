@@ -388,7 +388,7 @@ services:
     volumes:
       - tei_data:/data
     cpus: "2.00"
-    mem_limit: 4g
+    mem_limit: 12g
     <<: *default-logging
     networks: [backend]
 
@@ -403,7 +403,9 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:6333/healthz || exit 1"]
+      # qdrant's image ships no curl/wget; CMD-SHELL runs via dash which lacks
+      # /dev/tcp, so invoke bash explicitly for a TCP-connect liveness probe.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
       interval: 20s
       timeout: 5s
       retries: 10

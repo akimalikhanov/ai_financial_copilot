@@ -682,7 +682,7 @@ async def run_agent_loop(
 
         try:
             turn = await asyncio.wait_for(
-                llm.complete_with_tools(agent_messages, tools=tools),
+                llm.complete_with_tools(agent_messages, tools=tools, temperature=0.0),
                 timeout=_AGENT_TURN_TIMEOUT,
             )
             if turn.stats:

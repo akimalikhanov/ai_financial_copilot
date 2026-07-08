@@ -16,6 +16,10 @@ RUN uv sync --frozen --no-dev --group llm-engine --link-mode=copy
 # ── Stage 2: runtime ────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
+# Non-root user
+RUN groupadd --gid 1001 appgroup && \
+    useradd --uid 1001 --gid appgroup --no-create-home appuser
+
 WORKDIR /app
 
 # procps: celery inspect uses ps
@@ -33,7 +37,8 @@ COPY src/ ./src/
 COPY prompts/ ./prompts/
 COPY infra/config/ ./infra/config/
 
-RUN mkdir -p /tmp/prom_chat /tmp/prom_ingestion
+RUN mkdir -p /tmp/prom_chat /tmp/prom_ingestion && \
+    chown appuser /tmp/prom_chat /tmp/prom_ingestion
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app" \
@@ -42,6 +47,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PROJECT_ROOT="/app" \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+USER appuser
 
 # ── Chat worker (default) ───────────────────────────────────────────────────────
 # Override with: python -m src.workers.ingestion_worker

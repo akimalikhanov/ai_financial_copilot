@@ -304,7 +304,10 @@ def main() -> None:
     _print_summary(output, out_path)
 
     if args.compare:
-        run_compare(args.compare, out_path)
+        compare_out = out_path.with_name(
+            f"{out_path.stem}_vs_{Path(args.compare).stem}.compare.json"
+        )
+        run_compare(args.compare, out_path, compare_out)
 
 
 if __name__ == "__main__":

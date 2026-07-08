@@ -1,0 +1,6 @@
+# AVD-DS-0002: Dockerfile.frontend serves via nginx on port 80, which requires a
+# privileged port bind; nginx's own master process drops to an unprivileged user
+# for worker processes. Switching the whole container to non-root would require
+# rebasing to nginx-unprivileged or remapping to a high port — tracked separately,
+# not part of the base Dockerfile lint gate.
+AVD-DS-0002
