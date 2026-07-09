@@ -109,6 +109,12 @@ def _build_args() -> argparse.Namespace:
         default=None,
         help="Reasoning effort for the synthesis model (e.g. low, medium, high)",
     )
+    p.add_argument(
+        "--persist-db",
+        action="store_true",
+        default=False,
+        help="Persist this run to canary_runs/canary_run_results in Postgres",
+    )
     return p.parse_args()
 
 
@@ -286,6 +292,21 @@ async def _run(args: argparse.Namespace) -> RunOutput:
     return RunOutput(manifest=manifest, aggregate=aggregate, per_question=per_question)
 
 
+async def _persist(output: RunOutput, run_kind: str, regressions: list[str] | None) -> None:
+    from src.repository.canary_run_repository import CanaryRunRepository
+
+    await init_db()
+    try:
+        async with get_session_factory()() as session:
+            run = await CanaryRunRepository(session).create_run(
+                output, run_kind=run_kind, regressions=regressions
+            )
+            await session.commit()
+            logger.info("persisted canary_run id=%s", run.id)
+    finally:
+        await shutdown_db()
+
+
 def main() -> None:
     args = _build_args()
 
@@ -303,11 +324,15 @@ def main() -> None:
 
     _print_summary(output, out_path)
 
+    regressions: list[str] = []
     if args.compare:
         compare_out = out_path.with_name(
             f"{out_path.stem}_vs_{Path(args.compare).stem}.compare.json"
         )
-        run_compare(args.compare, out_path, compare_out)
+        regressions = run_compare(args.compare, out_path, compare_out)
+
+    if args.persist_db:
+        asyncio.run(_persist(output, run_kind="agentic", regressions=regressions))
 
 
 if __name__ == "__main__":

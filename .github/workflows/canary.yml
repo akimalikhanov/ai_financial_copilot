@@ -6,6 +6,17 @@ name: Canary
 # is up — not on a schedule that would fire while the machine is off.
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: "Model ID to answer questions with (see infra/config/models.yaml)"
+        required: false
+        default: "gpt-4o-mini"
+        type: string
+      reasoning_effort:
+        description: "Reasoning effort for the synthesis model (e.g. low, medium, high); leave blank for model default"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   canary:
@@ -37,23 +48,23 @@ jobs:
         run: |
           uv run python -m src.eval.run_agent \
             --test-set src/eval/fixtures/canary_eval.json \
-            --output src/eval/fixtures/runs/canary_latest.json
-      - name: Compare against baseline
+            --output /tmp/canary_latest.json \
+            --compare src/eval/fixtures/runs/canary_baseline.json \
+            --persist-db \
+            --model "${{ inputs.model }}" \
+            --prompt-version v3_agent_synthesis \
+            ${{ inputs.reasoning_effort != '' && format('--reasoning-effort {0}', inputs.reasoning_effort) || '' }}
+      - name: Check for regressions
         run: |
           uv run python -c "
-          import sys
-          from src.eval.compare import compare
-          regressions = compare(
-              'src/eval/fixtures/runs/canary_baseline.json',
-              'src/eval/fixtures/runs/canary_latest.json',
-              'src/eval/fixtures/runs/canary_latest.compare.json',
-          )
-          sys.exit(1 if regressions else 0)
+          import json, sys
+          out = json.load(open('/tmp/canary_latest_vs_canary_baseline.compare.json'))
+          sys.exit(1 if out.get('regressions') else 0)
           "
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: canary-run
           path: |
-            src/eval/fixtures/runs/canary_latest.json
-            src/eval/fixtures/runs/canary_latest.compare.json
+            /tmp/canary_latest.json
+            /tmp/canary_latest_vs_canary_baseline.compare.json

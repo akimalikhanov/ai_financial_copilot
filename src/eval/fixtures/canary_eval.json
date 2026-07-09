@@ -1,0 +1,145 @@
+{
+  "What was the value of Number of hotels at year-end of MGM Resorts International at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "N/A"
+    ],
+    "reference_pools": []
+  },
+  "According to the annual report, what is the Cash flow from operations (in GBP) for James Halstead plc  (within the last period or at the end of the last period)? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "6535000.0"
+    ],
+    "reference_pools": [
+      [
+        "James Halstead plc:p36"
+      ]
+    ]
+  },
+  "For HCA Healthcare, Inc., what was the value of Number of healthcare professionals on staff at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "294000.0"
+    ],
+    "reference_pools": [
+      [
+        "HCA Healthcare, Inc.:p1",
+        "HCA Healthcare, Inc.:p2"
+      ]
+    ]
+  },
+  "What was the value of Total power generation capacity (GW) of RWE AG at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "39.3"
+    ],
+    "reference_pools": [
+      [
+        "RWE AG:p46"
+      ]
+    ]
+  },
+  "What was the Gross margin (%) for Armadale Capital Plc according to the annual report (within the last period or at the end of the last period)? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "N/A"
+    ],
+    "reference_pools": []
+  },
+  "Did Franklin Covey Co. outline any new ESG initiatives in the annual report? If there is no mention, return False.": {
+    "kind": "boolean",
+    "answers": [
+      "True"
+    ],
+    "reference_pools": [
+      [
+        "Franklin Covey Co.:p14"
+      ]
+    ]
+  },
+  "Did Bionano Genomics, Inc. mention any mergers or acquisitions in the annual report? If there is no mention, return False.": {
+    "kind": "boolean",
+    "answers": [
+      "True"
+    ],
+    "reference_pools": [
+      [
+        "Bionano Genomics, Inc.:p6",
+        "Bionano Genomics, Inc.:p110",
+        "Bionano Genomics, Inc.:p112"
+      ]
+    ]
+  },
+  "What are the names of new products launched by Albany International Corp. as mentioned in the annual report?": {
+    "kind": "names",
+    "answers": [
+      "N/A"
+    ],
+    "reference_pools": []
+  },
+  "Which leadership positions changed at Crombie REIT in the reporting period? If data is not available, return 'N/A'. Give me the title of the position.": {
+    "kind": "names",
+    "answers": [
+      "President and Chief Executive Officer"
+    ],
+    "reference_pools": [
+      [
+        "Crombie REIT:p5"
+      ]
+    ]
+  },
+  "For Aurora Innovation, Inc., what was the value of Number of patents at year-end at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "1300.0"
+    ],
+    "reference_pools": [
+      [
+        "Aurora Innovation, Inc.:p8",
+        "Aurora Innovation, Inc.:p13"
+      ]
+    ]
+  },
+  "What is the total number of employees let go by Commerzbank according to the annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "9000.0"
+    ],
+    "reference_pools": [
+      [
+        "Commerzbank:p3",
+        "Commerzbank:p77",
+        "Commerzbank:p90"
+      ]
+    ]
+  },
+  "For FNCB Bancorp, Inc., what was the value of Non-performing loan ratio (NPL) at year-end at the end of the period listed in annual report? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "0.25"
+    ],
+    "reference_pools": [
+      [
+        "FNCB Bancorp, Inc.:p1",
+        "FNCB Bancorp, Inc.:p3",
+        "FNCB Bancorp, Inc.:p20",
+        "FNCB Bancorp, Inc.:p51"
+      ]
+    ]
+  },
+  "What was the Dividend per share (in USD) for Ritchie Bros. Auctioneers Incorporated according to the annual report (within the last period or at the end of the last period)? If data is not available, return 'N/A'.": {
+    "kind": "number",
+    "answers": [
+      "0.27"
+    ],
+    "reference_pools": [
+      [
+        "Ritchie Bros. Auctioneers Incorporated:p37",
+        "Ritchie Bros. Auctioneers Incorporated:p56",
+        "Ritchie Bros. Auctioneers Incorporated:p116",
+        "Ritchie Bros. Auctioneers Incorporated:p117"
+      ]
+    ]
+  }
+}

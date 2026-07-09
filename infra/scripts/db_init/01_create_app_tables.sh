@@ -838,6 +838,234 @@ CREATE TRIGGER trg_message_feedback_updated_at
 BEFORE UPDATE ON message_feedback
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- ============================================================================
+-- Table: canary_runs (one row per agentic/classic eval RunOutput)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS canary_runs (
+  id                        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Primary key UUID for the eval run.
+
+  run_kind                  text NOT NULL DEFAULT 'agentic',
+  -- Discriminator: 'agentic' (run_agent.py) or 'classic' (run.py). Lets both harnesses
+  -- share one table without conflating trend lines.
+
+  run_timestamp             timestamptz,
+  -- Timestamp from the RunManifest (when the eval run started).
+
+  git_sha                   text,
+  -- Git commit SHA the eval ran against.
+
+  test_set                  text,
+  -- Name/path of the test-set fixture used.
+
+  test_set_hash             text,
+  -- Hash of the test-set fixture content (detects silent fixture drift).
+
+  model                     text,
+  -- LLM model used to answer questions during the run.
+
+  judge_model                text,
+  -- LLM model used for judging (faithfulness/relevance/etc.).
+
+  k_values                  integer[],
+  -- Retrieval k values evaluated (e.g. {3,5,10}).
+
+  total_questions           integer,
+  -- Total number of questions in the test set.
+
+  evaluated                 integer,
+  -- Number of questions actually evaluated (excludes skipped/excluded).
+
+  excluded                  jsonb NOT NULL DEFAULT '[]'::jsonb,
+  -- Array of excluded question ids + reasons.
+
+  retrieval                 jsonb,
+  -- Aggregate retrieval metrics (recall@k/precision@k), k-dependent keys.
+
+  correctness               jsonb,
+  -- Aggregate correctness metrics, including by-kind breakdown.
+
+  correctness_overall       double precision,
+  -- Promoted scalar from correctness['overall'] for cheap trend-line queries.
+
+  judge                     jsonb,
+  -- Aggregate judge metrics (faithfulness/relevance/citation_accuracy/completeness).
+
+  hallucination             jsonb,
+  -- Aggregate hallucination metrics.
+
+  hallucination_rate_mean   double precision,
+  -- Promoted scalar for cheap trend-line queries.
+
+  total_cost_usd            numeric(12,6),
+  -- Sum of per-question cost_usd for this run.
+
+  total_latency_s           double precision,
+  -- Sum of per-question latency_s for this run.
+
+  regressions               jsonb NOT NULL DEFAULT '[]'::jsonb,
+  -- Question ids flagged as regressions vs. the committed baseline (from compare.py), when
+  -- --compare was used alongside --persist-db.
+
+  raw_manifest              jsonb,
+  -- Full RunManifest.model_dump() as a safety net for anything not promoted to a column.
+
+  created_at                timestamptz NOT NULL DEFAULT now(),
+  updated_at                timestamptz NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE canary_runs IS
+  'One row per canary/eval RunOutput (manifest + aggregate metrics). Additive history/trends
+   alongside the JSON-artifact + committed-baseline CI gate, which is unchanged.';
+
+COMMENT ON COLUMN canary_runs.id IS 'Primary key UUID.';
+COMMENT ON COLUMN canary_runs.run_kind IS 'Discriminator: agentic (run_agent.py) or classic (run.py).';
+COMMENT ON COLUMN canary_runs.run_timestamp IS 'When the eval run started, from the manifest.';
+COMMENT ON COLUMN canary_runs.git_sha IS 'Git commit SHA the eval ran against.';
+COMMENT ON COLUMN canary_runs.test_set IS 'Name/path of the test-set fixture used.';
+COMMENT ON COLUMN canary_runs.test_set_hash IS 'Hash of the test-set fixture content.';
+COMMENT ON COLUMN canary_runs.model IS 'LLM model used to answer questions during the run.';
+COMMENT ON COLUMN canary_runs.judge_model IS 'LLM model used for judging.';
+COMMENT ON COLUMN canary_runs.k_values IS 'Retrieval k values evaluated.';
+COMMENT ON COLUMN canary_runs.total_questions IS 'Total number of questions in the test set.';
+COMMENT ON COLUMN canary_runs.evaluated IS 'Number of questions actually evaluated.';
+COMMENT ON COLUMN canary_runs.excluded IS 'Array of excluded question ids + reasons.';
+COMMENT ON COLUMN canary_runs.retrieval IS 'Aggregate retrieval metrics, k-dependent keys.';
+COMMENT ON COLUMN canary_runs.correctness IS 'Aggregate correctness metrics incl. by-kind breakdown.';
+COMMENT ON COLUMN canary_runs.correctness_overall IS 'Promoted scalar from correctness[overall] for trend queries.';
+COMMENT ON COLUMN canary_runs.judge IS 'Aggregate judge metrics.';
+COMMENT ON COLUMN canary_runs.hallucination IS 'Aggregate hallucination metrics.';
+COMMENT ON COLUMN canary_runs.hallucination_rate_mean IS 'Promoted scalar for trend queries.';
+COMMENT ON COLUMN canary_runs.total_cost_usd IS 'Sum of per-question cost_usd for this run.';
+COMMENT ON COLUMN canary_runs.total_latency_s IS 'Sum of per-question latency_s for this run.';
+COMMENT ON COLUMN canary_runs.regressions IS 'Question ids flagged as regressions vs. committed baseline.';
+COMMENT ON COLUMN canary_runs.raw_manifest IS 'Full RunManifest.model_dump() safety net.';
+COMMENT ON COLUMN canary_runs.created_at IS 'Row creation time.';
+COMMENT ON COLUMN canary_runs.updated_at IS 'Row last update time (trigger managed).';
+
+CREATE INDEX IF NOT EXISTS canary_runs_created_idx
+  ON canary_runs (created_at DESC);
+COMMENT ON INDEX canary_runs_created_idx IS
+  'Supports listing recent runs across all kinds.';
+
+CREATE INDEX IF NOT EXISTS canary_runs_kind_created_idx
+  ON canary_runs (run_kind, created_at DESC);
+COMMENT ON INDEX canary_runs_kind_created_idx IS
+  'Primary trend-line query: runs of a given kind ordered by recency.';
+
+CREATE INDEX IF NOT EXISTS canary_runs_git_sha_idx
+  ON canary_runs (git_sha);
+COMMENT ON INDEX canary_runs_git_sha_idx IS
+  'Lookup a run by the commit it ran against.';
+
+DROP TRIGGER IF EXISTS trg_canary_runs_updated_at ON canary_runs;
+CREATE TRIGGER trg_canary_runs_updated_at
+BEFORE UPDATE ON canary_runs
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ============================================================================
+-- Table: canary_run_results (one row per PerQuestionResult, FK to canary_runs)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS canary_run_results (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  -- Primary key UUID for the per-question result.
+
+  canary_run_id         uuid NOT NULL REFERENCES canary_runs(id) ON DELETE CASCADE,
+  -- Parent eval run. Cascades delete with the run.
+
+  qid                   text,
+  -- Question id from the test set.
+
+  question              text,
+  -- Question text.
+
+  kind                  text,
+  -- Question-kind taxonomy label (used for by-kind correctness breakdown).
+
+  route                 text,
+  -- Router decision for this question (direct_answer/retrieve/etc.).
+
+  excluded_reason       text,
+  -- Reason this question was excluded from scoring, if any.
+
+  retrieved_page_keys   jsonb,
+  -- Page keys retrieved for this question.
+
+  metrics               jsonb,
+  -- Per-question retrieval metrics, k-dependent keys.
+
+  answer                text,
+  -- Generated answer text.
+
+  citation_spans        jsonb,
+  -- Citation spans in the generated answer.
+
+  correct               boolean,
+  -- Promoted scalar from correctness.correct.
+
+  correctness_reason    text,
+  -- Explanation for the correctness verdict.
+
+  judge                 jsonb,
+  -- JudgeOutput: {faithfulness, relevance, citation_accuracy, completeness: {score, justification},
+  -- unsupported_claims: [...]}, plus hallucination_rate added by the caller.
+
+  hallucination_rate    double precision,
+  -- Promoted scalar from judge.hallucination_rate.
+
+  latency_s             double precision,
+  -- Wall-clock latency for this question.
+
+  input_tokens          integer,
+  -- Input token count.
+
+  output_tokens         integer,
+  -- Output token count.
+
+  cost_usd              numeric(12,6),
+  -- Cost in USD for this question.
+
+  created_at            timestamptz NOT NULL DEFAULT now()
+  -- Write-once; rows aren't patched after insert (unlike llm_requests).
+);
+
+COMMENT ON TABLE canary_run_results IS
+  'One row per PerQuestionResult within a canary_runs row. Powers per-question history/regression
+   tables in Grafana without diffing JSON files by hand.';
+
+COMMENT ON COLUMN canary_run_results.id IS 'Primary key UUID.';
+COMMENT ON COLUMN canary_run_results.canary_run_id IS 'FK to canary_runs (cascade on delete).';
+COMMENT ON COLUMN canary_run_results.qid IS 'Question id from the test set.';
+COMMENT ON COLUMN canary_run_results.question IS 'Question text.';
+COMMENT ON COLUMN canary_run_results.kind IS 'Question-kind taxonomy label.';
+COMMENT ON COLUMN canary_run_results.route IS 'Router decision for this question.';
+COMMENT ON COLUMN canary_run_results.excluded_reason IS 'Reason this question was excluded from scoring, if any.';
+COMMENT ON COLUMN canary_run_results.retrieved_page_keys IS 'Page keys retrieved for this question.';
+COMMENT ON COLUMN canary_run_results.metrics IS 'Per-question retrieval metrics, k-dependent keys.';
+COMMENT ON COLUMN canary_run_results.answer IS 'Generated answer text.';
+COMMENT ON COLUMN canary_run_results.citation_spans IS 'Citation spans in the generated answer.';
+COMMENT ON COLUMN canary_run_results.correct IS 'Promoted scalar from correctness.correct.';
+COMMENT ON COLUMN canary_run_results.correctness_reason IS 'Explanation for the correctness verdict.';
+COMMENT ON COLUMN canary_run_results.judge IS 'JudgeOutput dict plus hallucination_rate.';
+COMMENT ON COLUMN canary_run_results.hallucination_rate IS 'Promoted scalar from judge.hallucination_rate.';
+COMMENT ON COLUMN canary_run_results.latency_s IS 'Wall-clock latency for this question.';
+COMMENT ON COLUMN canary_run_results.input_tokens IS 'Input token count.';
+COMMENT ON COLUMN canary_run_results.output_tokens IS 'Output token count.';
+COMMENT ON COLUMN canary_run_results.cost_usd IS 'Cost in USD for this question.';
+COMMENT ON COLUMN canary_run_results.created_at IS 'Row creation time (write-once).';
+
+CREATE INDEX IF NOT EXISTS canary_run_results_run_idx
+  ON canary_run_results (canary_run_id);
+COMMENT ON INDEX canary_run_results_run_idx IS
+  'Fetch all per-question results for a given run.';
+
+CREATE INDEX IF NOT EXISTS canary_run_results_qid_created_idx
+  ON canary_run_results (qid, created_at DESC);
+COMMENT ON INDEX canary_run_results_qid_created_idx IS
+  'Per-question history across runs (Grafana templated-qid panel).';
+
 SQL
 
 echo ">> Granting permissions to application user..."
