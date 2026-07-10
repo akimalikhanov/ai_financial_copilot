@@ -17,6 +17,26 @@ on:
         required: false
         default: ""
         type: string
+      max_tokens:
+        description: "Override synthesis model max output tokens (raise for reasoning models at high effort so reasoning doesn't starve the answer); blank = model default"
+        required: false
+        default: ""
+        type: string
+      limit:
+        description: "Run only the first N questions (for smoke-testing the workflow); leave blank to run the full set"
+        required: false
+        default: ""
+        type: string
+      run_kind:
+        description: "Discriminator for the persisted run + compare-to-latest lookup. Keep 'agentic' for the main trend; use a distinct value to track an experiment as a separate trend line."
+        required: false
+        default: "agentic"
+        type: string
+      run_description:
+        description: "Optional free-text note stored on the run (e.g. what this run is testing)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   canary:
@@ -38,22 +58,58 @@ jobs:
       RERANKER_BASE_URL: ${{ secrets.EVAL_RERANKER_BASE_URL }}
       REDIS_APP_HOST: ${{ secrets.EVAL_REDIS_APP_HOST }}
       REDIS_APP_PORT: ${{ secrets.EVAL_REDIS_APP_PORT }}
+      REDIS_APP_PASSWORD: ${{ secrets.EVAL_REDIS_APP_PASSWORD }}
       EVAL_USER_ID: ${{ secrets.EVAL_USER_ID }}
+      # Behavioral config (embedding provider, reranker settings, agent tool model, etc.)
+      # comes from .env.example via the "Load behavioral config" step below — NOT hardcoded
+      # here — so it can't drift from what the app actually ships. Above are only the
+      # eval-environment connection targets (hosts/ports/keys), which override the
+      # .env.example localhost defaults: config.py's load_dotenv(override=False) makes
+      # process env (these secrets) win over the .env file.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Isolate this self-hosted runner's uv cache from the developer's shared
+      # ~/.cache/uv (which backs ~20 other project venvs on this box). Persistent
+      # across canary runs so torch/vllm/CUDA wheels aren't re-downloaded, but
+      # independently measurable/prunable, and canary's uv.lock churn no longer
+      # bloats the dev cache. $HOME is expanded here (not resolvable in job env:).
+      - name: Isolate uv cache
+        run: echo "UV_CACHE_DIR=$HOME/.cache/uv-canary" >> "$GITHUB_ENV"
+        shell: bash
       - uses: ./.github/actions/setup-python-env
         with:
           groups: dev llm-engine
+          # Self-hosted runner: the isolated local UV_CACHE_DIR set above persists across
+          # runs on this machine, so the GitHub Actions remote cache is redundant overhead
+          # that always misses (its key bakes in the hosted-runner OS image).
+          enable-remote-cache: "false"
+      # Single source of truth for behavioral config (same as ci.yml). config.py's
+      # load_dotenv() reads this .env; the job-level env: secrets above already in the
+      # process env win (override=False), so eval hosts/keys override the localhost
+      # defaults while everything else (embedder provider, reranker, models) matches ship.
+      - name: Load behavioral config from .env.example
+        run: cp .env.example .env
+        shell: bash
       - name: Run canary eval
+        # RUN_DESCRIPTION goes through env (not string-interpolated) so a multi-word note
+        # is passed as a single quoted argv rather than splitting on spaces. The trailing
+        # optional flags use GHA conditionals: empty input -> flag omitted entirely.
+        env:
+          RUN_DESCRIPTION: ${{ inputs.run_description }}
         run: |
           uv run python -m src.eval.run_agent \
             --test-set src/eval/fixtures/canary_eval.json \
             --output /tmp/canary_latest.json \
             --compare src/eval/fixtures/runs/canary_baseline.json \
+            --compare-to-latest-db \
             --persist-db \
             --model "${{ inputs.model }}" \
             --prompt-version v3_agent_synthesis \
-            ${{ inputs.reasoning_effort != '' && format('--reasoning-effort {0}', inputs.reasoning_effort) || '' }}
+            --run-kind "${{ inputs.run_kind }}" \
+            ${{ inputs.limit != '' && format('--limit {0}', inputs.limit) || '' }} \
+            ${{ inputs.reasoning_effort != '' && format('--reasoning-effort {0}', inputs.reasoning_effort) || '' }} \
+            ${{ inputs.max_tokens != '' && format('--max-tokens {0}', inputs.max_tokens) || '' }} \
+            ${RUN_DESCRIPTION:+--run-description "$RUN_DESCRIPTION"}
       - name: Check for regressions
         run: |
           uv run python -c "
@@ -68,3 +124,12 @@ jobs:
           path: |
             /tmp/canary_latest.json
             /tmp/canary_latest_vs_canary_baseline.compare.json
+            /tmp/canary_latest_vs_latest_db.compare.json
+          if-no-files-found: ignore
+      # Keep the isolated canary cache bounded: prune artifacts not referenced by the
+      # current checkout's venv (chiefly stale torch/vllm/CUDA wheels left behind when
+      # uv.lock bumps those pins). Runs even on failure so the cache can't grow unbounded.
+      - name: Prune canary uv cache
+        if: always()
+        run: uv cache prune
+        shell: bash

@@ -27,11 +27,14 @@ def run_output_to_canary_run_kwargs(output: RunOutput, run_kind: str = "agentic"
 
     return {
         "run_kind": run_kind,
+        "run_description": manifest.run_description,
         "run_timestamp": datetime.fromisoformat(manifest.timestamp),
         "git_sha": manifest.git_sha,
         "test_set": manifest.test_set,
         "test_set_hash": manifest.test_set_hash,
         "model": manifest.model,
+        "reasoning_effort": manifest.reasoning_effort,
+        "max_tokens": manifest.max_tokens,
         "judge_model": manifest.judge_model,
         "k_values": manifest.k_values,
         "total_questions": manifest.total_questions,

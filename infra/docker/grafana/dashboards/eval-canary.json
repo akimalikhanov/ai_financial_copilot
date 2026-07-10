@@ -1,0 +1,482 @@
+{
+  "title": "Eval / Canary",
+  "uid": "eval-canary",
+  "description": "ML / product engineer view: canary eval run history — correctness, judge scores, hallucination, retrieval, cost, and regressions vs. the committed baseline (canary_runs / canary_run_results, persisted by src.eval.run_agent --persist-db).",
+  "schemaVersion": 39,
+  "version": 4,
+  "refresh": "",
+  "time": { "from": "now-90d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "qid",
+        "label": "Question (per-question history)",
+        "type": "query",
+        "datasource": { "type": "postgres", "uid": "postgres" },
+        "query": "SELECT DISTINCT r.qid FROM canary_run_results r JOIN canary_runs cr ON cr.id = r.canary_run_id WHERE cr.run_kind = 'agentic' AND r.qid IS NOT NULL ORDER BY r.qid;",
+        "includeAll": false,
+        "multi": false,
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Quality Trend (canary_runs)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "Correctness Accuracy (overall + by kind)",
+      "type": "timeseries",
+      "description": "correctness_overall plus per-kind accuracy from correctness->'by_kind', run_kind='agentic'.",
+      "gridPos": { "x": 0, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, 'overall' AS metric, correctness_overall AS value FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) UNION ALL SELECT cr.created_at AS time, kind_stats.kind || '.acc' AS metric, (kind_stats.value->>'acc')::double precision AS value FROM canary_runs cr, jsonb_each(cr.correctness->'by_kind') AS kind_stats(kind, value) WHERE cr.run_kind = 'agentic' AND $__timeFilter(cr.created_at) ORDER BY 1;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, 'baseline (overall)' AS metric, correctness_overall AS value FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline (overall)" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Judge Dimensions (mean, 1-5)",
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "title": "Judge — Faithfulness (mean)",
+      "type": "timeseries",
+      "description": "faithfulness_mean per agentic run vs. baseline. Does the answer stay grounded in retrieved context?",
+      "gridPos": { "x": 0, "y": 10, "w": 6, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, (judge->>'faithfulness_mean')::double precision AS faithfulness FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, (judge->>'faithfulness_mean')::double precision AS baseline FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 1,
+          "max": 5,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 22,
+      "title": "Judge — Relevance (mean)",
+      "type": "timeseries",
+      "description": "relevance_mean per agentic run vs. baseline. Does the answer address the question?",
+      "gridPos": { "x": 6, "y": 10, "w": 6, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, (judge->>'relevance_mean')::double precision AS relevance FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, (judge->>'relevance_mean')::double precision AS baseline FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 1,
+          "max": 5,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 23,
+      "title": "Judge — Citation Accuracy (mean)",
+      "type": "timeseries",
+      "description": "citation_accuracy_mean per agentic run vs. baseline. Do the cited refs actually support the claims?",
+      "gridPos": { "x": 12, "y": 10, "w": 6, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, (judge->>'citation_accuracy_mean')::double precision AS citation_accuracy FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, (judge->>'citation_accuracy_mean')::double precision AS baseline FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 1,
+          "max": 5,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 24,
+      "title": "Judge — Completeness (mean)",
+      "type": "timeseries",
+      "description": "completeness_mean per agentic run vs. baseline. Does the answer cover the full expected content?",
+      "gridPos": { "x": 18, "y": 10, "w": 6, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, (judge->>'completeness_mean')::double precision AS completeness FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, (judge->>'completeness_mean')::double precision AS baseline FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 1,
+          "max": 5,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "title": "Hallucination Rate (mean)",
+      "type": "timeseries",
+      "description": "hallucination_rate_mean per run, run_kind='agentic'.",
+      "gridPos": { "x": 8, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, hallucination_rate_mean FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT t AS time, hallucination_rate_mean AS baseline FROM canary_runs CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS bounds(t) WHERE run_kind = 'agentic_baseline' ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 10, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "baseline" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 5,
+      "title": "Retrieval recall@k / precision@k",
+      "type": "timeseries",
+      "description": "recall@5/10 and precision@5/10 from the retrieval jsonb column, run_kind='agentic'.",
+      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT cr.created_at AS time, m.key AS metric, (m.value)::double precision AS value FROM canary_runs cr, jsonb_each_text(cr.retrieval) AS m(key, value) WHERE cr.run_kind = 'agentic' AND m.key IN ('recall@5','recall@10','precision@5','precision@10') AND $__timeFilter(cr.created_at) ORDER BY 1;"
+        },
+        {
+          "refId": "baseline",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT b.t AS time, 'baseline ' || m.key AS metric, (m.value)::double precision AS value FROM canary_runs cr, jsonb_each_text(cr.retrieval) AS m(key, value) CROSS JOIN (VALUES ($__timeFrom()::timestamptz), ($__timeTo()::timestamptz)) AS b(t) WHERE cr.run_kind = 'agentic_baseline' AND m.key IN ('recall@5','recall@10','precision@5','precision@10') ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 6, "showPoints": "always" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/^baseline /" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 6] } },
+              { "id": "custom.showPoints", "value": "never" },
+              { "id": "custom.lineWidth", "value": 1 },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 6,
+      "title": "Latest Run Regressions",
+      "type": "stat",
+      "description": "Per-question regressions flagged vs. the committed baseline on the most recent agentic run. 0 = green, >0 = red.",
+      "gridPos": { "x": 16, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT jsonb_array_length(regressions) AS regression_count FROM canary_runs WHERE run_kind = 'agentic' ORDER BY created_at DESC LIMIT 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Cost & Latency Trend (canary_runs)",
+      "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 8,
+      "title": "Total Cost per Run (USD)",
+      "type": "timeseries",
+      "description": "total_cost_usd per agentic run — watch for cost regressions from model/prompt/agent-loop changes.",
+      "gridPos": { "x": 0, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, total_cost_usd FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 9,
+      "title": "Total Latency per Run (s)",
+      "type": "timeseries",
+      "description": "total_latency_s per agentic run — summed per-question latency.",
+      "gridPos": { "x": 8, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at AS time, total_latency_s FROM canary_runs WHERE run_kind = 'agentic' AND $__timeFilter(created_at) ORDER BY created_at;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Run & Question Detail (canary_run_results)",
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "title": "Recent Runs",
+      "type": "table",
+      "description": "Last 20 runs (includes the backfilled agentic_baseline row for reference — see run_kind).",
+      "gridPos": { "x": 0, "y": 27, "w": 24, "h": 9 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at, run_kind, run_description, git_sha, model, reasoning_effort, judge_model, evaluated, total_questions, correctness_overall, hallucination_rate_mean, total_cost_usd, jsonb_array_length(regressions) AS regression_count FROM canary_runs WHERE run_kind IN ('agentic', 'agentic_baseline') ORDER BY created_at DESC LIMIT 20;"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "sortBy": [{ "displayName": "created_at", "desc": true }] }
+    },
+    {
+      "id": 12,
+      "title": "Lowest-Scoring / Regressed Questions (latest run)",
+      "type": "table",
+      "description": "Per-question detail for the most recent agentic run, worst-first (incorrect + high hallucination first).",
+      "gridPos": { "x": 0, "y": 36, "w": 24, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT r.qid, r.question, r.kind, r.route, r.correct, (r.judge->'faithfulness'->>'score')::int AS faithfulness, (r.judge->'citation_accuracy'->>'score')::int AS citation_accuracy, r.hallucination_rate, r.latency_s, r.cost_usd FROM canary_run_results r WHERE r.canary_run_id = (SELECT id FROM canary_runs WHERE run_kind = 'agentic' ORDER BY created_at DESC LIMIT 1) ORDER BY r.correct ASC NULLS FIRST, r.hallucination_rate DESC NULLS LAST LIMIT 25;"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "sortBy": [{ "displayName": "correct", "desc": false }] }
+    },
+    {
+      "id": 13,
+      "title": "Per-Question History — $qid",
+      "type": "timeseries",
+      "description": "Selected question's correctness (0/1) and judge faithfulness score across all agentic runs. The Grafana-native replacement for diffing two run JSONs by hand.",
+      "gridPos": { "x": 0, "y": 46, "w": 24, "h": 9 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT cr.created_at AS time, 'correct' AS metric, (r.correct::int)::double precision AS value FROM canary_run_results r JOIN canary_runs cr ON cr.id = r.canary_run_id WHERE cr.run_kind = 'agentic' AND r.qid = '$qid' AND $__timeFilter(cr.created_at) UNION ALL SELECT cr.created_at AS time, 'faithfulness/5' AS metric, ((r.judge->'faithfulness'->>'score')::double precision / 5.0) AS value FROM canary_run_results r JOIN canary_runs cr ON cr.id = r.canary_run_id WHERE cr.run_kind = 'agentic' AND r.qid = '$qid' AND $__timeFilter(cr.created_at) ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 5, "pointSize": 8, "showPoints": "always" }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    }
+  ]
+}

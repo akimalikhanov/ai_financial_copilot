@@ -848,7 +848,12 @@ CREATE TABLE IF NOT EXISTS canary_runs (
 
   run_kind                  text NOT NULL DEFAULT 'agentic',
   -- Discriminator: 'agentic' (run_agent.py) or 'classic' (run.py). Lets both harnesses
-  -- share one table without conflating trend lines.
+  -- share one table without conflating trend lines. Low-cardinality — dashboards filter
+  -- on it. For free-text notes use run_description, not this.
+
+  run_description           text,
+  -- Optional free-text human note for a run (e.g. what it was testing). High-cardinality;
+  -- displayed, never filtered/grouped on (that's run_kind's job).
 
   run_timestamp             timestamptz,
   -- Timestamp from the RunManifest (when the eval run started).
@@ -864,6 +869,13 @@ CREATE TABLE IF NOT EXISTS canary_runs (
 
   model                     text,
   -- LLM model used to answer questions during the run.
+
+  reasoning_effort          text,
+  -- Reasoning effort passed to the synthesis model (e.g. low/medium/high); NULL = model default.
+
+  max_tokens                integer,
+  -- Max output tokens override for the synthesis model (max_completion_tokens for GPT-5,
+  -- counts reasoning tokens); NULL = model's configured default.
 
   judge_model                text,
   -- LLM model used for judging (faithfulness/relevance/etc.).
@@ -920,12 +932,15 @@ COMMENT ON TABLE canary_runs IS
    alongside the JSON-artifact + committed-baseline CI gate, which is unchanged.';
 
 COMMENT ON COLUMN canary_runs.id IS 'Primary key UUID.';
-COMMENT ON COLUMN canary_runs.run_kind IS 'Discriminator: agentic (run_agent.py) or classic (run.py).';
+COMMENT ON COLUMN canary_runs.run_kind IS 'Discriminator: agentic (run_agent.py) or classic (run.py). Low-cardinality; dashboards filter on it.';
+COMMENT ON COLUMN canary_runs.run_description IS 'Optional free-text human note for a run; displayed, never filtered on.';
 COMMENT ON COLUMN canary_runs.run_timestamp IS 'When the eval run started, from the manifest.';
 COMMENT ON COLUMN canary_runs.git_sha IS 'Git commit SHA the eval ran against.';
 COMMENT ON COLUMN canary_runs.test_set IS 'Name/path of the test-set fixture used.';
 COMMENT ON COLUMN canary_runs.test_set_hash IS 'Hash of the test-set fixture content.';
 COMMENT ON COLUMN canary_runs.model IS 'LLM model used to answer questions during the run.';
+COMMENT ON COLUMN canary_runs.reasoning_effort IS 'Reasoning effort for the synthesis model (low/medium/high); NULL = model default.';
+COMMENT ON COLUMN canary_runs.max_tokens IS 'Max output tokens override for the synthesis model; NULL = model default.';
 COMMENT ON COLUMN canary_runs.judge_model IS 'LLM model used for judging.';
 COMMENT ON COLUMN canary_runs.k_values IS 'Retrieval k values evaluated.';
 COMMENT ON COLUMN canary_runs.total_questions IS 'Total number of questions in the test set.';
@@ -943,6 +958,17 @@ COMMENT ON COLUMN canary_runs.regressions IS 'Question ids flagged as regression
 COMMENT ON COLUMN canary_runs.raw_manifest IS 'Full RunManifest.model_dump() safety net.';
 COMMENT ON COLUMN canary_runs.created_at IS 'Row creation time.';
 COMMENT ON COLUMN canary_runs.updated_at IS 'Row last update time (trigger managed).';
+
+-- Additive: reasoning_effort and run_description were added after the table already
+-- existed in some environments. CREATE TABLE IF NOT EXISTS above won't add them to a
+-- pre-existing table, so patch them in idempotently here (same pattern as the documents
+-- ALTERs above).
+ALTER TABLE canary_runs
+  ADD COLUMN IF NOT EXISTS reasoning_effort text;
+ALTER TABLE canary_runs
+  ADD COLUMN IF NOT EXISTS run_description text;
+ALTER TABLE canary_runs
+  ADD COLUMN IF NOT EXISTS max_tokens integer;
 
 CREATE INDEX IF NOT EXISTS canary_runs_created_idx
   ON canary_runs (created_at DESC);

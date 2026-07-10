@@ -209,47 +209,64 @@ class RoutedLLM:
 class LLMRouter:
     def __init__(self, config: Mapping[str, Any]):
         self._config = config
-        self._models: dict[str, RoutedLLM] = {}
 
         defaults = config.get("defaults") or {}
-        global_default_params = dict(defaults.get("params") or {})
-        global_default_stream = bool(defaults.get("stream", False))
+        self._global_default_params = dict(defaults.get("params") or {})
+        self._global_default_stream = bool(defaults.get("stream", False))
 
+        # Store raw per-model config; build the adapter lazily on first get(). This
+        # keeps an unconfigured provider (e.g. a Gemini model with no GEMINI_API_KEY)
+        # from failing router construction — it only fails if that model is actually
+        # routed to. Adapters that don't validate credentials eagerly (OpenAIAdapter)
+        # were already tolerant; Gemini's genai.Client() validates at construction.
+        self._model_cfgs: dict[str, Mapping[str, Any]] = {}
         for m in config.get("models") or []:
             model_id = m.get("id")
             provider = m.get("provider")
             if not model_id or not provider:
                 continue
+            self._model_cfgs[model_id] = m
 
-            adapter = _build_adapter(provider, m)
+        self._models: dict[str, RoutedLLM] = {}
 
-            params = dict(global_default_params)
-            params.update(m.get("params_override") or {})
+    def _build_routed(self, model_id: str, m: Mapping[str, Any]) -> RoutedLLM:
+        provider = m["provider"]
+        adapter = _build_adapter(provider, m)
 
-            self._models[model_id] = RoutedLLM(
-                adapter=adapter,
-                provider=provider,
-                model_id=model_id,
-                default_params=params,
-                default_stream=global_default_stream,
-                capabilities=dict(m.get("capabilities") or {}),
-            )
+        params = dict(self._global_default_params)
+        params.update(m.get("params_override") or {})
+
+        return RoutedLLM(
+            adapter=adapter,
+            provider=provider,
+            model_id=model_id,
+            default_params=params,
+            default_stream=self._global_default_stream,
+            capabilities=dict(m.get("capabilities") or {}),
+        )
 
     def get(self, model_id: str) -> RoutedLLM:
-        try:
-            return self._models[model_id]
-        except KeyError:
+        routed = self._models.get(model_id)
+        if routed is not None:
+            return routed
+
+        cfg = self._model_cfgs.get(model_id)
+        if cfg is None:
             raise LLMNotFoundError(
                 f"Unknown model_id: {model_id}",
                 model=model_id,
                 status_code=404,
             ) from None
 
+        routed = self._build_routed(model_id, cfg)
+        self._models[model_id] = routed
+        return routed
+
     def list_models(self) -> list[str]:
-        return sorted(self._models.keys())
+        return sorted(self._model_cfgs.keys())
 
     async def close(self) -> None:
-        """Close all adapter HTTP clients for graceful shutdown."""
+        """Close all instantiated adapter HTTP clients for graceful shutdown."""
         for routed in self._models.values():
             await routed.adapter.close()
 

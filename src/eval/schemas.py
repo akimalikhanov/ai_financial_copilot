@@ -51,8 +51,11 @@ class RunManifest(BaseModel):
     test_set: str
     test_set_hash: str
     model: str
+    reasoning_effort: str | None = None
+    max_tokens: int | None = None
     judge_model: str
     k_values: list[int]
+    run_description: str | None = None
     total_questions: int
     evaluated: int
     excluded: list[ExcludedEntry]

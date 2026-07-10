@@ -47,7 +47,10 @@ models:
       streaming: true
       tool_calling: true
       citation_mode: none
-    params_override: {temperature: 1.0, reasoning_effort: low, verbosity: low}
+    # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
+    # tokens too. The global default (2000) starves the answer at high reasoning_effort
+    # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
+    params_override: {temperature: 1.0, reasoning_effort: low, verbosity: low, max_tokens: 4000}
 
   - id: gpt-4o-mini
     label: "OpenAI GPT-4o-mini"

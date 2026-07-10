@@ -4,7 +4,7 @@ Usage:
     python -m src.eval.run_agent \
         --test-set data/answers_small.json \
         [--output data/eval/runs/<auto>.json] \
-        [--retrieval-only] [--compare <prev.json>] \
+        [--retrieval-only] [--compare <prev.json>] [--compare-to-latest-db] \
         [--limit N] [--model <model_id>] [--judge-model <judge_id>] \
         [--user-id <uuid>] [--k 5 10]
 
@@ -17,12 +17,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -50,6 +51,9 @@ from src.utils.config import (
     get_eval_user_id,
     get_redis_app_url,
 )
+
+if TYPE_CHECKING:
+    from src.models.canary_run import CanaryRun
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -110,10 +114,45 @@ def _build_args() -> argparse.Namespace:
         help="Reasoning effort for the synthesis model (e.g. low, medium, high)",
     )
     p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override the synthesis model's max output tokens (maps to "
+            "max_completion_tokens for GPT-5 models, which also counts reasoning tokens). "
+            "Leave unset to use the model's configured default. Raise it for reasoning "
+            "models at high effort so reasoning doesn't starve the answer."
+        ),
+    )
+    p.add_argument(
         "--persist-db",
         action="store_true",
         default=False,
         help="Persist this run to canary_runs/canary_run_results in Postgres",
+    )
+    p.add_argument(
+        "--compare-to-latest-db",
+        action="store_true",
+        default=False,
+        help=(
+            "Additionally compare this run against the most recently persisted "
+            "canary_runs row (run_kind='agentic'). Informational only — does not "
+            "affect --persist-db's own regressions column or the process exit code."
+        ),
+    )
+    p.add_argument(
+        "--run-kind",
+        default="agentic",
+        help=(
+            "Discriminator for the persisted run and the compare-to-latest-db lookup "
+            "(default: agentic). Use a distinct value to keep an experiment's trend line "
+            "separate from the main agentic trend in Grafana. Low-cardinality by design."
+        ),
+    )
+    p.add_argument(
+        "--run-description",
+        default=None,
+        help="Optional free-text note stored on the run (e.g. what this run is testing).",
     )
     return p.parse_args()
 
@@ -187,6 +226,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         model_id=args.model,
                         prompt_version=args.prompt_version,
                         reasoning_effort=args.reasoning_effort,
+                        max_tokens=args.max_tokens,
                         llm_router=llm_router,
                         retrieval_only=args.retrieval_only,
                         redis=redis,
@@ -283,11 +323,14 @@ async def _run(args: argparse.Namespace) -> RunOutput:
         test_set=str(test_set_path),
         test_set_hash=_file_sha256(test_set_path),
         model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        max_tokens=args.max_tokens,
         judge_model=judge_model,
         k_values=list(k_values),
         total_questions=len(questions),
         evaluated=len(questions) - len(excluded),
         excluded=excluded,
+        run_description=args.run_description,
     )
     return RunOutput(manifest=manifest, aggregate=aggregate, per_question=per_question)
 
@@ -303,6 +346,47 @@ async def _persist(output: RunOutput, run_kind: str, regressions: list[str] | No
             )
             await session.commit()
             logger.info("persisted canary_run id=%s", run.id)
+    finally:
+        await shutdown_db()
+
+
+def _canary_run_to_compare_dict(run: CanaryRun) -> dict:
+    """Reconstruct a compare()-shaped dict from a persisted CanaryRun (+ results) row."""
+    per_question = [
+        {
+            "qid": r.qid,
+            "question": r.question,
+            "retrieved_page_keys": r.retrieved_page_keys or [],
+            "correctness": {"correct": r.correct} if r.correct is not None else None,
+            "judge": r.judge,
+        }
+        for r in run.results
+    ]
+    return {
+        "manifest": run.raw_manifest or {},
+        "aggregate": {
+            "retrieval": run.retrieval or {},
+            "correctness": run.correctness or {},
+            "judge": run.judge or {},
+            "hallucination": run.hallucination or {},
+        },
+        "per_question": per_question,
+    }
+
+
+async def _fetch_latest_db_run_as_dict(run_kind: str = "agentic") -> dict | None:
+    from src.repository.canary_run_repository import CanaryRunRepository
+
+    await init_db()
+    try:
+        async with get_session_factory()() as session:
+            repo = CanaryRunRepository(session)
+            latest = await repo.get_latest(run_kind=run_kind)
+            if latest is None:
+                return None
+            with_results = await repo.get_with_results(latest.id)
+            assert with_results is not None
+            return _canary_run_to_compare_dict(with_results)
     finally:
         await shutdown_db()
 
@@ -331,8 +415,30 @@ def main() -> None:
         )
         regressions = run_compare(args.compare, out_path, compare_out)
 
+    if args.compare_to_latest_db:
+        # Fetch before persisting this run, so we don't compare the run against itself.
+        # Compare against the latest run of the SAME kind, so an experiment run trends
+        # against prior experiment runs rather than the main agentic line.
+        prev_dict = asyncio.run(_fetch_latest_db_run_as_dict(run_kind=args.run_kind))
+        if prev_dict is None:
+            logger.info("--compare-to-latest-db: no prior %s run in DB, skipping", args.run_kind)
+        else:
+            prev_path = out_path.with_name(f"{out_path.stem}_prev_db_run.json")
+            prev_path.write_text(json.dumps(prev_dict, indent=2))
+            latest_db_compare_out = out_path.with_name(f"{out_path.stem}_vs_latest_db.compare.json")
+            run_compare(prev_path, out_path, latest_db_compare_out)
+
     if args.persist_db:
-        asyncio.run(_persist(output, run_kind="agentic", regressions=regressions))
+        # Don't persist a run where nothing evaluated — that's an infra failure (e.g.
+        # Redis/DB/embedder unreachable), not a measurable result, and persisting it
+        # would corrupt trend lines and the compare-to-latest-db baseline with a zero row.
+        if output.manifest.evaluated <= 0:
+            logger.error(
+                "not persisting: 0/%d questions evaluated (all excluded) — likely infra failure",
+                output.manifest.total_questions,
+            )
+        else:
+            asyncio.run(_persist(output, run_kind=args.run_kind, regressions=regressions))
 
 
 if __name__ == "__main__":

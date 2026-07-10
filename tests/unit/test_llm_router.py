@@ -391,7 +391,7 @@ class TestLLMRouter:
         with pytest.raises(LLMNotFoundError, match="Unknown model_id"):
             router.get("unknown")
 
-    def test_router_calls_build_adapter_for_each_valid_model(self, monkeypatch, router_config):
+    def test_router_builds_adapter_lazily_on_first_get(self, monkeypatch, router_config):
         calls = []
 
         def fake_build_adapter(provider: str, cfg: dict[str, Any]):
@@ -402,9 +402,22 @@ class TestLLMRouter:
         monkeypatch.setattr(llm_router_mod, "_build_adapter", fake_build_adapter)
 
         router = LLMRouter(router_config)
+        # Construction must not build any adapter — an unconfigured provider (e.g. a
+        # Gemini model with no API key) should not fail router init.
+        assert calls == []
         assert router.list_models() == ["gemini", "gpt-4"]
 
-        # should be called only for valid entries with id+provider
+        # First get() builds exactly that model's adapter (invalid entries skipped).
+        router.get("gpt-4")
         assert ("openai", "gpt-4") in calls
+        assert ("google", "gemini") not in calls
+        assert len(calls) == 1
+
+        # Second get() of the same model is cached — no rebuild.
+        router.get("gpt-4")
+        assert len(calls) == 1
+
+        # Getting the other model builds only that one.
+        router.get("gemini")
         assert ("google", "gemini") in calls
         assert len(calls) == 2

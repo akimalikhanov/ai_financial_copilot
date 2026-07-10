@@ -129,6 +129,7 @@ async def _run_direct_answer(
     router: LLMRouter,
     prompt_version: str = "v3_bracket",
     reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
     system = get_system_prompt(version=prompt_version)
     renderer = get_prompt_renderer()
@@ -138,7 +139,11 @@ async def _run_direct_answer(
         ChatMessage(role=Role.user, content=user_msg),
     ]
     llm = router.get(model_id)
-    kwargs = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
+    kwargs: dict = {}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     resp = await llm.complete(messages=messages, temperature=0.0, **kwargs)
     parser = BracketCitationParser()
     out = parser.feed(resp.text or "")
@@ -154,6 +159,7 @@ async def _run_answer(
     router: LLMRouter,
     prompt_version: str = "v3_bracket",
     reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
     system = get_system_prompt(version=prompt_version)
     renderer = get_prompt_renderer()
@@ -167,7 +173,11 @@ async def _run_answer(
         ChatMessage(role=Role.user, content=user_msg),
     ]
     llm = router.get(model_id)
-    kwargs = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
+    kwargs: dict = {}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     resp = await llm.complete(messages=messages, temperature=0.0, **kwargs)
     parser = BracketCitationParser()
     out = parser.feed(resp.text or "")

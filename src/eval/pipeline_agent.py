@@ -65,6 +65,7 @@ async def run_one(
     model_id: str,
     prompt_version: str = "v3_agent_synthesis",
     reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
     llm_router: LLMRouter | None = None,
     retrieval_only: bool = False,
     redis: Redis | None = None,
@@ -104,7 +105,7 @@ async def run_one(
                 usage=None,
             )
         answer, spans, stats = await _run_direct_answer(
-            question.question, model_id, router, prompt_version, reasoning_effort
+            question.question, model_id, router, prompt_version, reasoning_effort, max_tokens
         )
         return AgentPipelineResult(
             route=route,
@@ -202,6 +203,7 @@ async def run_one(
         router,
         prompt_version,
         reasoning_effort,
+        max_tokens,
     )
 
     return AgentPipelineResult(
