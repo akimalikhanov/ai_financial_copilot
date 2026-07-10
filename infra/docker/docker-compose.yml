@@ -674,7 +674,7 @@ services:
   api:
     build:
       context: ../..
-      dockerfile: Dockerfile.api
+      dockerfile: infra/docker/Dockerfile.api
     container_name: api
     restart: unless-stopped
     env_file:
@@ -714,7 +714,7 @@ services:
   worker-chat:
     build:
       context: ../..
-      dockerfile: Dockerfile.worker
+      dockerfile: infra/docker/Dockerfile.worker
     container_name: worker-chat
     restart: unless-stopped
     env_file:
@@ -753,7 +753,7 @@ services:
   worker-ingestion:
     build:
       context: ../..
-      dockerfile: Dockerfile.worker
+      dockerfile: infra/docker/Dockerfile.worker
     container_name: worker-ingestion
     restart: unless-stopped
     env_file:
@@ -802,7 +802,7 @@ services:
   frontend:
     build:
       context: ../..
-      dockerfile: Dockerfile.frontend
+      dockerfile: infra/docker/Dockerfile.frontend
     container_name: frontend
     restart: unless-stopped
     depends_on:

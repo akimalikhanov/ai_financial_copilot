@@ -43,11 +43,11 @@ jobs:
         with:
           groups: dev llm-engine
       - run: cp .env.example .env
-      - run: .venv/bin/python -m pytest tests/unit/ --cov=src --cov-report=xml --cov-report=term
+      - run: .venv/bin/python -m pytest tests/unit/ --cov=src --cov-report=html --cov-report=term
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-xml
-          path: coverage.xml
+          name: coverage-html
+          path: htmlcov/
 
   integration-tests:
     runs-on: ubuntu-24.04
@@ -120,37 +120,43 @@ jobs:
         run: uvx semgrep scan --config p/python --config p/secrets --error
 
   docker:
-    # Cheap static checks only — no image builds. Dockerfile.api/Dockerfile.worker
-    # pull in the full llm-engine group (vllm + CUDA, ~25GB of layers), which is far
-    # too large to round-trip through the GHA cache (10GB/repo, shared across all
-    # caches): builds were oscillating between ~15s (cache hit) and ~20min (cache
-    # miss, mostly spent re-uploading that one layer) with no correctness signal
-    # gained over what's checked here. Actual image builds belong in a post-merge
-    # job that pushes straight to a registry instead of round-tripping through the
-    # GHA cache.
+    # Cheap static checks only — no image builds.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Parse the compose file with the .env.example values substituted in and fail on
+      # any schema/interpolation error (unknown keys, bad types, unset ${VAR} with no
+      # default). Catches a broken compose file without starting any container.
       - name: Validate compose config
         run: |
           cp .env.example .env
           docker compose --env-file .env config --quiet
+      # hadolint = a Dockerfile linter. It parses each Dockerfile's instructions and
+      # flags anti-patterns and mistakes (unpinned `apt-get install` versions, missing
+      # `--no-install-recommends`, `ADD` where `COPY` suffices, running as root, shell
+      # form pitfalls, etc.), plus ShellCheck on every RUN script. failure-threshold:
+      # error means only error-level rules break CI; warnings/info are informational.
       - name: Lint Dockerfile.api (hadolint)
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
-          dockerfile: Dockerfile.api
+          dockerfile: infra/docker/Dockerfile.api
           failure-threshold: error
       - name: Lint Dockerfile.worker (hadolint)
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
-          dockerfile: Dockerfile.worker
+          dockerfile: infra/docker/Dockerfile.worker
           failure-threshold: error
       - name: Lint Dockerfile.frontend (hadolint)
         uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
-          dockerfile: Dockerfile.frontend
+          dockerfile: infra/docker/Dockerfile.frontend
           failure-threshold: error
+      # trivy `config` scan = infrastructure-as-code misconfiguration scanner. Unlike
+      # hadolint (style/best-practice), this looks for SECURITY misconfigurations in
+      # Dockerfiles/compose/IaC across the repo (scan-ref: .) — e.g. images without a
+      # pinned digest, secrets baked into layers, over-broad privileges. Fails the job
+      # (exit-code: 1) only on HIGH/CRITICAL findings; .venv and node_modules skipped.
       - name: Scan Dockerfiles for misconfigurations (trivy config)
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
