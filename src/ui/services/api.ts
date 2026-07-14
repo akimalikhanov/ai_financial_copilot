@@ -90,14 +90,14 @@ export interface ReferencesEvent {
     page_numbers: number[];
     heading_path: string[];
     snippet: string | null;
-    bbox_hint?: {
+    bbox_hints?: {
       left: number;
       top: number;
       right: number;
       bottom: number;
       coord_origin: string;
       page: number;
-    } | null;
+    }[] | null;
   }[];
 }
 

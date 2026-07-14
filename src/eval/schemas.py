@@ -43,6 +43,12 @@ class PerQuestionResult(BaseModel):
     judge: dict[str, Any] | None = None
     latency_s: float | None = None
     usage: dict[str, Any] | None = None
+    # Agentic-path-only fields (populated by run_agent.py; Stage 0.5 baseline signal)
+    query_shape: str | None = None
+    agent_meta: dict[str, Any] | None = None
+    observations_count: int | None = None
+    confidence_counts: dict[str, int] | None = None
+    gaps_count: int | None = None
 
 
 class RunManifest(BaseModel):
@@ -52,6 +58,7 @@ class RunManifest(BaseModel):
     test_set_hash: str
     model: str
     reasoning_effort: str | None = None
+    verbosity: str | None = None
     max_tokens: int | None = None
     judge_model: str
     k_values: list[int]
@@ -66,6 +73,8 @@ class AggregateMetrics(BaseModel):
     correctness: dict[str, Any] = {}
     judge: dict[str, float] = {}
     hallucination: dict[str, Any] = {}
+    # Agentic-path-only, cut by query_shape (Stage 0 — docs/agentic_pattern_evolution_upd.md)
+    agent: dict[str, Any] = {}
 
 
 class RunOutput(BaseModel):

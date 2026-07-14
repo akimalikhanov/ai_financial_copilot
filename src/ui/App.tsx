@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Bot, Sun, Moon, Monitor, SlidersHorizontal,
   Pencil, Loader2, PanelLeft, Sparkles,
 } from 'lucide-react';
-import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem } from './types';
+import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem, BoundingBox } from './types';
 import { CitedText } from './components/CitedText';
 import {
   chatEnqueue,
@@ -109,7 +109,7 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       pageNumbers: r.page_numbers as number[],
       headingPath: r.heading_path as string[],
       snippet: (r.snippet as string | null),
-      bboxHint: (r.bbox_hint as Citation['bboxHint'] | undefined) ?? undefined,
+      bboxHints: (r.bbox_hints as ReferenceItem['bboxHints'] | undefined) ?? undefined,
     })),
     feedback: msg.feedback ? { rating: msg.feedback.rating, comment: msg.feedback.comment ?? null } : null,
   };
@@ -630,7 +630,7 @@ export default function App() {
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
   const [openPdfTabs, setOpenPdfTabs] = useState<{ doc: Document, page: number }[]>([]);
   const [activePdfDocId, setActivePdfDocId] = useState<string | null>(null);
-  const [activeHighlight, setActiveHighlight] = useState<{ bbox: Citation['bboxHint']; label: string } | undefined>(undefined);
+  const [activeHighlight, setActiveHighlight] = useState<{ bboxes: BoundingBox[]; label: string } | undefined>(undefined);
 
   // UI State
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -1035,7 +1035,7 @@ export default function App() {
               refId: r.ref_id, displayLabel: r.display_label, chunkId: r.chunk_id,
               documentId: r.document_id, documentName: r.document_name, filename: r.filename,
               pageNumbers: r.page_numbers, headingPath: r.heading_path, snippet: r.snippet,
-              bboxHint: r.bbox_hint ?? undefined,
+              bboxHints: r.bbox_hints ?? undefined,
             })),
           }));
         },
@@ -1125,7 +1125,7 @@ export default function App() {
       return [...prev, { doc, page: citation.page }];
     });
     setActivePdfDocId(doc.id);
-    setActiveHighlight(citation.bboxHint ? { bbox: citation.bboxHint, label: '' } : undefined);
+    setActiveHighlight(citation.bboxHints?.length ? { bboxes: citation.bboxHints, label: '' } : undefined);
   };
 
   const handleReferenceClick = (ref: ReferenceItem) => {
@@ -1147,7 +1147,7 @@ export default function App() {
       return [...prev, { doc, page }];
     });
     setActivePdfDocId(doc.id);
-    setActiveHighlight(ref.bboxHint ? { bbox: ref.bboxHint, label: ref.displayLabel } : undefined);
+    setActiveHighlight(ref.bboxHints?.length ? { bboxes: ref.bboxHints, label: ref.displayLabel } : undefined);
   };
 
   const handleNewChat = async () => {
@@ -1931,7 +1931,7 @@ export default function App() {
                 onPageChange={(docId, page) =>
                   setOpenPdfTabs(prev => prev.map(t => t.doc.id === docId ? { ...t, page } : t))
                 }
-                highlight={activeHighlight?.bbox}
+                highlight={activeHighlight?.bboxes}
                 highlightLabel={activeHighlight?.label}
               />
               <ControlPane

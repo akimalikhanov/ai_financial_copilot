@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Rename PDFs in data/pdfs from sha1.pdf to company_name.pdf using subset.csv mapping."""
+"""Rename PDFs in data/corpus/pdfs from sha1.pdf to company_name.pdf using subset.csv mapping."""
 
 import csv
 import re
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "corpus"
 PDFS_DIR = DATA_DIR / "pdfs"
 CSV_PATH = DATA_DIR / "subset.csv"
 

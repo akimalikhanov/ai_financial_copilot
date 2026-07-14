@@ -41,6 +41,7 @@ async def run_one(
     model_id: str,
     prompt_version: str = "v3_bracket",
     reasoning_effort: str | None = None,
+    verbosity: str | None = None,
     llm_router: LLMRouter | None = None,
     retrieval_only: bool = False,
 ) -> PipelineResult:
@@ -70,7 +71,12 @@ async def run_one(
             )
         # direct_answer: run LLM for correctness, no retrieval
         answer, spans, stats = await _run_direct_answer(
-            question.question, model_id, router, prompt_version, reasoning_effort
+            question.question,
+            model_id,
+            router,
+            prompt_version,
+            reasoning_effort,
+            verbosity=verbosity,
         )
         return PipelineResult(
             route=route,
@@ -111,7 +117,13 @@ async def run_one(
         )
 
     answer, spans, stats = await _run_answer(
-        question.question, rag_context, model_id, router, prompt_version, reasoning_effort
+        question.question,
+        rag_context,
+        model_id,
+        router,
+        prompt_version,
+        reasoning_effort,
+        verbosity=verbosity,
     )
     return PipelineResult(
         route=route,
@@ -130,6 +142,7 @@ async def _run_direct_answer(
     prompt_version: str = "v3_bracket",
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
+    verbosity: str | None = None,
 ) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
     system = get_system_prompt(version=prompt_version)
     renderer = get_prompt_renderer()
@@ -144,6 +157,8 @@ async def _run_direct_answer(
         kwargs["reasoning_effort"] = reasoning_effort
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if verbosity:
+        kwargs["verbosity"] = verbosity
     resp = await llm.complete(messages=messages, temperature=0.0, **kwargs)
     parser = BracketCitationParser()
     out = parser.feed(resp.text or "")
@@ -160,6 +175,7 @@ async def _run_answer(
     prompt_version: str = "v3_bracket",
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
+    verbosity: str | None = None,
 ) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
     system = get_system_prompt(version=prompt_version)
     renderer = get_prompt_renderer()
@@ -178,6 +194,8 @@ async def _run_answer(
         kwargs["reasoning_effort"] = reasoning_effort
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
+    if verbosity:
+        kwargs["verbosity"] = verbosity
     resp = await llm.complete(messages=messages, temperature=0.0, **kwargs)
     parser = BracketCitationParser()
     out = parser.feed(resp.text or "")

@@ -2,7 +2,7 @@
 
 Usage:
     python -m src.eval.run_agent \
-        --test-set data/answers_small.json \
+        --test-set data/golden_sets/answers_small.json \
         [--output data/eval/runs/<auto>.json] \
         [--retrieval-only] [--compare <prev.json>] [--compare-to-latest-db] \
         [--limit N] [--model <model_id>] [--judge-model <judge_id>] \
@@ -21,6 +21,7 @@ import json
 import logging
 import subprocess
 import time
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -44,6 +45,7 @@ from src.eval.schemas import (
     RunManifest,
     RunOutput,
 )
+from src.schemas.agent_findings import AnalyticalFindings
 from src.services.llm_router import get_router
 from src.utils.config import (
     get_eval_judge_model,
@@ -81,7 +83,7 @@ def _file_sha256(path: str | Path) -> str:
 
 def _build_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Agentic eval harness for AI Financial Copilot")
-    p.add_argument("--test-set", default="data/answers_small.json")
+    p.add_argument("--test-set", default="data/golden_sets/answers_small.json")
     p.add_argument("--output", default=None)
     p.add_argument("--retrieval-only", action="store_true")
     p.add_argument("--compare", default=None, metavar="PREV_RUN")
@@ -112,6 +114,11 @@ def _build_args() -> argparse.Namespace:
         "--reasoning-effort",
         default=None,
         help="Reasoning effort for the synthesis model (e.g. low, medium, high)",
+    )
+    p.add_argument(
+        "--verbosity",
+        default=None,
+        help="Verbosity for the synthesis model (GPT-5 only: low, medium, high)",
     )
     p.add_argument(
         "--max-tokens",
@@ -227,6 +234,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         prompt_version=args.prompt_version,
                         reasoning_effort=args.reasoning_effort,
                         max_tokens=args.max_tokens,
+                        verbosity=args.verbosity,
                         llm_router=llm_router,
                         retrieval_only=args.retrieval_only,
                         redis=redis,
@@ -240,6 +248,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                     continue
 
                 result.route = pr.route
+                result.query_shape = pr.query_shape
                 result.latency_s = round(time.monotonic() - t0, 3)
 
                 if pr.usage:
@@ -249,18 +258,36 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         "cost_usd": pr.usage.cost_usd,
                     }
 
-                # Log agent metadata per question
+                # Persist + log agent metadata per question (Stage 0.5 baseline signal:
+                # convergence_reason, iterations, gaps, confidence distribution — was
+                # previously log-only and lost after the run).
                 if pr.agent_meta:
                     m = pr.agent_meta
+                    result.agent_meta = {
+                        "iterations": m.iterations,
+                        "tool_calls_total": m.tool_calls_total,
+                        "convergence_reason": m.convergence_reason,
+                        "cost_usd_total": m.cost_usd_total,
+                        "input_tokens_total": m.input_tokens_total,
+                        "output_tokens_total": m.output_tokens_total,
+                    }
                     logger.info(
-                        "agent_meta qid=%s iterations=%d tool_calls=%d convergence=%s chunks=%d cost=$%.4f",
+                        "agent_meta qid=%s query_shape=%s iterations=%d tool_calls=%d "
+                        "convergence=%s chunks=%d cost=$%.4f",
                         q.qid,
+                        pr.query_shape,
                         m.iterations,
                         m.tool_calls_total,
                         m.convergence_reason,
                         len(pr.rag_context.items) if pr.rag_context else 0,
                         m.cost_usd_total,
                     )
+
+                if isinstance(pr.agent_findings, AnalyticalFindings):
+                    af = pr.agent_findings
+                    result.observations_count = len(af.observations)
+                    result.confidence_counts = dict(Counter(o.confidence for o in af.observations))
+                    result.gaps_count = len(af.gaps) if af.gaps else 0
 
                 if pr.rag_context and pr.rag_context.items:
                     retrieved_keys = context_to_page_keys(pr.rag_context)
@@ -324,6 +351,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
         test_set_hash=_file_sha256(test_set_path),
         model=args.model,
         reasoning_effort=args.reasoning_effort,
+        verbosity=args.verbosity,
         max_tokens=args.max_tokens,
         judge_model=judge_model,
         k_values=list(k_values),

@@ -2,7 +2,7 @@
 
 Usage:
     python -m src.eval.run \
-        --test-set data/answers_small.json \
+        --test-set data/golden_sets/answers_small.json \
         [--output data/eval/runs/<auto>.json] \
         [--retrieval-only] [--compare <prev.json>] \
         [--limit N] [--model <model_id>] [--judge-model <judge_id>] \
@@ -17,9 +17,10 @@ import hashlib
 import logging
 import subprocess
 import time
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID
 
 from src.db.connection import get_session_factory, init_db, shutdown_db
@@ -67,7 +68,7 @@ def _file_sha256(path: str | Path) -> str:
 
 def _build_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Eval harness for AI Financial Copilot")
-    p.add_argument("--test-set", default="data/answers_small.json")
+    p.add_argument("--test-set", default="data/golden_sets/answers_small.json")
     p.add_argument("--output", default=None)
     p.add_argument("--retrieval-only", action="store_true")
     p.add_argument("--compare", default=None, metavar="PREV_RUN")
@@ -96,6 +97,11 @@ def _build_args() -> argparse.Namespace:
         "--reasoning-effort",
         default=None,
         help="Reasoning effort for the model (e.g. low, medium, high)",
+    )
+    p.add_argument(
+        "--verbosity",
+        default=None,
+        help="Verbosity for the model (GPT-5 only: low, medium, high)",
     )
     return p.parse_args()
 
@@ -168,6 +174,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                     model_id=args.model,
                     prompt_version=args.prompt_version,
                     reasoning_effort=args.reasoning_effort,
+                    verbosity=args.verbosity,
                     llm_router=llm_router,
                     retrieval_only=args.retrieval_only,
                 )
@@ -318,11 +325,53 @@ def _compute_aggregate(
             1 for r in judge_rows if r.judge and r.judge.get("unsupported_claims")
         )
 
+    # Agent loop (agentic path only; empty for classic-path results), cut by query_shape
+    agent_agg: dict[str, Any] = {}
+    agent_rows = [r for r in results if r.agent_meta]
+    if agent_rows:
+
+        def _summarize(rows: list[PerQuestionResult]) -> dict[str, Any]:
+            n = len(rows)
+            conv: Counter[str] = Counter()
+            conf: Counter[str] = Counter()
+            iterations: list[int] = []
+            tool_calls: list[int] = []
+            costs: list[float] = []
+            gaps: list[int] = []
+            for r in rows:
+                m = r.agent_meta or {}
+                conv[m.get("convergence_reason", "unknown")] += 1
+                iterations.append(m.get("iterations", 0))
+                tool_calls.append(m.get("tool_calls_total", 0))
+                costs.append(m.get("cost_usd_total", 0.0))
+                if r.gaps_count is not None:
+                    gaps.append(r.gaps_count)
+                if r.confidence_counts:
+                    conf.update(r.confidence_counts)
+            return {
+                "n": n,
+                "convergence_reason": dict(conv),
+                "mean_iterations": round(sum(iterations) / n, 2),
+                "mean_tool_calls": round(sum(tool_calls) / n, 2),
+                "mean_cost_usd": round(sum(costs) / n, 4),
+                "gaps_nonempty_rate": (
+                    round(sum(1 for g in gaps if g > 0) / len(gaps), 4) if gaps else None
+                ),
+                "confidence_counts": dict(conf),
+            }
+
+        agent_agg["overall"] = _summarize(agent_rows)
+        by_shape: dict[str, list[PerQuestionResult]] = {}
+        for r in agent_rows:
+            by_shape.setdefault(r.query_shape or "unknown", []).append(r)
+        agent_agg["by_query_shape"] = {shape: _summarize(rows) for shape, rows in by_shape.items()}
+
     return AggregateMetrics(
         retrieval=ret,
         correctness=correct_agg,
         judge=judge_agg,
         hallucination=hal_agg,
+        agent=agent_agg,
     )
 
 
@@ -374,6 +423,22 @@ def _print_summary(output: RunOutput, out_path: Path) -> None:
         print(
             f"    questions w/ any    {agg.hallucination.get('questions_with_any_unsupported', 0)}"
         )
+
+    if agg.agent:
+        print("  AGENT LOOP (by query_shape)")
+        for shape, s in (agg.agent.get("by_query_shape") or {}).items():
+            conv = ", ".join(f"{k}={v}" for k, v in s["convergence_reason"].items())
+            conf = ", ".join(f"{k}={v}" for k, v in s["confidence_counts"].items()) or "—"
+            gaps_rate = s["gaps_nonempty_rate"]
+            print(f"    {shape:<12} n={s['n']}  convergence: {conv}")
+            print(
+                f"      {'':<12} mean_iter={s['mean_iterations']:.2f}  "
+                f"mean_tool_calls={s['mean_tool_calls']:.2f}  mean_cost=${s['mean_cost_usd']:.4f}"
+            )
+            print(
+                f"      {'':<12} confidence: {conf}  "
+                f"gaps_nonempty_rate={gaps_rate if gaps_rate is None else f'{gaps_rate:.2f}'}"
+            )
 
     print("  COST & LATENCY")
     if latencies:

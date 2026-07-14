@@ -52,6 +52,7 @@ class AgentPipelineResult(PipelineResult):
     agent_meta: AgentLoopMeta | None = None
     agent_findings: AgentFindings | AnalyticalFindings | None = None
     processed_findings: ProcessedFindings | None = None
+    query_shape: str | None = None
 
 
 def _make_redis() -> Redis:
@@ -66,6 +67,7 @@ async def run_one(
     prompt_version: str = "v3_agent_synthesis",
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
+    verbosity: str | None = None,
     llm_router: LLMRouter | None = None,
     retrieval_only: bool = False,
     redis: Redis | None = None,
@@ -93,6 +95,7 @@ async def run_one(
         session=session,
     )
     route = router_out.route
+    query_shape = getattr(router_out, "query_shape", None)
 
     if route != "retrieval":
         if retrieval_only:
@@ -103,9 +106,16 @@ async def run_one(
                 answer=None,
                 citation_spans=[],
                 usage=None,
+                query_shape=query_shape,
             )
         answer, spans, stats = await _run_direct_answer(
-            question.question, model_id, router, prompt_version, reasoning_effort, max_tokens
+            question.question,
+            model_id,
+            router,
+            prompt_version,
+            reasoning_effort,
+            max_tokens,
+            verbosity=verbosity,
         )
         return AgentPipelineResult(
             route=route,
@@ -114,6 +124,7 @@ async def run_one(
             answer=answer,
             citation_spans=spans,
             usage=stats,
+            query_shape=query_shape,
         )
 
     # Build a minimal ChatPipelineState for run_agent_loop
@@ -193,6 +204,7 @@ async def run_one(
             agent_meta=agent_meta,
             agent_findings=agent_findings,
             processed_findings=processed_findings,
+            query_shape=query_shape,
         )
 
     # Synthesise answer using the agent synthesis prompt (same model as classic eval)
@@ -204,6 +216,7 @@ async def run_one(
         prompt_version,
         reasoning_effort,
         max_tokens,
+        verbosity=verbosity,
     )
 
     return AgentPipelineResult(
@@ -216,6 +229,7 @@ async def run_one(
         agent_meta=agent_meta,
         agent_findings=agent_findings,
         processed_findings=processed_findings,
+        query_shape=query_shape,
     )
 
 

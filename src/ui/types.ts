@@ -25,7 +25,7 @@ export interface Citation {
   docId: string;
   page: number;
   excerpt: string;
-  bboxHint?: BoundingBox;
+  bboxHints?: BoundingBox[];
 }
 
 export interface CitationSpan {
@@ -45,7 +45,7 @@ export interface ReferenceItem {
   pageNumbers: number[];
   headingPath: string[];
   snippet: string | null;
-  bboxHint?: BoundingBox | null;
+  bboxHints?: BoundingBox[] | null;
 }
 
 export interface MessageFeedback {

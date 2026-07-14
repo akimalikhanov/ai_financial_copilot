@@ -1,4 +1,4 @@
-"""Re-upload PDFs from data/pdfs/ to Garage S3 using the storage_key already in the DB."""
+"""Re-upload PDFs from data/corpus/pdfs/ to Garage S3 using the storage_key already in the DB."""
 
 import asyncio
 import os
@@ -8,7 +8,7 @@ import asyncpg
 import boto3
 from botocore.config import Config
 
-PDF_DIR = Path(__file__).parent.parent / "data" / "pdfs"
+PDF_DIR = Path(__file__).parent.parent / "data" / "corpus" / "pdfs"
 
 DB_URL = (
     f"postgresql://{os.environ['APP_DB_USER']}:{os.environ['APP_DB_PASSWORD']}"

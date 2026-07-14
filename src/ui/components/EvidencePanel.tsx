@@ -18,7 +18,7 @@ interface EvidencePanelProps {
   onSwitchDoc: (docId: string) => void;
   onCloseDoc: (docId: string) => void;
   onPageChange: (docId: string, page: number) => void;
-  highlight?: Citation['bboxHint'];
+  highlight?: NonNullable<Citation['bboxHints']>;
   highlightLabel?: string;
 }
 
@@ -147,22 +147,21 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   // Backend sends bbox in raw PDF points; we convert to CSS % using each page's
   // unscaled PDF point dimensions (props.width / props.scale).
   const renderPage = useCallback((props: RenderPageProps) => {
-    const targetPageIndex = highlight ? highlight.page - 1 : -1;
-    const isHighlightPage = highlight && props.pageIndex === targetPageIndex;
+    const pageHighlight = highlight?.find(h => h.page - 1 === props.pageIndex);
     let style: React.CSSProperties | null = null;
-    if (isHighlightPage && highlight && props.scale > 0) {
+    if (pageHighlight && props.scale > 0) {
       const pageW = props.width / props.scale;
       const pageH = props.height / props.scale;
-      const bboxLeft = highlight.left;
-      const bboxRight = highlight.right;
+      const bboxLeft = pageHighlight.left;
+      const bboxRight = pageHighlight.right;
       let cssTop: number;
       let cssH: number;
-      if ((highlight.coord_origin || '').toUpperCase() === 'BOTTOMLEFT') {
-        cssTop = pageH - highlight.top;
-        cssH = highlight.top - highlight.bottom;
+      if ((pageHighlight.coord_origin || '').toUpperCase() === 'BOTTOMLEFT') {
+        cssTop = pageH - pageHighlight.top;
+        cssH = pageHighlight.top - pageHighlight.bottom;
       } else {
-        cssTop = highlight.top;
-        cssH = highlight.bottom - highlight.top;
+        cssTop = pageHighlight.top;
+        cssH = pageHighlight.bottom - pageHighlight.top;
       }
       style = {
         left: `${(bboxLeft / pageW) * 100}%`,

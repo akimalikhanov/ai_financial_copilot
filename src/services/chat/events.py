@@ -87,11 +87,12 @@ def error_event(exc: Exception, user_message: str | None = None) -> dict:
     }
 
 
-def _provenance_bbox_hint(provenance: ChunkProvenance | None) -> dict | None:
-    """Compute a union bounding box across all provenance items on the first page.
+def _provenance_bbox_hints(provenance: ChunkProvenance | None) -> list[dict] | None:
+    """Compute a union bounding box per page across all provenance items on that page.
 
-    A chunk may span multiple text blocks; merging them into one rect gives a
-    highlight that covers the whole chunk without multiple overlapping overlays.
+    A chunk may span multiple text blocks per page (and multiple pages); merging
+    each page's blocks into one rect per page gives a highlight that covers the
+    whole chunk on every page it touches, without multiple overlapping overlays.
     Docling bbox coordinates are in absolute PDF points (typically BOTTOMLEFT origin).
     """
     if not provenance:
@@ -99,22 +100,27 @@ def _provenance_bbox_hint(provenance: ChunkProvenance | None) -> dict | None:
     items_with_bbox = [item for item in provenance.items if item.bbox is not None]
     if not items_with_bbox:
         return None
-    first_page = items_with_bbox[0].page_no
-    page_items = [item for item in items_with_bbox if item.page_no == first_page]
-    coord_origin = page_items[0].bbox.coord_origin  # type: ignore[union-attr]
-    left = min(item.bbox.left for item in page_items)  # type: ignore[union-attr]
-    right = max(item.bbox.right for item in page_items)  # type: ignore[union-attr]
-    # For BOTTOMLEFT: bottom < top numerically; union keeps the lower bottom and higher top
-    bottom = min(item.bbox.bottom for item in page_items)  # type: ignore[union-attr]
-    top = max(item.bbox.top for item in page_items)  # type: ignore[union-attr]
-    return {
-        "left": left,
-        "top": top,
-        "right": right,
-        "bottom": bottom,
-        "coord_origin": coord_origin,
-        "page": first_page,
-    }
+    pages = sorted({item.page_no for item in items_with_bbox})
+    hints: list[dict] = []
+    for page_no in pages:
+        page_items = [item for item in items_with_bbox if item.page_no == page_no]
+        coord_origin = page_items[0].bbox.coord_origin  # type: ignore[union-attr]
+        left = min(item.bbox.left for item in page_items)  # type: ignore[union-attr]
+        right = max(item.bbox.right for item in page_items)  # type: ignore[union-attr]
+        # For BOTTOMLEFT: bottom < top numerically; union keeps the lower bottom and higher top
+        bottom = min(item.bbox.bottom for item in page_items)  # type: ignore[union-attr]
+        top = max(item.bbox.top for item in page_items)  # type: ignore[union-attr]
+        hints.append(
+            {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "coord_origin": coord_origin,
+                "page": page_no,
+            }
+        )
+    return hints
 
 
 def citation_to_dict(c: Citation, provenance: ChunkProvenance | None = None) -> dict:
@@ -130,9 +136,9 @@ def citation_to_dict(c: Citation, provenance: ChunkProvenance | None = None) -> 
         "heading_path": list(c.heading_path),
         "snippet": c.snippet,
     }
-    bbox_hint = _provenance_bbox_hint(provenance)
-    if bbox_hint is not None:
-        d["bbox_hint"] = bbox_hint
+    bbox_hints = _provenance_bbox_hints(provenance)
+    if bbox_hints is not None:
+        d["bbox_hints"] = bbox_hints
     return d
 
 
@@ -271,11 +277,11 @@ async def hydrate_bbox_hints(
     session: AsyncSession,
     messages_metadata: list[dict],
 ) -> None:
-    """Backfill ``bbox_hint`` on persisted message references for old messages.
+    """Backfill ``bbox_hints`` on persisted message references for old messages.
 
     Mutates each metadata dict in place. Looks at ``references`` and ``citations``
-    arrays, collects chunk_ids missing ``bbox_hint``, batch-fetches chunks, and
-    injects bbox_hint computed from chunk provenance.
+    arrays, collects chunk_ids missing ``bbox_hints``, batch-fetches chunks, and
+    injects bbox_hints computed from chunk provenance.
     """
     needed: set[UUID] = set()
     targets: list[dict] = []
@@ -287,7 +293,7 @@ async def hydrate_bbox_hints(
             if not isinstance(arr, list):
                 continue
             for entry in arr:
-                if not isinstance(entry, dict) or "bbox_hint" in entry:
+                if not isinstance(entry, dict) or "bbox_hints" in entry:
                     continue
                 cid = entry.get("chunk_id")
                 if not cid:
@@ -303,17 +309,17 @@ async def hydrate_bbox_hints(
 
     chunk_repo = ChunkRepository(session)
     chunks = await chunk_repo.get_by_ids(list(needed))
-    bbox_by_chunk: dict[str, dict] = {}
+    bbox_by_chunk: dict[str, list[dict]] = {}
     for chunk in chunks:
         prov = _parse_provenance(chunk.provenance if isinstance(chunk.provenance, list) else None)
-        hint = _provenance_bbox_hint(prov)
-        if hint is not None:
-            bbox_by_chunk[str(chunk.id)] = hint
+        hints = _provenance_bbox_hints(prov)
+        if hints is not None:
+            bbox_by_chunk[str(chunk.id)] = hints
 
     for entry in targets:
         cid = entry.get("chunk_id")
         if isinstance(cid, str) and cid in bbox_by_chunk:
-            entry["bbox_hint"] = bbox_by_chunk[cid]
+            entry["bbox_hints"] = bbox_by_chunk[cid]
 
 
 def agent_turn_started_event(iteration: int) -> dict:

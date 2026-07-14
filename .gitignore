@@ -53,3 +53,4 @@ scripts/eval_qa.py
 infra/scripts/langfuse_reset.sh
 
 actions-runner
+scripts/

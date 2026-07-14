@@ -149,4 +149,9 @@ def score_correctness(answer: str, kind: Kind, expected_answers: list[str]) -> d
         "name": _score_name,
         "names": _score_names,
     }
+    if kind not in dispatch:
+        # No deterministic scorer for this kind yet (e.g. "drivers" — Stage 0.5's
+        # driver-pool recall judge is not built). Don't crash the run; the LLM
+        # judge (metrics/judge.py) still runs and produces faithfulness/relevance signal.
+        return {"correct": False, "reason": "no_scorer_for_kind"}
     return dispatch[kind](answer, expected_answers)
