@@ -451,6 +451,9 @@ def get_agent_config() -> dict:
         "token_budget": int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
         "max_concurrent_searches": int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
         "max_chunks_per_entity": int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
+        # Analytical queries may re-search on an empty round (Pattern 3, 3.i); cap the
+        # reformulation attempts so an unanswerable question still terminates in budget.
+        "max_empty_analytical_rounds": int(os.getenv("AGENT_MAX_EMPTY_ANALYTICAL_ROUNDS", "2")),
     }
 
 

@@ -292,6 +292,9 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                 if pr.rag_context and pr.rag_context.items:
                     retrieved_keys = context_to_page_keys(pr.rag_context)
                     result.retrieved_page_keys = retrieved_keys
+                    result.ref_id_to_chunk_id = {
+                        item.ref_id: str(item.chunk_id) for item in pr.rag_context.items
+                    }
                     if expanded_pools:
                         result.metrics = compute_retrieval_metrics(
                             pr.rag_context, expanded_pools, k_values=k_values

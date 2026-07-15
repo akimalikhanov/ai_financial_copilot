@@ -403,7 +403,7 @@ def _render_observations_block(
         lines.append(f"\nConclusion: {findings.conclusion}")
 
     if findings.gaps:
-        lines.append("Gaps: " + "; ".join(findings.gaps))
+        lines.append("Unresolved (do not assert as fact): " + "; ".join(findings.gaps))
 
     lines.append("[END AGENT OBSERVATIONS]")
     return "\n".join(lines)

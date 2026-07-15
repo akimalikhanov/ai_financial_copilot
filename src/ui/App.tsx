@@ -630,7 +630,7 @@ export default function App() {
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
   const [openPdfTabs, setOpenPdfTabs] = useState<{ doc: Document, page: number }[]>([]);
   const [activePdfDocId, setActivePdfDocId] = useState<string | null>(null);
-  const [activeHighlight, setActiveHighlight] = useState<{ bboxes: BoundingBox[]; label: string } | undefined>(undefined);
+  const [activeHighlight, setActiveHighlight] = useState<{ bboxes: BoundingBox[]; label: string; chunkId?: string } | undefined>(undefined);
 
   // UI State
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -1147,7 +1147,11 @@ export default function App() {
       return [...prev, { doc, page }];
     });
     setActivePdfDocId(doc.id);
-    setActiveHighlight(ref.bboxHints?.length ? { bboxes: ref.bboxHints, label: ref.displayLabel } : undefined);
+    setActiveHighlight(
+      ref.bboxHints?.length
+        ? { bboxes: ref.bboxHints, label: ref.displayLabel, chunkId: ref.chunkId }
+        : undefined,
+    );
   };
 
   const handleNewChat = async () => {
@@ -1933,6 +1937,7 @@ export default function App() {
                 }
                 highlight={activeHighlight?.bboxes}
                 highlightLabel={activeHighlight?.label}
+                chunkId={activeHighlight?.chunkId}
               />
               <ControlPane
                 isOpen={isControlPaneOpen}

@@ -49,6 +49,7 @@ class PerQuestionResult(BaseModel):
     observations_count: int | None = None
     confidence_counts: dict[str, int] | None = None
     gaps_count: int | None = None
+    ref_id_to_chunk_id: dict[str, str] = {}
 
 
 class RunManifest(BaseModel):

@@ -265,6 +265,16 @@ def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int = 2) -
     return result
 
 
+def _stub_rejected_tool_call(tc: ToolCallRef) -> ToolCallRef:
+    """Strip a rejected finalizer call's claim/evidence payload before it re-enters history.
+
+    Otherwise the model keeps seeing its own rejected draft claims verbatim (assistant
+    tool-call messages survive `_compress_history`), inviting it to copy a stale claim
+    into the eventually-accepted call without re-deriving fresh evidence for it.
+    """
+    return replace(tc, arguments=json.dumps({"status": "rejected"}))
+
+
 def _assistant_msg_with_tool_calls(tool_calls: list[ToolCallRef]) -> ChatMessage:
     return ChatMessage(
         role=Role.assistant,
@@ -458,6 +468,37 @@ def _parse_findings(tc: ToolCallRef) -> AgentFindings | AnalyticalFindings:
     )
 
 
+def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
+    """Return a rejection reason if analytical findings are too thin to finalize, else None.
+
+    Reads the sufficiency signals the model already writes (Pattern 3, 3.ii): a finalizer
+    attempt is insufficient when it rests on low-confidence evidence or declares open gaps.
+    This is a deterministic gate — the irreducible-judgment LLM evaluator (3.iii) is only
+    warranted where this rule demonstrably under-fires. The caller applies it only while
+    iteration budget remains, so an unanswerable question still terminates in budget.
+    """
+    if not findings.observations:
+        return "No observations were reported. Search for supporting evidence before finalizing."
+    for o in findings.observations:
+        if not o.evidence_chunks:
+            return (
+                f"Observation '{o.claim[:80]}' cites no evidence_chunks — every claim must "
+                "reference at least one supporting chunk before finalizing."
+            )
+    if findings.gaps:
+        return (
+            "Open gaps remain: "
+            + "; ".join(findings.gaps)
+            + ". Search to close these gaps before finalizing."
+        )
+    if all(o.confidence == "low" for o in findings.observations):
+        return (
+            "Every observation is low-confidence. Search differently — likely a footnote, "
+            "reconciliation, or segment table — to corroborate before finalizing."
+        )
+    return None
+
+
 def _resolve_chunk_refs(
     refs: list[str] | None,
     ref_registry: dict[str, UUID],
@@ -538,6 +579,27 @@ def _finding_chunk_ids(findings: AgentFindings | AnalyticalFindings) -> set[str]
     return ids
 
 
+def _drop_evidence_free_observations(findings: AnalyticalFindings) -> AnalyticalFindings:
+    """Route observations with no resolvable evidence_chunks into gaps instead of synthesis.
+
+    `_analytical_insufficiency` rejects these while iteration budget remains, but the
+    gate is skipped once budget/iterations run out, and ref resolution can also empty
+    out a previously non-empty evidence_chunks list. Either way, an uncited claim must
+    not reach synthesis looking like a settled fact.
+    """
+    kept: list[Observation] = []
+    dropped_claims: list[str] = []
+    for o in findings.observations:
+        if o.evidence_chunks:
+            kept.append(o)
+        else:
+            dropped_claims.append(o.claim)
+    if not dropped_claims:
+        return findings
+    gaps = list(findings.gaps or []) + [f"Unsubstantiated claim: {c}" for c in dropped_claims]
+    return replace(findings, observations=tuple(kept), gaps=gaps)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -561,6 +623,7 @@ async def run_agent_loop(
     max_iterations: int = cfg["max_iterations"]
     token_budget: int = cfg["token_budget"]
     max_chunks_per_entity: int = cfg["max_chunks_per_entity"]
+    max_empty_analytical_rounds: int = cfg["max_empty_analytical_rounds"]
     _search_sem = asyncio.Semaphore(cfg["max_concurrent_searches"])
 
     query_shape = (
@@ -573,7 +636,10 @@ async def run_agent_loop(
     prompt_name = "v3_agent_analytical" if is_analytical else "v3_agent"
 
     system_content = get_system_prompt(version=prompt_name)
-    history = state.context_messages or []
+    # context_messages always ends with the current-turn user message (loaded with
+    # before_seq=assistant_seq, which includes it) — drop it here since it's appended
+    # explicitly below via state.user_query_raw (post prompt-injection sanitization).
+    history = (state.context_messages or [])[:-1]
     agent_messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
         *[ChatMessage(role=Role(m.role.value), content=m.content or "") for m in history],
@@ -646,6 +712,7 @@ async def run_agent_loop(
     lookup_chunks: dict[int, list[UUID]] = {}
     lookup_count = 0
     searched_entities: set[str] = set()
+    empty_rounds = 0  # analytical: consecutive turns returning no new chunks (3.i)
     token_spend = 0
     output_tokens_total = 0
     cost_usd_total = 0.0
@@ -654,6 +721,9 @@ async def run_agent_loop(
         "natural", "convergence", "iteration_cap", "budget_cap", "timeout"
     ] = "iteration_cap"
     agent_findings: AgentFindings | AnalyticalFindings | None = None
+    # Chunk ids cited by ANY finalizer attempt (accepted or rejected) this request,
+    # used to protect them from the post-loop eviction cap below.
+    ever_cited_chunk_ids: set[str] = set()
 
     lf = lf_client.get_client()
     iteration = 0
@@ -727,7 +797,9 @@ async def run_agent_loop(
                 if finalizer_tc.name == "report_findings" and _expected_entities:
                     missing = _expected_entities - searched_entities
                     if missing:
-                        agent_messages.append(_assistant_msg_with_tool_calls([finalizer_tc]))
+                        agent_messages.append(
+                            _assistant_msg_with_tool_calls([_stub_rejected_tool_call(finalizer_tc)])
+                        )
                         agent_messages.append(
                             ChatMessage(
                                 role=Role.tool,
@@ -739,7 +811,90 @@ async def run_agent_loop(
                                 ),
                             )
                         )
+                        AGENT_TOOL_CALLS.labels(finalizer_tc.name, "rejected").inc()
+                        if lf:
+                            with lf.start_as_current_observation(
+                                as_type="span",
+                                name="finalizer_rejected",
+                                input={"missing_entities": sorted(missing)},
+                            ) as _rej_span:
+                                _rej_span.update(
+                                    output={"reason": "missing_entity_searches"},
+                                    metadata={"iteration": iteration},
+                                )
+                        await add_event(
+                            redis_app,
+                            request_id,
+                            "tool_call_completed",
+                            {
+                                "entity": "__finalizer__",
+                                "error": True,
+                                "reason": "finalizer_rejected_missing_entities",
+                            },
+                        )
                         continue  # force another iteration
+
+                # 3.ii/3.iii: reject a thin analytical finalizer while budget remains and
+                # re-prompt with the specific gap, instead of finalizing on low-confidence
+                # evidence. Only fires when a further round is possible.
+                if (
+                    finalizer_tc.name == "report_analytical_findings"
+                    and iteration < max_iterations - 1
+                    and token_spend <= token_budget
+                ):
+                    try:
+                        _candidate = _parse_findings(finalizer_tc)
+                    except Exception:
+                        _candidate = None
+                    if isinstance(_candidate, AnalyticalFindings):
+                        # Protect chunks the model cited here even if this attempt is
+                        # rejected — a later accepted call must still be able to cite them.
+                        _resolved_candidate = _resolve_finding_refs(
+                            _candidate, ref_registry, request_id
+                        )
+                        ever_cited_chunk_ids.update(_finding_chunk_ids(_resolved_candidate))
+                        _reason = _analytical_insufficiency(_candidate)
+                        if _reason is not None:
+                            agent_messages.append(
+                                _assistant_msg_with_tool_calls(
+                                    [_stub_rejected_tool_call(finalizer_tc)]
+                                )
+                            )
+                            agent_messages.append(
+                                ChatMessage(
+                                    role=Role.tool,
+                                    tool_call_id=finalizer_tc.id,
+                                    content=f"report_analytical_findings rejected — {_reason}",
+                                )
+                            )
+                            AGENT_TOOL_CALLS.labels(finalizer_tc.name, "rejected").inc()
+                            if lf:
+                                with lf.start_as_current_observation(
+                                    as_type="span",
+                                    name="analytical_finalizer_rejected",
+                                    input={
+                                        "confidence": [
+                                            o.confidence for o in _candidate.observations
+                                        ],
+                                        "gaps": _candidate.gaps,
+                                    },
+                                ) as _rej_span:
+                                    _rej_span.update(
+                                        output={"reason": _reason},
+                                        metadata={"iteration": iteration},
+                                    )
+                            await add_event(
+                                redis_app,
+                                request_id,
+                                "tool_call_completed",
+                                {
+                                    "entity": "__finalizer__",
+                                    "error": True,
+                                    "reason": "analytical_finalizer_rejected",
+                                },
+                            )
+                            agent_messages = _compress_history(agent_messages, keep_last_n_turns=2)
+                            continue  # force another retrieval round
 
                 _fin_lf_stack = contextlib.ExitStack()
                 if lf:
@@ -758,6 +913,9 @@ async def run_agent_loop(
                     agent_findings = _resolve_finding_refs(
                         _parse_findings(finalizer_tc), ref_registry, request_id
                     )
+                    if isinstance(agent_findings, AnalyticalFindings):
+                        agent_findings = _drop_evidence_free_observations(agent_findings)
+                    ever_cited_chunk_ids.update(_finding_chunk_ids(agent_findings))
                     AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
                     # All chunks shown to the agent are admitted to the registry at search
                     # time; the post-loop per-lookup cap explicitly preserves cited chunks
@@ -916,8 +1074,28 @@ async def run_agent_loop(
                 )
 
             if new_chunks == 0:
-                convergence_reason = "convergence"
-                break
+                # For extraction/comparison, an empty round means the retrievable surface
+                # is exhausted — stop. For analytical queries, it means "this query found
+                # nothing new," which is a reason to search *differently*, not to finalize
+                # on thin evidence (doc Pattern 3, sub-task 3.i). Allow a bounded number of
+                # empty rounds to reformulate before falling back to convergence.
+                empty_rounds += 1
+                if not is_analytical or empty_rounds > max_empty_analytical_rounds:
+                    convergence_reason = "convergence"
+                    break
+                agent_messages.append(
+                    ChatMessage(
+                        role=Role.user,
+                        content=(
+                            "That search returned no new evidence. Do not finalize yet — the "
+                            "drivers you need are likely in a different section (a footnote, "
+                            "reconciliation, or segment table). Reformulate search_documents with "
+                            "different terms targeting where the magnitudes are disclosed."
+                        ),
+                    )
+                )
+                agent_messages = _compress_history(agent_messages, keep_last_n_turns=2)
+                continue
 
             if token_spend > token_budget:
                 convergence_reason = "budget_cap"
@@ -961,12 +1139,12 @@ async def run_agent_loop(
         keep_ids: set[UUID] = set()
         for cids in lookup_chunks.values():
             keep_ids.update(cids[:max_chunks_per_entity])
-        # Never evict a chunk the agent cited in its findings — those must stay citable
-        # in the synthesis context regardless of where they fell in the per-lookup ranking.
-        if agent_findings is not None:
-            for cid_str in _finding_chunk_ids(agent_findings):
-                with contextlib.suppress(ValueError):
-                    keep_ids.add(UUID(cid_str))
+        # Never evict a chunk the agent cited in ANY finalizer attempt (accepted or
+        # rejected) — those must stay citable in the synthesis context regardless of
+        # where they fell in the per-lookup ranking.
+        for cid_str in ever_cited_chunk_ids:
+            with contextlib.suppress(ValueError):
+                keep_ids.add(UUID(cid_str))
         if len(keep_ids) < len(chunk_registry):
             chunk_registry = {cid: chunk_registry[cid] for cid in keep_ids}
 

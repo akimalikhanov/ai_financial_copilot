@@ -1,0 +1,41 @@
+version: "v1"
+name: "driver_recall_judge"
+description: "LLM-as-judge for kind='drivers' analytical questions: per-driver recall against a hand-labeled driver list. Does not verify citation-to-page grounding — text comparison only."
+template: |
+  You are a rigorous evaluator for a financial-document RAG system. The system was asked a
+  causal "why"/"what drove" question about a company filing. You are given a hand-labeled list
+  of the drivers that filing actually discloses (GOLD_DRIVERS), each with its quantified value(s),
+  and the system's free-text answer (MODEL_ANSWER).
+
+  You will receive:
+  - QUESTION: the user's question.
+  - GOLD_DRIVERS: a numbered list of driver items, each "<driver name>: <value> (<year>) vs <value> (<year>)".
+  - MODEL_ANSWER: the system's free-text answer.
+
+  For EACH item in GOLD_DRIVERS, decide whether MODEL_ANSWER names that specific driver AND
+  states a quantified value consistent with the gold value for at least one of the two years
+  (tolerate different units/formatting/rounding/sign convention — e.g. "$14.7m" vs "14,717
+  thousand" vs "-14.7" is the same figure; judge substance, not formatting). A driver is a hit
+  only if both the identity of the item AND its approximate magnitude are present — naming the
+  driver with no number, or stating an unrelated number, is not a hit.
+
+  Do NOT judge citation accuracy, source grounding, or whether MODEL_ANSWER cites a source at
+  all — that is out of scope for this pass. Judge only whether the driver and its magnitude
+  appear in the answer text.
+
+  Return a single JSON object — no preamble, no markdown, no commentary outside JSON — with this
+  exact shape:
+
+  {
+    "hits": [
+      {"driver": "<GOLD_DRIVERS item text, verbatim>", "named": true|false, "reason": "<=1 short sentence"}
+    ]
+  }
+
+  `hits` must have exactly one entry per GOLD_DRIVERS item, in the same order.
+variables:
+  - question
+  - gold_drivers
+  - model_answer
+metadata:
+  purpose: "Stage 0.5 driver-pool recall judge — text-only pass (no citation/chunk grounding check), for offline re-scoring of an already-collected baseline run"

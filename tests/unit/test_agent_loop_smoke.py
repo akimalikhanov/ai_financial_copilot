@@ -14,6 +14,7 @@ from uuid import uuid4
 import pytest
 from fakeredis import FakeAsyncRedis
 
+from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import DocumentScopeResult, RouterOutput
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
@@ -175,3 +176,39 @@ async def test_agent_loop_stops_at_iteration_cap(monkeypatch: pytest.MonkeyPatch
     assert meta.iterations == 3  # AGENT_MAX_ITERATIONS
     assert meta.convergence_reason == "iteration_cap"
     assert agent_findings is None
+
+
+def test_analytical_insufficiency_rejects_evidence_free_observation() -> None:
+    """A claim with no evidence_chunks is rejected even if other signals look fine."""
+    findings = AnalyticalFindings(
+        question="q",
+        observations=(Observation(claim="Revenue grew", evidence_chunks=[], confidence="high"),),
+    )
+    reason = agent_loop_module._analytical_insufficiency(findings)
+    assert reason is not None
+    assert "no evidence_chunks" in reason
+
+
+def test_stub_rejected_tool_call_strips_arguments() -> None:
+    """Rejected finalizer arguments are stubbed so stale claims don't linger in history."""
+    tc = ToolCallRef(
+        id="call_1", name="report_analytical_findings", arguments=json.dumps({"claim": "x"})
+    )
+    stubbed = agent_loop_module._stub_rejected_tool_call(tc)
+    assert stubbed.id == tc.id
+    assert stubbed.name == tc.name
+    assert "claim" not in stubbed.arguments
+
+
+def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
+    """An observation with no evidence is routed into gaps instead of reaching synthesis."""
+    findings = AnalyticalFindings(
+        question="q",
+        observations=(
+            Observation(claim="Grounded claim", evidence_chunks=["c1"], confidence="high"),
+            Observation(claim="Ungrounded claim", evidence_chunks=[], confidence="high"),
+        ),
+    )
+    result = agent_loop_module._drop_evidence_free_observations(findings)
+    assert [o.claim for o in result.observations] == ["Grounded claim"]
+    assert any("Ungrounded claim" in g for g in result.gaps or [])

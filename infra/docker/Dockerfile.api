@@ -10,8 +10,12 @@ RUN pip install --no-cache-dir uv==0.8.19
 # Copy only the files uv needs to resolve/install deps (cache-friendly layer)
 COPY pyproject.toml uv.lock ./
 
-# Install production deps (no dev extras) into /build/.venv
-RUN uv sync --frozen --no-dev --group llm-engine --link-mode=copy
+# Install production deps (no dev extras) into /build/.venv.
+# BuildKit cache mount persists uv's wheel cache across local rebuilds (deps aren't
+# re-downloaded when only pyproject/uv.lock change). Inert in CI — CI never builds this
+# image. If a build job is added, this no-ops on ephemeral runners; use buildx cache there.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --group llm-engine --link-mode=copy
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime

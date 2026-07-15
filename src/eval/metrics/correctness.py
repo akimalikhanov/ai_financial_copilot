@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import re
+from pathlib import Path
 from typing import Literal
 
+import yaml
+from pydantic import BaseModel, ValidationError
 from rapidfuzz import fuzz
 
-Kind = Literal["number", "boolean", "name", "names"]
+from src.services.llm_adapters.base_adapter import ChatMessage, Role
+from src.services.llm_router import get_router
+from src.utils.json_schema import build_response_format
+
+logger = logging.getLogger(__name__)
+
+Kind = Literal["number", "boolean", "name", "names", "drivers"]
 
 _REFUSAL_RE = re.compile(
     r"\b(n/a|not available|not mentioned|not disclosed|not found|not stated"
@@ -150,8 +161,110 @@ def score_correctness(answer: str, kind: Kind, expected_answers: list[str]) -> d
         "names": _score_names,
     }
     if kind not in dispatch:
-        # No deterministic scorer for this kind yet (e.g. "drivers" — Stage 0.5's
-        # driver-pool recall judge is not built). Don't crash the run; the LLM
-        # judge (metrics/judge.py) still runs and produces faithfulness/relevance signal.
+        # "drivers" has no deterministic scorer (name+magnitude in free text can't be
+        # regexed reliably) — use the async LLM judge below (score_drivers_llm) instead.
+        # Don't crash the run; the general LLM judge (metrics/judge.py) still runs and
+        # produces faithfulness/relevance signal.
         return {"correct": False, "reason": "no_scorer_for_kind"}
     return dispatch[kind](answer, expected_answers)
+
+
+_DRIVER_JUDGE_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "driver_recall_judge_v1.yaml"
+
+_DRIVER_RECALL_THRESHOLD = 0.5
+
+
+class _DriverHit(BaseModel):
+    driver: str
+    named: bool
+    reason: str
+
+
+class DriverRecallOutput(BaseModel):
+    hits: list[_DriverHit]
+
+
+def _load_driver_judge_prompt() -> str:
+    with open(_DRIVER_JUDGE_PROMPT_PATH) as f:
+        data = yaml.safe_load(f)
+    return data["template"]
+
+
+def _format_gold_drivers(expected_answers: list[str]) -> str:
+    return "\n".join(f"{i + 1}. {d}" for i, d in enumerate(expected_answers))
+
+
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+
+def _parse_driver_judge_response(raw: str) -> DriverRecallOutput | None:
+    text = raw.strip()
+    m = _JSON_FENCE.search(text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        data = json.loads(text)
+        return DriverRecallOutput.model_validate(data)
+    except (json.JSONDecodeError, ValidationError) as e:
+        logger.warning("driver_judge_parse_failed: %s raw=%r", e, raw[:300])
+        return None
+
+
+async def score_drivers_llm(
+    *,
+    question: str,
+    answer: str,
+    expected_answers: list[str],
+    model_id: str,
+) -> dict:
+    """LLM-judged recall over the hand-labeled driver list for kind='drivers'.
+
+    Text-only comparison of MODEL_ANSWER against the gold driver list — does not verify
+    that a named driver's citation lands in that driver's reference_pools page(s) (the
+    other half of the doc's Stage 0.5 spec). That leg needs ref_id -> chunk -> page
+    resolution, which isn't available for an offline re-score of an already-collected run
+    (ref_id_to_chunk_id is unpopulated in analytical_tier1_baseline.json).
+
+    Returns {correct: bool, reason: str} to match score_correctness's contract, with
+    correct = recall >= 0.5 (same recall-threshold convention as _score_names).
+    On LLM/parse failure, returns {correct: False, reason: "driver_judge_failed"}.
+    """
+    if not expected_answers:
+        return {"correct": False, "reason": "no_expected_drivers"}
+
+    system = _load_driver_judge_prompt()
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"GOLD_DRIVERS:\n{_format_gold_drivers(expected_answers)}\n\n"
+        f"MODEL_ANSWER:\n{answer}"
+    )
+    messages = [
+        ChatMessage(role=Role.system, content=system),
+        ChatMessage(role=Role.user, content=user),
+    ]
+    response_format = build_response_format(
+        "driver_recall_output", DriverRecallOutput.model_json_schema()
+    )
+    llm = get_router().get(model_id)
+    try:
+        resp = await llm.complete(
+            messages=messages,
+            temperature=0.0,
+            response_format=response_format,
+        )
+    except Exception as e:
+        logger.exception("driver_judge_llm_error: %s", e)
+        return {"correct": False, "reason": "driver_judge_failed"}
+
+    parsed = _parse_driver_judge_response(resp.text or "")
+    if parsed is None or len(parsed.hits) != len(expected_answers):
+        return {"correct": False, "reason": "driver_judge_failed"}
+
+    n_hit = sum(1 for h in parsed.hits if h.named)
+    recall = n_hit / len(expected_answers)
+    correct = recall >= _DRIVER_RECALL_THRESHOLD
+    missed = [h.driver for h in parsed.hits if not h.named]
+    reason = f"driver_recall={recall:.2f} ({n_hit}/{len(expected_answers)} drivers named)"
+    if missed:
+        reason += f"; missed: {'; '.join(missed)}"
+    return {"correct": correct, "reason": reason}

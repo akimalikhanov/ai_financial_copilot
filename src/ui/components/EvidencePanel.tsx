@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { X, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Search } from 'lucide-react';
+import { X, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Search, Copy, Check } from 'lucide-react';
 import { Viewer, Worker } from '@react-pdf-viewer/core';
 import type { DocumentLoadEvent, PageChangeEvent, RenderPageProps } from '@react-pdf-viewer/core';
 import { pageNavigationPlugin } from '@react-pdf-viewer/page-navigation';
@@ -20,6 +20,7 @@ interface EvidencePanelProps {
   onPageChange: (docId: string, page: number) => void;
   highlight?: NonNullable<Citation['bboxHints']>;
   highlightLabel?: string;
+  chunkId?: string;
 }
 
 export const EvidencePanel: React.FC<EvidencePanelProps> = ({
@@ -32,8 +33,10 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
   onPageChange,
   highlight,
   highlightLabel,
+  chunkId,
 }) => {
   const [zoom, setZoom] = useState(100);
+  const [chunkIdCopied, setChunkIdCopied] = useState(false);
   const [numPages, setNumPages] = useState<number | null>(null);
   const [pageInput, setPageInput] = useState<string>('');
   const panelRef = useRef<HTMLDivElement>(null);
@@ -198,6 +201,17 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
     );
   }, [highlight, highlightLabel]);
 
+  const handleCopyChunkId = useCallback(async () => {
+    if (!chunkId) return;
+    try {
+      await navigator.clipboard.writeText(chunkId);
+      setChunkIdCopied(true);
+      setTimeout(() => setChunkIdCopied(false), 1500);
+    } catch {
+      // ignore
+    }
+  }, [chunkId]);
+
   const httpHeaders = useMemo(() => {
     const token = getAccessTokenValue();
     return token ? { Authorization: `Bearer ${token}` } : {};
@@ -276,6 +290,17 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
             </button>
           ))}
         </div>
+        {chunkId && (
+          <button
+            onClick={handleCopyChunkId}
+            title={chunkId}
+            className="hidden md:flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-mono
+              text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-3)] transition-colors flex-shrink-0"
+          >
+            {chunkIdCopied ? <Check size={11} /> : <Copy size={11} />}
+            <span className="truncate max-w-[110px]">{chunkId}</span>
+          </button>
+        )}
         <button
           onClick={onClose}
           className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-3)] transition-colors flex-shrink-0"

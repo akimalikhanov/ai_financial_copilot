@@ -54,3 +54,4 @@ infra/scripts/langfuse_reset.sh
 
 actions-runner
 scripts/
+src/eval/rescore_drivers.py

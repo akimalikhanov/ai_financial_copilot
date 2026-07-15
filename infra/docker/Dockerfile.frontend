@@ -6,7 +6,10 @@ WORKDIR /app
 
 # Install deps first (cache-friendly: only re-runs when package files change)
 COPY src/ui/package.json src/ui/package-lock.json ./
-RUN npm ci --ignore-scripts
+# BuildKit cache mount persists npm's download cache across local rebuilds. Inert in CI
+# (CI never builds this image). If a build job is added, use buildx cache on ephemeral runners.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --ignore-scripts
 
 # Copy the rest of the UI source and build.
 # VITE_API_BASE_URL is baked into the bundle at build time. Default "/api" makes

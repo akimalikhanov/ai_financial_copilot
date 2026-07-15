@@ -11,7 +11,13 @@ RUN pip install --no-cache-dir uv==0.8.19
 
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen --no-dev --group llm-engine --link-mode=copy
+# BuildKit cache mount: persists uv's wheel cache across local rebuilds so dep layers
+# don't re-download when only pyproject/uv.lock change. Requires BuildKit (implied by the
+# `# syntax=` directive on line 1). Inert in CI — CI never builds this image (it only lints
+# the Dockerfile and runs tests on host Python). If an image-build job is ever added to CI,
+# this mount no-ops on ephemeral runners; use buildx cache-from/cache-to there instead.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --group llm-engine --link-mode=copy
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
