@@ -22,6 +22,7 @@ from uuid import UUID
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.db import get_session_factory
 from src.eval.pipeline import PipelineResult, _run_answer, _run_direct_answer
 from src.eval.schemas import EvalQuestion
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
@@ -157,7 +158,7 @@ async def run_one(
         tool_llm = router.get(tool_model_id)
 
         chunk_registry, agent_findings, agent_meta = await run_agent_loop(
-            state, tool_llm, session, _redis, request_id, reranker
+            state, tool_llm, session, _redis, request_id, reranker, get_session_factory()
         )
     finally:
         if _owns_redis:

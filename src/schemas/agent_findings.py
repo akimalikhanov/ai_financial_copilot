@@ -1,38 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
 
-@dataclass(frozen=True, slots=True)
-class EntityFinding:
+
+class EntityFinding(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     entity: str
     available: bool
     value: float | None = None
     currency: str | None = None
     period_end: str | None = None
-    source_chunks: list[str] | None = None
+    source_chunks: list[str] = Field(
+        default=[],
+        description='Excerpt IDs from search results that contain the value, exactly as shown (e.g. ["S3", "S7"]).',
+    )
     reason: str | None = None
-    unit: str | None = None  # scale suffix as stated in document: "M", "B", "K", or "" for absolute
+    unit: str | None = Field(
+        default=None,
+        description="Scale suffix as stated in the document: 'M' for millions, 'B' for billions, 'K' for thousands, '' for absolute values.",
+    )
 
 
-@dataclass(frozen=True, slots=True)
-class AgentFindings:
+class AgentFindings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     metric_requested: str
     findings: tuple[EntityFinding, ...]
     comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class Observation:
+class Observation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     claim: str
-    evidence_chunks: list[str]
+    evidence_chunks: list[str] = Field(
+        description='Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',
+    )
     confidence: Literal["high", "medium", "low"]
-    refuted_by: list[str] | None = None
+    refuted_by: list[str] | None = Field(
+        default=None,
+        description="Excerpt IDs that contradict this claim, exactly as shown in search results.",
+    )
 
 
-@dataclass(frozen=True, slots=True)
-class AnalyticalFindings:
+class AnalyticalFindings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     question: str
     observations: tuple[Observation, ...]
     conclusion: str | None = None

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses as _dc
 import json as _json
 import logging
 from time import perf_counter
@@ -655,7 +654,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     )
                 try:
                     chunk_registry, agent_findings, agent_meta = await run_agent_loop(
-                        state, _tool_llm, session, redis_app, request_id, _get_reranker()
+                        state,
+                        _tool_llm,
+                        session,
+                        redis_app,
+                        request_id,
+                        _get_reranker(),
+                        _get_session_factory(),
                     )
                     if lf:
                         lf.update_current_span(
@@ -697,12 +702,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             if name not in covered
                         )
                         if missing_stubs:
-                            agent_findings = _dc.replace(
-                                agent_findings,
-                                findings=agent_findings.findings + missing_stubs,
+                            agent_findings = agent_findings.model_copy(
+                                update={"findings": agent_findings.findings + missing_stubs}
                             )
 
-                    agent_findings_json = _json.dumps(_dc.asdict(agent_findings))
+                    agent_findings_json = agent_findings.model_dump_json()
 
                     _fp_lf_stack = contextlib.ExitStack()
                     if lf:
@@ -716,7 +720,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                         agent_findings, "metric_requested", None
                                     ),
                                     "comparison_op": getattr(agent_findings, "comparison_op", None),
-                                    "findings": [_dc.asdict(f) for f in agent_findings.findings]
+                                    "findings": [f.model_dump() for f in agent_findings.findings]
                                     if isinstance(agent_findings, _AgentFindings)
                                     else None,
                                 },

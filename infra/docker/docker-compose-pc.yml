@@ -1,0 +1,873 @@
+x-logging: &default-logging
+  logging:
+    driver: local
+    options:
+      mode: non-blocking
+      max-buffer-size: 12m
+
+# App-tier logging: ship container stdout (JSON) to Fluent Bit's forward input
+# via the fluentd log driver, instead of tailing a host file.
+# IMPORTANT: the fluentd log driver runs in the Docker DAEMON (on the host), not
+# inside the compose network — so it cannot resolve the service DNS name
+# "fluent-bit". It must use the host-published address 127.0.0.1:24224 (see the
+# fluent-bit service `ports:` mapping). fluentd-async keeps container startup from
+# blocking when fluent-bit isn't up yet, buffering/retrying in the background.
+# Tag "app" matches the [FILTER]/[INPUT] rules in fluent-bit.conf. Trade-off:
+# `docker compose logs` won't show these services — their logs live in ES/Grafana.
+x-app-logging: &app-logging
+  logging:
+    driver: fluentd
+    options:
+      fluentd-address: "127.0.0.1:24224"
+      tag: "app"
+      fluentd-async: "true"
+      fluentd-retry-wait: "1s"
+      fluentd-max-retries: "30"
+
+# Shared env block for both Langfuse services.
+# Required new vars in .env:
+#   CLICKHOUSE_PASSWORD, LANGFUSE_NEXTAUTH_SECRET, LANGFUSE_SALT,
+#   LANGFUSE_ENCRYPTION_KEY (64 hex chars), LANGFUSE_S3_ACCESS_KEY_ID,
+#   LANGFUSE_S3_SECRET_ACCESS_KEY (copy from infra/docker/garage/secrets/garage_s3_creds after bootstrap)
+# Optional (auto-create org/project/user on first boot):
+#   LANGFUSE_INIT_ORG_ID, LANGFUSE_INIT_ORG_NAME, LANGFUSE_INIT_PROJECT_ID,
+#   LANGFUSE_INIT_PROJECT_NAME, LANGFUSE_INIT_PROJECT_PUBLIC_KEY,
+#   LANGFUSE_INIT_PROJECT_SECRET_KEY, LANGFUSE_INIT_USER_EMAIL,
+#   LANGFUSE_INIT_USER_NAME, LANGFUSE_INIT_USER_PASSWORD
+x-langfuse-env: &langfuse-env
+  # Postgres: direct connection (bypass pgbouncer — Prisma migrations need session mode)
+  DATABASE_URL: "postgresql://${LANGFUSE_DB_USER}:${LANGFUSE_DB_PASSWORD}@postgres:5432/${LANGFUSE_DB:-langfuse}"
+  # ClickHouse: HTTP for queries, native for migrations
+  CLICKHOUSE_URL: "http://clickhouse:8123"
+  CLICKHOUSE_MIGRATION_URL: "clickhouse://${CLICKHOUSE_USER:-clickhouse}:${CLICKHOUSE_PASSWORD}@clickhouse:9000"
+  CLICKHOUSE_USER: "${CLICKHOUSE_USER:-clickhouse}"
+  CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD}"
+  # Redis: reuse redis-app
+  REDIS_HOST: "redis-app"
+  REDIS_PORT: "6379"
+  REDIS_AUTH: "${REDIS_PASSWORD}"
+  # Auth / crypto
+  NEXTAUTH_SECRET: "${LANGFUSE_NEXTAUTH_SECRET}"
+  SALT: "${LANGFUSE_SALT}"
+  ENCRYPTION_KEY: "${LANGFUSE_ENCRYPTION_KEY}"
+  TELEMETRY_ENABLED: "false"
+  # S3: Garage (reuse existing object store), bucket "langfuse" created by garage-bootstrap
+  LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "garage"
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: "garage"
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "true"
+  LANGFUSE_S3_BATCH_EXPORT_BUCKET: "langfuse"
+  LANGFUSE_S3_BATCH_EXPORT_REGION: "garage"
+  LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: "http://garage:3900"
+  LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: "${LANGFUSE_S3_ACCESS_KEY_ID}"
+  LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: "${LANGFUSE_S3_SECRET_ACCESS_KEY}"
+  LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: "true"
+  # Optional first-boot seed (all empty = skip)
+  LANGFUSE_INIT_ORG_ID: "${LANGFUSE_INIT_ORG_ID:-}"
+  LANGFUSE_INIT_ORG_NAME: "${LANGFUSE_INIT_ORG_NAME:-}"
+  LANGFUSE_INIT_PROJECT_ID: "${LANGFUSE_INIT_PROJECT_ID:-}"
+  LANGFUSE_INIT_PROJECT_NAME: "${LANGFUSE_INIT_PROJECT_NAME:-}"
+  LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}"
+  LANGFUSE_INIT_PROJECT_SECRET_KEY: "${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}"
+  LANGFUSE_INIT_USER_EMAIL: "${LANGFUSE_INIT_USER_EMAIL:-}"
+  LANGFUSE_INIT_USER_NAME: "${LANGFUSE_INIT_USER_NAME:-}"
+  LANGFUSE_INIT_USER_PASSWORD: "${LANGFUSE_INIT_USER_PASSWORD:-}"
+
+# Host/endpoint overrides for the application tier (api + workers).
+# The full .env is injected via `env_file`, but it holds connection targets tuned
+# for host-process dev: `127.0.0.1` + the host-PUBLISHED ports. Inside the compose
+# network the app must instead reach dependencies by their service DNS names and
+# their *in-container* ports (which differ from published ports for redis-broker,
+# tei, and langfuse). Both facts are real topology differences between the two run
+# modes, so a single .env cannot satisfy both — these `environment:` values win
+# over env_file and supply the container-correct targets, leaving .env valid for
+# `make dev`. (Port-publish bind IPs are a separate concern, handled by dedicated
+# *_BIND_HOST / *_PUBLISH_HOST vars on each service — not overloaded here.)
+x-app-env: &app-env
+  # Postgres via PgBouncer
+  APP_DB_HOST: pgbouncer
+  APP_DB_PORT: "6432"
+  # Redis: app cache/SSE and Celery broker (both listen on 6379 in-container)
+  REDIS_APP_HOST: redis-app
+  REDIS_APP_PORT: "6379"
+  REDIS_BROKER_HOST: redis-broker
+  REDIS_BROKER_PORT: "6379"
+  # Vector + keyword search
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: "6333"
+  OPENSEARCH_HOST: opensearch
+  OPENSEARCH_HTTP_PORT: "9200"
+  # Object storage (Garage S3)
+  AWS_ENDPOINT_URL: "http://garage:3900"
+  # TEI inference (containers listen on :80 internally)
+  EMBEDDER_BASE_URL: "http://tei-embedder:80"
+  RERANKER_BASE_URL: "http://tei:80"
+  # Langfuse (web container listens on :3000 internally)
+  LANGFUSE_HOST: "http://langfuse-web:3000"
+
+networks:
+  backend:
+
+volumes:
+  postgres_data:
+  redis_app_data:
+  redis_broker_data:
+  qdrant_data:
+  opensearch_data:
+  garage_data:
+  garage_meta:
+  tei_data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+  es_data:
+  hf-model-cache:
+
+services:
+  postgres:
+    image: postgres:16.11-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      # superuser / default DB created by entrypoint
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+      # passed through for ../db_init/init.sh
+      LANGFUSE_DB: ${LANGFUSE_DB:-langfuse}
+      LANGFUSE_DB_USER: ${LANGFUSE_DB_USER:-langfuse}
+      LANGFUSE_DB_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+
+      APP_DB: ${APP_DB:-app}
+      APP_DB_USER: ${APP_DB_USER:-app}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    ports:
+      - "${POSTGRES_HOST:-127.0.0.1}:${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../scripts/db_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    cpus: "2.00"
+    mem_limit: 2g
+    <<: *default-logging
+    networks: [backend]
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    container_name: pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      # superuser creds (also used by auth_query connection)
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_USER: ${APP_DB_USER}
+      LANGFUSE_DB_USER: ${LANGFUSE_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      LANGFUSE_DB_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+
+      # DB names created by your init.sh
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      APP_DB: ${APP_DB:-app}
+      LANGFUSE_DB: ${LANGFUSE_DB:-langfuse}
+
+      # Where Postgres is reachable from PgBouncer
+      PGB_POSTGRES_HOST: ${PGB_POSTGRES_HOST:-postgres}
+      PGB_POSTGRES_PORT: ${PGB_POSTGRES_PORT:-5432}
+
+      # PgBouncer listen
+      PGB_LISTEN_ADDR: ${PGB_LISTEN_ADDR:-0.0.0.0}
+      PGB_LISTEN_PORT: ${PGB_LISTEN_PORT:-6432}
+
+    entrypoint: ["/bin/sh", "/pgbouncer-entrypoint.sh"]
+    volumes:
+      - ../scripts/pgbouncer-entrypoint.sh:/pgbouncer-entrypoint.sh:ro
+
+    ports:
+      - "${PGB_BIND_HOST:-127.0.0.1}:${PGB_APP_DB_PORT:-6432}:6432"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "PGPASSWORD=$$POSTGRES_PASSWORD psql -h 127.0.0.1 -p $$PGB_LISTEN_PORT -U $$POSTGRES_USER -d $$POSTGRES_DB -c 'SELECT 1' >/dev/null"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    cpus: "0.25"
+    mem_limit: 128m
+    <<: *default-logging
+    networks: [backend]
+    restart: unless-stopped
+
+  redis-app:
+    image: redis:7.2.12-alpine
+    container_name: redis-app
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "${REDIS_APP_BIND_HOST:-127.0.0.1}:${REDIS_APP_PORT:-6379}:6379"
+    volumes:
+      - redis_app_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    cpus: "1.00"
+    mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]
+
+  redis-broker:
+    image: redis:7.2.12-alpine
+    container_name: redis-broker
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "${REDIS_BROKER_BIND_HOST:-127.0.0.1}:${REDIS_BROKER_PORT:-6380}:6379"
+    volumes:
+      - redis_broker_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    cpus: "0.50"
+    mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: opensearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms1g -Xmx1g"
+      bootstrap.memory_lock: "true"
+      # DEV ONLY:
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "${OPENSEARCH_PUBLISH_HOST:-127.0.0.1}:${OPENSEARCH_HTTP_PORT:-9200}:9200"
+      - "${OPENSEARCH_PUBLISH_HOST:-127.0.0.1}:${OPENSEARCH_MANAGEMENT_PORT:-9600}:9600"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -q '\"status\"' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    cpus: "1.50"
+    mem_limit: 1536m
+    <<: *default-logging
+    networks: [backend]
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    container_name: opensearch-dashboards
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_HOSTS: http://opensearch:9200
+      # DEV ONLY:
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "${OPENSEARCH_DASHBOARDS_BIND_HOST:-127.0.0.1}:${OPENSEARCH_DASHBOARDS_PORT:-5601}:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    cpus: "0.50"
+    mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
+    container_name: tei
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model-id
+      - ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
+      - --dtype
+      - float16
+      - --max-batch-tokens
+      - "16384"
+      - --max-batch-requests
+      - "16"
+      - --max-client-batch-size
+      - "64"
+      - --payload-limit
+      - "10000000"
+    ports:
+      - "${RERANKER_BIND_HOST:-127.0.0.1}:${RERANKER_PORT:-8080}:80"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # The 120-1.9 (Blackwell) image declares cuda>=12.9, but host driver 570.181
+      # provides 12.8. CUDA minor-version compat runs the 12.9 build fine on 12.8;
+      # skip nvidia-container-cli's conservative version gate.
+      NVIDIA_DISABLE_REQUIRE: "true"
+    volumes:
+      - tei_data:/data
+    cpus: "2.00"
+    mem_limit: 4g
+    <<: *default-logging
+    networks: [backend]
+
+  tei-embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:120-1.9
+    container_name: tei-embedder
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command:
+      - --model-id
+      - ${EMBEDDER_MODEL_NAME:-BAAI/bge-m3}
+      - --dtype
+      - float16
+      - --max-batch-tokens
+      - "16384"
+      - --max-batch-requests
+      - "16"
+      - --max-client-batch-size
+      - "64"
+      - --payload-limit
+      - "10000000"
+    ports:
+      - "${EMBEDDER_BIND_HOST:-127.0.0.1}:${EMBEDDER_PORT:-8082}:80"
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # See tei service: bypass cuda>=12.9 gate; 12.9 build runs on 12.8 driver.
+      NVIDIA_DISABLE_REQUIRE: "true"
+    volumes:
+      - tei_data:/data
+    cpus: "2.00"
+    mem_limit: 12g
+    <<: *default-logging
+    networks: [backend]
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.3
+    container_name: qdrant
+    restart: unless-stopped
+    networks: [backend]
+    ports:
+      - "${QDRANT_BIND_HOST:-127.0.0.1}:${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_BIND_HOST:-127.0.0.1}:${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      # qdrant's image ships no curl/wget; CMD-SHELL runs via dash which lacks
+      # /dev/tcp, so invoke bash explicitly for a TCP-connect liveness probe.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Garage: S3-compatible object storage (alternative to MinIO), e.g. for PDFs.
+  # Docs: https://garagehq.deuxfleurs.fr/documentation/
+  garage-secrets:
+    image: alpine:3.20
+    container_name: garage-secrets
+    volumes:
+      - ./garage/secrets:/secrets
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      [
+        "set -e; apk add --no-cache openssl >/dev/null; \
+        test -f /secrets/garage_rpc_secret || openssl rand -hex 32 > /secrets/garage_rpc_secret; \
+        test -f /secrets/garage_admin_token || openssl rand -base64 32 > /secrets/garage_admin_token; \
+        test -f /secrets/garage_metrics_token || openssl rand -base64 32 > /secrets/garage_metrics_token; \
+        chmod 600 /secrets/garage_rpc_secret /secrets/garage_admin_token /secrets/garage_metrics_token || true;",
+      ]
+    restart: "no"
+    <<: *default-logging
+
+  garage:
+    image: dxflrs/garage:v2.2.0
+    container_name: garage
+    depends_on:
+      garage-secrets:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    volumes:
+      - ./garage/garage.toml:/etc/garage.toml:ro
+      - ./garage/secrets:/run/secrets:ro
+      - garage_meta:/var/lib/garage/meta
+      - garage_data:/var/lib/garage/data
+    ports:
+      - "${GARAGE_BIND_HOST:-127.0.0.1}:${GARAGE_S3_PORT:-3900}:3900"
+      - "${GARAGE_BIND_HOST:-127.0.0.1}:${GARAGE_ADMIN_PORT:-3901}:3901"
+      - "${GARAGE_BIND_HOST:-127.0.0.1}:${GARAGE_METRICS_PORT:-3902}:3902"
+      - "${GARAGE_BIND_HOST:-127.0.0.1}:${GARAGE_RPC_PORT:-3903}:3903"
+    cpus: "0.50"
+    mem_limit: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  # One-time bootstrap: layout, bucket pdfs, key app-key.
+  # Run: docker compose run --rm garage-bootstrap  (or: docker compose up garage-bootstrap)
+  garage-bootstrap:
+    profiles:
+      - garage-bootstrap
+    image: docker:cli
+    container_name: garage-bootstrap
+    depends_on:
+      garage:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../scripts/garage_bootstrap.sh:/bootstrap.sh:ro
+      - ./garage/secrets:/secrets
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    networks: [backend]
+    restart: "no"
+
+  qdrant-hc:
+    image: busybox:1.36
+    container_name: qdrant-hc
+    depends_on:
+      qdrant:
+        condition: service_started
+    networks: [backend]
+
+    mem_limit: 64m
+    mem_reservation: 16m
+    cpus: "0.10"
+    <<: *default-logging
+    command: ["sh", "-c", "sleep 9999999"]
+    # Choose ONE endpoint:
+    # - /healthz = "alive" style
+    # - /readyz = "ready" style (preferred if you want readiness gating)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://qdrant:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    restart: unless-stopped
+
+  langfuse-secrets:
+    image: alpine:3.20
+    container_name: langfuse-secrets
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      SECRETS_UID: "${SECRETS_UID:-1000}"
+      SECRETS_GID: "${SECRETS_GID:-1000}"
+    volumes:
+      - ./langfuse/secrets:/secrets
+      - ./garage/secrets:/garage_secrets:ro
+      - ../scripts/langfuse_bootstrap.sh:/langfuse_bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/langfuse_bootstrap.sh"]
+    restart: "no"
+    <<: *default-logging
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.12-alpine
+    container_name: clickhouse
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.d/langfuse-cluster.xml:/etc/clickhouse-server/config.d/langfuse-cluster.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    cpus: "2.00"
+    mem_limit: 4g
+    <<: *default-logging
+    networks: [backend]
+
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
+    container_name: langfuse-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      garage:
+        condition: service_started
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_URL: "${LANGFUSE_URL:-http://localhost:3003}"
+      # langfuse-web's Next.js server OOMs on the default ~512MB Node heap during
+      # startup; give it a larger old-space (and bump mem_limit to match).
+      NODE_OPTIONS: "--max-old-space-size=2560"
+    ports:
+      - "${LANGFUSE_BIND_HOST:-127.0.0.1}:${LANGFUSE_PORT:-3003}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    cpus: "1.00"
+    mem_limit: 3g
+    <<: *default-logging
+    networks: [backend]
+
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      garage:
+        condition: service_started
+    environment:
+      <<: *langfuse-env
+    cpus: "1.00"
+    mem_limit: 1g
+    <<: *default-logging
+    networks: [backend]
+
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-admin-api
+    environment:
+      PROMETHEUS_PORT: ${PROMETHEUS_PORT:-9090}
+    ports:
+      - "${PROMETHEUS_BIND_HOST:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    cpus: "1.00"
+    mem_limit: 2g
+    mem_reservation: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:${PROMETHEUS_PORT:-9090}/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    <<: *default-logging
+    networks: [backend]
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.1
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "${ES_BIND_HOST:-127.0.0.1}:${ES_BIND_PORT:-9201}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    cpus: "1.00"
+    mem_limit: 1g
+    mem_reservation: 512m
+    <<: *default-logging
+    networks: [backend]
+
+  es-bootstrap:
+    image: curlimages/curl:8.14.1
+    container_name: es-bootstrap
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./elasticsearch/ilm-policy.json:/bootstrap/ilm-policy.json:ro
+      - ./elasticsearch/index-template.json:/bootstrap/index-template.json:ro
+      - ./elasticsearch/bootstrap.sh:/bootstrap/bootstrap.sh:ro
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      ES_URL: "http://elasticsearch:9200"
+    restart: "no"
+    networks: [backend]
+
+  fluent-bit:
+    image: fluent/fluent-bit:4.0.3
+    container_name: fluent-bit
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+    ports:
+      # App containers ship logs over the backend network to fluent-bit:24224;
+      # the published binding is only for host-side inspection.
+      - "${FLUENT_BIT_BIND_HOST:-127.0.0.1}:${FLUENT_BIT_PORT:-24224}:24224"
+    environment:
+      ES_HOST: "elasticsearch"
+      ES_PORT: "9200"
+    cpus: "0.25"
+    mem_limit: 128m
+    <<: *default-logging
+    networks: [backend]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: api
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      # Container logs go to stdout only; Fluent Bit collects via fluentd driver.
+      LOG_FILE: ""
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    ports:
+      - "${API_BIND_HOST:-127.0.0.1}:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    cpus: "2.00"
+    mem_limit: 2g
+    <<: *app-logging
+    networks: [backend]
+
+  worker-chat:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    container_name: worker-chat
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom_chat
+      LOG_FILE: ""
+    command: ["python", "-m", "src.workers.chat_worker"]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    cpus: "2.00"
+    mem_limit: 3g
+    <<: *app-logging
+    networks: [backend]
+
+  worker-ingestion:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    container_name: worker-ingestion
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prom_ingestion
+      LOG_FILE: ""
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - hf-model-cache:/root/.cache/huggingface
+    command: ["python", "-m", "src.workers.ingestion_worker"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      qdrant-hc:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    cpus: "4.00"
+    mem_limit: 6g
+    <<: *app-logging
+    networks: [backend]
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.frontend
+    container_name: frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      API_HOST: ${API_HOST:-api}
+      API_PORT: ${API_PORT:-8000}
+    ports:
+      - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    cpus: "0.25"
+    mem_limit: 128m
+    <<: *default-logging
+    networks: [backend]
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    container_name: grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      es-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_MAX_REQUEST_SIZE: 50MB
+      GF_SERVER_MAX_QUERY_RESULT_SIZE: 50MB
+      GRAFANA_PORT: ${GRAFANA_PORT:-3004}
+      APP_DB_USER: ${APP_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      APP_DB: ${APP_DB}
+      PGB_APP_DB_HOST: ${PGB_APP_DB_HOST:-pgbouncer}
+      PGB_APP_DB_PORT: ${PGB_APP_DB_PORT:-6432}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3004}:3000"
+    cpus: "0.50"
+    mem_limit: 768m
+    mem_reservation: 192m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    <<: *default-logging
+    networks: [backend]

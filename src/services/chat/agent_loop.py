@@ -7,13 +7,15 @@ import contextlib
 import json
 import logging
 import os
-from dataclasses import dataclass, replace
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
+from pydantic import ValidationError
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.observability import langfuse as lf_client
 from src.observability.metrics import (
@@ -28,6 +30,11 @@ from src.repository.llm_request_repository import LLMRequestRepository, stats_to
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
+from src.services.chat.tools import (
+    REPORT_ANALYTICAL_TOOL,
+    REPORT_FINDINGS_TOOL,
+    SEARCH_TOOL,
+)
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -40,7 +47,7 @@ from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.context_assembler import assemble_rag_context
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.query_transformer import rewrite_query
-from src.utils.config import get_agent_config
+from src.utils.config import get_agent_config, get_query_transformer_model
 
 if TYPE_CHECKING:
     from src.schemas.chat import ChatPipelineState
@@ -54,108 +61,9 @@ _AGENT_TURN_TIMEOUT = float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60"))
 # ---------------------------------------------------------------------------
 # Tool definitions
 # ---------------------------------------------------------------------------
-
-_SEARCH_TOOL: dict = {
-    "type": "function",
-    "function": {
-        "name": "search_documents",
-        "description": "Search financial documents for a specific entity. Call once per entity.",
-        "parameters": {
-            "type": "object",
-            "required": ["entity", "query"],
-            "properties": {
-                "entity": {"type": "string"},
-                "query": {"type": "string"},
-            },
-            "additionalProperties": False,
-        },
-    },
-}
-
-_REPORT_FINDINGS_TOOL: dict = {
-    "type": "function",
-    "function": {
-        "name": "report_findings",
-        "description": "Call this once when you have finished searching. Report extracted values for all entities. This ends the search phase.",
-        "parameters": {
-            "type": "object",
-            "required": ["metric_requested", "findings"],
-            "properties": {
-                "metric_requested": {"type": "string"},
-                "comparison_op": {
-                    "type": ["string", "null"],
-                    "enum": ["argmin", "argmax", "list", "none", None],
-                },
-                "findings": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["entity", "available"],
-                        "properties": {
-                            "entity": {"type": "string"},
-                            "value": {"type": ["number", "null"]},
-                            "currency": {"type": ["string", "null"]},
-                            "period_end": {"type": ["string", "null"]},
-                            "source_chunks": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": 'Excerpt IDs from search results that contain the value, exactly as shown (e.g. ["S3", "S7"]).',
-                            },
-                            "available": {"type": "boolean"},
-                            "reason": {"type": ["string", "null"]},
-                            "unit": {
-                                "type": ["string", "null"],
-                                "description": "Scale suffix as stated in the document: 'M' for millions, 'B' for billions, 'K' for thousands, '' for absolute values.",
-                            },
-                        },
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "additionalProperties": False,
-        },
-    },
-}
-
-_REPORT_ANALYTICAL_TOOL: dict = {
-    "type": "function",
-    "function": {
-        "name": "report_analytical_findings",
-        "description": "Call this once when you have a complete chain of observations for a causal or narrative question. This ends the search phase.",
-        "parameters": {
-            "type": "object",
-            "required": ["question", "observations"],
-            "properties": {
-                "question": {"type": "string"},
-                "conclusion": {"type": ["string", "null"]},
-                "gaps": {"type": ["array", "null"], "items": {"type": "string"}},
-                "observations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["claim", "evidence_chunks", "confidence"],
-                        "properties": {
-                            "claim": {"type": "string"},
-                            "evidence_chunks": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": 'Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',
-                            },
-                            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                            "refuted_by": {
-                                "type": ["array", "null"],
-                                "items": {"type": "string"},
-                                "description": "Excerpt IDs that contradict this claim, exactly as shown in search results.",
-                            },
-                        },
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "additionalProperties": False,
-        },
-    },
-}
+# search_documents / report_findings / report_analytical_findings schemas are
+# generated from their Pydantic arg models in tools.py — schema and parser share
+# one source and cannot drift.
 
 _CONVERT_CURRENCY_TOOL: dict = {
     "type": "function",
@@ -183,8 +91,8 @@ _CONVERT_CURRENCY_TOOL: dict = {
 # All FX runs through router-extracted requested_currency → deterministic trigger in
 # findings_processor. _CONVERT_CURRENCY_TOOL / _execute_convert_currency are intentionally
 # kept but NOT exposed to the agent: add _CONVERT_CURRENCY_TOOL to the list below to revive.
-TOOLS_EXTRACTION_COMPARISON = [_SEARCH_TOOL, _REPORT_FINDINGS_TOOL]
-TOOLS_ANALYTICAL = [_SEARCH_TOOL, _REPORT_ANALYTICAL_TOOL]
+TOOLS_EXTRACTION_COMPARISON = [SEARCH_TOOL, REPORT_FINDINGS_TOOL]
+TOOLS_ANALYTICAL = [SEARCH_TOOL, REPORT_ANALYTICAL_TOOL]
 
 _FINALIZER_NAMES = frozenset({"report_findings", "report_analytical_findings"})
 
@@ -203,6 +111,9 @@ class AgentLoopMeta:
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     cost_usd_total: float = 0.0
+    # P0-4: input tokens attributed per model_id (agent tool model vs query-rewrite model).
+    # input_tokens_total is their sum; the budget cap checks the sum, unchanged.
+    input_tokens_by_model: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -429,43 +340,14 @@ async def _execute_convert_currency(
 
 
 def _parse_findings(tc: ToolCallRef) -> AgentFindings | AnalyticalFindings:
-    data = json.loads(tc.arguments)
+    """Parse and validate a finalizer tool call against its Pydantic schema.
+
+    Raises ``pydantic.ValidationError`` on malformed JSON or a schema violation,
+    surfaced at the caller instead of silently constructing garbage via ``.get()``.
+    """
     if tc.name == "report_findings":
-        raw_findings = data.get("findings", [])
-        findings = tuple(
-            EntityFinding(
-                entity=f["entity"],
-                available=f["available"],
-                value=f.get("value"),
-                currency=f.get("currency"),
-                period_end=f.get("period_end"),
-                source_chunks=f.get("source_chunks") or [],
-                reason=f.get("reason"),
-                unit=f.get("unit"),
-            )
-            for f in raw_findings
-        )
-        return AgentFindings(
-            metric_requested=data.get("metric_requested", ""),
-            findings=findings,
-            comparison_op=data.get("comparison_op"),
-        )
-    # report_analytical_findings
-    observations = tuple(
-        Observation(
-            claim=o["claim"],
-            evidence_chunks=o.get("evidence_chunks", []),
-            confidence=o["confidence"],
-            refuted_by=o.get("refuted_by"),
-        )
-        for o in data.get("observations", [])
-    )
-    return AnalyticalFindings(
-        question=data.get("question", ""),
-        observations=observations,
-        conclusion=data.get("conclusion"),
-        gaps=data.get("gaps"),
-    )
+        return AgentFindings.model_validate_json(tc.arguments)
+    return AnalyticalFindings.model_validate_json(tc.arguments)
 
 
 def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
@@ -544,8 +426,8 @@ def _resolve_finding_refs(
         for f in findings.findings:
             resolved, unresolved = _resolve_chunk_refs(f.source_chunks, ref_registry)
             all_unresolved.extend(unresolved)
-            new_findings.append(replace(f, source_chunks=resolved))
-        result = replace(findings, findings=tuple(new_findings))
+            new_findings.append(f.model_copy(update={"source_chunks": resolved}))
+        result = findings.model_copy(update={"findings": tuple(new_findings)})
     else:
         new_obs: list[Observation] = []
         for o in findings.observations:
@@ -555,8 +437,10 @@ def _resolve_finding_refs(
             if o.refuted_by is not None:
                 refuted, unresolved = _resolve_chunk_refs(o.refuted_by, ref_registry)
                 all_unresolved.extend(unresolved)
-            new_obs.append(replace(o, evidence_chunks=evidence, refuted_by=refuted))
-        result = replace(findings, observations=tuple(new_obs))
+            new_obs.append(
+                o.model_copy(update={"evidence_chunks": evidence, "refuted_by": refuted})
+            )
+        result = findings.model_copy(update={"observations": tuple(new_obs)})
 
     if all_unresolved:
         logger.warning(
@@ -597,7 +481,7 @@ def _drop_evidence_free_observations(findings: AnalyticalFindings) -> Analytical
     if not dropped_claims:
         return findings
     gaps = list(findings.gaps or []) + [f"Unsubstantiated claim: {c}" for c in dropped_claims]
-    return replace(findings, observations=tuple(kept), gaps=gaps)
+    return findings.model_copy(update={"observations": tuple(kept), "gaps": gaps})
 
 
 # ---------------------------------------------------------------------------
@@ -612,12 +496,18 @@ async def run_agent_loop(
     redis_app: Redis,
     request_id: str,
     reranker: Reranker | None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[dict[UUID, RetrievedChunk], AgentFindings | AnalyticalFindings | None, AgentLoopMeta]:
     """Run the agent tool-calling loop for retrieval queries.
 
     Returns (chunk_registry, agent_findings, meta).
     chunk_registry is keyed by chunk_id; values have turn_index stamped.
     agent_findings is None when the agent hit an iteration/budget cap.
+
+    ``session`` is used for the loop's own serial DB work (subrequest logging).
+    Concurrent searches each open their own session from ``session_factory``:
+    SQLAlchemy's AsyncSession is not safe for concurrent use, so the fan-out under
+    asyncio.gather must never share one (P0-1).
     """
     cfg = get_agent_config()
     max_iterations: int = cfg["max_iterations"]
@@ -713,7 +603,11 @@ async def run_agent_loop(
     lookup_count = 0
     searched_entities: set[str] = set()
     empty_rounds = 0  # analytical: consecutive turns returning no new chunks (3.i)
-    token_spend = 0
+    # P0-4: input tokens attributed per model_id rather than summed into one number.
+    # The budget cap still checks the total (sum), so cap behavior is unchanged; only
+    # telemetry attribution improves.
+    _rewrite_model_id = get_query_transformer_model()
+    input_by_model: dict[str, int] = defaultdict(int)
     output_tokens_total = 0
     cost_usd_total = 0.0
     tool_calls_total = 0
@@ -756,7 +650,7 @@ async def run_agent_loop(
                 timeout=_AGENT_TURN_TIMEOUT,
             )
             if turn.stats:
-                token_spend += turn.stats.input_tokens or 0
+                input_by_model[llm.model_id] += turn.stats.input_tokens or 0
                 output_tokens_total += turn.stats.output_tokens or 0
                 cost_usd_total += turn.stats.cost_usd or 0.0
                 if turn.stats.input_tokens:
@@ -840,7 +734,7 @@ async def run_agent_loop(
                 if (
                     finalizer_tc.name == "report_analytical_findings"
                     and iteration < max_iterations - 1
-                    and token_spend <= token_budget
+                    and sum(input_by_model.values()) <= token_budget
                 ):
                     try:
                         _candidate = _parse_findings(finalizer_tc)
@@ -909,18 +803,50 @@ async def run_agent_loop(
                             input=_fin_input,
                         )
                     )
+                # P0-3: only the parse+resolve is in the exception scope. A ValidationError
+                # here is a genuine parse failure; the Langfuse logging below must not be able
+                # to fire the "error" metric or log a parse failure for a call that parsed fine.
                 try:
                     agent_findings = _resolve_finding_refs(
                         _parse_findings(finalizer_tc), ref_registry, request_id
                     )
-                    if isinstance(agent_findings, AnalyticalFindings):
-                        agent_findings = _drop_evidence_free_observations(agent_findings)
-                    ever_cited_chunk_ids.update(_finding_chunk_ids(agent_findings))
-                    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
-                    # All chunks shown to the agent are admitted to the registry at search
-                    # time; the post-loop per-lookup cap explicitly preserves cited chunks
-                    # (see _finding_chunk_ids below), so no force-admit is needed here.
+                except ValidationError:
+                    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "error").inc()
+                    logger.warning(
+                        "agent_findings_parse_failed",
+                        extra={"request_id": request_id, "raw_args": finalizer_tc.arguments[:500]},
+                    )
                     if lf:
+                        lf.update_current_span(
+                            level="ERROR",
+                            metadata={"parse_ok": False, "raw_args": finalizer_tc.arguments[:300]},
+                        )
+                    await add_event(
+                        redis_app,
+                        request_id,
+                        "tool_call_completed",
+                        {
+                            "entity": "__finalizer__",
+                            "error": True,
+                            "reason": "findings_parse_failed",
+                        },
+                    )
+                    _fin_lf_stack.close()
+                    convergence_reason = "natural"
+                    break
+
+                # Parse succeeded (agent_findings is non-None). Everything below is outside the
+                # parse's exception scope; Langfuse logging is best-effort so a tracing failure
+                # can never re-label a successful finalize.
+                if isinstance(agent_findings, AnalyticalFindings):
+                    agent_findings = _drop_evidence_free_observations(agent_findings)
+                ever_cited_chunk_ids.update(_finding_chunk_ids(agent_findings))
+                AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
+                # All chunks shown to the agent are admitted to the registry at search
+                # time; the post-loop per-lookup cap explicitly preserves cited chunks
+                # (see _finding_chunk_ids below), so no force-admit is needed here.
+                if lf:
+                    with contextlib.suppress(Exception):
                         if isinstance(agent_findings, AgentFindings):
                             _findings_summary = [
                                 {
@@ -966,29 +892,7 @@ async def run_agent_loop(
                                     "observations_count": len(agent_findings.observations),
                                 },
                             )
-                except Exception:
-                    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "error").inc()
-                    logger.warning(
-                        "agent_findings_parse_failed",
-                        extra={"request_id": request_id, "raw_args": finalizer_tc.arguments[:500]},
-                    )
-                    if lf:
-                        lf.update_current_span(
-                            level="ERROR",
-                            metadata={"parse_ok": False, "raw_args": finalizer_tc.arguments[:300]},
-                        )
-                    await add_event(
-                        redis_app,
-                        request_id,
-                        "tool_call_completed",
-                        {
-                            "entity": "__finalizer__",
-                            "error": True,
-                            "reason": "findings_parse_failed",
-                        },
-                    )
-                finally:
-                    _fin_lf_stack.close()
+                _fin_lf_stack.close()
                 convergence_reason = "natural"
                 break
 
@@ -998,9 +902,11 @@ async def run_agent_loop(
             agent_messages.append(_assistant_msg_with_tool_calls(turn.tool_calls))
 
             async def _guarded_search(tc: ToolCallRef, _iter: int = iteration) -> _SearchResult:
-                async with _search_sem:
+                async with _search_sem, session_factory() as task_session:
+                    # A fresh session per concurrent search — the shared `session` is not
+                    # safe for concurrent use under asyncio.gather (P0-1).
                     return await _execute_search(
-                        tc, state, session, reranker, redis_app, request_id, _iter
+                        tc, state, task_session, reranker, redis_app, request_id, _iter
                     )
 
             results = await asyncio.gather(*[_guarded_search(tc) for tc in search_tcs])
@@ -1008,7 +914,7 @@ async def run_agent_loop(
             new_chunks = 0
             for tc, result in zip(search_tcs, results, strict=False):
                 if result.rewrite_stats:
-                    token_spend += result.rewrite_stats.input_tokens or 0
+                    input_by_model[_rewrite_model_id] += result.rewrite_stats.input_tokens or 0
                     output_tokens_total += result.rewrite_stats.output_tokens or 0
                     cost_usd_total += result.rewrite_stats.cost_usd or 0.0
                 entity_new = 0
@@ -1097,7 +1003,11 @@ async def run_agent_loop(
                 agent_messages = _compress_history(agent_messages, keep_last_n_turns=2)
                 continue
 
-            if token_spend > token_budget:
+            # P0-2: a productive round (new chunks admitted) resets the empty-round streak —
+            # `max_empty_analytical_rounds` counts *consecutive* empty rounds, not cumulative.
+            empty_rounds = 0
+
+            if sum(input_by_model.values()) > token_budget:
                 convergence_reason = "budget_cap"
                 break
 
@@ -1127,7 +1037,10 @@ async def run_agent_loop(
                         ],
                         "convergence_reason": convergence_reason,
                     },
-                    metadata={"token_spend_cumulative": token_spend, "new_chunks": new_chunks},
+                    metadata={
+                        "token_spend_cumulative": sum(input_by_model.values()),
+                        "new_chunks": new_chunks,
+                    },
                 )
             _turn_lf_stack.close()
 
@@ -1162,8 +1075,9 @@ async def run_agent_loop(
             iterations=iteration + 1,
             tool_calls_total=tool_calls_total,
             convergence_reason=convergence_reason,
-            input_tokens_total=token_spend,
+            input_tokens_total=sum(input_by_model.values()),
             output_tokens_total=output_tokens_total,
             cost_usd_total=cost_usd_total,
+            input_tokens_by_model=dict(input_by_model),
         ),
     )

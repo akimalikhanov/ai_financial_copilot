@@ -6,13 +6,17 @@ the iteration cap; that is deferred to Stage 16c (sufficiency-evaluated terminat
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from fakeredis import FakeAsyncRedis
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.chat import ChatPipelineState
@@ -22,6 +26,20 @@ from src.services.chat import agent_loop as agent_loop_module
 from src.services.chat.agent_loop import run_agent_loop
 from src.services.llm_adapters.base_adapter import AssistantTurnResult, ToolCallRef
 from src.services.llm_router import RoutedLLM
+
+
+def _fake_session_factory() -> async_sessionmaker[AsyncSession]:
+    """A callable yielding a fresh AsyncMock session per `async with` (mirrors
+    `async_sessionmaker`). Each call returns a distinct session object."""
+
+    def _factory() -> Any:
+        @contextlib.asynccontextmanager
+        async def _cm() -> AsyncIterator[Any]:
+            yield AsyncMock()
+
+        return _cm()
+
+    return cast("async_sessionmaker[AsyncSession]", _factory)
 
 
 def _make_chunk_with_payload() -> tuple[RetrievedChunk, dict]:
@@ -134,7 +152,13 @@ async def test_agent_loop_runs_search_then_finalizes(monkeypatch: pytest.MonkeyP
     )
 
     chunk_registry, agent_findings, meta = await run_agent_loop(
-        state, llm, state.session, state.redis_app, state.request_id, reranker=None
+        state,
+        llm,
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
     )
 
     assert meta.iterations == 2
@@ -170,12 +194,98 @@ async def test_agent_loop_stops_at_iteration_cap(monkeypatch: pytest.MonkeyPatch
     )
 
     _chunk_registry, agent_findings, meta = await run_agent_loop(
-        state, llm, state.session, state.redis_app, state.request_id, reranker=None
+        state,
+        llm,
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
     )
 
     assert meta.iterations == 3  # AGENT_MAX_ITERATIONS
     assert meta.convergence_reason == "iteration_cap"
     assert agent_findings is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_searches_each_open_a_distinct_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0-1: fanned-out searches must not share the loop's session — each opens its own.
+
+    Fire N searches in one turn and assert N distinct sessions were opened from the
+    factory (and that none of them is the loop's own serial `session`).
+    """
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")
+    state = _make_state()
+
+    n = 3
+    search_tcs = [
+        ToolCallRef(
+            id=f"call_{i}",
+            name="search_documents",
+            arguments=json.dumps({"entity": "Acme", "query": f"revenue {i}"}),
+        )
+        for i in range(n)
+    ]
+    findings_tc = ToolCallRef(
+        id="call_fin",
+        name="report_findings",
+        arguments=json.dumps(
+            {
+                "metric_requested": "revenue",
+                "findings": [{"entity": "Acme", "available": True, "value": 100}],
+            }
+        ),
+    )
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=search_tcs),
+            AssistantTurnResult(text="", tool_calls=[findings_tc]),
+        ]
+    )
+    llm = _routed_llm(adapter)
+
+    opened: list[Any] = []
+
+    def _recording_factory() -> Any:
+        @contextlib.asynccontextmanager
+        async def _cm() -> AsyncIterator[Any]:
+            sess = AsyncMock()
+            opened.append(sess)
+            yield sess
+
+        return _cm()
+
+    seen: list[Any] = []
+
+    async def _fake_execute_search(_tc: Any, _state: Any, session: Any, *_a: Any, **_k: Any):
+        seen.append(session)
+        # Yield to the event loop so overlapping searches can't be papered over.
+        await asyncio.sleep(0)
+        chunk, payloads = _make_chunk_with_payload()
+        return agent_loop_module._SearchResult(chunks=[chunk], payloads=payloads)
+
+    monkeypatch.setattr(
+        "src.services.chat.agent_loop._execute_search",
+        _fake_execute_search,
+    )
+
+    await run_agent_loop(
+        state,
+        llm,
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=cast("async_sessionmaker[AsyncSession]", _recording_factory),
+    )
+
+    assert len(opened) == n
+    assert len({id(s) for s in seen}) == n  # every search got its own session
+    assert state.session not in seen  # never the loop's shared session
 
 
 def test_analytical_insufficiency_rejects_evidence_free_observation() -> None:
