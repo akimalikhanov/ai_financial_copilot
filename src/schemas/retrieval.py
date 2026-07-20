@@ -134,6 +134,13 @@ class RAGContext:
     def retrieval_scores(self) -> tuple[float, ...]:
         return tuple(item.score for item in self.items)
 
+    @property
+    def chunk_to_ref(self) -> dict[UUID, str]:
+        return {item.chunk_id: item.ref_id for item in self.items}
+
+    def ref_for(self, chunk_id: UUID) -> str | None:
+        return self.chunk_to_ref.get(chunk_id)
+
 
 # ---------------------------------------------------------------------------
 # Answer-layer citation models (streaming parser output)

@@ -64,6 +64,10 @@ AGENT_ITERATIONS = Histogram(
     buckets=(1, 2, 3, 4, 5, 8),
 )
 AGENT_TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["tool", "status"])
+CITATION_REFS_DROPPED = Counter(
+    "citation_refs_dropped_total",
+    "Finding citations dropped (no excerpt in synthesis context)",
+)
 AGENT_TOOL_DURATION = Histogram(
     "agent_tool_duration_seconds",
     "Tool latency",

@@ -34,6 +34,7 @@ from src.services.chat.tools import (
     REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
     SEARCH_TOOL,
+    SearchDocumentsArgs,
 )
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
@@ -107,13 +108,15 @@ class AgentLoopMeta:
     iterations: int
     tool_calls_total: int
     convergence_reason: Literal["natural", "convergence", "iteration_cap", "budget_cap", "timeout"]
-    currency_normalized: bool = False
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     cost_usd_total: float = 0.0
     # P0-4: input tokens attributed per model_id (agent tool model vs query-rewrite model).
     # input_tokens_total is their sum; the budget cap checks the sum, unchanged.
     input_tokens_by_model: dict[str, int] = field(default_factory=dict)
+    # Entities the loop actually called search_documents for — the synthesis boundary uses
+    # this (not reported coverage) to label stubs for entities the agent never searched.
+    searched_entities: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -203,9 +206,21 @@ async def _execute_search(
     request_id: str,
     iteration: int,
 ) -> _SearchResult:
-    args = json.loads(tc.arguments)
-    entity: str = args.get("entity", "unknown")
-    raw_query: str = args.get("query", "")
+    try:
+        search_args = SearchDocumentsArgs.model_validate_json(tc.arguments)
+    except ValidationError:
+        logger.warning(
+            "agent_search_args_invalid",
+            extra={"request_id": request_id, "raw_args": tc.arguments[:500]},
+        )
+        AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+        return _SearchResult(
+            chunks=[],
+            payloads={},
+            error_str="search_documents call had invalid arguments — entity and query are required strings.",
+        )
+    entity = search_args.entity
+    raw_query = search_args.query
 
     _tool_started = perf_counter()
     await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
@@ -635,7 +650,19 @@ async def run_agent_loop(
                     input={
                         "iteration": iteration,
                         "messages": [
-                            {"role": m.role.value, "content": (m.content or "")[:500]}
+                            {
+                                "role": m.role.value,
+                                "content": (m.content or "")[:500],
+                                "tool_call_id": m.tool_call_id,
+                                "tool_calls": (
+                                    [
+                                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                                        for tc in m.tool_calls
+                                    ]
+                                    if m.tool_calls
+                                    else None
+                                ),
+                            }
                             for m in agent_messages
                         ],
                     },
@@ -1079,5 +1106,6 @@ async def run_agent_loop(
             output_tokens_total=output_tokens_total,
             cost_usd_total=cost_usd_total,
             input_tokens_by_model=dict(input_by_model),
+            searched_entities=frozenset(searched_entities),
         ),
     )

@@ -8,11 +8,14 @@ import random
 import re
 from dataclasses import dataclass
 from typing import Literal
+from uuid import UUID
 
 import httpx
 
 from src.observability import langfuse as lf_client
+from src.observability.metrics import CITATION_REFS_DROPPED
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
+from src.schemas.retrieval import RAGContext
 
 logger = logging.getLogger(__name__)
 
@@ -302,15 +305,23 @@ async def process_findings(
     )
 
 
-def _map_refs(raw_refs: list[str], chunk_id_to_ref: dict[str, str]) -> str:
-    """Map chunk UUIDs to S-labels, silently dropping any without a context excerpt."""
-    mapped = [chunk_id_to_ref[c] for c in raw_refs if c in chunk_id_to_ref]
+def _map_refs(raw_refs: list[str], rag_context: RAGContext) -> str:
+    """Map chunk UUIDs to S-labels via the RAGContext, dropping any without a context excerpt."""
+    mapped: list[str] = []
+    for raw in raw_refs:
+        ref: str | None = None
+        with contextlib.suppress(ValueError):
+            ref = rag_context.ref_for(UUID(raw))
+        if ref is not None:
+            mapped.append(ref)
+        else:
+            CITATION_REFS_DROPPED.inc()
     return ", ".join(mapped) or "—"
 
 
 def _render_findings_block(
     processed: ProcessedFindings,
-    chunk_id_to_ref: dict[str, str] | None = None,
+    rag_context: RAGContext | None = None,
 ) -> str:
     lines = ["[STRUCTURED FINDINGS]"]
 
@@ -350,10 +361,10 @@ def _render_findings_block(
         f = nf.finding
         unit_str = f.unit if f.unit is not None else "M"
         raw_chunks = f.source_chunks or []
-        if chunk_id_to_ref is not None:
+        if rag_context is not None:
             # Drop refs with no excerpt in the synthesis context — leaking a raw ref
             # here would let the model cite an ID the citation pipeline can't resolve.
-            chunks_str = _map_refs(raw_chunks, chunk_id_to_ref)
+            chunks_str = _map_refs(raw_chunks, rag_context)
         else:
             chunks_str = ", ".join(raw_chunks) or "—"
         if not f.available or f.value is None:
@@ -383,14 +394,14 @@ def _render_findings_block(
 
 def _render_observations_block(
     findings: AnalyticalFindings,
-    chunk_id_to_ref: dict[str, str] | None = None,
+    rag_context: RAGContext | None = None,
 ) -> str:
     lines = ["[AGENT OBSERVATIONS]", f"Question: {findings.question}", ""]
 
     for i, obs in enumerate(findings.observations, 1):
-        if chunk_id_to_ref is not None:
-            chunks_str = _map_refs(obs.evidence_chunks, chunk_id_to_ref)
-            refuted_str = _map_refs(obs.refuted_by or [], chunk_id_to_ref)
+        if rag_context is not None:
+            chunks_str = _map_refs(obs.evidence_chunks, rag_context)
+            refuted_str = _map_refs(obs.refuted_by or [], rag_context)
         else:
             chunks_str = ", ".join(obs.evidence_chunks) if obs.evidence_chunks else "—"
             refuted_str = ", ".join(obs.refuted_by) if obs.refuted_by else "—"

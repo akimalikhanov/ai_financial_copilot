@@ -41,9 +41,6 @@ from src.repository import (
 )
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
-from src.schemas.agent_findings import AgentFindings as _AgentFindings
-from src.schemas.agent_findings import AnalyticalFindings as _AnalyticalFindings
-from src.schemas.agent_findings import EntityFinding as _EntityFinding
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept for kill-switch path)
@@ -52,7 +49,7 @@ from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept f
     TransformerInput,
 )
 from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
-from src.services.chat.agent_loop import _order_chunks, run_agent_loop
+from src.services.chat.agent_loop import run_agent_loop
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
@@ -64,20 +61,13 @@ from src.services.chat.events import (
     out_of_scope_response,
     span_to_dict,
 )
-from src.services.chat.findings_processor import (
-    ProcessedFindings,
-    _render_findings_block,
-    _render_observations_block,
-    process_findings,
-)
+from src.services.chat.synthesis import run_synthesis
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
-from src.services.retrieval.context_assembler import assemble_rag_context
 
 # from src.services.retrieval.query_processor import process_query
-from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.query_transformer import rewrite_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
@@ -287,6 +277,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     agent_findings_json: str | None = None  # set by agent branch; used in persist
     _agent_answer_entity: str | None = None
     _agent_fx_rates: dict = {}
+    _agent_currency_converted: bool = False
     stage_total = 8
     stage_index = 0
     current_stage = "initializing"
@@ -683,138 +674,23 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 state.agent_meta = agent_meta
                 state.used_agent_loop = True
 
-                ordered = _order_chunks(chunk_registry)
-
-                processed: ProcessedFindings | None = None
-                if agent_findings is not None:
-                    # Step 3: defence-in-depth — inject stubs for entities the agent never searched
-                    if (
-                        isinstance(agent_findings, _AgentFindings)
-                        and state.scope_result
-                        and state.scope_result.per_entity_doc_ids
-                    ):
-                        covered = {f.entity for f in agent_findings.findings}
-                        missing_stubs = tuple(
-                            _EntityFinding(
-                                entity=name, available=False, reason="not searched by agent"
-                            )
-                            for name in sorted(state.scope_result.per_entity_doc_ids.keys())
-                            if name not in covered
-                        )
-                        if missing_stubs:
-                            agent_findings = agent_findings.model_copy(
-                                update={"findings": agent_findings.findings + missing_stubs}
-                            )
-
-                    agent_findings_json = agent_findings.model_dump_json()
-
-                    _fp_lf_stack = contextlib.ExitStack()
-                    if lf:
-                        _fp_lf_stack.enter_context(
-                            lf.start_as_current_observation(
-                                as_type="span",
-                                name="findings_processor",
-                                input={
-                                    "type": type(agent_findings).__name__,
-                                    "metric_requested": getattr(
-                                        agent_findings, "metric_requested", None
-                                    ),
-                                    "comparison_op": getattr(agent_findings, "comparison_op", None),
-                                    "findings": [f.model_dump() for f in agent_findings.findings]
-                                    if isinstance(agent_findings, _AgentFindings)
-                                    else None,
-                                },
-                            )
-                        )
-                    try:
-                        processed = await process_findings(
-                            agent_findings,
-                            requested_currency=getattr(
-                                state.router_output, "requested_currency", None
-                            ),
-                        )
-                        if lf:
-                            lf.update_current_span(
-                                output={
-                                    "currency_converted": processed.currency_converted,
-                                    "answer_entity": processed.answer_entity,
-                                    "fx_rates_used": processed.fx_rates_used,
-                                    "answer_note": processed.answer_note,
-                                    "comparison_op": processed.comparison_op,
-                                    "findings": [
-                                        {
-                                            "entity": nf.finding.entity,
-                                            "normalized_value": nf.normalized_value,
-                                            "fx_rate": nf.fx_rate,
-                                            "native_value": nf.finding.value,
-                                            "currency": nf.finding.currency,
-                                            "unit": nf.finding.unit,
-                                            "period_end": nf.finding.period_end,
-                                            "available": nf.finding.available,
-                                        }
-                                        for nf in processed.findings
-                                    ],
-                                },
-                            )
-                    finally:
-                        _fp_lf_stack.close()
-
-                    agent_meta.currency_normalized = processed.currency_converted
-                    _agent_answer_entity = processed.answer_entity
-                    _agent_fx_rates = processed.fx_rates_used
-
-                    # Step 11: narrow the synthesis context to the chunks the agent actually
-                    # cited in its findings — those are the evidence it reasoned over, and the
-                    # registry is already volume-capped per lookup in run_agent_loop. When the
-                    # findings cite nothing (e.g. a weak tool model that omits source_chunks),
-                    # fall back to the full capped registry rather than starving synthesis.
-                    cited_ids: set[UUID] = set()
-                    if isinstance(agent_findings, _AgentFindings):
-                        for _f in agent_findings.findings:
-                            for _sc in _f.source_chunks or []:
-                                with contextlib.suppress(Exception):
-                                    cited_ids.add(UUID(_sc))
-                    elif isinstance(agent_findings, _AnalyticalFindings):
-                        for _obs in agent_findings.observations:
-                            for _ec in _obs.evidence_chunks or []:
-                                with contextlib.suppress(Exception):
-                                    cited_ids.add(UUID(_ec))
-
-                    if cited_ids:
-                        synthesis_chunks = [c for c in ordered if c.chunk_id in cited_ids]
-                    else:
-                        synthesis_chunks = ordered
-                else:
-                    synthesis_chunks = ordered
-
-                chunk_ids = [c.chunk_id for c in synthesis_chunks]
-                payloads = await get_chunk_prompt_payloads(session, chunk_ids)
-                state.rag_context, _ = assemble_rag_context(
-                    synthesis_chunks, payloads, assume_unique=True
+                agent_result = await run_synthesis(
+                    chunk_registry,
+                    agent_findings,
+                    agent_meta,
+                    state.scope_result,
+                    getattr(state.router_output, "requested_currency", None),
+                    session,
                 )
+                state.rag_context = agent_result.rag_context
+                state.rag_context_str = agent_result.synthesis_context
 
-                # Step 6: UUID→ref_id map (follows assemble_rag_context — ref_ids assigned there)
-                _chunk_id_to_ref: dict[str, str] = {
-                    str(item.chunk_id): item.ref_id for item in state.rag_context.items
-                }
-
-                if processed is not None:
-                    if processed.analytical_findings is not None:
-                        findings_block = _render_observations_block(
-                            processed.analytical_findings, chunk_id_to_ref=_chunk_id_to_ref
-                        )
-                    else:
-                        findings_block = _render_findings_block(
-                            processed, chunk_id_to_ref=_chunk_id_to_ref
-                        )
-
-                    state.rag_context_str = (
-                        findings_block + "\n\n" + (state.rag_context.formatted_context or "")
-                    )
-                else:
-                    state.rag_context_str = (
-                        state.rag_context.formatted_context or "(No document context.)"
-                    )
+                if agent_result.findings is not None:
+                    agent_findings_json = agent_result.findings.model_dump_json()
+                if agent_result.processed is not None:
+                    _agent_answer_entity = agent_result.processed.answer_entity
+                    _agent_fx_rates = agent_result.processed.fx_rates_used
+                    _agent_currency_converted = agent_result.processed.currency_converted
 
                 logger.info(
                     "agent_loop_complete",
@@ -1138,7 +1014,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,
                             "convergence_reason": m.convergence_reason,
-                            "currency_normalized": m.currency_normalized,
+                            "currency_normalized": _agent_currency_converted,
                             "answer_entity": _agent_answer_entity,
                             "fx_rates_used": _agent_fx_rates,
                         }

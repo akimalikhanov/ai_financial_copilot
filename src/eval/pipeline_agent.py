@@ -29,16 +29,10 @@ from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.retrieval import RAGContext
-from src.services.chat.agent_loop import AgentLoopMeta, _order_chunks, run_agent_loop
-from src.services.chat.findings_processor import (
-    ProcessedFindings,
-    _render_findings_block,
-    _render_observations_block,
-    process_findings,
-)
+from src.services.chat.agent_loop import AgentLoopMeta, run_agent_loop
+from src.services.chat.findings_processor import ProcessedFindings
+from src.services.chat.synthesis import run_synthesis
 from src.services.llm_router import LLMRouter, get_router
-from src.services.retrieval.context_assembler import assemble_rag_context
-from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
 from src.utils.config import get_agent_config, get_redis_app_url
@@ -164,54 +158,33 @@ async def run_one(
         if _owns_redis:
             await _redis.aclose()
 
-    ordered = _order_chunks(chunk_registry)
-    chunk_ids = [c.chunk_id for c in ordered]
-    payloads = await get_chunk_prompt_payloads(session, chunk_ids)
-    rag_context, _ = assemble_rag_context(ordered, payloads, assume_unique=True)
-
-    processed_findings: ProcessedFindings | None = None
-    rag_context_str: str
-
-    if agent_findings is not None:
-        processed_findings = await process_findings(
-            agent_findings,
-            requested_currency=getattr(router_out, "requested_currency", None),
-        )
-
-        # Mirror the prod path: map finding chunk UUIDs to the synthesis context's
-        # S-labels so the synthesis model only ever sees citable excerpt IDs.
-        chunk_id_to_ref = {str(item.chunk_id): item.ref_id for item in rag_context.items}
-        if processed_findings.analytical_findings is not None:
-            findings_block = _render_observations_block(
-                processed_findings.analytical_findings, chunk_id_to_ref=chunk_id_to_ref
-            )
-        else:
-            findings_block = _render_findings_block(
-                processed_findings, chunk_id_to_ref=chunk_id_to_ref
-            )
-
-        rag_context_str = findings_block + "\n\n" + (rag_context.formatted_context or "")
-    else:
-        rag_context_str = rag_context.formatted_context or "(No document context.)"
+    agent_result = await run_synthesis(
+        chunk_registry,
+        agent_findings,
+        agent_meta,
+        scope_result,
+        getattr(router_out, "requested_currency", None),
+        session,
+    )
 
     if retrieval_only:
         return AgentPipelineResult(
             route=route,
-            rag_context=rag_context,
+            rag_context=agent_result.rag_context,
             retrieval_trace=None,
             answer=None,
             citation_spans=[],
             usage=None,
             agent_meta=agent_meta,
-            agent_findings=agent_findings,
-            processed_findings=processed_findings,
+            agent_findings=agent_result.findings,
+            processed_findings=agent_result.processed,
             query_shape=query_shape,
         )
 
     # Synthesise answer using the agent synthesis prompt (same model as classic eval)
     answer, spans, stats = await _run_answer(
         question.question,
-        _rag_context_with_override(rag_context, rag_context_str),
+        _rag_context_with_override(agent_result.rag_context, agent_result.synthesis_context),
         model_id,
         router,
         prompt_version,
@@ -222,14 +195,14 @@ async def run_one(
 
     return AgentPipelineResult(
         route=route,
-        rag_context=rag_context,
+        rag_context=agent_result.rag_context,
         retrieval_trace=None,
         answer=answer,
         citation_spans=spans,
         usage=stats,
         agent_meta=agent_meta,
-        agent_findings=agent_findings,
-        processed_findings=processed_findings,
+        agent_findings=agent_result.findings,
+        processed_findings=agent_result.processed,
         query_shape=query_shape,
     )
 

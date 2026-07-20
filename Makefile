@@ -50,3 +50,10 @@ test: test-unit test-integration
 .PHONY: test-cov
 test-cov:
 	.venv/bin/python -m pytest tests/unit/ --cov=src --cov-report=term --cov-report=html
+
+# Rebuild + restart the containerized stack, then drop the dangling images
+# left behind by the previous build (same tag, now untagged).
+.PHONY: docker-rebuild
+docker-rebuild:
+	cd infra/docker && docker compose --env-file ../../.env up -d --build
+	docker image prune -f
