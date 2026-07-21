@@ -13,9 +13,9 @@ import pytest
 from src.observability.metrics import CITATION_REFS_DROPPED
 from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat import synthesis
-from src.services.chat.agent_loop import AgentLoopMeta
-from src.services.chat.findings_processor import _map_refs
+from src.services.chat.agent import synthesis
+from src.services.chat.agent.processor import _map_refs
+from src.services.chat.agent.state import AgentLoopMeta
 from src.services.retrieval.context_assembler import assemble_rag_context
 
 

@@ -14,9 +14,9 @@ from httpx import ASGITransport, AsyncClient
 from src.api.routers import get_routers
 from src.db import init_db, shutdown_db
 from src.redis_client import close_redis_client, create_redis_app_client
+from src.services.chat.agent.state import get_agent_settings
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
 from src.services.llm_router import LLMRouter, RoutedLLM
-from src.utils.config import get_agent_config
 
 # Distinctive mock response to verify mock is used (avoids real LLM calls)
 MOCK_RESPONSE = "[INTEGRATION-TEST-MOCK-RESPONSE]"
@@ -55,7 +55,7 @@ def _create_mock_router(response_text: str = MOCK_RESPONSE) -> LLMRouter:
     )
     # Agent tool-calling loop is enabled via .env(.example) (AGENT_LOOP_ENABLED=True,
     # AGENT_TOOL_MODEL=gpt-5-mini) — register it too so router.get() finds it.
-    agent_tool_model_id = get_agent_config()["tool_model"]
+    agent_tool_model_id = get_agent_settings().tool_model
     agent_tool_llm = MockStreamingLLM(response_text=response_text)
     agent_tool_routed = RoutedLLM(
         adapter=agent_tool_llm,  # type: ignore[arg-type]

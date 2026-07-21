@@ -1,0 +1,92 @@
+"""Tool schemas + registry for the agent loop.
+
+Pydantic arg models are the single source of truth: their JSON schemas drive the tool
+definitions handed to the LLM, and the same models parse the tool-call arguments back
+— schema and parser cannot drift (P2-10, P0-3).
+
+`TOOL_REGISTRY` replaces the old `_FINALIZER_NAMES` frozenset + hardcoded dispatch
+(P2-14): it is the single place that knows which tool names are terminal (finalizers)
+and, per doc's Contract C3, which gates guard them (structural before sufficiency).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from pydantic import BaseModel, Field
+
+from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
+from src.services.chat.agent.gates import GateFn, analytical_insufficiency_gate, missing_entity_gate
+from src.utils.json_schema import make_strict
+
+
+def tool_schema(name: str, description: str, args: type[BaseModel]) -> dict:
+    """Build an OpenAI-compatible tool definition from a Pydantic arg model."""
+    schema = args.model_json_schema()
+    make_strict(schema)
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": schema},
+    }
+
+
+class SearchDocumentsArgs(BaseModel):
+    entity: str = Field(description="The entity (company, fund, etc.) to search documents for.")
+    query: str = Field(description="What to look for in that entity's documents.")
+
+
+SEARCH_TOOL = tool_schema(
+    "search_documents",
+    "Search financial documents for a specific entity. Call once per entity.",
+    SearchDocumentsArgs,
+)
+
+REPORT_FINDINGS_TOOL = tool_schema(
+    "report_findings",
+    "Call this once when you have finished searching. Report extracted values for all entities. This ends the search phase.",
+    AgentFindings,
+)
+
+REPORT_ANALYTICAL_TOOL = tool_schema(
+    "report_analytical_findings",
+    "Call this once when you have a complete chain of observations for a causal or narrative question. This ends the search phase.",
+    AnalyticalFindings,
+)
+
+
+@dataclass(frozen=True)
+class ToolRegistration:
+    schema: dict
+    terminal: bool = False
+    gates: tuple[GateFn, ...] = field(default_factory=tuple)
+
+
+TOOL_REGISTRY: dict[str, ToolRegistration] = {
+    "search_documents": ToolRegistration(schema=SEARCH_TOOL),
+    "report_findings": ToolRegistration(
+        schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
+    ),
+    "report_analytical_findings": ToolRegistration(
+        schema=REPORT_ANALYTICAL_TOOL, terminal=True, gates=(analytical_insufficiency_gate,)
+    ),
+}
+
+# Current per-query_shape tool sets — Stage 1.5's single-pool merge is a later step.
+TOOLS_EXTRACTION_COMPARISON = [
+    TOOL_REGISTRY["search_documents"].schema,
+    TOOL_REGISTRY["report_findings"].schema,
+]
+TOOLS_ANALYTICAL = [
+    TOOL_REGISTRY["search_documents"].schema,
+    TOOL_REGISTRY["report_analytical_findings"].schema,
+]
+
+
+def is_terminal(name: str) -> bool:
+    reg = TOOL_REGISTRY.get(name)
+    return reg is not None and reg.terminal
+
+
+def gates_for(name: str) -> tuple[GateFn, ...]:
+    reg = TOOL_REGISTRY.get(name)
+    return reg.gates if reg is not None else ()

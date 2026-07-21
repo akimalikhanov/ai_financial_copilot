@@ -366,6 +366,16 @@ def _compute_aggregate(
             by_shape.setdefault(r.query_shape or "unknown", []).append(r)
         agent_agg["by_query_shape"] = {shape: _summarize(rows) for shape, rows in by_shape.items()}
 
+        # Router misclassification rate — gold label (EvalQuestion.query_shape) vs the
+        # router's live prediction, over rows where a gold label was hand-authored.
+        labeled_rows = [r for r in agent_rows if r.expected_query_shape is not None]
+        if labeled_rows:
+            misclassified = [r for r in labeled_rows if r.query_shape != r.expected_query_shape]
+            agent_agg["query_shape_misclassification_rate"] = round(
+                len(misclassified) / len(labeled_rows), 4
+            )
+            agent_agg["query_shape_misclassified_qids"] = [r.qid for r in misclassified]
+
     return AggregateMetrics(
         retrieval=ret,
         correctness=correct_agg,
@@ -426,6 +436,9 @@ def _print_summary(output: RunOutput, out_path: Path) -> None:
 
     if agg.agent:
         print("  AGENT LOOP (by query_shape)")
+        misclass_rate = agg.agent.get("query_shape_misclassification_rate")
+        if misclass_rate is not None:
+            print(f"    router misclassification rate: {misclass_rate:.1%}")
         for shape, s in (agg.agent.get("by_query_shape") or {}).items():
             conv = ", ".join(f"{k}={v}" for k, v in s["convergence_reason"].items())
             conf = ", ".join(f"{k}={v}" for k, v in s["confidence_counts"].items()) or "—"

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.tools import (
+from src.services.chat.agent.tools import (
     REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
     SEARCH_TOOL,

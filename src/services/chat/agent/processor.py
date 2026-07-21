@@ -1,3 +1,5 @@
+"""FX normalization + findings rendering (moved from chat/findings_processor.py)."""
+
 from __future__ import annotations
 
 import asyncio

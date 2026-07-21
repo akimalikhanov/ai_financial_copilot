@@ -2,13 +2,13 @@
 
 The original pipeline.py (single-pass RAG) is preserved for backward-compatibility.
 This module mirrors its public interface — run_one returns a PipelineResult — but
-internally drives run_agent_loop the same way the Celery chat task does.
+internally drives run_agent the same way the Celery chat task does.
 
 Key differences from pipeline.py:
-- Uses run_agent_loop (multi-turn tool-calling) instead of a single rewrite+retrieve.
+- Uses run_agent (multi-turn tool-calling + synthesis) instead of a single rewrite+retrieve.
 - Requires a Redis connection for SSE event plumbing (events are fire-and-forget here).
 - Requires the agent feature models to be configured in models.yaml.
-- PipelineResult.rag_context is populated from the agent's chunk_registry.
+- PipelineResult.rag_context is populated from the agent's synthesized context.
 - agent_meta and agent_findings are exposed on PipelineResult for inspection.
 """
 
@@ -29,13 +29,13 @@ from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.retrieval import RAGContext
-from src.services.chat.agent_loop import AgentLoopMeta, run_agent_loop
-from src.services.chat.findings_processor import ProcessedFindings
-from src.services.chat.synthesis import run_synthesis
+from src.services.chat.agent import run_agent
+from src.services.chat.agent.processor import ProcessedFindings
+from src.services.chat.agent.state import AgentLoopMeta, get_agent_settings
 from src.services.llm_router import LLMRouter, get_router
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
-from src.utils.config import get_agent_config, get_redis_app_url
+from src.utils.config import get_redis_app_url
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ async def run_one(
     """
     router = llm_router or get_router()
     reranker = get_reranker()
-    cfg = get_agent_config()
+    settings = get_agent_settings()
 
     router_inp = RouterInput(
         query=question.question,
@@ -122,7 +122,7 @@ async def run_one(
             query_shape=query_shape,
         )
 
-    # Build a minimal ChatPipelineState for run_agent_loop
+    # Build a minimal ChatPipelineState for run_agent
     request_id = str(uuid.uuid4())
 
     _owns_redis = redis is None
@@ -148,24 +148,17 @@ async def run_one(
     state.llm_request = _LLMRequestStub()  # type: ignore[assignment]
 
     try:
-        tool_model_id: str = cfg["tool_model"]
+        tool_model_id: str = settings.tool_model
         tool_llm = router.get(tool_model_id)
 
-        chunk_registry, agent_findings, agent_meta = await run_agent_loop(
+        agent_result = await run_agent(
             state, tool_llm, session, _redis, request_id, reranker, get_session_factory()
         )
     finally:
         if _owns_redis:
             await _redis.aclose()
 
-    agent_result = await run_synthesis(
-        chunk_registry,
-        agent_findings,
-        agent_meta,
-        scope_result,
-        getattr(router_out, "requested_currency", None),
-        session,
-    )
+    agent_meta = agent_result.meta
 
     if retrieval_only:
         return AgentPipelineResult(

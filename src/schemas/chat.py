@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from src.schemas.query_router import DocumentScopeResult, RouterOutput
     from src.schemas.query_transform import TransformedQuery
     from src.schemas.retrieval import ProcessedQuery, RAGContext
-    from src.services.chat.agent_loop import AgentLoopMeta
+    from src.services.chat.agent.state import AgentLoopMeta
     from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
 

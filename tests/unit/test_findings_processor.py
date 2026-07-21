@@ -11,7 +11,7 @@ import pytest
 import respx
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
-from src.services.chat.findings_processor import _normalize_date, _to_millions, process_findings
+from src.services.chat.agent.processor import _normalize_date, _to_millions, process_findings
 
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 

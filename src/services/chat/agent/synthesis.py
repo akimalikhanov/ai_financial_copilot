@@ -4,7 +4,8 @@ Single home for the sequence `tasks.py` and `src.eval.pipeline_agent` previously
 re-implemented (and had drifted, see docs/stages/agentic_state_refactor_v2.md P0-5):
 resolve findings -> inject stubs for entities the agent never searched -> normalize FX ->
 select the evidence the findings actually cite -> assemble the RAG context -> render the
-findings block -> concatenate. Both callers now collapse to a single `run_synthesis` call.
+findings block -> concatenate. Both callers now collapse to a single `run_agent` call
+(see `__init__.py`), which calls this after the loop.
 """
 
 from __future__ import annotations
@@ -19,13 +20,13 @@ from src.observability import langfuse as lf_client
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
 from src.schemas.query_router import DocumentScopeResult
 from src.schemas.retrieval import RAGContext, RetrievedChunk
-from src.services.chat.agent_loop import AgentLoopMeta, _order_chunks
-from src.services.chat.findings_processor import (
+from src.services.chat.agent.processor import (
     ProcessedFindings,
     _render_findings_block,
     _render_observations_block,
     process_findings,
 )
+from src.services.chat.agent.state import AgentLoopMeta
 from src.services.retrieval.context_assembler import assemble_rag_context
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 
@@ -37,6 +38,10 @@ class AgentRunResult:
     findings: AgentFindings | AnalyticalFindings | None
     processed: ProcessedFindings | None
     meta: AgentLoopMeta
+
+
+def _order_chunks(registry: dict[UUID, RetrievedChunk]) -> list[RetrievedChunk]:
+    return sorted(registry.values(), key=lambda c: (c.turn_index, -(c.score or 0)))
 
 
 def _inject_unsearched_stubs(

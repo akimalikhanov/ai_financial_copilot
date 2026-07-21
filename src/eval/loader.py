@@ -19,6 +19,7 @@ def load(path: str | Path) -> list[EvalQuestion]:
                 kind=data["kind"],
                 answers=data["answers"],
                 reference_pools=data.get("reference_pools", []),
+                query_shape=data.get("query_shape"),
             )
         )
     return questions

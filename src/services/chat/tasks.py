@@ -49,7 +49,8 @@ from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept f
     TransformerInput,
 )
 from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
-from src.services.chat.agent_loop import run_agent_loop
+from src.services.chat.agent import run_agent
+from src.services.chat.agent.state import get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
@@ -61,7 +62,6 @@ from src.services.chat.events import (
     out_of_scope_response,
     span_to_dict,
 )
-from src.services.chat.synthesis import run_synthesis
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
@@ -73,7 +73,6 @@ from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
-    get_agent_config,
     get_conversation_naming_config,
     get_db_url,
     get_injection_scan_user_input_enabled,
@@ -606,16 +605,16 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
                 return
 
-            agent_cfg = get_agent_config()
+            agent_settings = get_agent_settings()
             _use_agent = (
-                agent_cfg["enabled"]
+                agent_settings.enabled
                 and state.processed_query.route == "retrieve"
                 and llm_request.user_id is not None
             )
 
             # 3.5 / 4 — agent branch or classic single-pass
             if _use_agent:
-                _tool_model_id: str = agent_cfg["tool_model"]
+                _tool_model_id: str = agent_settings.tool_model
                 _tool_llm = router.get(_tool_model_id)
                 if not _tool_llm.capabilities.get("tool_calling", False):
                     raise RuntimeError(
@@ -644,7 +643,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         )
                     )
                 try:
-                    chunk_registry, agent_findings, agent_meta = await run_agent_loop(
+                    agent_result = await run_agent(
                         state,
                         _tool_llm,
                         session,
@@ -653,13 +652,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         _get_reranker(),
                         _get_session_factory(),
                     )
+                    agent_meta = agent_result.meta
                     if lf:
                         lf.update_current_span(
                             output={
                                 "iterations": agent_meta.iterations,
                                 "tool_calls_total": agent_meta.tool_calls_total,
                                 "convergence_reason": agent_meta.convergence_reason,
-                                "chunks_collected": len(chunk_registry),
+                                "chunks_collected": len(agent_result.rag_context.items),
                             },
                             metadata={
                                 "input_tokens_total": agent_meta.input_tokens_total,
@@ -674,14 +674,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 state.agent_meta = agent_meta
                 state.used_agent_loop = True
 
-                agent_result = await run_synthesis(
-                    chunk_registry,
-                    agent_findings,
-                    agent_meta,
-                    state.scope_result,
-                    getattr(state.router_output, "requested_currency", None),
-                    session,
-                )
                 state.rag_context = agent_result.rag_context
                 state.rag_context_str = agent_result.synthesis_context
 
@@ -699,8 +691,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "iterations": agent_meta.iterations,
                         "tool_calls_total": agent_meta.tool_calls_total,
                         "convergence_reason": agent_meta.convergence_reason,
-                        "chunks_collected": len(chunk_registry),
-                        "findings_set": agent_findings is not None,
+                        "chunks_collected": len(agent_result.rag_context.items),
+                        "findings_set": agent_result.findings is not None,
                     },
                 )
 

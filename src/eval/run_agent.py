@@ -205,6 +205,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                     kind=q.kind,
                     expected_answers=q.answers,
                     reference_pools=q.reference_pools,
+                    expected_query_shape=q.query_shape,
                 )
 
                 unresolved = [

@@ -22,8 +22,8 @@ from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import DocumentScopeResult, RouterOutput
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat import agent_loop as agent_loop_module
-from src.services.chat.agent_loop import run_agent_loop
+from src.services.chat.agent import gates as gates_module
+from src.services.chat.agent.loop import _SearchResult, run_loop
 from src.services.llm_adapters.base_adapter import AssistantTurnResult, ToolCallRef
 from src.services.llm_router import RoutedLLM
 
@@ -114,7 +114,7 @@ def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_runs_search_then_finalizes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_agent_loop_runs_search_then_finalizes() -> None:
     """Loop issues a search_documents call, then report_findings, and terminates naturally."""
     state = _make_state()
 
@@ -144,14 +144,11 @@ async def test_agent_loop_runs_search_then_finalizes(monkeypatch: pytest.MonkeyP
     llm = _routed_llm(adapter)
 
     found_chunk, payloads = _make_chunk_with_payload()
-    monkeypatch.setattr(
-        "src.services.chat.agent_loop._execute_search",
-        AsyncMock(
-            return_value=agent_loop_module._SearchResult(chunks=[found_chunk], payloads=payloads)
-        ),
-    )
 
-    chunk_registry, agent_findings, meta = await run_agent_loop(
+    async def _fake_execute_search(*_args: Any, **_kwargs: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[found_chunk], payloads=payloads)
+
+    chunk_registry, agent_findings, meta = await run_loop(
         state,
         llm,
         state.session,
@@ -159,6 +156,7 @@ async def test_agent_loop_runs_search_then_finalizes(monkeypatch: pytest.MonkeyP
         state.request_id,
         reranker=None,
         session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
     )
 
     assert meta.iterations == 2
@@ -168,7 +166,7 @@ async def test_agent_loop_runs_search_then_finalizes(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_stops_at_iteration_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_agent_loop_stops_at_iteration_cap() -> None:
     """An LLM mock that would loop forever is still bounded by max_iterations."""
     state = _make_state()
 
@@ -184,16 +182,11 @@ async def test_agent_loop_stops_at_iteration_cap(monkeypatch: pytest.MonkeyPatch
     adapter.complete_with_tools = AsyncMock(side_effect=_always_search)
     llm = _routed_llm(adapter)
 
-    async def _fake_execute_search(*_args: Any, **_kwargs: Any):
+    async def _fake_execute_search(*_args: Any, **_kwargs: Any) -> _SearchResult:
         chunk, payloads = _make_chunk_with_payload()
-        return agent_loop_module._SearchResult(chunks=[chunk], payloads=payloads)
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
-    monkeypatch.setattr(
-        "src.services.chat.agent_loop._execute_search",
-        _fake_execute_search,
-    )
-
-    _chunk_registry, agent_findings, meta = await run_agent_loop(
+    _chunk_registry, agent_findings, meta = await run_loop(
         state,
         llm,
         state.session,
@@ -201,6 +194,7 @@ async def test_agent_loop_stops_at_iteration_cap(monkeypatch: pytest.MonkeyPatch
         state.request_id,
         reranker=None,
         session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
     )
 
     assert meta.iterations == 3  # AGENT_MAX_ITERATIONS
@@ -266,14 +260,9 @@ async def test_concurrent_searches_each_open_a_distinct_session(
         # Yield to the event loop so overlapping searches can't be papered over.
         await asyncio.sleep(0)
         chunk, payloads = _make_chunk_with_payload()
-        return agent_loop_module._SearchResult(chunks=[chunk], payloads=payloads)
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
-    monkeypatch.setattr(
-        "src.services.chat.agent_loop._execute_search",
-        _fake_execute_search,
-    )
-
-    await run_agent_loop(
+    await run_loop(
         state,
         llm,
         state.session,
@@ -281,6 +270,7 @@ async def test_concurrent_searches_each_open_a_distinct_session(
         state.request_id,
         reranker=None,
         session_factory=cast("async_sessionmaker[AsyncSession]", _recording_factory),
+        execute_search=_fake_execute_search,
     )
 
     assert len(opened) == n
@@ -294,17 +284,19 @@ def test_analytical_insufficiency_rejects_evidence_free_observation() -> None:
         question="q",
         observations=(Observation(claim="Revenue grew", evidence_chunks=[], confidence="high"),),
     )
-    reason = agent_loop_module._analytical_insufficiency(findings)
+    reason = gates_module._analytical_insufficiency(findings)
     assert reason is not None
     assert "no evidence_chunks" in reason
 
 
 def test_stub_rejected_tool_call_strips_arguments() -> None:
     """Rejected finalizer arguments are stubbed so stale claims don't linger in history."""
+    from src.services.chat.agent.transcript import stub_rejected_tool_call
+
     tc = ToolCallRef(
         id="call_1", name="report_analytical_findings", arguments=json.dumps({"claim": "x"})
     )
-    stubbed = agent_loop_module._stub_rejected_tool_call(tc)
+    stubbed = stub_rejected_tool_call(tc)
     assert stubbed.id == tc.id
     assert stubbed.name == tc.name
     assert "claim" not in stubbed.arguments
@@ -319,6 +311,6 @@ def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
             Observation(claim="Ungrounded claim", evidence_chunks=[], confidence="high"),
         ),
     )
-    result = agent_loop_module._drop_evidence_free_observations(findings)
+    result = gates_module.drop_evidence_free_observations(findings)
     assert [o.claim for o in result.observations] == ["Grounded claim"]
     assert any("Ungrounded claim" in g for g in result.gaps or [])

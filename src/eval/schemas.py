@@ -11,6 +11,8 @@ class EvalQuestion(BaseModel):
     kind: str
     answers: list[str]
     reference_pools: list[list[str]]
+    # Hand-authored gold label (Stage 0.5 router misclassification tracking); None where unlabeled.
+    query_shape: str | None = None
 
 
 class ExcludedEntry(BaseModel):
@@ -45,6 +47,7 @@ class PerQuestionResult(BaseModel):
     usage: dict[str, Any] | None = None
     # Agentic-path-only fields (populated by run_agent.py; Stage 0.5 baseline signal)
     query_shape: str | None = None
+    expected_query_shape: str | None = None  # gold label, from EvalQuestion.query_shape
     agent_meta: dict[str, Any] | None = None
     observations_count: int | None = None
     confidence_counts: dict[str, int] | None = None

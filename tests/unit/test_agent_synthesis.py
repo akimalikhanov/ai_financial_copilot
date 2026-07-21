@@ -1,4 +1,4 @@
-"""Unit tests for the synthesis boundary (src.services.chat.synthesis).
+"""Unit tests for the synthesis boundary (src.services.chat.agent.synthesis).
 
 Covers the anti-drift guard from docs/stages/agentic_state_refactor_v2.md step 3: both
 tasks.py and pipeline_agent.py now call run_synthesis, so a test here covers both.
@@ -13,8 +13,8 @@ import pytest
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
 from src.schemas.query_router import DocumentScopeResult
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat import synthesis
-from src.services.chat.agent_loop import AgentLoopMeta
+from src.services.chat.agent import synthesis
+from src.services.chat.agent.state import AgentLoopMeta
 
 
 def _chunk(score: float = 1.0) -> RetrievedChunk:
