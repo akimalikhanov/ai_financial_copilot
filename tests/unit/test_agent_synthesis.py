@@ -197,6 +197,7 @@ class TestSynthesisContextShape:
             question="Is revenue growing?",
             observations=(
                 Observation(
+                    aspect="revenue_trend",
                     claim="Revenue grew",
                     evidence_chunks=[str(c1.chunk_id)],
                     confidence="high",

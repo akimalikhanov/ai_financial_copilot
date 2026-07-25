@@ -6,8 +6,8 @@ to allow. Registered per tool in `tools.py` (Contract C3: structural before
 sufficiency); `loop.py` runs them in order and stops at the first reason.
 
 This directly fixes P1-8: both rejection paths now go through the same `reject()`,
-so both parse their candidate (feeding `last_candidate`/`protect`) and both compress
-history — previously only the analytical path did either.
+so both parse their candidate (feeding the `FindingsLedger` via `ingest` and `protect`)
+and both compress history — previously only the analytical path did either.
 """
 
 from __future__ import annotations
@@ -110,21 +110,36 @@ def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
 
 
 def missing_entity_gate(candidate: Candidate, state: AgentRunState) -> str | None:
-    """Structural gate: reject report_findings if any expected entity was never searched.
+    """Structural gate: reject report_findings until every expected entity has been both
+    *searched* and *reported* as a finding.
 
-    Unconditional — unlike the sufficiency gate below, this never waives on iteration
-    or budget pressure: a request that never searched an expected entity should not
-    finalize on it regardless of how much budget remains.
+    Reading ``findings.keys()`` (populated by the loop's `ingest` before gates run) —
+    not just ``searched_entities`` — closes the gap where an entity was searched but
+    omitted from the report: it previously slipped past both this gate and synthesis'
+    unsearched-stub backstop, vanishing from the answer. Keeping the searched check too
+    preserves the "must actually retrieve" guarantee, so an entity can't be waved
+    through by reporting ``available=false`` without ever searching. An entity for which
+    the documents genuinely lack the value is covered by reporting it ``available=false``
+    (grounding-exempt, so it still takes a ledger key).
+
+    Unconditional — unlike the sufficiency gate below, this never waives on iteration or
+    budget pressure: a request missing coverage should not finalize regardless of budget.
     """
     if not isinstance(candidate, AgentFindings) or not state.expected_entities:
         return None
-    missing = state.expected_entities - state.searched_entities
-    if not missing:
+    unsearched = state.expected_entities - state.searched_entities
+    unreported = (state.expected_entities & state.searched_entities) - state.findings.keys()
+    if not unsearched and not unreported:
         return None
-    return (
-        f"missing searches for: {', '.join(sorted(missing))}. "
-        "Search each missing entity before calling report_findings."
-    )
+    parts: list[str] = []
+    if unsearched:
+        parts.append(f"search these entities first: {', '.join(sorted(unsearched))}")
+    if unreported:
+        parts.append(
+            "report a finding for each already-searched entity (use available=false when "
+            f"the value isn't in the documents): {', '.join(sorted(unreported))}"
+        )
+    return "report_findings is incomplete — " + "; ".join(parts) + "."
 
 
 def analytical_insufficiency_gate(candidate: Candidate, state: AgentRunState) -> str | None:

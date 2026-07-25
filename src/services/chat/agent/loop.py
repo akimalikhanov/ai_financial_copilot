@@ -378,7 +378,11 @@ async def _handle_finalizer(
         # Protect chunks the model cited here even if this attempt is rejected — a
         # later accepted call must still be able to cite them.
         state.evidence.protect(gates_module.finding_chunk_ids(candidate))
-        state.last_candidate = candidate
+        # Fold every finalizer attempt (accepted or rejected below) into the ledger —
+        # this is what gives a non-converged run real content to serve (degraded) and
+        # exercises the in-place revision path across retried attempts. C6's grounding
+        # filter lives in `record`, so ungrounded items are dropped, not admitted.
+        state.findings.ingest(candidate, state.evidence)
 
         for gate in tools_module.gates_for(finalizer_tc.name):
             reason = gate(candidate, state)
@@ -394,7 +398,7 @@ async def _handle_finalizer(
                 return Continue()
 
         AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
-        state.accepted = candidate
+        state.sealed = True
         _log_finalizer_accept(lf, candidate)
         return Finalize(candidate)
     finally:
@@ -420,6 +424,7 @@ async def _run_turn(
     search_sem: asyncio.Semaphore,
     execute_search: ExecuteSearchFn,
     rewrite_model_id: str,
+    max_chunks_per_lookup: int,
 ) -> TurnOutcome:
     iteration = state.iteration
     await add_event(redis_app, request_id, "agent_turn_started", {"iteration": iteration})
@@ -545,7 +550,15 @@ async def _run_turn(
             if result.error_str is not None:
                 tool_content = result.error_str
             else:
-                ctx = state.evidence.assign_labels(result.chunks, result.payloads)
+                # P2 (audit finding): admit the full result above for provenance
+                # (seen_in_lookups / P1-5), but render only the top-N into the
+                # transcript — mid-loop, uncapped tool results were the single
+                # biggest per-turn token cost (~106k chars measured). The record
+                # stays complete; only the view is capped. `apply_cap` (post-loop)
+                # now exists purely as the final synthesis-selection safety net.
+                ctx = state.evidence.assign_labels(
+                    result.chunks[:max_chunks_per_lookup], result.payloads
+                )
                 tool_content = ctx.formatted_context or "(no results)"
             state.transcript.append(
                 ChatMessage(role=Role.tool, tool_call_id=tc.id, content=tool_content)
@@ -619,8 +632,9 @@ async def run_loop(
     """Run the agent tool-calling loop for retrieval queries.
 
     Returns (chunk_registry, agent_findings, meta). chunk_registry is keyed by
-    chunk_id; values have turn_index stamped. agent_findings is None when the agent
-    hit an iteration/budget cap without an accepted finalizer.
+    chunk_id; values have turn_index stamped. agent_findings is the FindingsLedger
+    projection — the accumulated findings, marked degraded when no finalizer sealed the
+    run, and None only when no finalizer was ever attempted.
 
     ``session`` is used for the loop's own serial DB work (subrequest logging).
     Concurrent searches each open their own session from ``session_factory``:
@@ -635,12 +649,10 @@ async def run_loop(
         else None
     )
     is_analytical = query_shape == "analytical"
-    tools = (
-        tools_module.TOOLS_ANALYTICAL if is_analytical else tools_module.TOOLS_EXTRACTION_COMPARISON
-    )
+    tools = tools_module.ALL_TOOLS
     prompt_name = "v3_agent_analytical" if is_analytical else "v3_agent"
     effort = EffortPrior.for_shape(settings, query_shape)
-    search_sem = asyncio.Semaphore(settings.max_concurrent_searches)
+    search_sem = asyncio.Semaphore(effort.max_concurrent_searches)
     rewrite_model_id = get_query_transformer_model()
 
     system_content = get_system_prompt(version=prompt_name)
@@ -666,9 +678,15 @@ async def run_loop(
             if years:
                 _entity_years[item.entity_name] = years
 
+    # Seeded regardless of query_shape: both finalizers are always in the tool pool
+    # now (Stage 1.5), so missing_entity_gate — which only fires for report_findings
+    # (isinstance-scoped, see gates.py) — must have real coverage data whichever
+    # finalizer the model ends up calling, not just for non-analytical shapes.
     expected_entities: set[str] = set()
-    if not is_analytical and chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
+    if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
         expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
+
+    if not is_analytical and expected_entities:
         lines: list[str] = []
         for name in sorted(expected_entities):
             years = _entity_years.get(name)
@@ -728,6 +746,7 @@ async def run_loop(
                 search_sem,
                 execute_search,
                 rewrite_model_id,
+                settings.max_chunks_per_entity,
             )
         except TimeoutError:
             logger.warning(
@@ -760,4 +779,8 @@ async def run_loop(
     )
 
     meta = build_meta(state, iterations_run)
-    return state.evidence.registry, state.accepted, meta
+    # Serve the ledger projection, not a single accepted candidate: a non-converged run
+    # now yields its accumulated partial findings marked degraded, instead of None →
+    # raw-excerpt fallback (P1-6). None only when no finalizer was ever attempted.
+    findings = state.findings.projection(degraded=not state.sealed)
+    return state.evidence.registry, findings, meta

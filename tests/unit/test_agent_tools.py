@@ -12,10 +12,13 @@ import json
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.services.chat.agent.tools import (
+    ALL_TOOLS,
     REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
     SEARCH_TOOL,
     SearchDocumentsArgs,
+    gates_for,
+    is_terminal,
     tool_schema,
 )
 
@@ -95,6 +98,7 @@ class TestRoundTrip:
                 "gaps": None,
                 "observations": [
                     {
+                        "aspect": "cogs",
                         "claim": "COGS rose 12%",
                         "evidence_chunks": ["S2"],
                         "confidence": "high",
@@ -118,3 +122,25 @@ class TestFieldDescriptionsPreserved:
         schema = tool_schema("x", "does x", SearchDocumentsArgs)
         assert schema["type"] == "function"
         assert schema["function"]["description"] == "does x"
+
+
+class TestUnifiedToolPool:
+    """Stage 1.5: one tool pool for every query_shape, not two hardcoded lists."""
+
+    def test_all_tools_contains_both_finalizers(self) -> None:
+        names = {t["function"]["name"] for t in ALL_TOOLS}
+        assert names == {"search_documents", "report_findings", "report_analytical_findings"}
+
+    def test_both_finalizers_are_terminal(self) -> None:
+        assert is_terminal("report_findings")
+        assert is_terminal("report_analytical_findings")
+        assert not is_terminal("search_documents")
+
+    def test_gates_scoped_to_their_own_finalizer(self) -> None:
+        # missing_entity_gate only guards report_findings; analytical_insufficiency_gate
+        # only guards report_analytical_findings — unifying the pool must not cross-wire
+        # a gate onto the wrong finalizer.
+        report_findings_gates = {g.__name__ for g in gates_for("report_findings")}
+        report_analytical_gates = {g.__name__ for g in gates_for("report_analytical_findings")}
+        assert report_findings_gates == {"missing_entity_gate"}
+        assert report_analytical_gates == {"analytical_insufficiency_gate"}

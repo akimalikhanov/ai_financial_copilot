@@ -35,6 +35,9 @@ class AgentFindings(BaseModel):
 class Observation(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    aspect: str = Field(
+        description="A short, stable key naming what this observation is about (e.g. 'revenue_driver', 'margin_trend') — the same aspect across turns updates the same conclusion.",
+    )
     claim: str
     evidence_chunks: list[str] = Field(
         description='Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',

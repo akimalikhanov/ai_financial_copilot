@@ -24,6 +24,19 @@ def _role_str(role: Any) -> str:
     return role.value if hasattr(role, "value") else role
 
 
+def _trace_message(m: ChatMessage) -> dict[str, Any]:
+    """Serialize a message for a Langfuse observation input, preserving tool-call
+    structure so tool-calling turns are legible in the trace (not a bare content: "")."""
+    out: dict[str, Any] = {"role": _role_str(m.role), "content": m.content or ""}
+    if m.tool_call_id:
+        out["tool_call_id"] = m.tool_call_id
+    if m.tool_calls:
+        out["tool_calls"] = [
+            {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls
+        ]
+    return out
+
+
 def _merge_params(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(defaults)
     for k, v in overrides.items():
@@ -118,7 +131,7 @@ class RoutedLLM:
             as_type="generation",
             name=_lf_name,
             model=self.model_id,
-            input=[{"role": _role_str(m.role), "content": m.content or ""} for m in messages],
+            input=[_trace_message(m) for m in messages],
         ) as gen:
             response = await self.adapter.complete(messages=messages, **merged)
             update_kwargs: dict = {"output": response.text}
@@ -155,7 +168,7 @@ class RoutedLLM:
             as_type="generation",
             name="llm.complete_with_tools",
             model=self.model_id,
-            input=[{"role": _role_str(m.role), "content": m.content or ""} for m in messages],
+            input=[_trace_message(m) for m in messages],
             metadata={"tools": [t["function"]["name"] for t in tools if "function" in t]},
         ) as gen:
             result = await self.adapter.complete_with_tools(

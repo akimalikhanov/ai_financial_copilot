@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, Observation
+from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
 from src.services.chat.agent import gates as gates_module
 from src.services.chat.agent.evidence import EvidenceLedger
+from src.services.chat.agent.findings import FindingsLedger
 from src.services.chat.agent.state import AgentRunState, EffortPrior
 from src.services.chat.agent.transcript import Transcript
 
 
+def _reported(*entities: str) -> FindingsLedger:
+    """A FindingsLedger keyed on the given entities (available=false is grounding-exempt,
+    so no EvidenceLedger seeding is needed to give each a key)."""
+    ledger = FindingsLedger()
+    for name in entities:
+        ledger.record(name, EntityFinding(entity=name, available=False), EvidenceLedger())
+    return ledger
+
+
 def _state(**overrides: object) -> AgentRunState:
     defaults: dict[str, object] = {
-        "effort": EffortPrior(max_iterations=4, max_empty_rounds=1, max_insufficiency_rejections=1),
+        "effort": EffortPrior(
+            max_iterations=4,
+            max_empty_rounds=1,
+            max_insufficiency_rejections=1,
+            max_concurrent_searches=3,
+        ),
         "token_budget": 1_000_000,
         "turn_timeout_seconds": 60.0,
         "transcript": Transcript([]),
@@ -24,14 +39,42 @@ def _state(**overrides: object) -> AgentRunState:
 
 class TestMissingEntityGate:
     def test_fires_when_entity_never_searched(self) -> None:
-        state = _state(expected_entities={"Acme", "Globex"}, searched_entities={"Acme"})
+        state = _state(
+            expected_entities={"Acme", "Globex"},
+            searched_entities={"Acme"},
+            findings=_reported("Acme"),
+        )
         candidate = AgentFindings(metric_requested="revenue", findings=())
         reason = gates_module.missing_entity_gate(candidate, state)
         assert reason is not None
-        assert "Globex" in reason
+        assert "search" in reason and "Globex" in reason
 
-    def test_silent_when_all_searched(self) -> None:
-        state = _state(expected_entities={"Acme"}, searched_entities={"Acme"})
+    def test_fires_when_searched_but_unreported(self) -> None:
+        """The gap this change closes: an entity searched but omitted from the report
+        used to slip past both this gate and synthesis' unsearched-stub backstop."""
+        state = _state(
+            expected_entities={"Acme"}, searched_entities={"Acme"}, findings=FindingsLedger()
+        )
+        candidate = AgentFindings(metric_requested="revenue", findings=())
+        reason = gates_module.missing_entity_gate(candidate, state)
+        assert reason is not None
+        assert "report" in reason and "Acme" in reason
+
+    def test_fires_when_reported_but_unsearched(self) -> None:
+        """The dual hole stays closed: reporting available=false without searching does
+        not wave an entity through — the must-retrieve guarantee is preserved."""
+        state = _state(
+            expected_entities={"Acme"}, searched_entities=set(), findings=_reported("Acme")
+        )
+        candidate = AgentFindings(metric_requested="revenue", findings=())
+        reason = gates_module.missing_entity_gate(candidate, state)
+        assert reason is not None
+        assert "search" in reason and "Acme" in reason
+
+    def test_silent_when_all_searched_and_reported(self) -> None:
+        state = _state(
+            expected_entities={"Acme"}, searched_entities={"Acme"}, findings=_reported("Acme")
+        )
         candidate = AgentFindings(metric_requested="revenue", findings=())
         assert gates_module.missing_entity_gate(candidate, state) is None
 
@@ -55,7 +98,9 @@ class TestAnalyticalInsufficiencyGate:
     def _thin_candidate(self) -> AnalyticalFindings:
         return AnalyticalFindings(
             question="q",
-            observations=(Observation(claim="x", evidence_chunks=[], confidence="high"),),
+            observations=(
+                Observation(aspect="a", claim="x", evidence_chunks=[], confidence="high"),
+            ),
         )
 
     def test_fires_when_retry_budget_remains(self) -> None:

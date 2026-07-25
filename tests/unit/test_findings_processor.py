@@ -78,7 +78,9 @@ class TestProcessFindingsAnalyticalPassthrough:
     async def test_analytical_findings_short_circuits(self) -> None:
         analytical = AnalyticalFindings(
             question="why?",
-            observations=(Observation(claim="x", evidence_chunks=[], confidence="high"),),
+            observations=(
+                Observation(aspect="a", claim="x", evidence_chunks=[], confidence="high"),
+            ),
         )
         result = await process_findings(analytical)
         assert result.findings == ()

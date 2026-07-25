@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.services.chat.agent.evidence import EvidenceLedger
+from src.services.chat.agent.findings import FindingsLedger
 from src.services.chat.agent.transcript import Transcript
 from src.utils.config import get_query_transformer_model
 
@@ -40,44 +40,55 @@ class AgentSettings(BaseModel):
     # high token spend with little correctness gain.
     max_insufficiency_rejections: int = Field(ge=0)
     turn_timeout_seconds: float = Field(gt=0)
+    # Stage 1.5: per-shape override for analytical queries, which tend to need more
+    # search turns to corroborate/refute multiple hypotheses. Defaults to max_iterations
+    # so the prior is shape-invariant until an operator tunes it against eval data.
+    max_iterations_analytical: int = Field(ge=1, le=20)
 
 
 def get_agent_settings() -> AgentSettings:
     """Read + validate agent config from env. Not cached — called once per request, like
     the dict it replaces, so env overrides (incl. in tests) always take effect."""
+    max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "5"))
     return AgentSettings(
         enabled=os.getenv("AGENT_LOOP_ENABLED", "false").strip().lower()
         not in {"0", "false", "no", "off"},
         tool_model=os.getenv("AGENT_TOOL_MODEL", get_query_transformer_model()),
-        max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "5")),
+        max_iterations=max_iterations,
         token_budget=int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
         max_chunks_per_entity=int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
         max_empty_analytical_rounds=int(os.getenv("AGENT_MAX_EMPTY_ANALYTICAL_ROUNDS", "1")),
         max_insufficiency_rejections=int(os.getenv("AGENT_MAX_INSUFFICIENCY_REJECTIONS", "1")),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
+        max_iterations_analytical=int(
+            os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", str(max_iterations))
+        ),
     )
 
 
 @dataclass(frozen=True)
 class EffortPrior:
-    """Per-request effort budget, derived from (settings, query_shape).
-
-    Stage 1.5 will make these vary by `query_shape`; for this step they're today's
-    global settings wrapped as-is (P3-16).
+    """Per-request effort budget, derived from (settings, query_shape) — Stage 1.5's
+    "soft prior on effort". Gates and the loop read these, never `settings` directly,
+    so there is exactly one path from query_shape to effort (doc's "one reader path").
     """
 
     max_iterations: int
     max_empty_rounds: int
     max_insufficiency_rejections: int
+    max_concurrent_searches: int
 
     @classmethod
     def for_shape(cls, settings: AgentSettings, shape: str | None) -> EffortPrior:
-        del shape  # unused until Stage 1.5 varies the prior by query_shape
+        max_iterations = (
+            settings.max_iterations_analytical if shape == "analytical" else settings.max_iterations
+        )
         return cls(
-            max_iterations=settings.max_iterations,
+            max_iterations=max_iterations,
             max_empty_rounds=settings.max_empty_analytical_rounds,
             max_insufficiency_rejections=settings.max_insufficiency_rejections,
+            max_concurrent_searches=settings.max_concurrent_searches,
         )
 
 
@@ -106,10 +117,10 @@ class AgentRunState:
 
     # --- durable record: complete, never truncated ---
     evidence: EvidenceLedger = field(default_factory=EvidenceLedger)
+    findings: FindingsLedger = field(default_factory=FindingsLedger)  # what we concluded (keyed)
+    sealed: bool = False  # did a finalizer commit the ledger (vs a degraded projection)
     expected_entities: set[str] = field(default_factory=set)
     searched_entities: set[str] = field(default_factory=set)
-    accepted: AgentFindings | AnalyticalFindings | None = None
-    last_candidate: AgentFindings | AnalyticalFindings | None = None
     spend: dict[str, TokenSpend] = field(default_factory=dict)
 
     # --- control: loop counters + outcome ---
@@ -139,6 +150,10 @@ class AgentLoopMeta:
     iterations: int
     tool_calls_total: int
     convergence_reason: ConvergenceReason
+    # Did a finalizer commit the ledger? False means the served findings are a degraded
+    # projection of accumulated partial findings (non-converged run) — the trace marker
+    # that tells a degraded serve apart from a sealed one.
+    sealed: bool = False
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     cost_usd_total: float = 0.0
@@ -155,6 +170,7 @@ def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
         iterations=iterations,
         tool_calls_total=state.tool_calls_total,
         convergence_reason=state.convergence_reason,
+        sealed=state.sealed,
         input_tokens_total=state.input_tokens_total(),
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
         cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),

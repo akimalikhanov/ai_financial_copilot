@@ -71,13 +71,15 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
     ),
 }
 
-# Current per-query_shape tool sets — Stage 1.5's single-pool merge is a later step.
-TOOLS_EXTRACTION_COMPARISON = [
+# Stage 1.5: one tool pool for every query_shape. Each gate is registered against the
+# specific finalizer it guards (missing_entity_gate only fires for report_findings,
+# analytical_insufficiency_gate only for report_analytical_findings), so handing the
+# model both finalizers unconditionally does not change which gate fires for which
+# candidate type — it only removes the branch that built two separate tool lists.
+# Prompt selection (v3_agent vs v3_agent_analytical) still varies by query_shape.
+ALL_TOOLS = [
     TOOL_REGISTRY["search_documents"].schema,
     TOOL_REGISTRY["report_findings"].schema,
-]
-TOOLS_ANALYTICAL = [
-    TOOL_REGISTRY["search_documents"].schema,
     TOOL_REGISTRY["report_analytical_findings"].schema,
 ]
 

@@ -79,10 +79,15 @@ class EvidenceLedger:
         payloads: dict[UUID, ChunkPromptPayload],
     ) -> RAGContext:
         """Assemble one tool result's RAGContext, numbering S-labels globally across the
-        request so labels never restart at S1 between searches."""
-        ctx, _ = assemble_rag_context(
-            chunks, payloads, assume_unique=True, ref_start=self._next_ref
-        )
+        request so labels never restart at S1 between searches.
+
+        A chunk already labelled — by an earlier search this run, or seeded from a prior
+        turn via `from_carryover` — keeps its one stable label and is not re-rendered:
+        re-surfacing updates provenance in `admit`, never mints a second S-label. This is
+        the dedup step 11's carried-evidence seeding depends on.
+        """
+        fresh = [c for c in chunks if c.chunk_id not in self._text]
+        ctx, _ = assemble_rag_context(fresh, payloads, assume_unique=True, ref_start=self._next_ref)
         for item in ctx.items:
             self._ref_registry[item.ref_id] = item.chunk_id
             self._text[item.chunk_id] = item.prompt_text
@@ -127,7 +132,14 @@ class EvidenceLedger:
 
     def apply_cap(self, max_per_lookup: int) -> None:
         """Post-loop, once: trim each lookup to its top-N chunks (reranker order), but
-        never evict a chunk any lookup ranked top-N (P1-5) or one `protect`ed."""
+        never evict a chunk any lookup ranked top-N (P1-5) or one `protect`ed.
+
+        This is the final synthesis-selection safety net, not the mid-loop token
+        control — the loop renders top-N per search directly at transcript entry
+        (P2), independently of this. `admit` above always sees the full, uncapped
+        result so this cap's any-lookup-top-N accounting stays correct regardless
+        of what got rendered mid-loop.
+        """
         if self._lookup_count <= 1:
             return
         keep_ids: set[UUID] = set(self._protected)

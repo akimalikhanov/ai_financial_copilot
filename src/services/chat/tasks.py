@@ -659,6 +659,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "iterations": agent_meta.iterations,
                                 "tool_calls_total": agent_meta.tool_calls_total,
                                 "convergence_reason": agent_meta.convergence_reason,
+                                "sealed": agent_meta.sealed,
                                 "chunks_collected": len(agent_result.rag_context.items),
                             },
                             metadata={
@@ -693,6 +694,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "convergence_reason": agent_meta.convergence_reason,
                         "chunks_collected": len(agent_result.rag_context.items),
                         "findings_set": agent_result.findings is not None,
+                        "sealed": agent_meta.sealed,
                     },
                 )
 
@@ -962,6 +964,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
                     if agent_findings_json is not None:
                         citation_meta["agent_findings"] = agent_findings_json
+                        # Persist the sealed/degraded marker beside the findings so a later
+                        # turn's carry-over can tell a committed finalizer from a degraded
+                        # partial serve (step 11 M2-synth) — `meta.sealed` is in-run only.
+                        if state.agent_meta is not None:
+                            citation_meta["agent_findings_sealed"] = state.agent_meta.sealed
 
                     # Finalize stage times (stream_llm_response ends here)
                     stage_times[current_stage] = round(perf_counter() - stage_start, 3)

@@ -87,6 +87,7 @@ class TestRefutedByNarrowing:
             question="Is revenue growing?",
             observations=(
                 Observation(
+                    aspect="revenue_trend",
                     claim="Revenue grew",
                     evidence_chunks=[str(evidence_chunk.chunk_id)],
                     confidence="high",

@@ -117,19 +117,29 @@ def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_agent_loop_runs_search_then_finalizes() -> None:
     """Loop issues a search_documents call, then report_findings, and terminates naturally."""
     state = _make_state()
+    found_chunk, payloads = _make_chunk_with_payload()
 
     search_tc = ToolCallRef(
         id="call_1",
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
     )
+    # The finding must cite the admitted chunk so it grounds (C6) and lands a ledger key —
+    # the coverage gate now requires every searched entity to be *reported*, not just searched.
     findings_tc = ToolCallRef(
         id="call_2",
         name="report_findings",
         arguments=json.dumps(
             {
                 "metric_requested": "revenue",
-                "findings": [{"entity": "Acme", "available": True, "value": 100}],
+                "findings": [
+                    {
+                        "entity": "Acme",
+                        "available": True,
+                        "value": 100,
+                        "source_chunks": [str(found_chunk.chunk_id)],
+                    }
+                ],
             }
         ),
     )
@@ -142,8 +152,6 @@ async def test_agent_loop_runs_search_then_finalizes() -> None:
         ]
     )
     llm = _routed_llm(adapter)
-
-    found_chunk, payloads = _make_chunk_with_payload()
 
     async def _fake_execute_search(*_args: Any, **_kwargs: Any) -> _SearchResult:
         return _SearchResult(entity="Acme", chunks=[found_chunk], payloads=payloads)
@@ -213,6 +221,9 @@ async def test_concurrent_searches_each_open_a_distinct_session(
     """
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")
     state = _make_state()
+    # One shared chunk across all searches (they dedup on chunk_id); the finding cites it so
+    # the coverage gate accepts the finalizer instead of forcing an unscripted extra turn.
+    shared_chunk, shared_payloads = _make_chunk_with_payload()
 
     n = 3
     search_tcs = [
@@ -229,7 +240,14 @@ async def test_concurrent_searches_each_open_a_distinct_session(
         arguments=json.dumps(
             {
                 "metric_requested": "revenue",
-                "findings": [{"entity": "Acme", "available": True, "value": 100}],
+                "findings": [
+                    {
+                        "entity": "Acme",
+                        "available": True,
+                        "value": 100,
+                        "source_chunks": [str(shared_chunk.chunk_id)],
+                    }
+                ],
             }
         ),
     )
@@ -259,8 +277,7 @@ async def test_concurrent_searches_each_open_a_distinct_session(
         seen.append(session)
         # Yield to the event loop so overlapping searches can't be papered over.
         await asyncio.sleep(0)
-        chunk, payloads = _make_chunk_with_payload()
-        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+        return _SearchResult(entity="Acme", chunks=[shared_chunk], payloads=shared_payloads)
 
     await run_loop(
         state,
@@ -282,7 +299,11 @@ def test_analytical_insufficiency_rejects_evidence_free_observation() -> None:
     """A claim with no evidence_chunks is rejected even if other signals look fine."""
     findings = AnalyticalFindings(
         question="q",
-        observations=(Observation(claim="Revenue grew", evidence_chunks=[], confidence="high"),),
+        observations=(
+            Observation(
+                aspect="revenue", claim="Revenue grew", evidence_chunks=[], confidence="high"
+            ),
+        ),
     )
     reason = gates_module._analytical_insufficiency(findings)
     assert reason is not None
@@ -307,8 +328,12 @@ def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
     findings = AnalyticalFindings(
         question="q",
         observations=(
-            Observation(claim="Grounded claim", evidence_chunks=["c1"], confidence="high"),
-            Observation(claim="Ungrounded claim", evidence_chunks=[], confidence="high"),
+            Observation(
+                aspect="grounded", claim="Grounded claim", evidence_chunks=["c1"], confidence="high"
+            ),
+            Observation(
+                aspect="ungrounded", claim="Ungrounded claim", evidence_chunks=[], confidence="high"
+            ),
         ),
     )
     result = gates_module.drop_evidence_free_observations(findings)

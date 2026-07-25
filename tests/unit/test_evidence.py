@@ -64,6 +64,26 @@ class TestAssignLabels:
         assert ctx1.items[0].ref_id == "S1"
         assert ctx2.items[0].ref_id == "S2"
 
+    def test_resurfaced_chunk_keeps_one_stable_label(self) -> None:
+        """Blocker 2: a chunk re-surfaced by a later search is not re-labelled or
+        re-rendered — the dedup step 11's carried-evidence seeding relies on."""
+        ledger = EvidenceLedger()
+        c1, c2 = _chunk(), _chunk()
+        payloads = {c1.chunk_id: _payload(c1), c2.chunk_id: _payload(c2)}
+
+        ctx1 = ledger.assign_labels([c1], payloads)
+        assert ctx1.items[0].ref_id == "S1"
+
+        # A second search returns c1 again (re-surfaced) plus a fresh c2.
+        ctx2 = ledger.assign_labels([c1, c2], payloads)
+        # c1 is not re-rendered; only the fresh c2 gets a label, continuing at S2.
+        assert [item.chunk_id for item in ctx2.items] == [c2.chunk_id]
+        assert ctx2.items[0].ref_id == "S2"
+
+        # c1 still resolves under its one original label; no second label was minted.
+        resolved, _ = ledger.resolve_refs(["S1", "S2"])
+        assert resolved == [str(c1.chunk_id), str(c2.chunk_id)]
+
     def test_resolve_refs_maps_label_to_uuid(self) -> None:
         ledger = EvidenceLedger()
         c1 = _chunk()
