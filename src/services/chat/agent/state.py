@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
+from src.schemas.agent_findings import AnalyticalFindings
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.findings import FindingsLedger
 from src.services.chat.agent.transcript import Transcript
@@ -43,8 +44,21 @@ class AgentSettings(BaseModel):
     # Independent of max_insufficiency_rejections by design (D1) — the two gates hold
     # separate budgets so one exhausting itself never silences the other. Either at 0
     # disables the mechanism.
+    #
+    # NOTE (P2-2): neither cap is the operative bound at current defaults. One
+    # find-then-follow round costs two turns (rejected finalizer + search) and the gate
+    # waives on the second-to-last iteration, so `max_iterations_analytical` allows only
+    # ~2 rejection rounds regardless of what these are set to. The per-item cap is
+    # borderline reachable; the request-wide one essentially never is. Tune
+    # `max_iterations_analytical` — a spend decision — rather than these, and settle the
+    # question from the per-run rejection counts now carried in `AgentLoopMeta` (P2-3)
+    # rather than by argument.
     max_named_item_rejections_per_item: int = Field(ge=0)
     max_named_item_rejections_total: int = Field(ge=0)
+    # Cap on `restatement_integrity_gate` (P0-1): placeholder figures and dropped/renamed
+    # aspect keys. Its own pool — a restatement loss is a regression of already-verified
+    # content, so it must not be silenced by whichever gate coerced the restatement.
+    max_restatement_rejections: int = Field(ge=0)
     turn_timeout_seconds: float = Field(gt=0)
     # Stage 1.5: per-shape override for analytical queries, which tend to need more
     # search turns to corroborate/refute multiple hypotheses. Defaults to max_iterations
@@ -72,6 +86,7 @@ def get_agent_settings() -> AgentSettings:
         max_named_item_rejections_total=int(
             os.getenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_TOTAL", "10")
         ),
+        max_restatement_rejections=int(os.getenv("AGENT_MAX_RESTATEMENT_REJECTIONS", "2")),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
         max_iterations_analytical=int(
             os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", str(max_iterations))
@@ -94,6 +109,7 @@ class EffortPrior:
     # finalizer already (FR-11), so no per-shape branch is needed here.
     max_named_item_rejections_per_item: int
     max_named_item_rejections_total: int
+    max_restatement_rejections: int
 
     @classmethod
     def for_shape(cls, settings: AgentSettings, shape: str | None) -> EffortPrior:
@@ -107,6 +123,7 @@ class EffortPrior:
             max_concurrent_searches=settings.max_concurrent_searches,
             max_named_item_rejections_per_item=settings.max_named_item_rejections_per_item,
             max_named_item_rejections_total=settings.max_named_item_rejections_total,
+            max_restatement_rejections=settings.max_restatement_rejections,
         )
 
 
@@ -139,6 +156,11 @@ class AgentRunState:
     sealed: bool = False  # did a finalizer commit the ledger (vs a degraded projection)
     expected_entities: set[str] = field(default_factory=set)
     searched_entities: set[str] = field(default_factory=set)
+    # Every search query issued this run, whitespace-collapsed and case-folded — the
+    # referent `confirmed_absent_gate` checks an absence claim against (P1-2).
+    # `searched_entities` is too coarse: an item's name lives inside the query string,
+    # not the entity field.
+    issued_queries: list[str] = field(default_factory=list)
     spend: dict[str, TokenSpend] = field(default_factory=dict)
 
     # --- control: loop counters + outcome ---
@@ -150,6 +172,17 @@ class AgentRunState:
     # request-wide total across all items.
     named_item_rejections: dict[str, int] = field(default_factory=dict)
     named_item_rejections_total: int = 0
+    restatement_rejections: int = 0
+    # Any finalizer rejection, whatever the cause — `restatement_integrity_gate`'s
+    # key-loss check only applies to a restatement that was coerced by one.
+    finalizer_rejections: int = 0
+    # The ledger's key set immediately before the current finalizer attempt was folded in.
+    # `ingest` no longer prunes on a rejected attempt, so this snapshot is the only thing
+    # that still distinguishes established keys from the ones this attempt introduced.
+    keys_before_attempt: set[str] = field(default_factory=set)
+    # P0-4: armed by a named-item rejection with that rejection's item names; consumed by
+    # the one empty round the follow-up search is expected to produce. None = not armed.
+    named_item_grace: tuple[str, ...] | None = None
     tool_calls_total: int = 0
     convergence_reason: ConvergenceReason = "iteration_cap"
 
@@ -186,9 +219,33 @@ class AgentLoopMeta:
     # Entities the loop actually called search_documents for — the synthesis boundary uses
     # this (not reported coverage) to label stubs for entities the agent never searched.
     searched_entities: frozenset[str] = field(default_factory=frozenset)
+    # P2-3: the sequential-depth mechanism's per-run signal. These counters previously
+    # lived only in run state, so "did this help?" had no answer joinable per question —
+    # a Prometheus label and a Langfuse span name are not comparable across an eval run.
+    insufficiency_rejections: int = 0
+    named_item_rejections: int = 0
+    restatement_rejections: int = 0
+    # Terminal status tally over the served projection's named items. The three numbers
+    # needed to state a falsifiable prediction about the mechanism.
+    named_items_resolved: int = 0
+    named_items_confirmed_absent: int = 0
+    named_items_unresolved: int = 0
+
+
+def _named_item_tally(state: AgentRunState) -> tuple[int, int, int]:
+    """(resolved, confirmed_absent, unresolved) over the findings actually served."""
+    projection = state.findings.projection()
+    if not isinstance(projection, AnalyticalFindings):
+        return (0, 0, 0)
+    counts = {"resolved": 0, "confirmed_absent": 0, "unresolved": 0}
+    for o in projection.observations:
+        if o.named_item is not None:
+            counts[o.named_item.status] += 1
+    return (counts["resolved"], counts["confirmed_absent"], counts["unresolved"])
 
 
 def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
+    resolved, confirmed_absent, unresolved = _named_item_tally(state)
     return AgentLoopMeta(
         iterations=iterations,
         tool_calls_total=state.tool_calls_total,
@@ -199,4 +256,10 @@ def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
         cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),
         input_tokens_by_model={mid: ts.input_tokens for mid, ts in state.spend.items()},
         searched_entities=frozenset(state.searched_entities),
+        insufficiency_rejections=state.insufficiency_rejections,
+        named_item_rejections=state.named_item_rejections_total,
+        restatement_rejections=state.restatement_rejections,
+        named_items_resolved=resolved,
+        named_items_confirmed_absent=confirmed_absent,
+        named_items_unresolved=unresolved,
     )

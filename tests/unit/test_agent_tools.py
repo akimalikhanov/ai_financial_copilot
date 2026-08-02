@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import missing_entity_gate, named_item_gate
+from src.services.chat.agent.gates import missing_entity_gate
 from src.services.chat.agent.tools import (
     ALL_TOOLS,
     REPORT_ANALYTICAL_TOOL,
@@ -183,12 +183,24 @@ class TestUnifiedToolPool:
         report_findings_gates = {g.__name__ for g in gates_for("report_findings")}
         report_analytical_gates = {g.__name__ for g in gates_for("report_analytical_findings")}
         assert report_findings_gates == {"missing_entity_gate"}
-        assert report_analytical_gates == {"named_item_gate", "analytical_insufficiency_gate"}
+        assert report_analytical_gates == {
+            "restatement_integrity_gate",
+            "confirmed_absent_gate",
+            "named_item_gate",
+            "analytical_insufficiency_gate",
+        }
 
-    def test_named_item_gate_runs_before_insufficiency_gate(self) -> None:
-        # AC-14/FR-13: loop.py stops at the first reason, so this ordering *is* the
-        # implementation of "a candidate tripping both reports the named item".
-        assert gates_for("report_analytical_findings")[0] is named_item_gate
+    def test_analytical_gates_run_most_specific_first(self) -> None:
+        # AC-14/FR-13: loop.py stops at the first rejection, so this ordering *is* the
+        # implementation of "the most specific, most damaging complaint wins". Losing
+        # established content outranks an unbacked absence claim, which outranks a
+        # pending item, which outranks the generic thinness complaint.
+        assert [g.__name__ for g in gates_for("report_analytical_findings")] == [
+            "restatement_integrity_gate",
+            "confirmed_absent_gate",
+            "named_item_gate",
+            "analytical_insufficiency_gate",
+        ]
 
     def test_report_findings_gates_unchanged(self) -> None:
         # AC-9, FR-11: the named-item gate must not be cross-wired onto the other finalizer.

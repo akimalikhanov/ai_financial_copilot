@@ -29,6 +29,7 @@ def _settings(**overrides: object) -> AgentSettings:
         "max_insufficiency_rejections": 1,
         "max_named_item_rejections_per_item": 2,
         "max_named_item_rejections_total": 10,
+        "max_restatement_rejections": 2,
         "turn_timeout_seconds": 60.0,
         "max_iterations_analytical": 7,
     }

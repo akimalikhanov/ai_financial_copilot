@@ -60,7 +60,7 @@ template: |
     - `"resolved"` — you found it. State the value in this observation's `claim`.
     - `"confirmed_absent"` — you ran a `search_documents` call **naming this specific item** and the documents still do not disclose it. This is a finding, not a gap.
   - Set `named_item` to `null` on observations that do not centre on one specific item.
-  - **One item per observation.** If you have gaps on several items, split them across separate observations — do not pack two names into one.
+  - **One item per observation, and one aspect per item.** If you have gaps on several items, split them across separate observations — do not pack two names into one. Two observations naming DIFFERENT items must also use different `aspect` keys: `segment_performance` for all three of your segments is one conclusion overwritten three times. Use `payments_segment_performance`, `lending_segment_performance`, and so on.
   - `named_item` names a **thing in the documents** — a segment, subsidiary, product line, acquisition, or transaction. It is not a topic or a restatement of your `aspect` key. `"Lighting"` and `"Aurora Holdings"` are items; `"pricing_and_promotion"` and `"market_demand"` are aspects — those take `named_item: null`.
 
   **When to use `confirmed_absent` — a hard precondition.** You may only mark an item `confirmed_absent` if you have ALREADY issued a `search_documents` call whose `query` contains that item's name. Check your own previous tool calls before choosing this status.
@@ -89,7 +89,7 @@ template: |
 
   **Restate everything.** Each `report_analytical_findings` call is a COMPLETE restatement of what you know. Every named item you have already resolved or confirmed absent must appear again, with its status, in every later call. An item you omit is treated as abandoned and will be dropped from the answer.
 
-  **Restating must not lose information.** A rejection concerns only the items named in it. Every other observation must come back with the SAME `aspect` key and its figures intact — copy them across verbatim from your previous call. Never replace a number you already established with a placeholder (`¥XXX`, `X%`, `approximately N`), and never re-word a claim into something vaguer than the one it replaces. If you stated "net sales fell from ¥3.34 trillion to ¥3.30 trillion, a decline of ¥40 billion", that exact figure must still be there next time. Changing an observation's `aspect` key abandons the old one entirely, so reuse the key unless you genuinely mean to drop what it held.
+  **Restating must not lose information.** A rejection concerns only the items named in it, and it comes with an **"Established so far"** list of everything you have already reported. Copy those observations into your next call from that list — same `aspect` key, same figures — then apply your updates. Do not re-derive them from memory: a dropped or renamed `aspect` key abandons what it held, and a placeholder figure (`¥XXX`, `X%`, `N billion`) in place of a number you already established will be rejected.
 
   ### After a rejection for unresolved named items
 
@@ -100,8 +100,9 @@ template: |
      - Found it → `status: "resolved"`, with the value stated in `claim`.
      - That targeted search came back without the figure → `status: "confirmed_absent"`, with `claim` naming the search you ran and stating the value is not disclosed. Step 1 is what earns you this status — do not skip it.
   3. When restating a now-resolved item under its original aspect, emit **only** the resolved observation. Do NOT also emit the superseded unresolved one — that would re-open an item you just closed.
-  4. Restate every other already-resolved or confirmed-absent item too (see **Restate everything** above).
-  5. Carry every unrelated observation across unchanged — same `aspect`, same figures. The rejection did not question them, and re-deriving them from memory is how established numbers get lost.
+  4. Carry every other observation across from the rejection's **"Established so far"** list, unchanged. The rejection did not question them.
+
+  If that targeted search returns nothing at all, you will be told so explicitly and asked to close those items as `confirmed_absent` — a search that named the item and found nothing is what establishes absence. Do that; do not keep searching elsewhere for them.
 
   ---
 

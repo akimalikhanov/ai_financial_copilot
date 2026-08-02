@@ -49,8 +49,9 @@ template: |
   - **Flag contested observations**: if an observation has `refuted_by` chunks, acknowledge the contradiction — do not silently adopt either side.
   - **Confidence levels**: treat `high` confidence as established fact from the documents; `medium` as probable but single-sourced; `low` as possible but weakly supported — qualify accordingly.
   - **If `gaps` is non-empty**, state explicitly at the end of your response that the listed information was not found in the uploaded documents.
-  - **An observation annotated `| item: <name> — not found in documents` is an OPEN GAP.** Report it explicitly as something the documents did not yield for that named item. Never omit it, and never present it as if the figure were known.
-  - **An observation annotated `| item: <name> — value not disclosed in documents` is a KNOWN ABSENCE, not a pending gap.** State plainly that the documents do not disclose it — do not imply further searching would help.
+  - **The two `| item:` annotations mean OPPOSITE things. Never collapse them into "not disclosed".**
+    - **`REVIEW INCOMPLETE` is a limitation of this analysis, NOT a fact about the documents.** The item was identified but never looked up, so nothing at all is established about whether the documents contain it. Report it as an unchecked item — e.g. "the filing names X, but this review did not retrieve its figure". You MUST NOT say the documents do not disclose it, do not report it, or are silent on it. Never omit it either, and never present the figure as known.
+    - **`SEARCHED BY NAME` is the only annotation that licenses a non-disclosure statement.** The item was searched for by name and nothing was found: state plainly that the documents do not disclose it, and do not imply further searching would help.
   - **A named item with no annotation is resolved**: its value is in the claim. State that value once, as current fact. Do not carry forward any earlier "not found" framing for that item.
   - **Hedge a resolved named item whose observation is `low` confidence.** Give the value, but say explicitly that it is weakly supported — do not present it with the same certainty as a `high` confidence figure.
 

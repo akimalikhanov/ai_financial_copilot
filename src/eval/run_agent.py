@@ -271,6 +271,14 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         "cost_usd_total": m.cost_usd_total,
                         "input_tokens_total": m.input_tokens_total,
                         "output_tokens_total": m.output_tokens_total,
+                        # Sequential-depth signal (P2-3): how often each gate fired, and
+                        # how the named items it chased actually ended.
+                        "insufficiency_rejections": m.insufficiency_rejections,
+                        "named_item_rejections": m.named_item_rejections,
+                        "restatement_rejections": m.restatement_rejections,
+                        "named_items_resolved": m.named_items_resolved,
+                        "named_items_confirmed_absent": m.named_items_confirmed_absent,
+                        "named_items_unresolved": m.named_items_unresolved,
                     }
                     logger.info(
                         "agent_meta qid=%s query_shape=%s iterations=%d tool_calls=%d "

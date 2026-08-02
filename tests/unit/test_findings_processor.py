@@ -110,7 +110,10 @@ class TestRenderObservationsBlock:
         )
         return next(line for line in block.splitlines() if line.startswith("1."))
 
-    def test_unresolved_item_annotated_as_not_found(self) -> None:
+    def test_unresolved_item_annotated_as_an_incomplete_review(self) -> None:
+        # P0-3: `unresolved` means "named, never searched for" — a statement about this
+        # run's budget, not about the filing. It is set precisely when the safety valves
+        # engage, so it must not read as anything document-shaped.
         line = self._obs_line(
             Observation(
                 aspect="payments_rev",
@@ -120,10 +123,13 @@ class TestRenderObservationsBlock:
                 named_item=NamedItem(name="Payments segment", status="unresolved"),
             )
         )
-        assert line.endswith(" | item: Payments segment — not found in documents")
+        assert "| item: Payments segment — REVIEW INCOMPLETE" in line
+        assert "never located" in line
+        assert "do not disclose" not in line
 
-    def test_confirmed_absent_item_annotated_as_not_disclosed(self) -> None:
-        # AC-11: a known absence is reported differently from a still-open gap.
+    def test_confirmed_absent_item_annotated_as_a_non_disclosure(self) -> None:
+        # AC-11/P0-3: the only status that licenses a non-disclosure statement, and it
+        # must not be a near-synonym of the one above.
         line = self._obs_line(
             Observation(
                 aspect="payments_rev",
@@ -133,7 +139,10 @@ class TestRenderObservationsBlock:
                 named_item=NamedItem(name="Payments segment", status="confirmed_absent"),
             )
         )
-        assert line.endswith(" | item: Payments segment — value not disclosed in documents")
+        assert line.endswith(
+            " | item: Payments segment — SEARCHED BY NAME — the documents do not disclose this value"
+        )
+        assert "REVIEW INCOMPLETE" not in line
 
     def test_resolved_item_emits_no_annotation(self) -> None:
         # AC-15: the value is already in the claim — a second framing would let stale

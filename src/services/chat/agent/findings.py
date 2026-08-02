@@ -2,8 +2,8 @@
 
 The third state store, beside `Transcript` (the model's view) and `EvidenceLedger`
 (retrieved chunks). Where the transcript logs *interactions*, this stores *conclusions*,
-addressed by a stable key — ``EntityFinding.entity`` or ``Observation.aspect`` — and
-updated in place.
+addressed by a stable key — ``EntityFinding.entity``, or ``observation_key`` (aspect plus
+the item the observation names, P1-1) — and updated in place.
 
 10a (this step): the loop populates it by parsing every finalizer attempt (accepted or
 rejected) via `ingest`, and projects it back for synthesis via `projection`. No
@@ -29,6 +29,7 @@ from src.schemas.agent_findings import (
     AnalyticalFindings,
     EntityFinding,
     Observation,
+    observation_key,
 )
 
 if TYPE_CHECKING:
@@ -103,15 +104,18 @@ class FindingsLedger:
     def ingest(
         self, candidate: AgentFindings | AnalyticalFindings, evidence: EvidenceLedger
     ) -> None:
-        """Fold one finalizer attempt (accepted or rejected) into the ledger.
+        """Fold one finalizer attempt (accepted or rejected) into the ledger, without pruning.
 
-        A finalizer is a *complete re-statement* of the answer, so the served set tracks
-        the latest attempt: a key the model omits on reformulation was deliberately
-        abandoned, not revised, and must not be resurrected into the served/sealed
-        projection (the same reason `transcript.py` strips rejected drafts). Restated
-        keys update in place (revisions++); abandoned keys are pruned. This differs from
-        10b's incremental `record`, where omission carries no meaning and nothing is
-        pruned — hence the prune lives here, on the full-restatement path, not in `record`.
+        Restated keys update in place (revisions++); keys this attempt omits are left
+        alone. The prune moved to `prune_to`, called only on the attempt that is actually
+        *accepted* (P0-1).
+
+        The prune's premise is that omitting a key is deliberate abandonment. That holds
+        for a voluntary restatement and fails for one coerced by a gate, where the model
+        is re-emitting under duress from a transcript whose rejected draft has been
+        stripped: a key it fails to reproduce — or reproduces under a renamed aspect — was
+        lost, not abandoned, and pruning here destroyed the established entry before any
+        gate could see it was gone.
         """
         items: list[tuple[str, EntityFinding | Observation]]
         if isinstance(candidate, AgentFindings):
@@ -124,11 +128,35 @@ class FindingsLedger:
             self._question = candidate.question
             self._conclusion = candidate.conclusion
             self._gaps = list(candidate.gaps) if candidate.gaps else None
-            items = [(o.aspect, o) for o in candidate.observations]
-        for stale_key in self._entries.keys() - {key for key, _ in items}:
-            del self._entries[stale_key]
+            items = [(observation_key(o), o) for o in candidate.observations]
         for key, finding in items:
             self.record(key, finding, evidence)
+
+    def restrict_to(self, live: set[str]) -> set[str]:
+        """Drop every entry whose key is not in ``live``. Returns the dropped keys."""
+        dropped = self._entries.keys() - live
+        for key in dropped:
+            del self._entries[key]
+        return dropped
+
+    def prune_to(self, candidate: AgentFindings | AnalyticalFindings) -> set[str]:
+        """Drop keys the *accepted* restatement abandoned. Returns the dropped keys.
+
+        A finalizer is a complete re-statement, so on the accepted call a key the model
+        omitted was deliberately abandoned and must not be resurrected into the served
+        projection (the same reason `transcript.py` strips rejected drafts). The caller
+        records the dropped keys as a gap, so the omission at least reaches the answer as
+        a stated limitation rather than vanishing (P1-3).
+        """
+        if isinstance(candidate, AgentFindings):
+            live = {f.entity for f in candidate.findings}
+        else:
+            live = {observation_key(o) for o in candidate.observations}
+        return self.restrict_to(live)
+
+    def add_gap(self, gap: str) -> None:
+        """Append a loop-authored caveat to the served envelope's `gaps`."""
+        self._gaps = [*(self._gaps or []), gap]
 
     def keys(self) -> set[str]:
         return set(self._entries)

@@ -403,7 +403,12 @@ def test_v4_prompt_requires_lossless_restatement():
     assert "Restating must not lose information." in prompt
     assert "placeholder" in prompt
     # The aspect-key half: changing the key abandons the entry rather than updating it.
-    assert "Changing an observation's `aspect` key abandons the old one" in prompt
+    assert "renamed `aspect` key abandons what it held" in prompt
+    # P0-2: the prompt may only tell the model to copy from content it can actually see.
+    # `stub_rejected_tool_call` deletes the previous call's payload, so the source of
+    # truth is the "Established so far" block `gates._established_block` supplies.
+    assert "Established so far" in prompt
+    assert "from your previous call" not in prompt
 
 
 def test_v3_agent_analytical_prompt_still_loads():
@@ -417,7 +422,10 @@ def test_synthesis_prompt_carries_named_item_reporting_rules():
     observations block can now emit, or an unresolved item reaches the answer silently."""
     prompt = get_system_prompt(version="v3_agent_synthesis")
 
-    assert "not found in documents" in prompt
-    assert "value not disclosed in documents" in prompt
-    assert "OPEN GAP" in prompt
-    assert "KNOWN ABSENCE" in prompt
+    # P0-3: the two annotations must be given as opposites. The failure mode is synthesis
+    # flattening them into "not disclosed", which turns the loop's own exhaustion into a
+    # disclosure finding — so the prompt has to say so explicitly.
+    assert "REVIEW INCOMPLETE" in prompt
+    assert "SEARCHED BY NAME" in prompt
+    assert "OPPOSITE things" in prompt
+    assert "only annotation that licenses a non-disclosure statement" in prompt

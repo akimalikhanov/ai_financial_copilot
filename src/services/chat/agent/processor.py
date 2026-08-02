@@ -411,10 +411,22 @@ def _render_observations_block(
         # item's value is already stated in the claim, so repeating it here would give
         # synthesis two framings of the same fact (FR-7, FR-2a). Per-aspect
         # update-in-place in the ledger (D14) means no dedup is needed here.
+        #
+        # The two non-resolved statuses must read as opposites, not near-synonyms (P0-3).
+        # `unresolved` means "named, never searched for" — a statement about this run's
+        # budget, not about the filing — and it is set precisely when the safety valves
+        # engage (per-item cap, last iteration, spend exhausted), so phrasing it as
+        # anything document-shaped turns the loop's own exhaustion into a disclosure
+        # finding. Only `confirmed_absent` licenses a non-disclosure statement.
         item_str = ""
         if obs.named_item is not None and obs.named_item.status != "resolved":
-            not_found = obs.named_item.status == "unresolved"
-            detail = "not found in documents" if not_found else "value not disclosed in documents"
+            if obs.named_item.status == "unresolved":
+                detail = (
+                    "REVIEW INCOMPLETE — this item was identified but its value was never "
+                    "located; nothing follows about what the documents contain"
+                )
+            else:
+                detail = "SEARCHED BY NAME — the documents do not disclose this value"
             item_str = f" | item: {obs.named_item.name} — {detail}"
         lines.append(
             f"{i}. [{obs.confidence} confidence] {obs.claim}"

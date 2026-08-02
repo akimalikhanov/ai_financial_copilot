@@ -666,6 +666,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
+                                "named_item_rejections": agent_meta.named_item_rejections,
+                                "restatement_rejections": agent_meta.restatement_rejections,
+                                "named_items_resolved": agent_meta.named_items_resolved,
+                                "named_items_confirmed_absent": (
+                                    agent_meta.named_items_confirmed_absent
+                                ),
+                                "named_items_unresolved": agent_meta.named_items_unresolved,
                             },
                         )
                 finally:

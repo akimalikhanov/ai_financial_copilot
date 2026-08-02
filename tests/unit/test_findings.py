@@ -13,6 +13,7 @@ from src.schemas.agent_findings import (
     AgentFindings,
     AnalyticalFindings,
     EntityFinding,
+    NamedItem,
     Observation,
 )
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
@@ -138,9 +139,11 @@ class TestProjection:
         assert FindingsLedger().projection() is None
 
     def test_reformulated_attempt_does_not_resurrect_dropped_key(self) -> None:
-        # A finalizer is a full re-statement: a key present in a rejected attempt but
-        # omitted from the reformulation was abandoned, not revised, so it must not leak
-        # into the served projection (matches transcript.py stripping rejected drafts).
+        # A finalizer is a full re-statement, so on the *accepted* call a key the model
+        # omitted was abandoned, not revised, and must not leak into the served projection
+        # (matches transcript.py stripping rejected drafts). The prune lives in `prune_to`,
+        # which the loop calls only once a candidate has cleared every gate — see
+        # `test_rejected_attempt_does_not_prune` for why `ingest` must not do it (P0-1).
         evidence, ids = _seed_evidence(2)
         ledger = FindingsLedger()
         ledger.ingest(  # attempt 1 (later rejected): keeps A, plus B it will abandon
@@ -174,6 +177,22 @@ class TestProjection:
             ),
             evidence,
         )
+        assert ledger.prune_to(
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="A",
+                        claim="keep revised",
+                        evidence_chunks=[ids[0]],
+                        confidence="high",
+                    ),
+                    Observation(
+                        aspect="C", claim="new", evidence_chunks=[ids[1]], confidence="high"
+                    ),
+                ),
+            )
+        ) == {"B"}
         served = ledger.projection()
         assert isinstance(served, AnalyticalFindings)
         assert {o.aspect for o in served.observations} == {"A", "C"}
@@ -181,6 +200,146 @@ class TestProjection:
         assert "abandon" not in claims  # the dropped key is not resurrected
         assert "keep revised" in claims  # the restated key supersedes in place
         assert ledger.revised_keys(min_revisions=1) == ["A"]
+
+    def test_rejected_attempt_does_not_prune(self) -> None:
+        # P0-1: pruning on every fold destroyed established content. When a gate coerces a
+        # restatement, the model re-emits from a transcript whose rejected draft has been
+        # stripped; a key it fails to reproduce — or reproduces under a renamed aspect —
+        # was lost, not abandoned. Keeping it is what lets the gate see the loss at all,
+        # and what lets the rejection message hand the content back (P0-2).
+        evidence, ids = _seed_evidence(2)
+        ledger = FindingsLedger()
+        ledger.ingest(
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="group_revenue_change",
+                        claim="net sales fell ¥40 billion",
+                        evidence_chunks=[ids[0]],
+                        confidence="high",
+                    ),
+                ),
+            ),
+            evidence,
+        )
+        # The rejected retry renames the aspect and vaguens the figure.
+        ledger.ingest(
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="total_revenue_change",
+                        claim="net sales fell",
+                        evidence_chunks=[ids[1]],
+                        confidence="high",
+                    ),
+                ),
+            ),
+            evidence,
+        )
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert {o.aspect for o in served.observations} == {
+            "group_revenue_change",
+            "total_revenue_change",
+        }
+        assert "net sales fell ¥40 billion" in {o.claim for o in served.observations}
+
+    def test_add_gap_reaches_the_projection(self) -> None:
+        # P1-3: when a drop is allowed to stand, the omission must surface as a stated
+        # limitation rather than vanishing.
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        ledger.ingest(
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="A", claim="keep", evidence_chunks=[ids[0]], confidence="high"
+                    ),
+                ),
+            ),
+            evidence,
+        )
+        ledger.add_gap("Previously reported observations were dropped without resolution: B")
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert served.gaps == [
+            "Previously reported observations were dropped without resolution: B"
+        ]
+
+
+class TestItemKeyedObservations:
+    """P1-1: the ledger keys observations on aspect *plus* named item, so a discovered set
+    of items reported under one shared aspect survives to synthesis intact."""
+
+    @staticmethod
+    def _segment(aspect: str, item: str, claim: str, ref: str) -> Observation:
+        return Observation(
+            aspect=aspect,
+            claim=claim,
+            evidence_chunks=[ref],
+            confidence="high",
+            named_item=NamedItem(name=item, status="resolved"),
+        )
+
+    def test_three_items_under_one_aspect_are_three_out(self) -> None:
+        # The failure this fixes: three in, one out. The gate saw all three (it reads the
+        # candidate, pre-collapse) and charged three rejections; synthesis saw one.
+        evidence, ids = _seed_evidence(3)
+        ledger = FindingsLedger()
+        ledger.ingest(
+            AnalyticalFindings(
+                question="how did each segment perform?",
+                observations=(
+                    self._segment("segment_performance", "Payments segment", "up 12%", ids[0]),
+                    self._segment("segment_performance", "Lending segment", "down 4%", ids[1]),
+                    self._segment("segment_performance", "Treasury unit", "flat", ids[2]),
+                ),
+            ),
+            evidence,
+        )
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert len(served.observations) == 3
+        assert {o.claim for o in served.observations} == {"up 12%", "down 4%", "flat"}
+
+    def test_same_item_still_updates_in_place(self) -> None:
+        # C4 must not regress: the same item under the same aspect is one conclusion,
+        # revised — including across the unresolved -> resolved transition (D14).
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        base = AnalyticalFindings(
+            question="q",
+            observations=(
+                Observation(
+                    aspect="segment_mix",
+                    claim="Payments was cited; its margin is not stated.",
+                    evidence_chunks=[ids[0]],
+                    confidence="medium",
+                    named_item=NamedItem(name="Payments segment", status="unresolved"),
+                ),
+            ),
+        )
+        ledger.ingest(base, evidence)
+        ledger.ingest(
+            base.model_copy(
+                update={
+                    "observations": (
+                        self._segment(
+                            "segment_mix", "the Payments segment", "margin was 22%", ids[0]
+                        ),
+                    )
+                }
+            ),
+            evidence,
+        )
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert len(served.observations) == 1
+        assert served.observations[0].claim == "margin was 22%"
+        assert ledger.revised_keys(min_revisions=1) == list(ledger.keys())
 
 
 class TestDegradedServing:

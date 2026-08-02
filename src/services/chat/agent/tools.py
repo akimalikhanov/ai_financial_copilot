@@ -19,8 +19,10 @@ from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.services.chat.agent.gates import (
     GateFn,
     analytical_insufficiency_gate,
+    confirmed_absent_gate,
     missing_entity_gate,
     named_item_gate,
+    restatement_integrity_gate,
 )
 from src.utils.json_schema import make_strict
 
@@ -72,12 +74,21 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
         schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
     ),
     "report_analytical_findings": ToolRegistration(
-        # named_item_gate first: `loop.py` stops at the first reason, so a candidate
-        # tripping both reports the specific unresolved item rather than the generic
-        # thinness complaint (FR-13, D8).
+        # Order matters — `loop.py` stops at the first rejection, so the most specific,
+        # most damaging complaint must come first (FR-13, D8):
+        #   1. restatement_integrity — content already established is being lost; fixing
+        #      anything else on top of a degraded restatement bakes the loss in.
+        #   2. confirmed_absent — an unbacked absence claim is a fabricated finding.
+        #   3. named_item — a specific item still needs its follow-up search.
+        #   4. analytical_insufficiency — the generic thinness complaint, last.
         schema=REPORT_ANALYTICAL_TOOL,
         terminal=True,
-        gates=(named_item_gate, analytical_insufficiency_gate),
+        gates=(
+            restatement_integrity_gate,
+            confirmed_absent_gate,
+            named_item_gate,
+            analytical_insufficiency_gate,
+        ),
     ),
 }
 

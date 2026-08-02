@@ -33,7 +33,7 @@ from src.observability.metrics import (
 )
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
+from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, describe_key
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent import gates as gates_module
@@ -76,6 +76,9 @@ class _SearchResult:
     # Hydrated payloads for chunks — context is assembled later, sequentially, so
     # S-labels can be numbered globally across all searches in the request.
     payloads: dict[UUID, ChunkPromptPayload]
+    # The raw query the model asked for (pre-rewrite) — `confirmed_absent_gate` checks an
+    # absence claim against the queries actually issued, and the item's name lives here.
+    query: str = ""
     error_str: str | None = None
     rewrite_stats: LLMResponseStats | None = None
 
@@ -227,6 +230,7 @@ async def _execute_search(
             entity=entity,
             chunks=[],
             payloads={},
+            query=raw_query,
             error_str=f"Search failed for entity: {entity}",
             rewrite_stats=rewrite_stats,
         )
@@ -238,7 +242,11 @@ async def _execute_search(
     AGENT_TOOL_CALLS.labels("search_documents", "ok").inc()
     AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
     return _SearchResult(
-        entity=entity, chunks=chunks, payloads=payloads, rewrite_stats=rewrite_stats
+        entity=entity,
+        chunks=chunks,
+        payloads=payloads,
+        query=raw_query,
+        rewrite_stats=rewrite_stats,
     )
 
 
@@ -378,6 +386,14 @@ async def _handle_finalizer(
         # Protect chunks the model cited here even if this attempt is rejected — a
         # later accepted call must still be able to cite them.
         state.evidence.protect(gates_module.finding_chunk_ids(candidate))
+        # Snapshot before the fold: `ingest` no longer prunes, so afterwards the ledger
+        # cannot tell an established key from one this attempt introduced. This is
+        # `restatement_integrity_gate`'s referent for detecting a dropped or renamed key.
+        state.keys_before_attempt = state.findings.keys()
+        # A new finalizer attempt supersedes any pending follow-up, so the empty-round
+        # exemption disarms here and is re-armed only if this attempt is itself rejected
+        # for a named item (P0-4).
+        state.named_item_grace = None
         # Fold every finalizer attempt (accepted or rejected below) into the ledger —
         # this is what gives a non-converged run real content to serve (degraded) and
         # exercises the in-place revision path across retried attempts. C6's grounding
@@ -385,24 +401,38 @@ async def _handle_finalizer(
         state.findings.ingest(candidate, state.evidence)
 
         for gate in tools_module.gates_for(finalizer_tc.name):
-            reason = gate(candidate, state)
-            if reason is not None:
-                # One attribution drives both the metric label (D15) and which budget
-                # the rejection spends (D1) — `named_item_gate` charges only its own
-                # counters, which it already incremented itself.
-                is_named_item = gate is gates_module.named_item_gate
+            rejection = gate(candidate, state)
+            if rejection is not None:
+                if rejection.charges_restatement:
+                    # An attempt rejected for restatement loss is not admitted: its new
+                    # keys are, by hypothesis, the renamed or placeholder-bearing product
+                    # of a degraded restatement. Leaving them in would make the *correction*
+                    # — which re-emits under the original key — look like a fresh drop, and
+                    # would put the degraded claim in the projection a non-converged run
+                    # serves. In-place updates to keys that already existed stand; the
+                    # accepted attempt overwrites them.
+                    state.findings.restrict_to(state.keys_before_attempt)
+                # Every gate is treated identically: the `Rejection` carries its own
+                # metric label and the budgets it spends, and `reject` is the sole writer.
                 await gates_module.reject(
-                    reason=reason,
+                    rejection=rejection,
                     finalizer_tc=finalizer_tc,
                     candidate=candidate,
                     state=state,
                     redis_app=redis_app,
                     request_id=request_id,
-                    metric_status="rejected_named_item" if is_named_item else "rejected",
-                    charge_insufficiency=not is_named_item,
                 )
                 return Continue()
 
+        # Accepted: only now does omission mean abandonment. Anything the accepted
+        # restatement dropped is pruned, but recorded as a gap so a silently vanished
+        # observation still reaches the answer as a stated limitation (P1-3).
+        dropped = state.findings.prune_to(candidate)
+        if dropped:
+            state.findings.add_gap(
+                "Previously reported observations were dropped without resolution: "
+                + ", ".join(describe_key(k) for k in sorted(dropped))
+            )
         AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
         state.sealed = True
         _log_finalizer_accept(lf, candidate)
@@ -531,6 +561,8 @@ async def _run_turn(
             new_chunks += entity_new
             if result.entity:
                 state.searched_entities.add(result.entity)
+            if result.query:
+                state.issued_queries.append(" ".join(result.query.split()).casefold())
             logger.debug(
                 "tool_call_completed",
                 extra={
@@ -571,6 +603,30 @@ async def _run_turn(
             )
 
         if new_chunks == 0:
+            # P0-4: a named-item follow-up narrows over ground an earlier hop already
+            # covered, so an empty result is its expected outcome — and is exactly what
+            # licenses `confirmed_absent`. That round gets one exemption from the
+            # empty-round counter, consumed on use (so it cannot stall) and re-armed only
+            # by another named-item rejection, with a nudge that agrees with the rejection
+            # rather than contradicting it.
+            if is_analytical and state.named_item_grace is not None:
+                items = ", ".join(f'"{name}"' for name in state.named_item_grace)
+                state.named_item_grace = None
+                state.transcript.append(
+                    ChatMessage(
+                        role=Role.user,
+                        content=(
+                            "That search returned no new evidence. If the query you just "
+                            f"ran named {items}, that settles it: call "
+                            "report_analytical_findings now, re-reporting those items with "
+                            'named_item.status = "confirmed_absent" and every other '
+                            "observation restated unchanged. If it did not name them, "
+                            "search again using each item's exact name in the query."
+                        ),
+                    )
+                )
+                state.transcript.compress()
+                return Continue()
             # For extraction/comparison, an empty round means the retrievable surface
             # is exhausted — stop. For analytical queries, it means "this query found
             # nothing new," which is a reason to search *differently*, not to finalize

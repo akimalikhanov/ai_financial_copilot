@@ -419,8 +419,7 @@ def _capture_gate_state(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
     monkeypatch.setattr(gates_module, "named_item_gate", _spy)
     # tools.py captured the original function object in TOOL_REGISTRY at import time, so
-    # the registration must be re-pointed too — and loop.py's `gate is named_item_gate`
-    # attribution check compares against the module attribute, which now *is* the spy.
+    # the registration must be re-pointed too.
     import src.services.chat.agent.tools as tools_module
 
     reg = tools_module.TOOL_REGISTRY["report_analytical_findings"]
@@ -695,3 +694,351 @@ async def test_empty_and_failed_search_rounds_leave_named_item_counters_untouche
     assert run_state.named_item_rejections_total == 0
     assert run_state.insufficiency_rejections == 0
     assert _counter_value("report_analytical_findings", "rejected_named_item") == before
+
+
+@pytest.mark.asyncio
+async def test_named_item_followups_empty_round_is_exempt_and_licenses_absence(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """P0-4: a named-item follow-up narrows over ground an earlier hop already covered, so
+    an empty result is its *expected* outcome — and is exactly what licenses
+    `confirmed_absent`. Before the exemption, the empty-round nudge told the model to
+    search elsewhere in the one scenario the mechanism exists for, so the honest finding
+    was unreachable on the path that most needs it.
+    """
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "5")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        _observation(
+                            "segment_mix",
+                            "Management cited the Payments segment; its margin is not stated.",
+                            item="Payments segment",
+                        ),
+                    )
+                ],
+            ),
+            # The targeted follow-up. It names the item and returns nothing new.
+            AssistantTurnResult(
+                text="", tool_calls=[_search("c2", "Payments segment margin H2 2023")]
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c3",
+                        _observation(
+                            "segment_mix",
+                            "The documents do not disclose the Payments segment margin.",
+                            item="Payments segment",
+                            status="confirmed_absent",
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(tc: Any, *_a: Any, **_k: Any) -> _SearchResult:
+        query = json.loads(tc.arguments)["query"]
+        # The follow-up re-surfaces the same chunk: admitted already, so zero new.
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads, query=query)
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+    item = findings.observations[0].named_item
+    assert item is not None and item.status == "confirmed_absent"
+
+    run_state = _capture_gate_state[-1]
+    # The exempt round was not charged, so convergence never fired against the follow-up.
+    assert run_state.empty_rounds == 0
+    assert run_state.named_item_grace is None  # consumed, then disarmed by the next attempt
+    assert meta.convergence_reason == "natural"
+    # P2-3: the terminal-status tally is what makes the mechanism measurable per question.
+    assert meta.named_items_confirmed_absent == 1
+    assert meta.named_items_unresolved == 0
+    assert meta.named_item_rejections == 1
+
+    # The nudge the exemption substitutes must agree with the rejection, not contradict it.
+    nudges = [m.content or "" for m in run_state.transcript.messages if m.role.value == "user"]
+    assert any("confirmed_absent" in n for n in nudges)
+    assert not any("Do not finalize yet" in n for n in nudges)
+
+
+@pytest.mark.asyncio
+async def test_renaming_an_aspect_under_rejection_is_caught_and_the_figure_survives(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """P0-1 end to end (observed on trace 7a1c5fa9). Coerced into a full restatement, the
+    model re-emits an *unrelated* observation under a renamed aspect carrying a placeholder
+    where a real figure had been. Previously `ingest` pruned the original key before any
+    gate could see it, and the degraded claim was served as settled.
+    """
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "6")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    established = _observation("group_revenue_change", "Net sales fell by ¥40 billion.")
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        established,
+                        _observation("segment_mix", "Payments was cited.", item="Payments segment"),
+                    )
+                ],
+            ),
+            AssistantTurnResult(text="", tool_calls=[_search("c2", "Payments segment margin")]),
+            # The rejected retry: aspect renamed, figure replaced by a placeholder.
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c3",
+                        _observation("total_revenue_change", "Net sales fell by ¥XXX."),
+                        _observation(
+                            "segment_mix",
+                            "Payments margin was 22%.",
+                            item="Payments segment",
+                            status="resolved",
+                        ),
+                    )
+                ],
+            ),
+            # Corrected: the original key and its figure are back.
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c4",
+                        established,
+                        _observation(
+                            "segment_mix",
+                            "Payments margin was 22%.",
+                            item="Payments segment",
+                            status="resolved",
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(tc: Any, *_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(
+            entity="Acme",
+            chunks=[chunk],
+            payloads=payloads,
+            query=json.loads(tc.arguments)["query"],
+        )
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+    claims = {o.claim for o in findings.observations}
+    assert "Net sales fell by ¥40 billion." in claims
+    assert not any("¥XXX" in c for c in claims)
+    assert {o.aspect for o in findings.observations} == {"group_revenue_change", "segment_mix"}
+
+    run_state = _capture_gate_state[-1]
+    assert run_state.restatement_rejections == 1
+    assert meta.restatement_rejections == 1
+
+    # P0-2: the rejection handed the established content back, since the stub had deleted
+    # the model's own draft from history.
+    rejections = [
+        m.content or ""
+        for m in run_state.transcript.messages
+        if m.role.value == "tool" and "rejected —" in (m.content or "")
+    ]
+    assert any("Established so far" in r and "¥40 billion" in r for r in rejections)
+
+
+@pytest.mark.asyncio
+async def test_dropped_observation_allowed_to_stand_is_recorded_as_a_gap(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """P1-3: dropping the inconvenient observation is the cheapest exit from the named-item
+    gate. Once the restatement gate waives (here: last iteration), the omission is still
+    allowed — but it must reach the answer as a stated limitation rather than vanishing
+    with no gap entry, no metric, and no trace signal.
+    """
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "3")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        _observation("input_costs", "Input costs rose 12%."),
+                        _observation("segment_mix", "Payments was cited.", item="Payments segment"),
+                    )
+                ],
+            ),
+            # Last iteration — every gate waives. The model simply deletes the item.
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical("c2", _observation("input_costs", "Input costs rose 12%."))
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(tc: Any, *_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(
+            entity="Acme",
+            chunks=[chunk],
+            payloads=payloads,
+            query=json.loads(tc.arguments)["query"],
+        )
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+    # The drop stands — the served set tracks the accepted restatement.
+    assert {o.aspect for o in findings.observations} == {"input_costs"}
+    # ...but it is no longer silent.
+    assert findings.gaps is not None
+    assert any("dropped without resolution: segment_mix" in g for g in findings.gaps)
+
+
+@pytest.mark.asyncio
+async def test_a_discovered_set_of_items_survives_to_the_served_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-1 end to end: three segments discovered and resolved under one shared aspect.
+
+    Keying the ledger on `aspect` alone made this three in and one out — the gate saw all
+    three (it reads the candidate, pre-collapse) and charged three rejections, while
+    synthesis received one. A discovered set is the dominant shape for the questions this
+    mechanism exists to serve, so the loss was both silent and common.
+    """
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "5")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    segments = ("Payments segment", "Lending segment", "Treasury unit")
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "segment performance")]),
+            # All three named under ONE aspect, none resolved yet.
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        *[
+                            _observation("segment_performance", f"{name} was cited.", item=name)
+                            for name in segments
+                        ],
+                    )
+                ],
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[_search(f"c2{i}", f"{name} margin") for i, name in enumerate(segments)],
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c3",
+                        *[
+                            _observation(
+                                "segment_performance",
+                                f"{name} margin was {20 + i}%.",
+                                item=name,
+                                status="resolved",
+                            )
+                            for i, name in enumerate(segments)
+                        ],
+                    )
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(tc: Any, *_a: Any, **_k: Any) -> _SearchResult:
+        fresh, fresh_payloads = _make_chunk_with_payload()
+        return _SearchResult(
+            entity="Acme",
+            chunks=[chunk, fresh],
+            payloads={**payloads, **fresh_payloads},
+            query=json.loads(tc.arguments)["query"],
+        )
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+    # Three in, three out — and each carries its own figure, not one overwritten twice.
+    assert len(findings.observations) == 3
+    assert {o.named_item.name for o in findings.observations if o.named_item} == set(segments)
+    assert {o.claim for o in findings.observations} == {
+        f"{name} margin was {20 + i}%." for i, name in enumerate(segments)
+    }
+    # P2-3: the tally now reflects the whole set rather than the one survivor.
+    assert meta.named_items_resolved == 3
+    assert meta.named_item_rejections == 3  # D7: one rejection carrying three items
