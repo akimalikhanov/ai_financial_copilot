@@ -407,9 +407,18 @@ def _render_observations_block(
         else:
             chunks_str = ", ".join(obs.evidence_chunks) if obs.evidence_chunks else "—"
             refuted_str = ", ".join(obs.refuted_by) if obs.refuted_by else "—"
+        # A named item's status is annotated only when it is *not* resolved: a resolved
+        # item's value is already stated in the claim, so repeating it here would give
+        # synthesis two framings of the same fact (FR-7, FR-2a). Per-aspect
+        # update-in-place in the ledger (D14) means no dedup is needed here.
+        item_str = ""
+        if obs.named_item is not None and obs.named_item.status != "resolved":
+            not_found = obs.named_item.status == "unresolved"
+            detail = "not found in documents" if not_found else "value not disclosed in documents"
+            item_str = f" | item: {obs.named_item.name} — {detail}"
         lines.append(
             f"{i}. [{obs.confidence} confidence] {obs.claim}"
-            f" | evidence: {chunks_str} | refuted_by: {refuted_str}"
+            f" | evidence: {chunks_str} | refuted_by: {refuted_str}{item_str}"
         )
 
     if findings.conclusion:

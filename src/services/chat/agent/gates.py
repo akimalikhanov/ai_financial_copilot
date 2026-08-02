@@ -13,7 +13,8 @@ and both compress history — previously only the analytical path did either.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import string
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from redis.asyncio import Redis
@@ -109,6 +110,61 @@ def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
     return None
 
 
+_LEADING_ARTICLES = ("the ", "a ", "an ")
+
+
+def _normalize_item_name(name: str) -> str:
+    """D9's identity key: case-fold, strip surrounding whitespace/punctuation, drop a
+    leading article, collapse internal whitespace.
+
+    Deterministic string handling only — no similarity computation (FR-12). Two names
+    differing by more than case, surrounding punctuation, leading article, or internal
+    spacing are simply different items; canonical-name reuse is a prompt-enforced
+    discipline (D9, EC-5), not something this function tries to recover.
+    """
+    key = " ".join(name.split()).strip().casefold()
+    key = key.strip(string.punctuation + string.whitespace)
+    for article in _LEADING_ARTICLES:
+        if key.startswith(article):
+            key = key[len(article) :]
+            break
+    return " ".join(key.split())
+
+
+def unresolved_named_items(
+    observations: Iterable[Observation],
+) -> dict[str, tuple[str, str]]:
+    """Named items still open across ``observations``: normalized key -> (name, aspect).
+
+    A key is unresolved when at least one observation reports it ``unresolved`` and no
+    observation reports it ``resolved`` or ``confirmed_absent`` (FR-2, FR-2a, EC-2).
+    Resolution wins regardless of observation order (FR-8), so this is computed in two
+    passes rather than by last-write-wins.
+
+    ``confirmed_absent`` closes an item exactly as ``resolved`` does — the documents not
+    disclosing a value is an answer, not a gap to keep chasing (FR-2a). No value
+    comparison anywhere: two ``resolved`` observations carrying different values are both
+    simply resolved, and adjudicating them is not this function's job (EC-11, D12).
+
+    ``name``/``aspect`` come from the first observation to report the key unresolved, so
+    a rejection message quotes the model's own wording back to it (D15).
+    """
+    open_items: dict[str, tuple[str, str]] = {}
+    closed: set[str] = set()
+    for o in observations:
+        item = o.named_item
+        if item is None:
+            continue
+        key = _normalize_item_name(item.name)
+        if not key:
+            continue
+        if item.status == "unresolved":
+            open_items.setdefault(key, (item.name, o.aspect))
+        else:
+            closed.add(key)
+    return {k: v for k, v in open_items.items() if k not in closed}
+
+
 def missing_entity_gate(candidate: Candidate, state: AgentRunState) -> str | None:
     """Structural gate: reject report_findings until every expected entity has been both
     *searched* and *reported* as a finding.
@@ -162,6 +218,56 @@ def analytical_insufficiency_gate(candidate: Candidate, state: AgentRunState) ->
     return _analytical_insufficiency(candidate)
 
 
+def named_item_gate(candidate: Candidate, state: AgentRunState) -> str | None:
+    """Sequential-depth gate: reject an analytical finalizer that names an item without
+    reporting its value, while budget remains to go find it.
+
+    Unresolved items are computed over the **union** of this attempt's observations and
+    the ledger's projection. The candidate is pre-collapse and complete; the projection
+    carries prior attempts' surviving state. Reading the projection alone would let a
+    resolved-then-unresolved ordering under one aspect discard the resolution and re-flag
+    a settled item, since `ingest()` collapses same-aspect observations last-write-wins.
+
+    Waives on the same retry predicate as `analytical_insufficiency_gate` — there is no
+    point rejecting when no further round can happen (FR-6, EC-4). Deliberately does not
+    read `insufficiency_rejections`: the two gates hold independent budgets (D1).
+    """
+    if not isinstance(candidate, AnalyticalFindings):
+        return None
+    if state.named_item_rejections_total >= state.effort.max_named_item_rejections_total:
+        return None
+    can_retry = state.iteration < state.effort.max_iterations - 1 and state.spend_within_budget()
+    if not can_retry:
+        return None
+
+    prior = state.findings.projection()
+    prior_observations = prior.observations if isinstance(prior, AnalyticalFindings) else ()
+    unresolved = unresolved_named_items((*candidate.observations, *prior_observations))
+
+    # FR-6 per-item: an item that has already been chased to its cap stops causing
+    # rejection on its own account, and stops consuming the shared pool with it (§3).
+    chargeable = {
+        key: value
+        for key, value in unresolved.items()
+        if state.named_item_rejections.get(key, 0) < state.effort.max_named_item_rejections_per_item
+    }
+    if not chargeable:
+        return None
+
+    for key in chargeable:
+        state.named_item_rejections[key] = state.named_item_rejections.get(key, 0) + 1
+    state.named_item_rejections_total += len(chargeable)
+
+    items = "; ".join(f'"{name}" (aspect: {aspect})' for name, aspect in chargeable.values())
+    return (
+        f"these named items were reported without their value: {items}. Call "
+        "search_documents for each, combining the item name with its aspect. If a search "
+        "shows the documents do not disclose the value, re-report that observation with "
+        'named_item.status = "confirmed_absent". Restate every already-resolved named item '
+        "in your next report_analytical_findings call."
+    )
+
+
 async def reject(
     *,
     reason: str,
@@ -170,9 +276,23 @@ async def reject(
     state: AgentRunState,
     redis_app: Redis,
     request_id: str,
+    metric_status: str = "rejected",
+    charge_insufficiency: bool = True,
 ) -> None:
     """Shared rejection boilerplate: stub the tool call, append the rejection message,
-    increment the metric, emit the LF span and SSE event, compress history."""
+    increment the metric, emit the LF span and SSE event, compress history.
+
+    `metric_status` distinguishes *why* a finalizer was rejected on the existing
+    `AGENT_TOOL_CALLS` status label, the LF span name, and the SSE reason — no new
+    metric object (D15). Defaults to the previous constant, so existing callers are
+    behaviour-neutral.
+
+    `charge_insufficiency` names which budget this rejection spends. It must be False
+    for a `named_item_gate` rejection: D1/FR-5 require the two gates' budgets be
+    independent, and `max_insufficiency_rejections` defaults to 1, so charging a
+    named-item rejection to it would disable `analytical_insufficiency_gate` for the
+    rest of the run after a single find-then-follow round.
+    """
     state.transcript.append_tool_calls([stub_rejected_tool_call(finalizer_tc)])
     state.transcript.append(
         ChatMessage(
@@ -181,11 +301,11 @@ async def reject(
             content=f"{finalizer_tc.name} rejected — {reason}",
         )
     )
-    AGENT_TOOL_CALLS.labels(finalizer_tc.name, "rejected").inc()
+    AGENT_TOOL_CALLS.labels(finalizer_tc.name, metric_status).inc()
 
     lf = lf_client.get_client()
     if lf:
-        span_name = f"{finalizer_tc.name}_rejected"
+        span_name = f"{finalizer_tc.name}_{metric_status}"
         lf_input: dict = {"reason": reason}
         if isinstance(candidate, AnalyticalFindings):
             lf_input = {
@@ -201,7 +321,12 @@ async def reject(
         redis_app,
         request_id,
         "tool_call_completed",
-        {"entity": "__finalizer__", "error": True, "reason": f"{finalizer_tc.name}_rejected"},
+        {
+            "entity": "__finalizer__",
+            "error": True,
+            "reason": f"{finalizer_tc.name}_{metric_status}",
+        },
     )
-    state.insufficiency_rejections += 1 if isinstance(candidate, AnalyticalFindings) else 0
+    if charge_insufficiency and isinstance(candidate, AnalyticalFindings):
+        state.insufficiency_rejections += 1
     state.transcript.compress()

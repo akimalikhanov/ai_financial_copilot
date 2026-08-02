@@ -387,6 +387,10 @@ async def _handle_finalizer(
         for gate in tools_module.gates_for(finalizer_tc.name):
             reason = gate(candidate, state)
             if reason is not None:
+                # One attribution drives both the metric label (D15) and which budget
+                # the rejection spends (D1) — `named_item_gate` charges only its own
+                # counters, which it already incremented itself.
+                is_named_item = gate is gates_module.named_item_gate
                 await gates_module.reject(
                     reason=reason,
                     finalizer_tc=finalizer_tc,
@@ -394,6 +398,8 @@ async def _handle_finalizer(
                     state=state,
                     redis_app=redis_app,
                     request_id=request_id,
+                    metric_status="rejected_named_item" if is_named_item else "rejected",
+                    charge_insufficiency=not is_named_item,
                 )
                 return Continue()
 
@@ -650,7 +656,10 @@ async def run_loop(
     )
     is_analytical = query_shape == "analytical"
     tools = tools_module.ALL_TOOLS
-    prompt_name = "v3_agent_analytical" if is_analytical else "v3_agent"
+    # Rollback lever: reverting this to the v3 analytical prompt disables named-item
+    # tracking end to end — with no prompt asking for `named_item`, the field is always
+    # None and `named_item_gate` never fires. v3 stays on disk for exactly that.
+    prompt_name = "v4_agent_analytical" if is_analytical else "v3_agent"
     effort = EffortPrior.for_shape(settings, query_shape)
     search_sem = asyncio.Semaphore(effort.max_concurrent_searches)
     rewrite_model_id = get_query_transformer_model()

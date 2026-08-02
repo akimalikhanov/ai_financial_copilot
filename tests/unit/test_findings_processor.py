@@ -10,8 +10,19 @@ import httpx
 import pytest
 import respx
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
-from src.services.chat.agent.processor import _normalize_date, _to_millions, process_findings
+from src.schemas.agent_findings import (
+    AgentFindings,
+    AnalyticalFindings,
+    EntityFinding,
+    NamedItem,
+    Observation,
+)
+from src.services.chat.agent.processor import (
+    _normalize_date,
+    _render_observations_block,
+    _to_millions,
+    process_findings,
+)
 
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 
@@ -86,6 +97,84 @@ class TestProcessFindingsAnalyticalPassthrough:
         assert result.findings == ()
         assert result.answer_entity is None
         assert result.analytical_findings is analytical
+
+
+class TestRenderObservationsBlock:
+    """FR-7/FR-2a: an unresolved or confirmed-absent named item must reach synthesis
+    as an explicit annotation, so a gap can't be silently dropped from the answer."""
+
+    @staticmethod
+    def _obs_line(observation: Observation) -> str:
+        block = _render_observations_block(
+            AnalyticalFindings(question="why?", observations=(observation,))
+        )
+        return next(line for line in block.splitlines() if line.startswith("1."))
+
+    def test_unresolved_item_annotated_as_not_found(self) -> None:
+        line = self._obs_line(
+            Observation(
+                aspect="payments_rev",
+                claim="Payments revenue is not broken out",
+                evidence_chunks=["S1"],
+                confidence="medium",
+                named_item=NamedItem(name="Payments segment", status="unresolved"),
+            )
+        )
+        assert line.endswith(" | item: Payments segment — not found in documents")
+
+    def test_confirmed_absent_item_annotated_as_not_disclosed(self) -> None:
+        # AC-11: a known absence is reported differently from a still-open gap.
+        line = self._obs_line(
+            Observation(
+                aspect="payments_rev",
+                claim="The filing does not disclose segment revenue",
+                evidence_chunks=["S1"],
+                confidence="high",
+                named_item=NamedItem(name="Payments segment", status="confirmed_absent"),
+            )
+        )
+        assert line.endswith(" | item: Payments segment — value not disclosed in documents")
+
+    def test_resolved_item_emits_no_annotation(self) -> None:
+        # AC-15: the value is already in the claim — a second framing would let stale
+        # "not found" language survive alongside the resolution.
+        resolved = Observation(
+            aspect="payments_rev",
+            claim="Payments revenue was $12M",
+            evidence_chunks=["S1"],
+            confidence="high",
+            named_item=NamedItem(name="Payments segment", status="resolved"),
+        )
+        line = self._obs_line(resolved)
+        assert "| item:" not in line
+        # Byte-identical to the same observation carrying no named item at all.
+        assert line == self._obs_line(resolved.model_copy(update={"named_item": None}))
+
+    def test_no_named_item_renders_byte_identically_to_today(self) -> None:
+        # Regression guard: existing behaviour is untouched when named_item is absent.
+        block = _render_observations_block(
+            AnalyticalFindings(
+                question="why did margins fall?",
+                observations=(
+                    Observation(
+                        aspect="cogs",
+                        claim="COGS rose 12%",
+                        evidence_chunks=["S2"],
+                        confidence="high",
+                    ),
+                ),
+                conclusion="Input costs rose.",
+            )
+        )
+        assert block == (
+            "[AGENT OBSERVATIONS]\n"
+            "Question: why did margins fall?\n"
+            "\n"
+            "1. [high confidence] COGS rose 12% | evidence: S2 | refuted_by: —\n"
+            "\n"
+            "Conclusion: Input costs rose.\n"
+            "[END AGENT OBSERVATIONS]"
+        )
 
 
 class TestCurrencyResolutionPriority:

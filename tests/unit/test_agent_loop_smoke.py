@@ -339,3 +339,359 @@ def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
     result = gates_module.drop_evidence_free_observations(findings)
     assert [o.claim for o in result.observations] == ["Grounded claim"]
     assert any("Ungrounded claim" in g for g in result.gaps or [])
+
+
+# ---------------------------------------------------------------------------
+# Sequential depth (find-then-follow) — loop-level coverage (T-10)
+# ---------------------------------------------------------------------------
+
+
+def _analytical_state() -> ChatPipelineState:
+    """A pipeline state routed `analytical`, which is what loads the v4 prompt and makes
+    `named_item_gate` reachable (FR-11)."""
+    state = _make_state()
+    state.router_output.query_shape = "analytical"  # type: ignore[union-attr]
+    return state
+
+
+def _report_analytical(
+    call_id: str,
+    *observations: dict[str, Any],
+    conclusion: str = "A conclusion.",
+) -> ToolCallRef:
+    return ToolCallRef(
+        id=call_id,
+        name="report_analytical_findings",
+        arguments=json.dumps(
+            {
+                "question": "Why did margin compress?",
+                "conclusion": conclusion,
+                "gaps": [],
+                "observations": list(observations),
+            }
+        ),
+    )
+
+
+def _observation(
+    aspect: str,
+    claim: str,
+    *,
+    item: str | None = None,
+    status: str = "unresolved",
+    ref: str = "S1",
+) -> dict[str, Any]:
+    obs: dict[str, Any] = {
+        "aspect": aspect,
+        "claim": claim,
+        "evidence_chunks": [ref],
+        "confidence": "high",
+        "refuted_by": None,
+        "named_item": None,
+    }
+    if item is not None:
+        obs["named_item"] = {"name": item, "status": status}
+    return obs
+
+
+def _search(call_id: str, query: str) -> ToolCallRef:
+    return ToolCallRef(
+        id=call_id,
+        name="search_documents",
+        arguments=json.dumps({"entity": "Acme", "query": query}),
+    )
+
+
+@pytest.fixture
+def _capture_gate_state(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record the live `AgentRunState` each time `named_item_gate` is consulted.
+
+    The gate is left doing its real work — this only keeps a handle on the state object
+    `run_loop` builds internally, which is otherwise unreachable from a caller and is
+    where FR-5's counters live.
+    """
+    seen: list[Any] = []
+    real = gates_module.named_item_gate
+
+    def _spy(candidate: Any, run_state: Any) -> Any:
+        seen.append(run_state)
+        return real(candidate, run_state)
+
+    monkeypatch.setattr(gates_module, "named_item_gate", _spy)
+    # tools.py captured the original function object in TOOL_REGISTRY at import time, so
+    # the registration must be re-pointed too — and loop.py's `gate is named_item_gate`
+    # attribution check compares against the module attribute, which now *is* the spy.
+    import src.services.chat.agent.tools as tools_module
+
+    reg = tools_module.TOOL_REGISTRY["report_analytical_findings"]
+    monkeypatch.setitem(
+        tools_module.TOOL_REGISTRY,
+        "report_analytical_findings",
+        type(reg)(
+            schema=reg.schema,
+            terminal=reg.terminal,
+            gates=tuple(_spy if g is real else g for g in reg.gates),
+        ),
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_named_item_reject_then_search_then_resolve(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """AC-2 -> AC-3 end to end: the loop keeps going after a named-item rejection, the
+    model searches, re-reports resolved, and the sealed projection carries the value.
+
+    Also pins the budget-attribution fix: a named-item rejection must leave
+    `insufficiency_rejections` at 0, or (default cap 1) it silently disables
+    `analytical_insufficiency_gate` for the rest of the run (D1, FR-5).
+    """
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "5")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        _observation(
+                            "segment_mix",
+                            "Management cited the Payments segment; its margin is not stated here.",
+                            item="Payments segment",
+                            status="unresolved",
+                        ),
+                    )
+                ],
+            ),
+            AssistantTurnResult(
+                text="", tool_calls=[_search("c2", "Payments segment margin segment_mix")]
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c3",
+                        _observation(
+                            "segment_mix",
+                            "The Payments segment posted a 22% gross margin, below the 41% group average.",
+                            item="Payments segment",
+                            status="resolved",
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    before = _counter_value("report_analytical_findings", "rejected_named_item")
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    # The loop CONTINUED past the rejection rather than stopping or finalizing on it.
+    assert meta.iterations == 4
+    assert meta.convergence_reason == "natural"
+    assert meta.sealed is True
+
+    assert isinstance(findings, AnalyticalFindings)
+    assert len(findings.observations) == 1
+    resolved = findings.observations[0]
+    assert resolved.named_item is not None
+    assert resolved.named_item.status == "resolved"
+    assert "22%" in resolved.claim
+
+    run_state = _capture_gate_state[-1]
+    assert run_state.named_item_rejections == {"payments segment": 1}
+    assert run_state.named_item_rejections_total == 1
+    # D1 / FR-5: the named-item rejection spent only its own budget.
+    assert run_state.insufficiency_rejections == 0
+
+    # D15: the rejection is independently measurable from the existing metric.
+    assert _counter_value("report_analytical_findings", "rejected_named_item") == before + 1
+
+
+def _counter_value(tool: str, status: str) -> float:
+    from src.observability.metrics import AGENT_TOOL_CALLS
+
+    return AGENT_TOOL_CALLS.labels(tool, status)._value.get()
+
+
+@pytest.mark.asyncio
+async def test_two_unresolved_items_are_chased_in_one_turn(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """AC-18, EC-12, D7: two items unresolved at once cost 2 units of the shared pool, and
+    both follow-up searches dispatch through the pre-existing `search_sem` — no new limit."""
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "5")
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "2")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c1",
+                        _observation("segment_mix", "Payments named.", item="Payments segment"),
+                        _observation("sub_mix", "Aurora named.", item="Aurora Holdings"),
+                    )
+                ],
+            ),
+            # Both follow-ups issued in the SAME turn — the mechanism adds no serialization.
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _search("c2", "Payments segment segment_mix"),
+                    _search("c3", "Aurora Holdings sub_mix"),
+                ],
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c4",
+                        _observation(
+                            "segment_mix",
+                            "Payments margin was 22%.",
+                            item="Payments segment",
+                            status="resolved",
+                        ),
+                        _observation(
+                            "sub_mix",
+                            "Aurora contributed $4m.",
+                            item="Aurora Holdings",
+                            status="resolved",
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    in_flight = 0
+    peak = 0
+
+    async def _fake_execute_search(*_a: Any, **_k: Any) -> _SearchResult:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+    assert {o.named_item.status for o in findings.observations if o.named_item} == {"resolved"}
+
+    run_state = _capture_gate_state[-1]
+    # D7: one rejection carrying two items spends two units, not one.
+    assert run_state.named_item_rejections_total == 2
+    assert run_state.named_item_rejections == {"payments segment": 1, "aurora holdings": 1}
+
+    # EC-12: bounded by the existing semaphore, and genuinely concurrent within it.
+    assert peak == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_and_failed_search_rounds_leave_named_item_counters_untouched(
+    monkeypatch: pytest.MonkeyPatch, _capture_gate_state: list[Any]
+) -> None:
+    """AC-7, FR-10, EC-3: an unproductive round (zero chunks) and an outright search
+    failure both flow through the pre-existing empty-round path. Neither is a finalize
+    rejection, so neither moves an FR-5 counter."""
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "5")
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "2")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search("c0", "margin drivers")]),
+            # One search returns nothing; the other fails outright (error_str, the shape
+            # `_execute_search` produces for a retrieval failure — it does not raise).
+            AssistantTurnResult(
+                text="",
+                tool_calls=[_search("c1", "nothing here"), _search("c2", "boom")],
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[
+                    _report_analytical(
+                        "c3",
+                        _observation(
+                            "segment_mix",
+                            "Payments margin was 22%.",
+                            item="Payments segment",
+                            status="resolved",
+                        ),
+                    )
+                ],
+            ),
+        ]
+    )
+
+    async def _fake_execute_search(tc: Any, *_a: Any, **_k: Any) -> _SearchResult:
+        query = json.loads(tc.arguments)["query"]
+        if query == "nothing here":
+            return _SearchResult(entity="Acme", chunks=[], payloads={})
+        if query == "boom":
+            return _SearchResult(
+                entity="Acme", chunks=[], payloads={}, error_str="search failed: upstream 503"
+            )
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    before = _counter_value("report_analytical_findings", "rejected_named_item")
+
+    _registry, findings, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_fake_execute_search,
+    )
+
+    assert meta.sealed is True
+    assert isinstance(findings, AnalyticalFindings)
+
+    run_state = _capture_gate_state[-1]
+    assert run_state.empty_rounds == 1  # the unproductive round was counted, once
+    assert run_state.named_item_rejections == {}
+    assert run_state.named_item_rejections_total == 0
+    assert run_state.insufficiency_rejections == 0
+    assert _counter_value("report_analytical_findings", "rejected_named_item") == before

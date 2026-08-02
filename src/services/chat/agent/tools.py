@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import GateFn, analytical_insufficiency_gate, missing_entity_gate
+from src.services.chat.agent.gates import (
+    GateFn,
+    analytical_insufficiency_gate,
+    missing_entity_gate,
+    named_item_gate,
+)
 from src.utils.json_schema import make_strict
 
 
@@ -67,7 +72,12 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
         schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
     ),
     "report_analytical_findings": ToolRegistration(
-        schema=REPORT_ANALYTICAL_TOOL, terminal=True, gates=(analytical_insufficiency_gate,)
+        # named_item_gate first: `loop.py` stops at the first reason, so a candidate
+        # tripping both reports the specific unresolved item rather than the generic
+        # thinness complaint (FR-13, D8).
+        schema=REPORT_ANALYTICAL_TOOL,
+        terminal=True,
+        gates=(named_item_gate, analytical_insufficiency_gate),
     ),
 }
 
@@ -76,7 +86,7 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
 # analytical_insufficiency_gate only for report_analytical_findings), so handing the
 # model both finalizers unconditionally does not change which gate fires for which
 # candidate type — it only removes the branch that built two separate tool lists.
-# Prompt selection (v3_agent vs v3_agent_analytical) still varies by query_shape.
+# Prompt selection (v3_agent vs v4_agent_analytical) still varies by query_shape.
 ALL_TOOLS = [
     TOOL_REGISTRY["search_documents"].schema,
     TOOL_REGISTRY["report_findings"].schema,

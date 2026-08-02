@@ -32,6 +32,17 @@ class AgentFindings(BaseModel):
     comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
 
 
+class NamedItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(
+        description="The item's label exactly as the documents name it (e.g. 'Payments segment', 'Acme Sub Ltd'). Reuse the exact same name for the same item on every turn of this run.",
+    )
+    status: Literal["unresolved", "resolved", "confirmed_absent"] = Field(
+        description="'unresolved' — the item is named but its value has not been found yet. 'resolved' — the value was found and is stated in this observation's claim. 'confirmed_absent' — the documents do not disclose this value at all, which is not the same as 'not yet found'.",
+    )
+
+
 class Observation(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -46,6 +57,10 @@ class Observation(BaseModel):
     refuted_by: list[str] | None = Field(
         default=None,
         description="Excerpt IDs that contradict this claim, exactly as shown in search results.",
+    )
+    named_item: NamedItem | None = Field(
+        default=None,
+        description="The one specific item (segment, subsidiary, transaction) this observation is about, when it names such an item. At most one item per observation — if you have gaps on several items, split them across separate observations.",
     )
 
 

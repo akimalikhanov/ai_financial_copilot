@@ -45,6 +45,7 @@ experiments/
 infra/docker/garage/secrets/*
 docs/
 data/
+specs/
 
 test.txt
 test.sh

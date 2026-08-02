@@ -39,6 +39,12 @@ class AgentSettings(BaseModel):
     # and force a re-prompt per request — uncapped rejection loops drove iteration_cap /
     # high token spend with little correctness gain.
     max_insufficiency_rejections: int = Field(ge=0)
+    # Caps on the named-item gate's rejections: per distinct item, and across the request.
+    # Independent of max_insufficiency_rejections by design (D1) — the two gates hold
+    # separate budgets so one exhausting itself never silences the other. Either at 0
+    # disables the mechanism.
+    max_named_item_rejections_per_item: int = Field(ge=0)
+    max_named_item_rejections_total: int = Field(ge=0)
     turn_timeout_seconds: float = Field(gt=0)
     # Stage 1.5: per-shape override for analytical queries, which tend to need more
     # search turns to corroborate/refute multiple hypotheses. Defaults to max_iterations
@@ -60,6 +66,12 @@ def get_agent_settings() -> AgentSettings:
         max_chunks_per_entity=int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
         max_empty_analytical_rounds=int(os.getenv("AGENT_MAX_EMPTY_ANALYTICAL_ROUNDS", "1")),
         max_insufficiency_rejections=int(os.getenv("AGENT_MAX_INSUFFICIENCY_REJECTIONS", "1")),
+        max_named_item_rejections_per_item=int(
+            os.getenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_PER_ITEM", "2")
+        ),
+        max_named_item_rejections_total=int(
+            os.getenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_TOTAL", "10")
+        ),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
         max_iterations_analytical=int(
             os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", str(max_iterations))
@@ -78,6 +90,10 @@ class EffortPrior:
     max_empty_rounds: int
     max_insufficiency_rejections: int
     max_concurrent_searches: int
+    # Shape-invariant: the named-item gate is isinstance-scoped to the analytical
+    # finalizer already (FR-11), so no per-shape branch is needed here.
+    max_named_item_rejections_per_item: int
+    max_named_item_rejections_total: int
 
     @classmethod
     def for_shape(cls, settings: AgentSettings, shape: str | None) -> EffortPrior:
@@ -89,6 +105,8 @@ class EffortPrior:
             max_empty_rounds=settings.max_empty_analytical_rounds,
             max_insufficiency_rejections=settings.max_insufficiency_rejections,
             max_concurrent_searches=settings.max_concurrent_searches,
+            max_named_item_rejections_per_item=settings.max_named_item_rejections_per_item,
+            max_named_item_rejections_total=settings.max_named_item_rejections_total,
         )
 
 
@@ -127,6 +145,11 @@ class AgentRunState:
     iteration: int = 0
     empty_rounds: int = 0
     insufficiency_rejections: int = 0
+    # Named-item gate budgets, kept separate from insufficiency_rejections (D1):
+    # normalized item key -> times that item has been charged a rejection, and the
+    # request-wide total across all items.
+    named_item_rejections: dict[str, int] = field(default_factory=dict)
+    named_item_rejections_total: int = 0
     tool_calls_total: int = 0
     convergence_reason: ConvergenceReason = "iteration_cap"
 

@@ -364,3 +364,60 @@ def test_system_prompt_with_real_templates():
     # Should contain the Financial Document Analyst prompt
     assert "Financial Document Analyst" in system_prompt
     assert "RAG-based" in system_prompt or "Retrieval-Augmented Generation" in system_prompt
+
+
+def test_v4_agent_analytical_prompt_loads_and_renders():
+    """The prompt loop.py selects for analytical queries must exist and carry the
+    named-item contract — the loop would fail at request time otherwise."""
+    prompt = get_system_prompt(version="v4_agent_analytical")
+
+    assert "report_analytical_findings" in prompt
+    assert "named_item" in prompt
+    # The three statuses the schema defines must all be explained to the model.
+    assert '"unresolved"' in prompt
+    assert '"resolved"' in prompt
+    assert '"confirmed_absent"' in prompt
+
+
+def test_v4_prompt_gates_confirmed_absent_on_a_targeted_search():
+    """Observed on a real run (trace 3c716d0a): the model marked a segment
+    `confirmed_absent` after only broad aspect searches, closing the item before the gate
+    could force a follow-up (EC-9 / plan §6 R2). The prompt must state the precondition
+    as a checkable rule, not a judgement call."""
+    prompt = get_system_prompt(version="v4_agent_analytical")
+
+    assert "hard precondition" in prompt.lower()
+    # The rule itself: a search naming the item must already have happened.
+    assert "search_documents` call whose `query` contains that item's name" in prompt
+    # And the fallback when it hasn't.
+    assert "A broad search's silence is not evidence of absence." in prompt
+
+
+def test_v4_prompt_requires_lossless_restatement():
+    """Observed on a real run (trace 7a1c5fa9): after a named-item rejection the model
+    restated an *unrelated* observation, replacing an established figure with the
+    placeholder "¥XXX" and changing its aspect key — so the ledger pruned the good entry
+    and served the placeholder. Restatement must preserve what it restates (D6/FR-2)."""
+    prompt = get_system_prompt(version="v4_agent_analytical")
+
+    assert "Restating must not lose information." in prompt
+    assert "placeholder" in prompt
+    # The aspect-key half: changing the key abandons the entry rather than updating it.
+    assert "Changing an observation's `aspect` key abandons the old one" in prompt
+
+
+def test_v3_agent_analytical_prompt_still_loads():
+    """The rollback lever (plan §6 R5): reverting loop.py's one line must leave a
+    working tree, so v3 has to stay loadable on disk."""
+    assert "report_analytical_findings" in get_system_prompt(version="v3_agent_analytical")
+
+
+def test_synthesis_prompt_carries_named_item_reporting_rules():
+    """FR-7/FR-2a/FR-14/FR-15: synthesis must be told how to report each annotation the
+    observations block can now emit, or an unresolved item reaches the answer silently."""
+    prompt = get_system_prompt(version="v3_agent_synthesis")
+
+    assert "not found in documents" in prompt
+    assert "value not disclosed in documents" in prompt
+    assert "OPEN GAP" in prompt
+    assert "KNOWN ABSENCE" in prompt
