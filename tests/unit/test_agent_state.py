@@ -7,12 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.services.chat.agent.evidence import EvidenceLedger
-from src.services.chat.agent.state import (
-    AgentRunState,
-    AgentSettings,
-    EffortPrior,
-    get_agent_settings,
-)
+from src.services.chat.agent.state import AgentRunState, AgentSettings, EffortPrior
 from src.services.chat.agent.transcript import Transcript
 from src.services.llm_adapters.base_adapter import LLMResponseStats
 
@@ -27,9 +22,6 @@ def _settings(**overrides: object) -> AgentSettings:
         "max_chunks_per_entity": 5,
         "max_empty_analytical_rounds": 1,
         "max_insufficiency_rejections": 1,
-        "max_named_item_rejections_per_item": 2,
-        "max_named_item_rejections_total": 10,
-        "max_restatement_rejections": 2,
         "turn_timeout_seconds": 60.0,
         "max_iterations_analytical": 7,
     }
@@ -61,18 +53,6 @@ class TestEffortPriorForShape:
         assert prior.max_empty_rounds == settings.max_empty_analytical_rounds
         assert prior.max_insufficiency_rejections == settings.max_insufficiency_rejections
         assert prior.max_concurrent_searches == settings.max_concurrent_searches
-
-    def test_named_item_caps_are_shape_invariant(self) -> None:
-        # The named-item gate is isinstance-scoped to the analytical finalizer (FR-11),
-        # so for_shape must carry both caps through unchanged for every shape.
-        settings = _settings()
-        for shape in ("analytical", "extraction", "comparison", None):
-            prior = EffortPrior.for_shape(settings, shape)
-            assert (
-                prior.max_named_item_rejections_per_item
-                == settings.max_named_item_rejections_per_item
-            )
-            assert prior.max_named_item_rejections_total == settings.max_named_item_rejections_total
 
 
 def _state(**overrides: object) -> AgentRunState:
@@ -139,30 +119,3 @@ class TestAgentSettingsValidation:
     def test_turn_timeout_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
             _settings(turn_timeout_seconds=0)
-
-    def test_named_item_rejection_caps_default_from_env(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_PER_ITEM", raising=False)
-        monkeypatch.delenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_TOTAL", raising=False)
-        settings = get_agent_settings()
-        assert settings.max_named_item_rejections_per_item == 2
-        assert settings.max_named_item_rejections_total == 10
-
-    def test_named_item_total_cap_of_zero_is_the_kill_switch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # ge=0, not ge=1: an operator must be able to disable the mechanism entirely
-        # via env without a code change (plan §6 rollback lever 1).
-        monkeypatch.setenv("AGENT_MAX_NAMED_ITEM_REJECTIONS_TOTAL", "0")
-        assert get_agent_settings().max_named_item_rejections_total == 0
-        assert _settings(max_named_item_rejections_total=0).max_named_item_rejections_total == 0
-        assert (
-            _settings(max_named_item_rejections_per_item=0).max_named_item_rejections_per_item == 0
-        )
-
-    def test_named_item_caps_reject_negative(self) -> None:
-        with pytest.raises(ValidationError):
-            _settings(max_named_item_rejections_total=-1)
-        with pytest.raises(ValidationError):
-            _settings(max_named_item_rejections_per_item=-1)

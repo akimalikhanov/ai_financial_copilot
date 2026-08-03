@@ -16,14 +16,7 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import (
-    GateFn,
-    analytical_insufficiency_gate,
-    confirmed_absent_gate,
-    missing_entity_gate,
-    named_item_gate,
-    restatement_integrity_gate,
-)
+from src.services.chat.agent.gates import GateFn, analytical_insufficiency_gate, missing_entity_gate
 from src.utils.json_schema import make_strict
 
 
@@ -74,21 +67,7 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
         schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
     ),
     "report_analytical_findings": ToolRegistration(
-        # Order matters — `loop.py` stops at the first rejection, so the most specific,
-        # most damaging complaint must come first (FR-13, D8):
-        #   1. restatement_integrity — content already established is being lost; fixing
-        #      anything else on top of a degraded restatement bakes the loss in.
-        #   2. confirmed_absent — an unbacked absence claim is a fabricated finding.
-        #   3. named_item — a specific item still needs its follow-up search.
-        #   4. analytical_insufficiency — the generic thinness complaint, last.
-        schema=REPORT_ANALYTICAL_TOOL,
-        terminal=True,
-        gates=(
-            restatement_integrity_gate,
-            confirmed_absent_gate,
-            named_item_gate,
-            analytical_insufficiency_gate,
-        ),
+        schema=REPORT_ANALYTICAL_TOOL, terminal=True, gates=(analytical_insufficiency_gate,)
     ),
 }
 
@@ -97,7 +76,7 @@ TOOL_REGISTRY: dict[str, ToolRegistration] = {
 # analytical_insufficiency_gate only for report_analytical_findings), so handing the
 # model both finalizers unconditionally does not change which gate fires for which
 # candidate type — it only removes the branch that built two separate tool lists.
-# Prompt selection (v3_agent vs v4_agent_analytical) still varies by query_shape.
+# Prompt selection (v3_agent vs v3_agent_analytical) still varies by query_shape.
 ALL_TOOLS = [
     TOOL_REGISTRY["search_documents"].schema,
     TOOL_REGISTRY["report_findings"].schema,

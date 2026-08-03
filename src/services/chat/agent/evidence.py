@@ -118,23 +118,6 @@ class EvidenceLedger:
                 resolved.append(candidate)
         return resolved, unresolved
 
-    def labels_for(self, chunk_ids: Iterable[str]) -> list[str]:
-        """Reverse of `resolve_refs`: chunk-UUID strings back to the S-labels the model
-        was shown. Unlabelled or unknown chunks are skipped.
-
-        Findings store resolved UUIDs, but anything rendered back into the model's view
-        must speak in labels — that is the handle it can cite (P0-2).
-        """
-        labels: list[str] = []
-        for cid_str in chunk_ids:
-            try:
-                record = self._records.get(UUID(cid_str))
-            except ValueError:
-                continue
-            if record is not None and record.ref_id is not None:
-                labels.append(record.ref_id)
-        return labels
-
     def text_for(self, chunk_id: UUID) -> str | None:
         """Chunk prompt text, held in-memory since search time (P3-21)."""
         return self._text.get(chunk_id)

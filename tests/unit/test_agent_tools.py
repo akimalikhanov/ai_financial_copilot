@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import missing_entity_gate
 from src.services.chat.agent.tools import (
     ALL_TOOLS,
     REPORT_ANALYTICAL_TOOL,
@@ -41,21 +40,6 @@ class TestSchemaShape:
     def test_report_analytical_tool_name(self) -> None:
         assert REPORT_ANALYTICAL_TOOL["function"]["name"] == "report_analytical_findings"
         assert "observations" in _params(REPORT_ANALYTICAL_TOOL)["properties"]
-
-    def test_named_item_strict_shape(self) -> None:
-        # Pins the model-facing contract for named_item: strict mode must require the key
-        # (emitted as null when absent) and render it as a nullable $ref with default null,
-        # exactly as refuted_by already renders. A make_strict change must not alter this.
-        params = _params(REPORT_ANALYTICAL_TOOL)
-        observation = params["$defs"]["Observation"]
-        assert "named_item" in observation["required"]
-        prop = observation["properties"]["named_item"]
-        assert prop["default"] is None
-        assert prop["anyOf"] == [{"$ref": "#/$defs/NamedItem"}, {"type": "null"}]
-
-        named_item = params["$defs"]["NamedItem"]
-        assert named_item["additionalProperties"] is False
-        assert set(named_item["required"]) == {"name", "status"}
 
     def test_make_strict_applied(self) -> None:
         # Every object node is additionalProperties:false with an exhaustive required list.
@@ -127,30 +111,6 @@ class TestRoundTrip:
         assert parsed.question == "Why did margins fall?"
         assert len(parsed.observations) == 1
         assert parsed.observations[0].confidence == "high"
-        # named_item absent from the payload still parses, defaulting to None.
-        assert parsed.observations[0].named_item is None
-
-    def test_report_analytical_named_item_round_trip(self) -> None:
-        payload = json.dumps(
-            {
-                "question": "How did Payments do?",
-                "observations": [
-                    {
-                        "aspect": "payments_revenue",
-                        "claim": "Payments segment revenue is not broken out.",
-                        "evidence_chunks": ["S1"],
-                        "confidence": "medium",
-                        "refuted_by": None,
-                        "named_item": {"name": "Payments segment", "status": "unresolved"},
-                    }
-                ],
-            }
-        )
-        parsed = AnalyticalFindings.model_validate(json.loads(payload))
-        item = parsed.observations[0].named_item
-        assert item is not None
-        assert item.name == "Payments segment"
-        assert item.status == "unresolved"
 
 
 class TestFieldDescriptionsPreserved:
@@ -183,25 +143,4 @@ class TestUnifiedToolPool:
         report_findings_gates = {g.__name__ for g in gates_for("report_findings")}
         report_analytical_gates = {g.__name__ for g in gates_for("report_analytical_findings")}
         assert report_findings_gates == {"missing_entity_gate"}
-        assert report_analytical_gates == {
-            "restatement_integrity_gate",
-            "confirmed_absent_gate",
-            "named_item_gate",
-            "analytical_insufficiency_gate",
-        }
-
-    def test_analytical_gates_run_most_specific_first(self) -> None:
-        # AC-14/FR-13: loop.py stops at the first rejection, so this ordering *is* the
-        # implementation of "the most specific, most damaging complaint wins". Losing
-        # established content outranks an unbacked absence claim, which outranks a
-        # pending item, which outranks the generic thinness complaint.
-        assert [g.__name__ for g in gates_for("report_analytical_findings")] == [
-            "restatement_integrity_gate",
-            "confirmed_absent_gate",
-            "named_item_gate",
-            "analytical_insufficiency_gate",
-        ]
-
-    def test_report_findings_gates_unchanged(self) -> None:
-        # AC-9, FR-11: the named-item gate must not be cross-wired onto the other finalizer.
-        assert gates_for("report_findings") == (missing_entity_gate,)
+        assert report_analytical_gates == {"analytical_insufficiency_gate"}

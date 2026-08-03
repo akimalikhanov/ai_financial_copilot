@@ -2,8 +2,8 @@
 
 The third state store, beside `Transcript` (the model's view) and `EvidenceLedger`
 (retrieved chunks). Where the transcript logs *interactions*, this stores *conclusions*,
-addressed by a stable key — ``EntityFinding.entity``, or ``observation_key`` (aspect plus
-the item the observation names, P1-1) — and updated in place.
+addressed by a stable key — ``EntityFinding.entity`` or ``Observation.aspect`` — and
+updated in place.
 
 10a (this step): the loop populates it by parsing every finalizer attempt (accepted or
 rejected) via `ingest`, and projects it back for synthesis via `projection`. No
@@ -29,7 +29,6 @@ from src.schemas.agent_findings import (
     AnalyticalFindings,
     EntityFinding,
     Observation,
-    observation_key,
 )
 
 if TYPE_CHECKING:
@@ -107,15 +106,10 @@ class FindingsLedger:
         """Fold one finalizer attempt (accepted or rejected) into the ledger, without pruning.
 
         Restated keys update in place (revisions++); keys this attempt omits are left
-        alone. The prune moved to `prune_to`, called only on the attempt that is actually
-        *accepted* (P0-1).
-
-        The prune's premise is that omitting a key is deliberate abandonment. That holds
-        for a voluntary restatement and fails for one coerced by a gate, where the model
-        is re-emitting under duress from a transcript whose rejected draft has been
-        stripped: a key it fails to reproduce — or reproduces under a renamed aspect — was
-        lost, not abandoned, and pruning here destroyed the established entry before any
-        gate could see it was gone.
+        alone. Pruning happens only in `prune_to`, called on the attempt that is actually
+        *accepted* — a rejected attempt is not a deliberate restatement, it's a draft the
+        model is about to be told to redo, and treating its omissions as abandonment
+        destroys established entries before any gate has even evaluated them.
         """
         items: list[tuple[str, EntityFinding | Observation]]
         if isinstance(candidate, AgentFindings):
@@ -128,16 +122,9 @@ class FindingsLedger:
             self._question = candidate.question
             self._conclusion = candidate.conclusion
             self._gaps = list(candidate.gaps) if candidate.gaps else None
-            items = [(observation_key(o), o) for o in candidate.observations]
+            items = [(o.aspect, o) for o in candidate.observations]
         for key, finding in items:
             self.record(key, finding, evidence)
-
-    def restrict_to(self, live: set[str]) -> set[str]:
-        """Drop every entry whose key is not in ``live``. Returns the dropped keys."""
-        dropped = self._entries.keys() - live
-        for key in dropped:
-            del self._entries[key]
-        return dropped
 
     def prune_to(self, candidate: AgentFindings | AnalyticalFindings) -> set[str]:
         """Drop keys the *accepted* restatement abandoned. Returns the dropped keys.
@@ -146,13 +133,16 @@ class FindingsLedger:
         omitted was deliberately abandoned and must not be resurrected into the served
         projection (the same reason `transcript.py` strips rejected drafts). The caller
         records the dropped keys as a gap, so the omission at least reaches the answer as
-        a stated limitation rather than vanishing (P1-3).
+        a stated limitation rather than vanishing.
         """
         if isinstance(candidate, AgentFindings):
             live = {f.entity for f in candidate.findings}
         else:
-            live = {observation_key(o) for o in candidate.observations}
-        return self.restrict_to(live)
+            live = {o.aspect for o in candidate.observations}
+        dropped = self._entries.keys() - live
+        for key in dropped:
+            del self._entries[key]
+        return dropped
 
     def add_gap(self, gap: str) -> None:
         """Append a loop-authored caveat to the served envelope's `gaps`."""
