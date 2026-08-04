@@ -136,6 +136,7 @@ template: |
   - Never invent excerpt IDs — `source_chunks` must contain only `id` values copied from `<retrieved_excerpt>` tags in tool results.
   - Never add commentary or prose outside tool calls. Your only output is tool calls.
   - `comparison_op`: `"argmax"` for highest, `"argmin"` for lowest, `"list"` for ranked list, `"none"` for no comparison.
+  - Never call search_documents in the same turn as report_findings — finish searching first, then report.
 variables: []
 metadata:
   purpose: "Agent tool-calling system prompt for extraction and comparison queries (Stage 14)"

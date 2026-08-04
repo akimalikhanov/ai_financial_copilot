@@ -108,7 +108,6 @@ def _routed_llm(adapter: Any) -> RoutedLLM:
 
 @pytest.fixture(autouse=True)
 def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AGENT_LOOP_ENABLED", "true")
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "3")
     monkeypatch.setenv("AGENT_TOKEN_BUDGET", "1000000")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "1")
@@ -156,7 +155,7 @@ async def test_mid_loop_tool_message_capped_but_ledger_holds_full_set() -> None:
     async def _fake_execute_search(*_args: Any, **_kwargs: Any) -> _SearchResult:
         return _SearchResult(entity="Acme", chunks=chunks, payloads=payloads)
 
-    chunk_registry, _findings, _meta = await run_loop(
+    evidence, _findings, _meta = await run_loop(
         state,
         llm,
         state.session,
@@ -167,8 +166,8 @@ async def test_mid_loop_tool_message_capped_but_ledger_holds_full_set() -> None:
         execute_search=_fake_execute_search,
     )
 
-    # The ledger (returned registry) admitted the full result — provenance intact.
-    assert len(chunk_registry) == 5
+    # The ledger admitted the full result — provenance intact.
+    assert len(evidence) == 5
 
     # But the second LLM call (after the search turn) must only ever have seen the
     # capped render in its tool message, not all 5 excerpts.

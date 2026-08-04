@@ -28,7 +28,6 @@ ConvergenceReason = Literal["natural", "convergence", "iteration_cap", "budget_c
 class AgentSettings(BaseModel):
     """Validated agent env config (P2-15) — replaces the untyped dict from get_agent_config()."""
 
-    enabled: bool
     tool_model: str
     max_iterations: int = Field(ge=1, le=20)
     token_budget: int = Field(ge=1000)
@@ -51,8 +50,6 @@ def get_agent_settings() -> AgentSettings:
     the dict it replaces, so env overrides (incl. in tests) always take effect."""
     max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "5"))
     return AgentSettings(
-        enabled=os.getenv("AGENT_LOOP_ENABLED", "false").strip().lower()
-        not in {"0", "false", "no", "off"},
         tool_model=os.getenv("AGENT_TOOL_MODEL", get_query_transformer_model()),
         max_iterations=max_iterations,
         token_budget=int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
@@ -159,7 +156,6 @@ class AgentLoopMeta:
     cost_usd_total: float = 0.0
     # P0-4: input tokens attributed per model_id (agent tool model vs query-rewrite model).
     # input_tokens_total is their sum; the budget cap checks the sum, unchanged.
-    input_tokens_by_model: dict[str, int] = field(default_factory=dict)
     # Entities the loop actually called search_documents for — the synthesis boundary uses
     # this (not reported coverage) to label stubs for entities the agent never searched.
     searched_entities: frozenset[str] = field(default_factory=frozenset)
@@ -182,7 +178,6 @@ def debug_snapshot(state: AgentRunState) -> dict:
         "convergence_reason": state.convergence_reason,
         "findings": findings.model_dump(mode="json") if findings is not None else None,
         "findings_keys": sorted(state.findings.keys()),
-        "revised_keys": state.findings.revised_keys(),
         "evidence_chunk_count": len(state.evidence),
         "transcript_message_count": len(state.transcript.messages),
         "searched_entities": sorted(state.searched_entities),
@@ -202,6 +197,5 @@ def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
         input_tokens_total=state.input_tokens_total(),
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
         cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),
-        input_tokens_by_model={mid: ts.input_tokens for mid, ts in state.spend.items()},
         searched_entities=frozenset(state.searched_entities),
     )

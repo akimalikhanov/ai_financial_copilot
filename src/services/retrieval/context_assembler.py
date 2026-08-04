@@ -30,7 +30,7 @@ def _dedup_chunks(chunks: Sequence[RetrievedChunk]) -> list[RetrievedChunk]:
     return out
 
 
-def _wrap_excerpt(ref_id: str, source_doc: str, flagged: bool, text: str) -> str:
+def wrap_excerpt(ref_id: str, source_doc: str, flagged: bool, text: str) -> str:
     flagged_attr = "true" if flagged else "false"
     return (
         f'<retrieved_excerpt id="{ref_id}" source_doc="{source_doc}" flagged="{flagged_attr}">\n'
@@ -137,7 +137,7 @@ def assemble_rag_context(
                 provenance=payload.provenance,
             )
         )
-        blocks.append(_wrap_excerpt(ref_id, payload.document_name, flagged, prompt_text))
+        blocks.append(wrap_excerpt(ref_id, payload.document_name, flagged, prompt_text))
 
     return (
         RAGContext(

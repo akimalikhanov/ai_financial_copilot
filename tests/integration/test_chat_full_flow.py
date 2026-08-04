@@ -16,20 +16,15 @@ import pytest
 
 from src.redis_client import get_chat_tail
 from src.services.llm_adapters.base_adapter import LLMStreamChunk
-from src.services.llm_router import LLMRouter, RoutedLLM
-from tests.integration.conftest import MOCK_RESPONSE
+from tests.integration.conftest import MOCK_RESPONSE, MockStreamingLLM, create_agentic_router
 
 
-class _MockErrorLLM:
-    """Mock LLM that raises during streaming."""
+class _MockErrorLLM(MockStreamingLLM):
+    """Mock LLM that routes normally, then raises during the synthesis stream."""
 
     def __init__(self, error_msg: str = "Simulated streaming error") -> None:
-        self.provider = "mock"
-        self.model_id = "mock-model"
+        super().__init__()
         self._error_msg = error_msg
-
-    async def close(self) -> None:
-        pass
 
     def stream(self, *_args: Any, **_kwargs: Any) -> AsyncGenerator[LLMStreamChunk, None]:
         async def _gen() -> AsyncGenerator[LLMStreamChunk, None]:
@@ -37,25 +32,6 @@ class _MockErrorLLM:
             yield  # unreachable, makes _gen an async generator
 
         return _gen()
-
-
-def _create_error_router(error_msg: str = "Simulated streaming error") -> LLMRouter:
-    mock_llm = _MockErrorLLM(error_msg=error_msg)
-    routed = RoutedLLM(
-        adapter=mock_llm,  # type: ignore[arg-type]
-        provider="mock",
-        model_id="gpt-4o-mini",
-        default_params={"temperature": 0.2, "max_tokens": 2000},
-        default_stream=True,
-        capabilities={},
-    )
-    config = {
-        "defaults": {"stream": True, "params": {"temperature": 0.2, "max_tokens": 2000}},
-        "models": [],
-    }
-    router = LLMRouter(config)
-    router._models["gpt-4o-mini"] = routed
-    return router
 
 
 @pytest.mark.integration
@@ -218,7 +194,7 @@ async def test_chat_tail_cache_populated_after_flow(async_client, integration_ap
 async def test_chat_error_propagation_sse(async_client, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify SSE emits structured error event when LLM raises during streaming."""
     error_msg = "Simulated streaming error"
-    error_router = _create_error_router(error_msg)
+    error_router = create_agentic_router(chat_adapter=_MockErrorLLM(error_msg))
     monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: error_router)
     monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: error_router)
     monkeypatch.setattr("src.services.chat.tasks._router", error_router)

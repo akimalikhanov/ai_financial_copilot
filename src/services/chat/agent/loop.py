@@ -38,6 +38,7 @@ from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent import gates as gates_module
 from src.services.chat.agent import tools as tools_module
+from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.state import (
     AgentLoopMeta,
     AgentRunState,
@@ -99,7 +100,8 @@ class Continue:
 
 @dataclass(frozen=True)
 class Finalize:
-    findings: AgentFindings | AnalyticalFindings
+    """Marker: a finalizer was accepted. The findings themselves are served from
+    `state.findings.projection()`, never from this object."""
 
 
 @dataclass(frozen=True)
@@ -138,22 +140,23 @@ async def _execute_search(
             payloads={},
             error_str="search_documents call had invalid arguments — entity and query are required strings.",
         )
-    entity = search_args.entity
     raw_query = search_args.query
 
-    _tool_started = perf_counter()
-    await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
-
-    # Resolve doc_ids for this entity
+    # Resolve doc_ids for this entity. The analytical agent passes entity="" — resolve it
+    # to the primary entity's name here so the ledger, the SSE events and the trace span
+    # all carry the entity actually searched rather than an empty string.
     per_entity = (state.scope_result.per_entity_doc_ids or {}) if state.scope_result else {}
+    entity = search_args.entity
     if entity and entity in per_entity:
         doc_ids = per_entity[entity]
     elif not entity and per_entity:
-        # Analytical agent passes entity="" — scope to the first (primary) entity's docs
-        # rather than leaking to the full user corpus.
-        doc_ids = next(iter(per_entity.values()))
+        # Scope to the first (primary) entity's docs rather than leaking to the full corpus.
+        entity, doc_ids = next(iter(per_entity.items()))
     else:
         doc_ids = state.scope_result.doc_ids if state.scope_result else None
+
+    _tool_started = perf_counter()
+    await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
 
     # Rewrite at tool boundary — cheap model, eval-independent
     scope_docs: list[ScopeDocSummary] = []
@@ -386,9 +389,6 @@ async def _handle_finalizer(
         candidate = _resolve_candidate_refs(raw_candidate, state, request_id)
         if isinstance(candidate, AnalyticalFindings):
             candidate = gates_module.drop_evidence_free_observations(candidate)
-        # Protect chunks the model cited here even if this attempt is rejected — a
-        # later accepted call must still be able to cite them.
-        state.evidence.protect(gates_module.finding_chunk_ids(candidate))
         # Fold every finalizer attempt (accepted or rejected below) into the ledger —
         # this is what gives a non-converged run real content to serve (degraded) and
         # exercises the in-place revision path across retried attempts. C6's grounding
@@ -420,7 +420,7 @@ async def _handle_finalizer(
         AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
         state.sealed = True
         _log_finalizer_accept(lf, candidate, state)
-        return Finalize(candidate)
+        return Finalize()
     finally:
         _fin_lf_stack.close()
 
@@ -540,8 +540,7 @@ async def _run_turn(
         for tc, result in zip(search_tcs, results, strict=False):
             if result.rewrite_stats:
                 state.record_spend(rewrite_model_id, result.rewrite_stats)
-            lookup_id = state.evidence.start_lookup()
-            entity_new = state.evidence.admit(lookup_id, iteration, result.chunks)
+            entity_new = state.evidence.admit(result.chunks)
             new_chunks += entity_new
             if result.entity:
                 state.searched_entities.add(result.entity)
@@ -570,12 +569,10 @@ async def _run_turn(
             if result.error_str is not None:
                 tool_content = result.error_str
             else:
-                # P2 (audit finding): admit the full result above for provenance
-                # (seen_in_lookups / P1-5), but render only the top-N into the
-                # transcript — mid-loop, uncapped tool results were the single
-                # biggest per-turn token cost (~106k chars measured). The record
-                # stays complete; only the view is capped. `apply_cap` (post-loop)
-                # now exists purely as the final synthesis-selection safety net.
+                # P2 (audit finding): admit the full result above for provenance, but
+                # render only the top-N into the transcript — mid-loop, uncapped tool
+                # results were the single biggest per-turn token cost (~106k chars
+                # measured). The record stays complete; only the view is capped.
                 ctx = state.evidence.assign_labels(
                     result.chunks[:max_chunks_per_lookup], result.payloads
                 )
@@ -604,7 +601,7 @@ async def _run_turn(
                     ),
                 )
             )
-            state.transcript.compress()
+            state.transcript.compress(state.evidence)
             return Continue()
 
         # P0-2: a productive round (new chunks admitted) resets the empty-round streak —
@@ -614,7 +611,7 @@ async def _run_turn(
         if not state.spend_within_budget():
             return Stop("budget_cap")
 
-        state.transcript.compress()
+        state.transcript.compress(state.evidence)
         return Continue()
     finally:
         if lf:
@@ -648,13 +645,19 @@ async def run_loop(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     execute_search: ExecuteSearchFn = _execute_search,
-) -> tuple[dict[UUID, RetrievedChunk], AgentFindings | AnalyticalFindings | None, AgentLoopMeta]:
+) -> tuple[
+    EvidenceLedger,
+    AgentFindings | AnalyticalFindings | None,
+    AgentLoopMeta,
+]:
     """Run the agent tool-calling loop for retrieval queries.
 
-    Returns (chunk_registry, agent_findings, meta). chunk_registry is keyed by
-    chunk_id; values have turn_index stamped. agent_findings is the FindingsLedger
-    projection — the accumulated findings, marked degraded when no finalizer sealed the
-    run, and None only when no finalizer was ever attempted.
+    Returns (evidence, agent_findings, meta). The ledger carries the ordered chunks, the
+    payloads cached at render time (so synthesis hydrates nothing, D2), and the rendered
+    subset — what the model could actually read, the only defensible pool for synthesis to
+    fall back on. agent_findings is the FindingsLedger projection — the accumulated
+    findings, marked degraded when no finalizer sealed the run, and None only when no
+    finalizer was ever attempted.
 
     ``session`` is used for the loop's own serial DB work (subrequest logging).
     Concurrent searches each open their own session from ``session_factory``:
@@ -698,10 +701,9 @@ async def run_loop(
             if years:
                 _entity_years[item.entity_name] = years
 
-    # Seeded regardless of query_shape: both finalizers are always in the tool pool
-    # now (Stage 1.5), so missing_entity_gate — which only fires for report_findings
-    # (isinstance-scoped, see gates.py) — must have real coverage data whichever
-    # finalizer the model ends up calling, not just for non-analytical shapes.
+    # Seeded regardless of query_shape: the entity-injection message below and
+    # `_inject_unsearched_stubs` at the synthesis boundary both read this to tell
+    # "searched and found nothing" from "never searched", whichever finalizer runs.
     expected_entities: set[str] = set()
     if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
         expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
@@ -788,9 +790,6 @@ async def run_loop(
             break
         # Continue(): fall through to the next iteration
 
-    # Post-loop, once: per-lookup context-window cap (never evicts a protected chunk).
-    state.evidence.apply_cap(settings.max_chunks_per_entity)
-
     await add_event(
         redis_app,
         request_id,
@@ -811,4 +810,4 @@ async def run_loop(
     # now yields its accumulated partial findings marked degraded, instead of None →
     # raw-excerpt fallback (P1-6). None only when no finalizer was ever attempted.
     findings = state.findings.projection(degraded=not state.sealed)
-    return state.evidence.registry, findings, meta
+    return state.evidence, findings, meta

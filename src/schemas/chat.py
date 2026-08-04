@@ -14,8 +14,7 @@ if TYPE_CHECKING:
 
     from src.models.llm_request import LLMRequest
     from src.schemas.query_router import DocumentScopeResult, RouterOutput
-    from src.schemas.query_transform import TransformedQuery
-    from src.schemas.retrieval import ProcessedQuery, RAGContext
+    from src.schemas.retrieval import RAGContext
     from src.services.chat.agent.state import AgentLoopMeta
     from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
@@ -52,18 +51,19 @@ class ChatPipelineState:
     history: ConversationHistory | None = None
     context_messages: list[ChatMessage] | None = None
     user_query_raw: str = ""
-    processed_query: ProcessedQuery | None = None
     router_output: RouterOutput | None = None
     scope_result: DocumentScopeResult | None = None
-    transformed_query: TransformedQuery | None = None
     rag_context: RAGContext | None = None
     rag_context_str: str = ""
     adapter_messages: list[AdapterChatMessage] | None = None
     accumulated_content: str = ""
     clean_content: str = ""
     params: dict = field(default_factory=dict)
-    used_agent_loop: bool = False
     agent_meta: AgentLoopMeta | None = None
+    # Findings-processor outputs, carried from the agent stage to the trace payload.
+    agent_answer_entity: str | None = None
+    agent_fx_rates: dict = field(default_factory=dict)
+    agent_currency_converted: bool = False
 
 
 class LLMResponseStats(BaseModel):

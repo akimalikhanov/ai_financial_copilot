@@ -26,7 +26,6 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-      citation_mode: bracket
     params_override: {temperature: 1.0, max_tokens: 2000, verbosity: high, reasoning_effort: high}
 
   - id: gpt-5-mini
@@ -46,7 +45,6 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-      citation_mode: none
     # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
     # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
@@ -69,7 +67,6 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-      citation_mode: none
     params_override: {}
 
   # === Google Gemini adapters ===
@@ -91,7 +88,6 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-      citation_mode: none
     params_override: {}
 
   # === Local vLLM adapters ===
@@ -112,5 +108,4 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-      citation_mode: bracket
     params_override: {max_tokens: 1024}

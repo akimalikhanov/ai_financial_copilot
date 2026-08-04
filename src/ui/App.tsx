@@ -90,7 +90,7 @@ function groupChatsByDate(chats: Chat[]): { label: string; items: Chat[] }[] {
 
 const toUiMessage = (msg: { id: string; role: string; content: string; created_at: string; metadata?: Record<string, unknown>; feedback?: { rating: 'up' | 'down'; comment?: string | null } | null }): Message => {
   const meta = msg.metadata || {};
-  const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels: string[] }> | undefined;
+  const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels?: string[] }> | undefined;
   const refs = meta.references as Array<Record<string, unknown>> | undefined;
   return {
     id: msg.id,
@@ -98,7 +98,9 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
     content: msg.content,
     timestamp: new Date(msg.created_at).getTime(),
     citations: meta.citations as Citation[] | undefined,
-    citationSpans: spans?.map((s) => ({ start: s.start, end: s.end, refIds: s.ref_ids, displayLabels: s.display_labels })),
+    // display_labels is absent on messages persisted after the C-label hop was removed;
+    // those pills render the S-labels the references carry.
+    citationSpans: spans?.map((s) => ({ start: s.start, end: s.end, refIds: s.ref_ids, displayLabels: s.display_labels ?? s.ref_ids })),
     references: refs?.map((r: Record<string, unknown>) => ({
       refId: r.ref_id as string,
       displayLabel: r.display_label as string,
@@ -1025,7 +1027,7 @@ export default function App() {
         (span) => {
           updateMessage(conversationId, placeholderId, m => ({
             ...m,
-            citationSpans: [...(m.citationSpans || []), { start: span.start, end: span.end, refIds: span.ref_ids, displayLabels: span.display_labels }],
+            citationSpans: [...(m.citationSpans || []), { start: span.start, end: span.end, refIds: span.ref_ids, displayLabels: span.ref_ids }],
           }));
         },
         (refs) => {

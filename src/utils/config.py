@@ -493,10 +493,6 @@ def get_rag_vector_weight() -> float:
     return float(os.getenv("RAG_VECTOR_WEIGHT", "0.6"))
 
 
-def get_rag_score_threshold() -> float:
-    return float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
-
-
 def get_vector_search_top_k() -> int:
     """VECTOR_SEARCH_TOP_K (default: 10)."""
     return int(os.getenv("VECTOR_SEARCH_TOP_K", "10"))
@@ -566,11 +562,6 @@ def get_injection_scan_user_input_enabled() -> bool:
 def get_injection_scan_chunks_enabled() -> bool:
     """INJECTION_SCAN_CHUNKS (default: true). Regex injection scan on retrieved RAG chunks."""
     return _parse_bool(os.getenv("INJECTION_SCAN_CHUNKS"), True)
-
-
-def get_system_prompt_version() -> str:
-    """SYSTEM_PROMPT_VERSION (default: v2). Controls which system prompt YAML is loaded."""
-    return os.getenv("SYSTEM_PROMPT_VERSION", "v2")
 
 
 def get_chat_retrieval_timeout() -> float:

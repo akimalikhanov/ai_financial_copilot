@@ -10,7 +10,7 @@ import httpx
 import pytest
 import respx
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding, Observation
+from src.schemas.agent_findings import AgentFindings, EntityFinding
 from src.services.chat.agent.processor import _normalize_date, _to_millions, process_findings
 
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
@@ -71,21 +71,6 @@ def _disable_langfuse(monkeypatch: pytest.MonkeyPatch):
     from src.observability import langfuse as lf_client
 
     monkeypatch.setattr(lf_client, "get_client", lambda: None)
-
-
-class TestProcessFindingsAnalyticalPassthrough:
-    @pytest.mark.asyncio
-    async def test_analytical_findings_short_circuits(self) -> None:
-        analytical = AnalyticalFindings(
-            question="why?",
-            observations=(
-                Observation(aspect="a", claim="x", evidence_chunks=[], confidence="high"),
-            ),
-        )
-        result = await process_findings(analytical)
-        assert result.findings == ()
-        assert result.answer_entity is None
-        assert result.analytical_findings is analytical
 
 
 class TestCurrencyResolutionPriority:

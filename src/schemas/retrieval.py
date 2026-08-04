@@ -2,34 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
 
 RetrievalSource = Literal["vector", "keyword", "hybrid"]
-
-Route = Literal["direct_answer", "retrieve", "out_of_scope"]
-
-
-class RouterOutput(BaseModel):
-    """Schema for LLM router response. LLM must output valid JSON matching this structure."""
-
-    route: Route
-    user_intent: str
-    reason: str | None = None
-
-
-@dataclass(slots=True, frozen=True)
-class ProcessedQuery:
-    """Result of query preprocessing and routing."""
-
-    normalized_text: str
-    route: Route
-    user_intent: str
-    reason: str | None = None
-
 
 REF_PLACEHOLDER = "__REF__"  # safer than str.format() for arbitrary chunk text
 SOURCE_REF_PREFIX = "S"
@@ -154,34 +133,6 @@ class AnswerCitationSpan:
     start: int  # char offset in clean text (inclusive)
     end: int  # char offset in clean text (exclusive)
     ref_ids: tuple[str, ...]  # e.g. ("S1", "S4")
-
-
-@dataclass
-class DisplayLabelMap:
-    """Maps source ref_ids to presentation-layer display labels (C1, C2, ...).
-
-    Labels are assigned sequentially by first appearance in the answer text,
-    so the display order is independent of retrieval/reranker order.
-    """
-
-    _source_to_label: dict[str, str] = field(default_factory=dict)
-    _next_index: int = field(default=1)
-
-    def get_or_assign(self, ref_id: str) -> str:
-        """Get existing label or assign next sequential one."""
-        if ref_id not in self._source_to_label:
-            self._source_to_label[ref_id] = f"C{self._next_index}"
-            self._next_index += 1
-        return self._source_to_label[ref_id]
-
-    def get_labels_for_refs(self, ref_ids: tuple[str, ...]) -> tuple[str, ...]:
-        """Get or assign labels for multiple refs, preserving order."""
-        return tuple(self.get_or_assign(r) for r in ref_ids)
-
-    @property
-    def mapping(self) -> dict[str, str]:
-        """Return a copy of the current source-to-display mapping."""
-        return dict(self._source_to_label)
 
 
 @dataclass

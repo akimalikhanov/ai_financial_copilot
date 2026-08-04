@@ -27,21 +27,18 @@ async def generate_conversation_title(
     llm_router: LLMRouter,
     model: str,
     max_len: int = 60,
-    session: AsyncSession | None = None,
-    parent_request_id: UUID | None = None,
-    conversation_id: UUID | None = None,
+    session: AsyncSession,
+    parent_request_id: UUID,
+    conversation_id: UUID,
     user_id: UUID | None = None,
 ) -> str | None:
     """Call a cheap LLM to produce a short title. Returns None on any failure.
 
-    Registers a Langfuse generation (via ``_lf_name``) and, when the logging
-    context is supplied, a completed ``llm_requests`` sub-request — matching the
-    pattern used by rewrite_query / query_router / table_summarizer.
+    Registers a Langfuse generation (via ``_lf_name``) and a completed
+    ``llm_requests`` sub-request — matching the pattern used by rewrite_query /
+    query_router / table_summarizer.
     """
     request_params: dict = {"temperature": 0.3, "max_tokens": 30}
-    should_log_subrequest = (
-        session is not None and parent_request_id is not None and conversation_id is not None
-    )
 
     try:
         llm = llm_router.get(model)
@@ -65,18 +62,17 @@ async def generate_conversation_title(
         logger.warning("conversation_naming_llm_error", exc_info=True)
         return None
 
-    if should_log_subrequest:
-        await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
-            parent_request_id=parent_request_id,  # type: ignore[arg-type]
-            conversation_id=conversation_id,  # type: ignore[arg-type]
-            user_id=user_id,
-            provider=llm.provider,
-            model=model,
-            request_type="conversation_naming",
-            request_params=request_params,
-            status="completed",
-            **stats_to_request_kwargs(resp.stats),
-        )
+    await LLMRequestRepository(session).create_subrequest(
+        parent_request_id=parent_request_id,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        provider=llm.provider,
+        model=model,
+        request_type="conversation_naming",
+        request_params=request_params,
+        status="completed",
+        **stats_to_request_kwargs(resp.stats),
+    )
 
     title = (resp.text or "").strip().strip("\"'").strip()[:max_len]
     return title if title else None

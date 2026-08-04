@@ -282,20 +282,8 @@ def test_get_system_prompt_loads_template(temp_prompts_dir):
         mock_loader_instance = PromptLoader(temp_prompts_dir)
         mock_loader.return_value = mock_loader_instance
 
-        result = get_system_prompt()
+        result = get_system_prompt(version="v1")
 
-        assert result == "You are a test assistant.\n"
-
-
-def test_get_system_prompt_uses_default_version(temp_prompts_dir):
-    """Test that get_system_prompt uses v1 by default."""
-    with patch("src.services.prompts.prompt_renderer.get_prompt_loader") as mock_loader:
-        mock_loader_instance = PromptLoader(temp_prompts_dir)
-        mock_loader.return_value = mock_loader_instance
-
-        result = get_system_prompt()
-
-        # Should load v1
         assert result == "You are a test assistant.\n"
 
 
@@ -328,7 +316,7 @@ def test_full_flow_load_and_render(temp_prompts_dir):
     # Get system prompt using the temp loader
     with patch("src.services.prompts.prompt_renderer.get_prompt_loader") as mock_loader:
         mock_loader.return_value = loader
-        system_prompt = get_system_prompt()
+        system_prompt = get_system_prompt(version="v1")
         assert "test assistant" in system_prompt.lower()
 
     # Render user message
@@ -359,7 +347,7 @@ def test_renderer_with_default_loader():
 def test_system_prompt_with_real_templates():
     """Test that get_system_prompt works with real templates."""
     # This uses the actual prompts directory
-    system_prompt = get_system_prompt()
+    system_prompt = get_system_prompt(version="v3_agent_synthesis")
 
     # Should contain the Financial Document Analyst prompt
     assert "Financial Document Analyst" in system_prompt

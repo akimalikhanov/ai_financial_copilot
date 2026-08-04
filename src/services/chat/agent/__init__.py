@@ -34,10 +34,15 @@ async def run_agent(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AgentRunResult:
     """Run the tool-calling loop, then synthesize its output. One call, one boundary."""
-    chunk_registry, findings, meta = await run_loop(
+    evidence, findings, meta = await run_loop(
         state, llm, session, redis_app, request_id, reranker, session_factory
     )
     requested_currency = getattr(state.router_output, "requested_currency", None)
     return await run_synthesis(
-        chunk_registry, findings, meta, state.scope_result, requested_currency, session
+        evidence,
+        findings,
+        meta,
+        state.scope_result,
+        requested_currency,
+        max_chunks_per_entity=get_agent_settings().max_chunks_per_entity,
     )

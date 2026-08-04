@@ -33,22 +33,11 @@ from src.observability.metrics import (
     ROUTER_DECISIONS,
 )
 from src.redis_client import add_event
-from src.repository import (
-    ConversationRepository,
-    DocumentRepository,
-    LLMRequestRepository,
-    MessageRepository,
-)
+from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
-from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept for kill-switch path)
-    ScopeDocSummary,
-    TransformedQuery,
-    TransformerInput,
-)
-from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
+from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput
 from src.services.chat.agent import run_agent
 from src.services.chat.agent.state import get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
@@ -62,13 +51,10 @@ from src.services.chat.events import (
     out_of_scope_response,
     span_to_dict,
 )
+from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
-from src.services.retrieval.chat_rag import run_chat_rag_pipeline
-
-# from src.services.retrieval.query_processor import process_query
-from src.services.retrieval.query_transformer import rewrite_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
@@ -76,7 +62,6 @@ from src.utils.config import (
     get_conversation_naming_config,
     get_db_url,
     get_injection_scan_user_input_enabled,
-    get_query_transformer_config,
     get_redis_app_url,
 )
 
@@ -85,8 +70,6 @@ logger = logging.getLogger(__name__)
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
     "agent_loop": "chain",
-    "transform_query": "chain",
-    "build_rag_context": "retriever",
 }
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
@@ -130,8 +113,6 @@ def _scope_summary(
     Combines what the user selected (mode + filters) with how it resolved
     (source, doc count, per-entity companies) into a flat, glanceable dict.
     """
-    from src.schemas.query_router import DocumentScopeResult
-
     requested_mode = chat_scope.mode if chat_scope else "allDocs"
     summary: dict[str, object] = {
         "requested_mode": requested_mode,
@@ -272,12 +253,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
-    retrieval_trace: RetrievalTrace | None = None
     agent_findings_json: str | None = None  # set by agent branch; used in persist
-    _agent_answer_entity: str | None = None
-    _agent_fx_rates: dict = {}
-    _agent_currency_converted: bool = False
-    stage_total = 8
+    # 7 stages, plus scan_user_input when the guardrail is on.
+    stage_total = 7 + int(get_injection_scan_user_input_enabled())
     stage_index = 0
     current_stage = "initializing"
 
@@ -453,8 +431,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         new_seq=state.assistant_seq,
                     )
                     usage_data = build_usage_event(
-                        refusal_text,
-                        None,
                         state.assistant_message_id,
                         state.assistant_seq,
                         None,
@@ -501,15 +477,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 conversation_id=state.conversation_id,
             )
             ROUTER_DECISIONS.labels(state.router_output.route).inc()
-            # Shim for downstream stages that still read processed_query.route
-            state.processed_query = ProcessedQuery(
-                normalized_text=state.user_query_raw.strip(),
-                route="retrieve"
-                if state.router_output.route == "retrieval"
-                else state.router_output.route,
-                user_intent=state.router_output.user_intent,
-                reason=state.router_output.reasoning,
-            )
             _scope_doc_ids = (
                 [str(d) for d in state.scope_result.doc_ids]
                 if state.scope_result and state.scope_result.doc_ids is not None
@@ -570,7 +537,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         _root_span.update(metadata={"scope": scope_summary})  # type: ignore[attr-defined]
 
             # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
-            if state.processed_query.route == "out_of_scope":
+            if state.router_output.route == "out_of_scope":
                 redirect_text = out_of_scope_response()
                 await add_event(redis_app, request_id, "delta", {"text": redirect_text})
                 await message_repo.update_on_final(
@@ -586,8 +553,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     new_seq=state.assistant_seq,
                 )
                 usage_data = build_usage_event(
-                    redirect_text,
-                    None,
                     state.assistant_message_id,
                     state.assistant_seq,
                     None,
@@ -606,14 +571,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 return
 
             agent_settings = get_agent_settings()
-            _use_agent = (
-                agent_settings.enabled
-                and state.processed_query.route == "retrieve"
-                and llm_request.user_id is not None
-            )
-
-            # 3.5 / 4 — agent branch or classic single-pass
-            if _use_agent:
+            # `user_id` is nullable on LLMRequest, and the agent loop cannot search
+            # without one — route that case to the no-context path explicitly.
+            if state.router_output.route == "retrieval" and llm_request.user_id is not None:
                 _tool_model_id: str = agent_settings.tool_model
                 _tool_llm = router.get(_tool_model_id)
                 if not _tool_llm.capabilities.get("tool_calling", False):
@@ -673,7 +633,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
                 AGENT_ITERATIONS.observe(agent_meta.iterations)
                 state.agent_meta = agent_meta
-                state.used_agent_loop = True
 
                 state.rag_context = agent_result.rag_context
                 state.rag_context_str = agent_result.synthesis_context
@@ -681,9 +640,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 if agent_result.findings is not None:
                     agent_findings_json = agent_result.findings.model_dump_json()
                 if agent_result.processed is not None:
-                    _agent_answer_entity = agent_result.processed.answer_entity
-                    _agent_fx_rates = agent_result.processed.fx_rates_used
-                    _agent_currency_converted = agent_result.processed.currency_converted
+                    state.agent_answer_entity = agent_result.processed.answer_entity
+                    state.agent_fx_rates = agent_result.processed.fx_rates_used
+                    state.agent_currency_converted = agent_result.processed.currency_converted
 
                 logger.info(
                     "agent_loop_complete",
@@ -699,79 +658,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             else:
-                # 3.5 rewrite_query — retrieval route only
-                if state.processed_query.route == "retrieve" and llm_request.user_id:
-                    await _log_stage("transform_query")
-                    doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
-
-                    scope_docs: list[ScopeDocSummary] = []
-                    if doc_ids_scope:
-                        cfg = get_query_transformer_config()
-                        doc_repo = DocumentRepository(session)
-                        rows = await doc_repo.get_scope_doc_summaries(
-                            llm_request.user_id, doc_ids_scope, limit=cfg["max_scope_docs"]
-                        )
-                        scope_docs = [
-                            ScopeDocSummary(document_id=r[0], company=r[1], year=r[2]) for r in rows
-                        ]
-
-                    try:
-                        state.transformed_query, _ = await rewrite_query(
-                            state.user_query_raw,
-                            conversation_history=[
-                                {"role": m.role.value, "content": m.content}
-                                for m in (state.context_messages or [])
-                            ],
-                            user_intent=state.router_output.user_intent,
-                            scope_docs=scope_docs,
-                            llm_router=router,
-                            session=session,
-                            parent_request_id=llm_request.id,
-                            conversation_id=state.conversation_id,
-                            user_id=llm_request.user_id,
-                        )
-                    except Exception:
-                        logger.exception("query_rewrite_failed", extra={"request_id": request_id})
-                        state.transformed_query = TransformedQuery(
-                            semantic_query=state.user_query_raw,
-                            keyword_query=state.user_query_raw,
-                            fallback=True,
-                        )
-
-                    tq = state.transformed_query
-                    logger.info(
-                        "query_rewrite_result",
-                        extra={
-                            "request_id": request_id,
-                            "semantic_query": tq.semantic_query,
-                            "keyword_query": tq.keyword_query,
-                            "fallback": tq.fallback,
-                        },
-                    )
-
-                # 4. build_rag_context
-                await _log_stage("build_rag_context")
-                if state.processed_query.route == "direct_answer" or not llm_request.user_id:
-                    state.rag_context_str = "(No document context - general question.)"
-                else:
-                    doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
-                    transformed = state.transformed_query or TransformedQuery(
-                        semantic_query=state.user_query_raw,
-                        keyword_query=state.user_query_raw,
-                        fallback=True,
-                    )
-
-                    state.rag_context, retrieval_trace, _ = await run_chat_rag_pipeline(
-                        session,
-                        transformed=transformed,
-                        user_id=llm_request.user_id,
-                        doc_ids=doc_ids,
-                        reranker=_get_reranker(),
-                    )
-                    state.rag_context_str = (
-                        state.rag_context.formatted_context
-                        or "(No document context - general question.)"
-                    )
+                state.rag_context_str = "(No document context - general question.)"
 
             top_score = (
                 state.rag_context.items[0].score
@@ -784,7 +671,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             await _log_stage("render_prompt")
             # ~4 chars/token heuristic — a cheap, bounded proxy for synthesis context size.
             RAG_CONTEXT_TOKENS.observe(len(state.rag_context_str or "") / 4)
-            # Resolve model + citation_mode before rendering so prompt version is model-aware
             try:
                 llm = router.get(llm_request.model)
             except Exception as e:
@@ -794,11 +680,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 await session.commit()
                 return
 
-            citation_mode = llm.capabilities.get("citation_mode", "none")
-            if citation_mode == "bracket":
-                prompt_version = "v3_agent_synthesis" if state.used_agent_loop else "v3_bracket"
-            else:
-                prompt_version = "v3_none"
+            prompt_version = "v3_agent_synthesis"
 
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})
@@ -813,10 +695,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 lf.update_current_span(
                     input={
                         "prompt_version": prompt_version,
-                        "citation_mode": citation_mode,
                         "num_chunks": num_chunks,
                         "context_messages": len(state.context_messages),
-                        "used_agent_loop": state.used_agent_loop,
                     },
                     output={
                         "num_messages": len(state.adapter_messages),
@@ -854,107 +734,64 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 **extra,
             )
 
-            parser = BracketCitationParser() if citation_mode == "bracket" else None
+            parser = BracketCitationParser()
             think_stripper = ThinkingStripper()
 
             try:
+                chunk = None
                 async for chunk in stream:
                     state.accumulated_content += chunk.text  # raw for DB
-                    visible_chunk = think_stripper.feed(chunk.text)
+                    # Strip [S1] markers, track spans. Emitted for every chunk, including
+                    # the final one — a final chunk can carry text, and skipping it would
+                    # drop that text and any spans it completed from the SSE stream.
+                    result = parser.feed(think_stripper.feed(chunk.text))
+                    state.clean_content += result.visible_text
+                    if result.visible_text:
+                        await add_event(
+                            redis_app, request_id, "delta", {"text": result.visible_text}
+                        )
+                    for span in result.completed_spans:
+                        await add_event(redis_app, request_id, "citation_span", span_to_dict(span))
 
-                    if parser is not None:
-                        # Bracket-citation mode: strip [S1] markers, track spans.
-                        # Emitted for every chunk, including the final one — a final
-                        # chunk can carry text, and skipping it would drop that text
-                        # and any spans it completed from the SSE stream.
-                        result = parser.feed(visible_chunk)
-                        state.clean_content += result.visible_text
-                        if result.visible_text:
-                            await add_event(
-                                redis_app, request_id, "delta", {"text": result.visible_text}
-                            )
-                        for span in result.completed_spans:
-                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
-                            await add_event(
-                                redis_app,
-                                request_id,
-                                "citation_span",
-                                span_to_dict(span, labels),
-                            )
+                if chunk is not None:
+                    final_result = parser.finalize()
+                    state.clean_content += final_result.visible_text
+                    if final_result.visible_text:
+                        await add_event(
+                            redis_app, request_id, "delta", {"text": final_result.visible_text}
+                        )
+                    for span in final_result.completed_spans:
+                        await add_event(redis_app, request_id, "citation_span", span_to_dict(span))
 
-                        if not chunk.is_final:
-                            continue
-
-                        # ── Final chunk (bracket mode) ──
-                        final_result = parser.finalize()
-                        state.clean_content += final_result.visible_text
-                        if final_result.visible_text:
-                            await add_event(
-                                redis_app, request_id, "delta", {"text": final_result.visible_text}
-                            )
-                        for span in final_result.completed_spans:
-                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
-                            await add_event(
-                                redis_app,
-                                request_id,
-                                "citation_span",
-                                span_to_dict(span, labels),
-                            )
-
-                        # Emit references: cited sources only, or all sources as fallback
-                        if state.rag_context:
-                            if parser.label_map.mapping:
-                                ref_items = build_references_list(
-                                    state.rag_context, parser.label_map
-                                )
-                            else:
-                                # Model produced no bracket citations (e.g. bare number answer) —
-                                # fall back to emitting all retrieved sources so the evidence panel
-                                # still populates.
-                                ref_items = build_all_references(state.rag_context)
-                            await add_event(
-                                redis_app, request_id, "references", {"items": ref_items}
-                            )
-
-                    else:
-                        # No-citation mode: raw text = clean text, no span parsing.
-                        # Delta emitted for the final chunk too — it can carry text.
-                        state.clean_content += visible_chunk
-                        if visible_chunk:
-                            await add_event(redis_app, request_id, "delta", {"text": visible_chunk})
-
-                        if not chunk.is_final:
-                            continue
-
-                        # ── Final chunk (no-citation mode) ──
-                        # Emit ALL retrieved sources as evidence panel references
-                        if state.rag_context and state.rag_context.items:
-                            ref_items = build_all_references(state.rag_context)
-                            await add_event(
-                                redis_app, request_id, "references", {"items": ref_items}
-                            )
+                    # Cited sources, in order of first appearance; all retrieved sources
+                    # as a fallback when the model emitted no citations at all (e.g. a
+                    # bare-number answer) so the evidence panel still populates. Built
+                    # once here and shared by the SSE event, persistence, and usage.
+                    ref_items: list[dict] = []
+                    if state.rag_context:
+                        cited_ref_ids: list[str] = []
+                        for span in parser.all_spans:
+                            for ref_id in span.ref_ids:
+                                if ref_id not in cited_ref_ids:
+                                    cited_ref_ids.append(ref_id)
+                        ref_items = (
+                            build_references_list(state.rag_context, cited_ref_ids)
+                            if cited_ref_ids
+                            else build_all_references(state.rag_context)
+                        )
+                    if ref_items:
+                        await add_event(redis_app, request_id, "references", {"items": ref_items})
 
                     # 7. persist_and_emit
                     await _log_stage("persist_and_emit")
                     # Build citation metadata for persistence
                     citation_meta: dict = {}
-                    if parser is not None:
-                        if parser.all_spans:
-                            citation_meta["citation_spans"] = [
-                                span_to_dict(s, parser.label_map.get_labels_for_refs(s.ref_ids))
-                                for s in parser.all_spans
-                            ]
-                        if state.rag_context:
-                            if parser.label_map.mapping:
-                                citation_meta["references"] = build_references_list(
-                                    state.rag_context, parser.label_map
-                                )
-                            elif state.rag_context.items:
-                                citation_meta["references"] = build_all_references(
-                                    state.rag_context
-                                )
-                    elif state.rag_context and state.rag_context.items:
-                        citation_meta["references"] = build_all_references(state.rag_context)
+                    if parser.all_spans:
+                        citation_meta["citation_spans"] = [
+                            span_to_dict(sp) for sp in parser.all_spans
+                        ]
+                    if ref_items:
+                        citation_meta["references"] = ref_items
 
                     if state.rag_context and state.rag_context.items:
                         citation_meta["retrieved_chunks"] = [
@@ -975,11 +812,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     total_time = round(perf_counter() - pipeline_started_at, 3)
 
                     confidence = compute_confidence(top_score, num_chunks)
-                    ungrounded = (
-                        has_ungrounded_claims(state.clean_content)
-                        if citation_mode == "bracket"
-                        else None
-                    )
+                    ungrounded = has_ungrounded_claims(state.clean_content, parser.all_spans)
 
                     # Build pipeline trace
                     trace_payload: dict = {
@@ -998,24 +831,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             else None,
                         },
                     }
-                    if state.transformed_query is not None:
-                        tq = state.transformed_query
-                        trace_payload["query_transform"] = {
-                            "semantic_query": tq.semantic_query,
-                            "keyword_query": tq.keyword_query,
-                            "fallback": tq.fallback,
-                        }
-                    if retrieval_trace is not None:
-                        trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
                     if state.agent_meta is not None:
                         m = state.agent_meta
                         trace_payload["agent"] = {
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,
                             "convergence_reason": m.convergence_reason,
-                            "currency_normalized": _agent_currency_converted,
-                            "answer_entity": _agent_answer_entity,
-                            "fx_rates_used": _agent_fx_rates,
+                            "currency_normalized": state.agent_currency_converted,
+                            "answer_entity": state.agent_answer_entity,
+                            "fx_rates_used": state.agent_fx_rates,
                         }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,
@@ -1049,8 +873,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         if agent_findings_json
                         else None,
                     )
-                    if parser is not None:
-                        RAG_CITATIONS.observe(len(parser.all_spans))
+                    RAG_CITATIONS.observe(len(parser.all_spans))
 
                     if chunk.stats:
                         _model = llm_request.model
@@ -1118,13 +941,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     )
 
                     usage_data = build_usage_event(
-                        state.accumulated_content,
-                        state.rag_context,
                         state.assistant_message_id,
                         state.assistant_seq,
                         chunk.stats,
-                        citation_spans=parser.all_spans if parser is not None else None,
-                        label_map=parser.label_map if parser is not None else None,
+                        citation_spans=parser.all_spans,
+                        references=ref_items,
                     )
                     await session.commit()
 
@@ -1143,8 +964,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     naming_cfg = get_conversation_naming_config()
                     if naming_cfg["enabled"] and state.assistant_seq == 2 and state.user_query_raw:
                         try:
-                            from src.services.chat.naming import generate_conversation_title
-
                             # Use a fresh session so the naming sub-request + title update
                             # commit together, independent of the main pipeline session.
                             async with sf() as naming_session:

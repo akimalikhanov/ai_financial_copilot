@@ -47,8 +47,7 @@ def _seed_evidence(n: int) -> tuple[EvidenceLedger, list[str]]:
             heading_trail=(),
             prompt_text=f"Excerpt {i}.",
         )
-    lookup = ledger.start_lookup()
-    ledger.admit(lookup, 0, chunks)
+    ledger.admit(chunks)
     ledger.assign_labels(chunks, payloads)
     return ledger, [str(c.chunk_id) for c in chunks]
 
@@ -99,7 +98,7 @@ class TestRevision:
         ledger.record("margin", second, evidence)
 
         assert ledger.keys() == {"margin"}
-        assert ledger.revised_keys(min_revisions=1) == ["margin"]
+        assert (e := ledger.entry("margin")) is not None and e.revisions == 1
         served = ledger.projection()
         assert isinstance(served, AnalyticalFindings)
         assert [o.claim for o in served.observations] == ["Margins fell sharply"]
@@ -112,7 +111,7 @@ class TestRevision:
             Observation(aspect="margin", claim="c", evidence_chunks=[ids[0]], confidence="high"),
             evidence,
         )
-        assert ledger.revised_keys(min_revisions=1) == []
+        assert (e := ledger.entry("margin")) is not None and e.revisions == 0
 
 
 class TestProjection:
@@ -181,7 +180,7 @@ class TestProjection:
         assert {o.aspect for o in served.observations} == {"A", "B", "C"}
         claims = {o.claim for o in served.observations}
         assert "keep revised" in claims  # the restated key supersedes in place
-        assert ledger.revised_keys(min_revisions=1) == ["A"]
+        assert (e := ledger.entry("A")) is not None and e.revisions == 1
 
     def test_prune_to_drops_abandoned_keys_on_accept(self) -> None:
         # prune_to is the loop's accept-time call: only now does an omitted key count as
@@ -272,3 +271,101 @@ class TestDegradedServing:
         served = ledger.projection(degraded=False)
         assert isinstance(served, AnalyticalFindings)
         assert served.gaps is None
+
+
+class TestKindGuard:
+    def test_offkind_record_rejected_prior_entries_intact(self) -> None:
+        # Both finalizers are offered on every request, so one stray analytical call on an
+        # extraction run must not flip _kind and make projection() drop every EntityFinding.
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        ledger.record(
+            "Acme",
+            EntityFinding(entity="Acme", available=True, value=10.0, source_chunks=[ids[0]]),
+            evidence,
+        )
+
+        stray = Observation(aspect="margin", claim="c", evidence_chunks=[ids[0]], confidence="high")
+        assert ledger.record("margin", stray, evidence) is False
+
+        served = ledger.projection()
+        assert isinstance(served, AgentFindings)
+        assert [f.entity for f in served.findings] == ["Acme"]
+
+    def test_offkind_ingest_ignored(self) -> None:
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        ledger.ingest(
+            AgentFindings(
+                metric_requested="revenue",
+                findings=(
+                    EntityFinding(
+                        entity="Acme", available=True, value=10.0, source_chunks=[ids[0]]
+                    ),
+                ),
+            ),
+            evidence,
+        )
+        ledger.ingest(
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(aspect="a", claim="c", evidence_chunks=[ids[0]], confidence="high"),
+                ),
+            ),
+            evidence,
+        )
+
+        served = ledger.projection()
+        assert isinstance(served, AgentFindings)
+        assert served.metric_requested == "revenue"
+        assert [f.entity for f in served.findings] == ["Acme"]
+
+
+class TestEnvelopeNullGuard:
+    def test_later_attempt_does_not_erase_envelope_fields(self) -> None:
+        # A second attempt that omits metric_requested/comparison_op must not blank the
+        # values the first one established.
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        ledger.ingest(
+            AgentFindings(
+                metric_requested="revenue",
+                comparison_op="argmax",
+                findings=(
+                    EntityFinding(
+                        entity="Acme", available=True, value=10.0, source_chunks=[ids[0]]
+                    ),
+                ),
+            ),
+            evidence,
+        )
+        ledger.ingest(
+            AgentFindings(
+                metric_requested="",
+                findings=(
+                    EntityFinding(
+                        entity="Acme", available=True, value=11.0, source_chunks=[ids[0]]
+                    ),
+                ),
+            ),
+            evidence,
+        )
+
+        served = ledger.projection()
+        assert isinstance(served, AgentFindings)
+        assert served.metric_requested == "revenue"
+        assert served.comparison_op == "argmax"
+
+    def test_later_attempt_does_not_erase_question(self) -> None:
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        obs = Observation(aspect="a", claim="c", evidence_chunks=[ids[0]], confidence="high")
+        ledger.ingest(
+            AnalyticalFindings(question="Why did margins fall?", observations=(obs,)), evidence
+        )
+        ledger.ingest(AnalyticalFindings(question="", observations=(obs,)), evidence)
+
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert served.question == "Why did margins fall?"

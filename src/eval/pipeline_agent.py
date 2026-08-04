@@ -1,11 +1,6 @@
-"""Eval pipeline variant that exercises the agentic retrieval path.
+"""The eval pipeline: drives run_agent the same way the Celery chat task does.
 
-The original pipeline.py (single-pass RAG) is preserved for backward-compatibility.
-This module mirrors its public interface — run_one returns a PipelineResult — but
-internally drives run_agent the same way the Celery chat task does.
-
-Key differences from pipeline.py:
-- Uses run_agent (multi-turn tool-calling + synthesis) instead of a single rewrite+retrieve.
+- Uses run_agent (multi-turn tool-calling + synthesis), matching what production serves.
 - Requires a Redis connection for SSE event plumbing (events are fire-and-forget here).
 - Requires the agent feature models to be configured in models.yaml.
 - PipelineResult.rag_context is populated from the agent's synthesized context.
@@ -23,21 +18,34 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db import get_session_factory
-from src.eval.pipeline import PipelineResult, _run_answer, _run_direct_answer
 from src.eval.schemas import EvalQuestion
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.retrieval import RAGContext
+from src.schemas.retrieval import AnswerCitationSpan, RAGContext, RetrievalTrace
 from src.services.chat.agent import run_agent
 from src.services.chat.agent.processor import ProcessedFindings
 from src.services.chat.agent.state import AgentLoopMeta, get_agent_settings
+from src.services.chat.citation_parser import BracketCitationParser
+from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
 from src.services.llm_router import LLMRouter, get_router
+from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
 from src.utils.config import get_redis_app_url
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PipelineResult:
+    route: str
+    rag_context: RAGContext | None
+    retrieval_trace: RetrievalTrace | None
+    answer: str | None
+    citation_spans: list[AnswerCitationSpan]
+    usage: LLMResponseStats | None
+    excluded_reason: str | None = None
 
 
 @dataclass
@@ -207,3 +215,74 @@ def _rag_context_with_override(base: RAGContext, formatted_context: str) -> RAGC
         items=base.items,
         chunk_count=base.chunk_count,
     )
+
+
+async def _complete(
+    context: str,
+    question: str,
+    model_id: str,
+    router: LLMRouter,
+    prompt_version: str,
+    reasoning_effort: str | None,
+    max_tokens: int | None,
+    verbosity: str | None,
+) -> tuple[str, BracketCitationParser, LLMResponseStats | None]:
+    messages = [
+        ChatMessage(role=Role.system, content=get_system_prompt(version=prompt_version)),
+        ChatMessage(
+            role=Role.user,
+            content=get_prompt_renderer().render_user_message(
+                context=context, user_query=question, version="v1"
+            ),
+        ),
+    ]
+    kwargs: dict = {}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if verbosity:
+        kwargs["verbosity"] = verbosity
+    resp = await router.get(model_id).complete(messages=messages, temperature=0.0, **kwargs)
+    parser = BracketCitationParser()
+    out = parser.feed(resp.text or "")
+    fin = parser.finalize()
+    return out.visible_text + fin.visible_text, parser, resp.stats
+
+
+async def _run_direct_answer(
+    question: str,
+    model_id: str,
+    router: LLMRouter,
+    prompt_version: str,
+    reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
+    verbosity: str | None = None,
+) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
+    answer, _parser, stats = await _complete(
+        "", question, model_id, router, prompt_version, reasoning_effort, max_tokens, verbosity
+    )
+    return answer, [], stats
+
+
+async def _run_answer(
+    question: str,
+    rag_context: RAGContext,
+    model_id: str,
+    router: LLMRouter,
+    prompt_version: str,
+    reasoning_effort: str | None = None,
+    max_tokens: int | None = None,
+    verbosity: str | None = None,
+) -> tuple[str, list[AnswerCitationSpan], LLMResponseStats | None]:
+    answer, parser, stats = await _complete(
+        rag_context.formatted_context,
+        question,
+        model_id,
+        router,
+        prompt_version,
+        reasoning_effort,
+        max_tokens,
+        verbosity,
+    )
+    return answer, list(parser.all_spans), stats

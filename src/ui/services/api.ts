@@ -76,7 +76,6 @@ export interface CitationSpanEvent {
   start: number;
   end: number;
   ref_ids: string[];
-  display_labels: string[];
 }
 
 export interface ReferencesEvent {

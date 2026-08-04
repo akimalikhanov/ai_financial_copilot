@@ -208,4 +208,4 @@ async def reject(
         {"entity": "__finalizer__", "error": True, "reason": f"{finalizer_tc.name}_rejected"},
     )
     state.insufficiency_rejections += 1 if isinstance(candidate, AnalyticalFindings) else 0
-    state.transcript.compress()
+    state.transcript.compress(state.evidence)

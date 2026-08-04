@@ -88,10 +88,18 @@ class FindingsLedger:
         self, key: str, finding: EntityFinding | Observation, evidence: EvidenceLedger
     ) -> bool:
         """Insert or update-in-place. Returns False (and leaves any prior entry intact)
-        when C6's grounding filter drops the item."""
+        when C6's grounding filter drops the item, or when the item's type disagrees with
+        the kind already established for this run."""
+        kind: Literal["agent", "analytical"] = (
+            "agent" if isinstance(finding, EntityFinding) else "analytical"
+        )
+        # Both finalizers are offered on every request, so a stray off-kind call would
+        # otherwise flip _kind and make projection() drop every entry of the real kind.
+        if self._kind is not None and kind != self._kind:
+            return False
         if not _is_grounded(finding, evidence):
             return False
-        self._kind = "agent" if isinstance(finding, EntityFinding) else "analytical"
+        self._kind = kind
         entry = self._entries.get(key)
         if entry is None:
             self._entries[key] = FindingEntry(key=key, finding=finding)
@@ -110,16 +118,24 @@ class FindingsLedger:
         *accepted* — a rejected attempt is not a deliberate restatement, it's a draft the
         model is about to be told to redo, and treating its omissions as abandonment
         destroys established entries before any gate has even evaluated them.
+
+        Envelope fields are last-write-wins but null-guarded: a later attempt that omits a
+        field must not erase the value an earlier one established.
         """
+        kind: Literal["agent", "analytical"] = (
+            "agent" if isinstance(candidate, AgentFindings) else "analytical"
+        )
+        if self._kind is not None and kind != self._kind:
+            return
         items: list[tuple[str, EntityFinding | Observation]]
         if isinstance(candidate, AgentFindings):
             self._kind = "agent"
-            self._metric_requested = candidate.metric_requested
-            self._comparison_op = candidate.comparison_op
+            self._metric_requested = candidate.metric_requested or self._metric_requested
+            self._comparison_op = candidate.comparison_op or self._comparison_op
             items = [(f.entity, f) for f in candidate.findings]
         else:
             self._kind = "analytical"
-            self._question = candidate.question
+            self._question = candidate.question or self._question
             self._conclusion = candidate.conclusion
             self._gaps = list(candidate.gaps) if candidate.gaps else None
             items = [(o.aspect, o) for o in candidate.observations]
@@ -151,8 +167,8 @@ class FindingsLedger:
     def keys(self) -> set[str]:
         return set(self._entries)
 
-    def revised_keys(self, min_revisions: int = 1) -> list[str]:
-        return [e.key for e in self._entries.values() if e.revisions >= min_revisions]
+    def entry(self, key: str) -> FindingEntry | None:
+        return self._entries.get(key)
 
     def projection(self, *, degraded: bool = False) -> AgentFindings | AnalyticalFindings | None:
         """The findings synthesis serves. None when no finalizer was ever attempted

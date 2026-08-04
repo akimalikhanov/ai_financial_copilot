@@ -59,7 +59,6 @@ class ProcessedFindings:
     metric_requested: str | None = None
     target_currency: str | None = None
     comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
-    analytical_findings: AnalyticalFindings | None = None
 
 
 _UNIT_TO_MILLIONS: dict[str | None, float] = {
@@ -114,19 +113,11 @@ _DEFAULT_COMPARISON_CURRENCY = "USD"
 
 
 async def process_findings(
-    findings: AgentFindings | AnalyticalFindings,
+    findings: AgentFindings,
     requested_currency: str | None = None,
 ) -> ProcessedFindings:
-    if isinstance(findings, AnalyticalFindings):
-        return ProcessedFindings(
-            findings=(),
-            answer_entity=None,
-            fx_rates_used={},
-            currency_converted=False,
-            answer_note=None,
-            analytical_findings=findings,
-        )
-
+    """FX-normalize and rank an extraction run's entity findings. Analytical runs have no
+    values to normalize — `run_synthesis` renders those directly and never calls this."""
     available = [f for f in findings.findings if f.available and f.value is not None]
     op = findings.comparison_op
     is_comparison = op in ("argmin", "argmax")
@@ -161,7 +152,8 @@ async def process_findings(
     currency_converted = False
 
     if needs_fx:
-        assert resolved_target is not None  # narrowed above
+        if resolved_target is None:  # narrowed above; keep the invariant under -O
+            raise RuntimeError("needs_fx implies a resolved target currency")
         # Unique (from_currency, date) pairs requiring conversion
         pairs: list[tuple[str, str | None]] = list(
             {
@@ -270,9 +262,11 @@ async def process_findings(
     # against converted values (unknown denomination) and are flagged in answer_note.
     answer_entity: str | None = None
     if is_comparison:
-        assert resolved_target is not None or not multi_ccy, (
-            "argmin/argmax reached comparator with multi-currency findings and no resolved_target"
-        )
+        if resolved_target is None and multi_ccy:
+            raise RuntimeError(
+                "argmin/argmax reached comparator with multi-currency findings "
+                "and no resolved_target"
+            )
         rankable = [
             n
             for n in normalized
@@ -321,10 +315,7 @@ def _map_refs(raw_refs: list[str], rag_context: RAGContext) -> str:
     return ", ".join(mapped) or "—"
 
 
-def _render_findings_block(
-    processed: ProcessedFindings,
-    rag_context: RAGContext | None = None,
-) -> str:
+def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext) -> str:
     lines = ["[STRUCTURED FINDINGS]"]
 
     header_parts = []
@@ -362,13 +353,9 @@ def _render_findings_block(
     for nf in processed.findings:
         f = nf.finding
         unit_str = f.unit if f.unit is not None else "M"
-        raw_chunks = f.source_chunks or []
-        if rag_context is not None:
-            # Drop refs with no excerpt in the synthesis context — leaking a raw ref
-            # here would let the model cite an ID the citation pipeline can't resolve.
-            chunks_str = _map_refs(raw_chunks, rag_context)
-        else:
-            chunks_str = ", ".join(raw_chunks) or "—"
+        # Drop refs with no excerpt in the synthesis context — leaking a raw ref here
+        # would let the model cite an ID the citation pipeline can't resolve.
+        chunks_str = _map_refs(f.source_chunks or [], rag_context)
         if not f.available or f.value is None:
             reason = f.reason or "not found in retrieved context"
             lines.append(f"{f.entity:<22} | N/A | not available: {reason}")
@@ -394,19 +381,12 @@ def _render_findings_block(
     return "\n".join(lines)
 
 
-def _render_observations_block(
-    findings: AnalyticalFindings,
-    rag_context: RAGContext | None = None,
-) -> str:
+def _render_observations_block(findings: AnalyticalFindings, rag_context: RAGContext) -> str:
     lines = ["[AGENT OBSERVATIONS]", f"Question: {findings.question}", ""]
 
     for i, obs in enumerate(findings.observations, 1):
-        if rag_context is not None:
-            chunks_str = _map_refs(obs.evidence_chunks, rag_context)
-            refuted_str = _map_refs(obs.refuted_by or [], rag_context)
-        else:
-            chunks_str = ", ".join(obs.evidence_chunks) if obs.evidence_chunks else "—"
-            refuted_str = ", ".join(obs.refuted_by) if obs.refuted_by else "—"
+        chunks_str = _map_refs(obs.evidence_chunks, rag_context)
+        refuted_str = _map_refs(obs.refuted_by or [], rag_context)
         lines.append(
             f"{i}. [{obs.confidence} confidence] {obs.claim}"
             f" | evidence: {chunks_str} | refuted_by: {refuted_str}"

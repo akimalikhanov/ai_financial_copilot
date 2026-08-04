@@ -14,12 +14,11 @@ import contextlib
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from src.observability import langfuse as lf_client
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
 from src.schemas.query_router import DocumentScopeResult
-from src.schemas.retrieval import RAGContext, RetrievedChunk
+from src.schemas.retrieval import RAGContext
+from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.processor import (
     ProcessedFindings,
     _render_findings_block,
@@ -28,7 +27,6 @@ from src.services.chat.agent.processor import (
 )
 from src.services.chat.agent.state import AgentLoopMeta
 from src.services.retrieval.context_assembler import assemble_rag_context
-from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 
 
 @dataclass(frozen=True)
@@ -38,10 +36,6 @@ class AgentRunResult:
     findings: AgentFindings | AnalyticalFindings | None
     processed: ProcessedFindings | None
     meta: AgentLoopMeta
-
-
-def _order_chunks(registry: dict[UUID, RetrievedChunk]) -> list[RetrievedChunk]:
-    return sorted(registry.values(), key=lambda c: (c.turn_index, -(c.score or 0)))
 
 
 def _inject_unsearched_stubs(
@@ -83,14 +77,17 @@ def _cited_chunk_ids(findings: AgentFindings | AnalyticalFindings) -> set[UUID]:
 
 
 async def run_synthesis(
-    chunk_registry: dict[UUID, RetrievedChunk],
+    evidence: EvidenceLedger,
     agent_findings: AgentFindings | AnalyticalFindings | None,
     agent_meta: AgentLoopMeta,
     scope_result: DocumentScopeResult | None,
     requested_currency: str | None,
-    session: AsyncSession,
+    max_chunks_per_entity: int,
 ) -> AgentRunResult:
-    ordered = _order_chunks(chunk_registry)
+    ordered = evidence.ordered_chunks()
+    # The fallback pool is what the model could actually read: falling back to excerpts
+    # it never saw would let synthesis cite text no reasoning was ever grounded in.
+    fallback = evidence.rendered_chunks()[:max_chunks_per_entity]
     lf = lf_client.get_client()
 
     findings = agent_findings
@@ -100,74 +97,78 @@ async def run_synthesis(
         if isinstance(findings, AgentFindings):
             findings = _inject_unsearched_stubs(findings, agent_meta, scope_result)
 
-        _lf_stack = contextlib.ExitStack()
-        if lf:
-            _lf_stack.enter_context(
-                lf.start_as_current_observation(
-                    as_type="span",
-                    name="findings_processor",
-                    input={
-                        "type": type(findings).__name__,
-                        "metric_requested": getattr(findings, "metric_requested", None),
-                        "comparison_op": getattr(findings, "comparison_op", None),
-                        "findings": [f.model_dump() for f in findings.findings]
-                        if isinstance(findings, AgentFindings)
-                        else None,
-                    },
-                )
-            )
-        try:
-            processed = await process_findings(findings, requested_currency=requested_currency)
+            _lf_stack = contextlib.ExitStack()
             if lf:
-                lf.update_current_span(
-                    output={
-                        "currency_converted": processed.currency_converted,
-                        "answer_entity": processed.answer_entity,
-                        "fx_rates_used": processed.fx_rates_used,
-                        "answer_note": processed.answer_note,
-                        "comparison_op": processed.comparison_op,
-                        "findings": [
-                            {
-                                "entity": nf.finding.entity,
-                                "normalized_value": nf.normalized_value,
-                                "fx_rate": nf.fx_rate,
-                                "native_value": nf.finding.value,
-                                "currency": nf.finding.currency,
-                                "unit": nf.finding.unit,
-                                "period_end": nf.finding.period_end,
-                                "available": nf.finding.available,
-                            }
-                            for nf in processed.findings
-                        ],
-                    },
+                _lf_stack.enter_context(
+                    lf.start_as_current_observation(
+                        as_type="span",
+                        name="findings_processor",
+                        input={
+                            "metric_requested": findings.metric_requested,
+                            "comparison_op": findings.comparison_op,
+                            "findings": [f.model_dump() for f in findings.findings],
+                        },
+                    )
                 )
-        finally:
-            _lf_stack.close()
+            try:
+                processed = await process_findings(findings, requested_currency=requested_currency)
+                if lf:
+                    lf.update_current_span(
+                        output={
+                            "currency_converted": processed.currency_converted,
+                            "answer_entity": processed.answer_entity,
+                            "fx_rates_used": processed.fx_rates_used,
+                            "answer_note": processed.answer_note,
+                            "comparison_op": processed.comparison_op,
+                            "findings": [
+                                {
+                                    "entity": nf.finding.entity,
+                                    "normalized_value": nf.normalized_value,
+                                    "fx_rate": nf.fx_rate,
+                                    "native_value": nf.finding.value,
+                                    "currency": nf.finding.currency,
+                                    "unit": nf.finding.unit,
+                                    "period_end": nf.finding.period_end,
+                                    "available": nf.finding.available,
+                                }
+                                for nf in processed.findings
+                            ],
+                        },
+                    )
+            finally:
+                _lf_stack.close()
 
         # Narrow the synthesis context to the chunks the agent actually cited in its
-        # findings — those are the evidence it reasoned over, and the registry is
-        # already volume-capped per lookup. When findings cite nothing (e.g. a weak
-        # tool model that omits source_chunks), fall back to the full capped registry
-        # rather than starving synthesis.
+        # findings — those are the evidence it reasoned over. When findings cite nothing
+        # (e.g. a weak tool model that omits source_chunks), fall back to the chunks the
+        # model was actually shown rather than starving synthesis.
         cited_ids = _cited_chunk_ids(findings)
-        synthesis_chunks = [c for c in ordered if c.chunk_id in cited_ids] if cited_ids else ordered
+        synthesis_chunks = (
+            [c for c in ordered if c.chunk_id in cited_ids] if cited_ids else fallback
+        )
     else:
-        synthesis_chunks = ordered
+        synthesis_chunks = fallback
 
-    chunk_ids = [c.chunk_id for c in synthesis_chunks]
-    payloads = await get_chunk_prompt_payloads(session, chunk_ids)
+    # Payloads were cached (already sanitized) when the loop rendered these chunks — no
+    # second hydration, and the re-scan below is a no-op over sanitized text (D2).
+    payloads = evidence.payloads_for(c.chunk_id for c in synthesis_chunks)
+    synthesis_chunks = [c for c in synthesis_chunks if c.chunk_id in payloads]
     rag_context, _ = assemble_rag_context(synthesis_chunks, payloads, assume_unique=True)
 
-    if processed is not None:
-        if processed.analytical_findings is not None:
-            findings_block = _render_observations_block(
-                processed.analytical_findings, rag_context=rag_context
-            )
-        else:
-            findings_block = _render_findings_block(processed, rag_context=rag_context)
-        synthesis_context = findings_block + "\n\n" + (rag_context.formatted_context or "")
+    # Pick the renderer by findings type: analytical runs have no values to FX-normalize,
+    # so they skip `process_findings` entirely and render their observations directly.
+    if isinstance(findings, AnalyticalFindings):
+        findings_block = _render_observations_block(findings, rag_context)
+    elif processed is not None:
+        findings_block = _render_findings_block(processed, rag_context)
     else:
-        synthesis_context = rag_context.formatted_context or "(No document context.)"
+        findings_block = None
+
+    synthesis_context = (
+        findings_block + "\n\n" + (rag_context.formatted_context or "")
+        if findings_block is not None
+        else rag_context.formatted_context or "(No document context.)"
+    )
 
     return AgentRunResult(
         rag_context=rag_context,

@@ -57,8 +57,7 @@ def _run_turn(
     """Simulate one search turn: admit chunks, render a tool result, append it. Returns
     the S-labels this turn showed the model."""
     chunks = [_chunk(), _chunk()]
-    lookup = ledger.start_lookup()
-    ledger.admit(lookup, iteration, chunks)
+    ledger.admit(chunks)
     ctx = ledger.assign_labels(chunks, {c.chunk_id: _payload(c) for c in chunks})
 
     tc = ToolCallRef(
@@ -121,6 +120,59 @@ def test_aggressive_eviction_drops_old_tool_results() -> None:
     resolved, unresolved = ledger.resolve_refs(shown_per_turn[0])
     assert unresolved == []
     assert len(resolved) == len(shown_per_turn[0])
+
+
+def test_rendered_then_evicted_then_rereturned_chunk_is_readable() -> None:
+    """A chunk rendered in turn 1, evicted by compaction, and re-returned by a later
+    search must be readable again — otherwise `resolve_refs` still resolves it while the
+    model can read it in neither the transcript nor the fresh tool result, so a claim
+    could be grounded on text the model never saw.
+    """
+    ledger = EvidenceLedger()
+    transcript = Transcript([ChatMessage(role=Role.system, content="sys")])
+
+    # Turn 0: two chunks rendered, then compacted out of the model's view.
+    chunks = [_chunk(), _chunk()]
+    payloads = {c.chunk_id: _payload(c) for c in chunks}
+    ledger.admit(chunks)
+    ctx0 = ledger.assign_labels(chunks, payloads)
+    labels = [i.ref_id for i in ctx0.items]
+    tc0 = ToolCallRef(
+        id="call_0", name="search_documents", arguments=json.dumps({"entity": "A", "query": "q"})
+    )
+    transcript.append_tool_calls([tc0])
+    transcript.append(
+        ChatMessage(role=Role.tool, tool_call_id=tc0.id, content=ctx0.formatted_context)
+    )
+
+    # A second turn pushes turn 0 past the keep window.
+    _run_turn(ledger, transcript, 1)
+    transcript.compress(ledger)
+
+    # Gone as a *rendered excerpt* (the stub keeps a label-range breadcrumb, not the text).
+    tag = f'id="{labels[0]}"'
+    assert not any(tag in (m.content or "") for m in transcript.messages if m.role == Role.tool)
+
+    # Turn 2 re-returns the evicted chunk: it is revived under its ORIGINAL label.
+    ledger.admit([chunks[0]])
+    ctx2 = ledger.assign_labels([chunks[0]], payloads)
+
+    assert labels[0] in ctx2.formatted_context, "re-returned evicted chunk must be re-emitted"
+    assert [i.ref_id for i in ctx2.items] == [labels[0]], "revival must not mint a new label"
+
+
+def test_still_rendered_chunk_is_not_re_emitted() -> None:
+    """A chunk still visible in the transcript is deduped as before — revival applies
+    only to chunks compaction actually evicted."""
+    ledger = EvidenceLedger()
+    chunks = [_chunk()]
+    payloads = {c.chunk_id: _payload(c) for c in chunks}
+    ledger.admit(chunks)
+    ledger.assign_labels(chunks, payloads)
+
+    ctx2 = ledger.assign_labels(chunks, payloads)
+    assert ctx2.items == ()
+    assert ctx2.formatted_context == ""
 
 
 def test_evicted_stub_is_informative() -> None:

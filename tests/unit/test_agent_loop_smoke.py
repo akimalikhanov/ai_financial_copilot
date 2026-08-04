@@ -106,7 +106,6 @@ def _routed_llm(adapter: Any) -> RoutedLLM:
 
 @pytest.fixture(autouse=True)
 def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AGENT_LOOP_ENABLED", "true")
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "3")
     monkeypatch.setenv("AGENT_TOKEN_BUDGET", "1000000")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "1")
@@ -156,7 +155,7 @@ async def test_agent_loop_runs_search_then_finalizes() -> None:
     async def _fake_execute_search(*_args: Any, **_kwargs: Any) -> _SearchResult:
         return _SearchResult(entity="Acme", chunks=[found_chunk], payloads=payloads)
 
-    chunk_registry, agent_findings, meta = await run_loop(
+    evidence, agent_findings, meta = await run_loop(
         state,
         llm,
         state.session,
@@ -170,7 +169,7 @@ async def test_agent_loop_runs_search_then_finalizes() -> None:
     assert meta.iterations == 2
     assert meta.convergence_reason == "natural"
     assert agent_findings is not None
-    assert chunk_registry  # search chunk was admitted to the registry
+    assert len(evidence)  # search chunk was admitted to the ledger
 
 
 @pytest.mark.asyncio
@@ -194,7 +193,7 @@ async def test_agent_loop_stops_at_iteration_cap() -> None:
         chunk, payloads = _make_chunk_with_payload()
         return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
-    _chunk_registry, agent_findings, meta = await run_loop(
+    _evidence, agent_findings, meta = await run_loop(
         state,
         llm,
         state.session,
@@ -293,6 +292,51 @@ async def test_concurrent_searches_each_open_a_distinct_session(
     assert len(opened) == n
     assert len({id(s) for s in seen}) == n  # every search got its own session
     assert state.session not in seen  # never the loop's shared session
+
+
+@pytest.mark.asyncio
+async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The analytical agent passes entity="" — the result and both SSE events must carry
+    the resolved primary entity, not a blank string."""
+    from src.services.chat.agent import loop as loop_module
+
+    state = _make_state()
+    chunk, payloads = _make_chunk_with_payload()
+
+    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
+        return (
+            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
+            None,
+        )
+
+    async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
+        return None, None, [chunk]
+
+    async def _fake_payloads(*_a: Any, **_k: Any) -> dict:
+        return payloads
+
+    events: list[tuple[str, dict]] = []
+
+    async def _fake_add_event(_redis: Any, _rid: str, name: str, payload: dict) -> None:
+        events.append((name, payload))
+
+    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
+    monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
+    monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", _fake_payloads)
+    monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
+
+    tc = ToolCallRef(
+        id="call_1",
+        name="search_documents",
+        arguments=json.dumps({"entity": "", "query": "revenue"}),
+    )
+    result = await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
+    )
+
+    assert result.entity == "Acme"
+    started = [p for n, p in events if n == "tool_call_started"]
+    assert started and started[0]["entity"] == "Acme"
 
 
 def test_analytical_insufficiency_rejects_evidence_free_observation() -> None:

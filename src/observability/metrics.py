@@ -68,6 +68,11 @@ CITATION_REFS_DROPPED = Counter(
     "citation_refs_dropped_total",
     "Finding citations dropped (no excerpt in synthesis context)",
 )
+REVIVED_CHUNKS_PER_TURN = Histogram(
+    "agent_revived_chunks_per_turn",
+    "Evicted-then-re-returned chunks re-emitted under their original label",
+    buckets=(0, 1, 2, 3, 5, 10),
+)
 AGENT_TOOL_DURATION = Histogram(
     "agent_tool_duration_seconds",
     "Tool latency",

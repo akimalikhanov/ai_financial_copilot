@@ -22,8 +22,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from src.services.llm_adapters.base_adapter import ChatMessage, Role, ToolCallRef
+
+if TYPE_CHECKING:
+    from src.services.chat.agent.evidence import EvidenceLedger
 
 # Excerpts are rendered as <retrieved_excerpt id="Sn" ...> (context_assembler); the
 # label is the stable handle the ledger resolves, so an evicted result keeps its
@@ -68,9 +72,15 @@ def _summarize_evicted(content: str, call: ToolCallRef | None) -> str:
     return f"[compacted] {body}"
 
 
-def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int) -> list[ChatMessage]:
+def _compress_history(
+    messages: list[ChatMessage], keep_last_n_turns: int
+) -> tuple[list[ChatMessage], list[str]]:
     """Replace rendered search results from turns older than keep_last_n_turns with a
     compact summary stub (which search, which labels), keeping the turn structure.
+
+    Returns (messages, evicted_labels). The labels go to `EvidenceLedger.mark_evicted` so
+    the ledger knows what left the model's view; this module stays ledger-free (single
+    writer, Contract C2).
 
     A "turn" is an assistant message that contains tool_calls followed by its tool
     result messages. Whole turns are compacted so the agent never sees a partial view
@@ -82,7 +92,7 @@ def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int) -> li
         i for i, m in enumerate(messages) if m.role == Role.assistant and m.tool_calls
     ]
     if len(turn_starts) <= keep_last_n_turns:
-        return messages
+        return messages, []
 
     cutoff_idx = turn_starts[-(keep_last_n_turns)]
     calls_by_id: dict[str, ToolCallRef] = {
@@ -90,8 +100,10 @@ def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int) -> li
     }
 
     result = []
+    evicted: list[str] = []
     for i, m in enumerate(messages):
         if i < cutoff_idx and m.role == Role.tool and _LABEL_RE.search(m.content or ""):
+            evicted.extend(_LABEL_RE.findall(m.content or ""))
             result.append(
                 ChatMessage(
                     role=Role.tool,
@@ -106,7 +118,7 @@ def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int) -> li
             # query) — and the tool_call_id linkage — survive; everything else passes
             # through unchanged.
             result.append(m)
-    return result
+    return result, evicted
 
 
 class Transcript:
@@ -119,11 +131,16 @@ class Transcript:
     def append_tool_calls(self, tool_calls: list[ToolCallRef]) -> None:
         self.messages.append(assistant_msg_with_tool_calls(tool_calls))
 
-    def compress(self, keep_last_n_turns: int = 1) -> None:
+    def compress(self, evidence: EvidenceLedger | None = None, keep_last_n_turns: int = 1) -> None:
         """Evict bulky tool-result context from all but the most recent turn(s).
 
         Aggressive by default (`keep_last_n_turns=1`): only the latest turn's rendered
         chunks stay in the model's view. Licensed by Contract C1 — every evicted S-label
         still resolves through `EvidenceLedger`, so the model can cite it regardless.
+
+        The ledger is told which labels left the view so a later search that re-returns
+        one re-renders it instead of assuming the model can still read it.
         """
-        self.messages = _compress_history(self.messages, keep_last_n_turns)
+        self.messages, evicted = _compress_history(self.messages, keep_last_n_turns)
+        if evidence is not None and evicted:
+            evidence.mark_evicted(evicted)
