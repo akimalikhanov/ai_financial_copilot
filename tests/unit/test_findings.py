@@ -182,9 +182,10 @@ class TestProjection:
         assert "keep revised" in claims  # the restated key supersedes in place
         assert (e := ledger.entry("A")) is not None and e.revisions == 1
 
-    def test_prune_to_drops_abandoned_keys_on_accept(self) -> None:
-        # prune_to is the loop's accept-time call: only now does an omitted key count as
-        # deliberately abandoned. Returns the dropped keys so the caller can record a gap.
+    def test_a_later_report_never_drops_an_earlier_key(self) -> None:
+        # D3 deleted prune_to. Reports are incremental, so a report that omits an
+        # established key is the model moving on — not retracting. Treating omission as
+        # abandonment is what made the reverted commit need restatement coercion.
         evidence, ids = _seed_evidence(2)
         ledger = FindingsLedger()
         ledger.ingest(
@@ -192,26 +193,57 @@ class TestProjection:
                 question="q",
                 observations=(
                     Observation(
-                        aspect="A", claim="keep", evidence_chunks=[ids[0]], confidence="high"
+                        aspect="A", claim="first", evidence_chunks=[ids[0]], confidence="high"
                     ),
                     Observation(
-                        aspect="B", claim="abandon", evidence_chunks=[ids[1]], confidence="low"
+                        aspect="B", claim="second", evidence_chunks=[ids[1]], confidence="low"
                     ),
                 ),
             ),
             evidence,
         )
-        accepted = AnalyticalFindings(
-            question="q",
-            observations=(
-                Observation(aspect="A", claim="keep", evidence_chunks=[ids[0]], confidence="high"),
+        ledger.ingest(  # a later report covering only C
+            AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="C", claim="third", evidence_chunks=[ids[0]], confidence="high"
+                    ),
+                ),
             ),
+            evidence,
         )
-        dropped = ledger.prune_to(accepted)
-        assert dropped == {"B"}
         served = ledger.projection()
         assert isinstance(served, AnalyticalFindings)
-        assert {o.aspect for o in served.observations} == {"A"}
+        assert {o.aspect for o in served.observations} == {"A", "B", "C"}
+        assert not hasattr(ledger, "prune_to")
+
+
+class TestGapClosure:
+    def test_add_gap_with_closes_marks_the_key_addressed(self) -> None:
+        # D4: a key that produced no finding is still addressed once its failure is
+        # stated — that pairing is what stops Stop("covered") serving a silent hole.
+        ledger = FindingsLedger()
+        ledger.add_gap("Not resolved: why did margins move?", closes="A2")
+        assert ledger.closed_as_gap() == {"A2"}
+        # `keys()` here is FindingsLedger's method, not a dict view: the gap closes the
+        # aspect without creating a finding entry for it.
+        assert ledger.keys() == set()
+
+    def test_add_gap_without_closes_records_no_closure(self) -> None:
+        ledger = FindingsLedger()
+        ledger.add_gap("some free-floating caveat")
+        assert ledger.closed_as_gap() == set()
+
+    def test_add_gap_deduplicates(self) -> None:
+        ledger = FindingsLedger()
+        ledger.add_gap("Not resolved: q", closes="A1")
+        ledger.add_gap("Not resolved: q", closes="A1")
+        evidence, _ = _seed_evidence(1)
+        ledger.ingest(AnalyticalFindings(question="q", observations=()), evidence)
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert served.gaps == ["Not resolved: q"]
 
     def test_add_gap_appends_to_existing_gaps(self) -> None:
         evidence, ids = _seed_evidence(1)
@@ -369,3 +401,40 @@ class TestEnvelopeNullGuard:
         served = ledger.projection()
         assert isinstance(served, AnalyticalFindings)
         assert served.question == "Why did margins fall?"
+
+    def test_later_attempt_with_null_conclusion_does_not_erase_prior(self) -> None:
+        # A later report with conclusion=None must not blank a previously-established one.
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        obs_a = Observation(aspect="A", claim="c1", evidence_chunks=[ids[0]], confidence="high")
+        obs_b = Observation(aspect="B", claim="c2", evidence_chunks=[ids[0]], confidence="high")
+        ledger.ingest(
+            AnalyticalFindings(question="q", conclusion="Costs rose.", observations=(obs_a,)),
+            evidence,
+        )
+        ledger.ingest(
+            AnalyticalFindings(question="q", conclusion=None, observations=(obs_b,)), evidence
+        )
+
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert served.conclusion == "Costs rose."
+
+    def test_later_attempt_with_empty_gaps_preserves_earlier_gaps(self) -> None:
+        # A later report with gaps=[] must not wipe gaps a prior attempt (or add_gap)
+        # already recorded — union, not replace.
+        evidence, ids = _seed_evidence(1)
+        ledger = FindingsLedger()
+        obs_a = Observation(aspect="A", claim="c1", evidence_chunks=[ids[0]], confidence="high")
+        obs_b = Observation(aspect="B", claim="c2", evidence_chunks=[ids[0]], confidence="high")
+        ledger.ingest(
+            AnalyticalFindings(
+                question="q", gaps=["Unsubstantiated claim: x"], observations=(obs_a,)
+            ),
+            evidence,
+        )
+        ledger.ingest(AnalyticalFindings(question="q", gaps=[], observations=(obs_b,)), evidence)
+
+        served = ledger.projection()
+        assert isinstance(served, AnalyticalFindings)
+        assert served.gaps == ["Unsubstantiated claim: x"]

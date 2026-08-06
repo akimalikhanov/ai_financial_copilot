@@ -14,7 +14,7 @@ from uuid import UUID
 
 import httpx
 
-from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import CITATION_REFS_DROPPED
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
 from src.schemas.retrieval import RAGContext
@@ -163,17 +163,9 @@ async def process_findings(
             }
         )
 
-        lf = lf_client.get_client()
-        _fx_lf_stack = contextlib.ExitStack()
-        if lf:
-            _fx_lf_stack.enter_context(
-                lf.start_as_current_observation(
-                    as_type="span",
-                    name="fx_conversion",
-                    input={"pairs": list(pairs), "target_currency": resolved_target},
-                )
-            )
-        try:
+        with lf_span(
+            "fx_conversion", input={"pairs": list(pairs), "target_currency": resolved_target}
+        ) as obs:
             async with httpx.AsyncClient(timeout=_FX_TIMEOUT) as client:
                 results = await asyncio.gather(
                     *[_fetch_rate(client, cur, resolved_target, date) for cur, date in pairs]
@@ -188,9 +180,9 @@ async def process_findings(
                 else:
                     failed.append(key)
 
-            if lf:
+            if obs:
                 if failed:
-                    lf.update_current_span(
+                    obs.update(
                         level="ERROR",
                         status_message=f"FX fetch failed for: {', '.join(failed)}",
                         output={
@@ -200,14 +192,12 @@ async def process_findings(
                         },
                     )
                 else:
-                    lf.update_current_span(
+                    obs.update(
                         output={
                             "pairs_fetched": len(results),
                             "rates_ok": fx_rates_used,
                         }
                     )
-        finally:
-            _fx_lf_stack.close()
 
         if failed:
             # For argmin/argmax we can't rank with a hole — abort the whole result.

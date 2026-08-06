@@ -27,10 +27,6 @@ from src.schemas.retrieval import (
 )
 from src.services.retrieval.context_assembler import assemble_rag_context, wrap_excerpt
 
-# Per-turn cap on revivals, so a search re-returning a large evicted set cannot
-# reinflate the transcript compaction just shrank.
-_MAX_REVIVALS_PER_TURN = 3
-
 
 def _wrap_excerpt_for(item: ContextItem, payloads: dict[UUID, ChunkPromptPayload]) -> str:
     """The excerpt exactly as rendered into the transcript, so a revived block carries its
@@ -80,7 +76,7 @@ class EvidenceLedger:
         self,
         chunks: Sequence[RetrievedChunk],
         payloads: dict[UUID, ChunkPromptPayload],
-        max_revivals: int = _MAX_REVIVALS_PER_TURN,
+        max_revivals: int = 3,
     ) -> RAGContext:
         """Assemble one tool result's RAGContext, numbering S-labels globally across the
         request so labels never restart at S1 between searches.
@@ -94,7 +90,11 @@ class EvidenceLedger:
         re-returned by a later search, is **revived**: re-emitted verbatim under its
         original label, minting no new ref. Without this it is readable in neither the
         transcript nor a fresh tool result, while `resolve_refs` still resolves it — so a
-        claim could be grounded on text the model never actually read.
+        claim could be grounded on text the model never actually read. `max_revivals`
+        bounds that per turn so a search re-returning a large evicted set cannot reinflate
+        what compaction just shrank; the loop passes
+        `EffortPrior.max_revivals_per_turn`, and the default here serves the callers
+        outside the loop (synthesis re-assembly, tests) that have no effort prior.
         """
         fresh = [c for c in chunks if c.chunk_id not in self._items]
         revived = [

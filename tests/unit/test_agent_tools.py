@@ -12,13 +12,14 @@ import json
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.services.chat.agent.tools import (
-    ALL_TOOLS,
+    ANALYTICAL_TOOLS,
+    EXTRACTION_TOOLS,
     REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
+    REPORT_TOOL_NAMES,
+    SEARCH_ANALYTICAL_TOOL,
     SEARCH_TOOL,
     SearchDocumentsArgs,
-    gates_for,
-    is_terminal,
     tool_schema,
 )
 
@@ -30,8 +31,20 @@ def _params(tool: dict) -> dict:
 class TestSchemaShape:
     def test_search_tool_names_and_params(self) -> None:
         assert SEARCH_TOOL["function"]["name"] == "search_documents"
-        props = _params(SEARCH_TOOL)["properties"]
-        assert set(props) == {"entity", "query"}
+        params = _params(SEARCH_TOOL)
+        # Extraction keeps the two-field search: make_strict forces every property into
+        # `required`, so offering sub_question here would oblige a null for a concept
+        # v3_agent never explains.
+        assert set(params["properties"]) == {"entity", "query"}
+        assert set(params["required"]) == {"entity", "query"}
+
+    def test_analytical_search_tool_carries_sub_question(self) -> None:
+        assert SEARCH_ANALYTICAL_TOOL["function"]["name"] == "search_documents"
+        params = _params(SEARCH_ANALYTICAL_TOOL)
+        assert set(params["properties"]) == {"entity", "query", "sub_question"}
+        # Required, so the plan seeds from every analytical search rather than whichever
+        # ones the model remembered to decompose.
+        assert set(params["required"]) == {"entity", "query", "sub_question"}
 
     def test_report_findings_tool_name(self) -> None:
         assert REPORT_FINDINGS_TOOL["function"]["name"] == "report_findings"
@@ -124,23 +137,45 @@ class TestFieldDescriptionsPreserved:
         assert schema["function"]["description"] == "does x"
 
 
-class TestUnifiedToolPool:
-    """Stage 1.5: one tool pool for every query_shape, not two hardcoded lists."""
+class TestPerPathToolPools:
+    """Step 7: each path names its own pool, and no tool is terminal."""
 
-    def test_all_tools_contains_both_finalizers(self) -> None:
-        names = {t["function"]["name"] for t in ALL_TOOLS}
-        assert names == {"search_documents", "report_findings", "report_analytical_findings"}
+    def test_analytical_pool_offers_only_its_own_finalizer(self) -> None:
+        names = [t["function"]["name"] for t in ANALYTICAL_TOOLS]
+        assert names == ["search_documents", "report_analytical_findings"]
 
-    def test_both_finalizers_are_terminal(self) -> None:
-        assert is_terminal("report_findings")
-        assert is_terminal("report_analytical_findings")
-        assert not is_terminal("search_documents")
+    def test_extraction_pool_offers_only_its_own_finalizer(self) -> None:
+        # report_analytical_findings leaving extraction's view is the point: v3_agent
+        # never named it, and an Observation on an extraction run flips the ledger kind.
+        names = [t["function"]["name"] for t in EXTRACTION_TOOLS]
+        assert names == ["search_documents", "report_findings"]
 
-    def test_gates_scoped_to_their_own_finalizer(self) -> None:
-        # missing_entity_gate only guards report_findings; analytical_insufficiency_gate
-        # only guards report_analytical_findings — unifying the pool must not cross-wire
-        # a gate onto the wrong finalizer.
-        report_findings_gates = {g.__name__ for g in gates_for("report_findings")}
-        report_analytical_gates = {g.__name__ for g in gates_for("report_analytical_findings")}
-        assert report_findings_gates == {"missing_entity_gate"}
-        assert report_analytical_gates == {"analytical_insufficiency_gate"}
+    def test_neither_pool_sees_the_other_paths_finalizer(self) -> None:
+        analytical = {t["function"]["name"] for t in ANALYTICAL_TOOLS}
+        extraction = {t["function"]["name"] for t in EXTRACTION_TOOLS}
+        assert "report_findings" not in analytical
+        assert "report_analytical_findings" not in extraction
+
+    def test_report_tool_names_spans_both_pools(self) -> None:
+        # The loop partitions each turn on this set, so a report tool missing from it
+        # would be routed to the search path and executed as a search.
+        pooled = {t["function"]["name"] for t in (*ANALYTICAL_TOOLS, *EXTRACTION_TOOLS)}
+        assert REPORT_TOOL_NAMES.issubset(pooled)
+        assert {"report_findings", "report_analytical_findings"} == REPORT_TOOL_NAMES
+        assert "search_documents" not in REPORT_TOOL_NAMES
+
+    def test_no_terminal_or_gate_machinery_remains(self) -> None:
+        # D3 deleted the registry: nothing ends the run but the loop's own coverage check,
+        # so a re-introduced `terminal` flag would silently restore the one-shot finalizer.
+        import src.services.chat.agent.tools as tools_module
+
+        for attr in ("TOOL_REGISTRY", "is_terminal", "gates_for", "ToolRegistration"):
+            assert not hasattr(tools_module, attr), f"{attr} should have been deleted by D3"
+
+    def test_report_descriptions_invite_incremental_calls(self) -> None:
+        # The schema description is the only place the model is told it may report more
+        # than once; "call this ONCE ... ends the search phase" is what it replaced.
+        for tool in (REPORT_FINDINGS_TOOL, REPORT_ANALYTICAL_TOOL):
+            desc = tool["function"]["description"].lower()
+            assert "more than once" in desc
+            assert "ends the search phase" not in desc

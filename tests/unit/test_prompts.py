@@ -352,3 +352,56 @@ def test_system_prompt_with_real_templates():
     # Should contain the Financial Document Analyst prompt
     assert "Financial Document Analyst" in system_prompt
     assert "RAG-based" in system_prompt or "Retrieval-Augmented Generation" in system_prompt
+
+
+# -------------------------
+# v5 analytical agent prompt (10b step 6)
+# -------------------------
+
+
+def test_v5_analytical_prompt_renders_and_names_only_its_tools():
+    """The prompt must name every tool the analytical pool offers and no other: a prompt
+    naming a tool the model was not given produces a call the provider rejects."""
+    prompt = get_system_prompt(version="v5_agent_analytical")
+
+    assert "search_documents" in prompt
+    assert "report_analytical_findings" in prompt
+    # `report_findings` is the extraction finalizer — naming it here would invite a call
+    # whose AgentFindings payload lands on the wrong ledger kind.
+    assert "report_findings(" not in prompt
+    assert "call report_findings" not in prompt
+
+
+def test_v5_analytical_prompt_drops_the_one_shot_finalizer_framing():
+    """D3: the report tool is non-terminal and the loop owns termination. Prose telling
+    the model to call it ONCE, or that it ends the search phase, contradicts the loop."""
+    prompt = get_system_prompt(version="v5_agent_analytical")
+
+    assert "ONCE" not in prompt
+    assert "ends the search phase" not in prompt
+    assert "as soon as its evidence settles" in prompt
+
+
+def test_v5_analytical_prompt_fixes_no_aspect_count():
+    """Width is anchored on the question, not a number: every seeded aspect is an
+    obligation that either lands a finding or surfaces as an unresolved gap, so a fixed
+    count spends searches on invented hypotheses and pads the answer with manufactured gaps."""
+    prompt = get_system_prompt(version="v5_agent_analytical")
+
+    assert "3–4" not in prompt
+    assert "sub_question" in prompt  # the mechanism that opens an aspect
+
+
+def test_v5_analytical_prompt_caps_fanout_at_max_concurrent_searches():
+    """The turn-1 fan-out must not exceed AGENT_MAX_CONCURRENT_SEARCHES (default 3), or
+    the extra searches queue behind the semaphore instead of running in parallel."""
+    import re
+
+    from src.services.chat.agent.state import get_agent_settings
+
+    prompt = get_system_prompt(version="v5_agent_analytical")
+    example = prompt.split("## Example")[1]
+    turn_1 = example.split("Turn 2")[0]
+
+    fanout = len(re.findall(r"search_documents\(", turn_1))
+    assert fanout == get_agent_settings().max_concurrent_searches

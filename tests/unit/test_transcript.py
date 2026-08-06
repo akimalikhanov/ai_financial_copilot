@@ -16,7 +16,7 @@ import pytest
 
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent.evidence import EvidenceLedger
-from src.services.chat.agent.transcript import Transcript
+from src.services.chat.agent.transcript import Transcript, cap_history
 from src.services.llm_adapters.base_adapter import ChatMessage, Role, ToolCallRef
 
 _EVICTED_PREFIX = "[compacted]"
@@ -217,3 +217,71 @@ def test_non_labelled_tool_results_survive_compaction() -> None:
     contents = [m.content for m in transcript.messages if m.role == Role.tool]
     assert reject_note in contents  # untouched
     assert any((c or "").startswith(_EVICTED_PREFIX) for c in contents)  # the bulky one went
+
+
+def test_report_only_turn_is_not_a_compaction_boundary() -> None:
+    """10b §4b: only assistant messages issuing a *search* start a turn.
+
+    Reports are non-terminal now and can arrive in their own turn. Counting one as a
+    boundary would shift the cutoff and evict the current search's excerpts a turn early —
+    the model would then compose claims from a breadcrumb instead of the text.
+    """
+    ledger = EvidenceLedger()
+    transcript = Transcript([ChatMessage(role=Role.system, content="sys")])
+
+    labels = _run_turn(ledger, transcript, 0)
+    # A report-only turn: assistant tool_calls carrying no search.
+    transcript.append_tool_calls(
+        [ToolCallRef(id="r1", name="report_analytical_findings", arguments="{}")]
+    )
+    transcript.append(ChatMessage(role=Role.tool, tool_call_id="r1", content="Recorded A1."))
+    transcript.compress(ledger)
+
+    live = [
+        m
+        for m in transcript.messages
+        if m.role == Role.tool and not (m.content or "").startswith(_EVICTED_PREFIX)
+    ]
+    # The search's excerpts survive: the report turn did not push them past the cutoff.
+    search_result = next(m for m in live if "retrieved_excerpt" in (m.content or ""))
+    for label in labels:
+        assert label in (search_result.content or "")
+
+
+# ---------------------------------------------------------------------------
+# 10b §4 row 2 — prior conversation is capped, not carried whole
+# ---------------------------------------------------------------------------
+
+
+def _pair(n: int, answer_len: int = 10) -> list[ChatMessage]:
+    return [
+        ChatMessage(role=Role.user, content=f"q{n}"),
+        ChatMessage(role=Role.assistant, content=f"a{n}" * answer_len),
+    ]
+
+
+def test_cap_history_keeps_only_the_last_n_pairs() -> None:
+    messages = [*_pair(1), *_pair(2), *_pair(3)]
+    kept = cap_history(messages, max_turns=2, max_assistant_chars=1000)
+    assert [m.content for m in kept][0] == "q2"
+    assert len(kept) == 4
+
+
+def test_cap_history_starts_at_a_user_message_never_mid_pair() -> None:
+    """Slicing to a message count instead of a turn boundary would carry an assistant
+    answer whose question was dropped — worse than useless context."""
+    messages = [*_pair(1), *_pair(2), *_pair(3)]
+    kept = cap_history(messages, max_turns=1, max_assistant_chars=1000)
+    assert [m.role for m in kept] == [Role.user, Role.assistant]
+    assert kept[0].content == "q3"
+
+
+def test_cap_history_truncates_assistant_content_only() -> None:
+    messages = [ChatMessage(role=Role.user, content="u" * 500), *_pair(1, answer_len=500)]
+    kept = cap_history(messages, max_turns=2, max_assistant_chars=100)
+    assert kept[0].content == "u" * 500  # a prior question is the only record of what was asked
+    assert kept[-1].content == "a1" * 50 + "\u2026"
+
+
+def test_cap_history_zero_turns_drops_everything() -> None:
+    assert cap_history([*_pair(1)], max_turns=0, max_assistant_chars=100) == []

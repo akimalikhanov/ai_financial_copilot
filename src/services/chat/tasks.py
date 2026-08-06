@@ -621,12 +621,35 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "convergence_reason": agent_meta.convergence_reason,
                                 "sealed": agent_meta.sealed,
                                 "chunks_collected": len(agent_result.rag_context.items),
+                                # Step 9: is reporting incremental, or is the model
+                                # one-shotting anyway? The kill criterion for the whole
+                                # decomposition mechanism — was dropped on the floor
+                                # (computed onto AgentLoopMeta, never surfaced here).
+                                "plan_seeded": agent_meta.plan_seeded,
+                                "plan_covered": agent_meta.plan_covered,
+                                "report_calls_total": agent_meta.report_calls_total,
+                                "turns_to_first_report": agent_meta.turns_to_first_report,
+                                "unknown_aspect_keys": agent_meta.unknown_aspect_keys,
+                                "ungrounded_close_rate": agent_meta.ungrounded_close_rate,
+                                "revised_keys": agent_meta.revised_keys,
                             },
                             metadata={
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
                             },
+                        )
+                        lf_trace_id = UUID(request_id).hex
+                        if agent_meta.plan_seeded:
+                            lf.create_score(
+                                name="agent_plan_coverage",
+                                value=agent_meta.plan_covered / agent_meta.plan_seeded,
+                                trace_id=lf_trace_id,
+                            )
+                        lf.create_score(
+                            name="agent_ungrounded_close_rate",
+                            value=agent_meta.ungrounded_close_rate,
+                            trace_id=lf_trace_id,
                         )
                 finally:
                     _agent_lf_stack.close()
@@ -837,9 +860,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,
                             "convergence_reason": m.convergence_reason,
+                            "sealed": m.sealed,
                             "currency_normalized": state.agent_currency_converted,
                             "answer_entity": state.agent_answer_entity,
                             "fx_rates_used": state.agent_fx_rates,
+                            # Step 9 decomposition/coverage instrumentation — previously
+                            # computed onto AgentLoopMeta but never persisted, so it was
+                            # invisible to DB/Grafana queries over Message.trace.
+                            "plan_seeded": m.plan_seeded,
+                            "plan_covered": m.plan_covered,
+                            "report_calls_total": m.report_calls_total,
+                            "turns_to_first_report": m.turns_to_first_report,
+                            "unknown_aspect_keys": m.unknown_aspect_keys,
+                            "ungrounded_close_rate": m.ungrounded_close_rate,
+                            "revised_keys": m.revised_keys,
                         }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,

@@ -1,22 +1,23 @@
-"""Tool schemas + registry for the agent loop.
+"""Tool schemas for the agent loop.
 
 Pydantic arg models are the single source of truth: their JSON schemas drive the tool
 definitions handed to the LLM, and the same models parse the tool-call arguments back
 — schema and parser cannot drift (P2-10, P0-3).
 
-`TOOL_REGISTRY` replaces the old `_FINALIZER_NAMES` frozenset + hardcoded dispatch
-(P2-14): it is the single place that knows which tool names are terminal (finalizers)
-and, per doc's Contract C3, which gates guard them (structural before sufficiency).
+Post-D3 there is no registry: no tool is terminal and no tool has gates, so the only
+thing a caller ever needs is the schema list.
+
+Each path names its own pool (10b step 7). A shape-invariant pool under a shape-varying
+prompt is what let an extraction run see `report_analytical_findings` — a tool `v3_agent`
+never names, whose payload lands on the wrong ledger kind. `run_loop` assigns prompt and
+pool on one line so neither can be set without the other.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from pydantic import BaseModel, Field
 
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import GateFn, analytical_insufficiency_gate, missing_entity_gate
 from src.utils.json_schema import make_strict
 
 
@@ -31,6 +32,34 @@ def tool_schema(name: str, description: str, args: type[BaseModel]) -> dict:
 
 
 class SearchDocumentsArgs(BaseModel):
+    """Parses every `search_documents` call, on both paths.
+
+    `sub_question` stays optional here because this one model must accept the extraction
+    pool's two-field payload as well as the analytical pool's three-field one. The
+    *schemas* differ (below); the parser is deliberately the looser of the two, so a call
+    from either pool round-trips through it.
+    """
+
+    entity: str = Field(description="The entity (company, fund, etc.) to search documents for.")
+    query: str = Field(description="What to look for in that entity's documents.")
+    sub_question: str | None = Field(
+        default=None,
+        description=(
+            "The question this search is trying to answer, in plain words. A new "
+            "sub_question opens a new aspect; reuse the exact wording to re-search an "
+            "aspect you already opened."
+        ),
+    )
+
+
+class _ExtractionSearchArgs(BaseModel):
+    """Schema-only: the two-field search the extraction path advertises.
+
+    A separate model rather than a nullable field because `make_strict` forces every
+    property into `required` — offering `sub_question` to a path with no decomposition
+    would oblige the model to emit a null for a concept `v3_agent` never explains.
+    """
+
     entity: str = Field(description="The entity (company, fund, etc.) to search documents for.")
     query: str = Field(description="What to look for in that entity's documents.")
 
@@ -38,57 +67,35 @@ class SearchDocumentsArgs(BaseModel):
 SEARCH_TOOL = tool_schema(
     "search_documents",
     "Search financial documents for a specific entity. Call once per entity.",
+    _ExtractionSearchArgs,
+)
+
+SEARCH_ANALYTICAL_TOOL = tool_schema(
+    "search_documents",
+    "Search financial documents for one aspect of the question. "
+    "Each call targets ONE aspect, not one entity.",
     SearchDocumentsArgs,
 )
 
 REPORT_FINDINGS_TOOL = tool_schema(
     "report_findings",
-    "Call this once when you have finished searching. Report extracted values for all entities. This ends the search phase.",
+    "Report extracted values for entities you have finished searching. "
+    "You may call this more than once, and may search in the same turn — "
+    "report each entity as soon as its evidence settles.",
     AgentFindings,
 )
 
 REPORT_ANALYTICAL_TOOL = tool_schema(
     "report_analytical_findings",
-    "Call this once when you have a complete chain of observations for a causal or narrative question. This ends the search phase.",
+    "Report observations for aspects whose evidence has settled. "
+    "You may call this more than once, and may search in the same turn — "
+    "report each aspect as soon as you can, rather than saving them all for the end.",
     AnalyticalFindings,
 )
 
+ANALYTICAL_TOOLS = [SEARCH_ANALYTICAL_TOOL, REPORT_ANALYTICAL_TOOL]
+EXTRACTION_TOOLS = [SEARCH_TOOL, REPORT_FINDINGS_TOOL]
 
-@dataclass(frozen=True)
-class ToolRegistration:
-    schema: dict
-    terminal: bool = False
-    gates: tuple[GateFn, ...] = field(default_factory=tuple)
-
-
-TOOL_REGISTRY: dict[str, ToolRegistration] = {
-    "search_documents": ToolRegistration(schema=SEARCH_TOOL),
-    "report_findings": ToolRegistration(
-        schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
-    ),
-    "report_analytical_findings": ToolRegistration(
-        schema=REPORT_ANALYTICAL_TOOL, terminal=True, gates=(analytical_insufficiency_gate,)
-    ),
-}
-
-# Stage 1.5: one tool pool for every query_shape. Each gate is registered against the
-# specific finalizer it guards (missing_entity_gate only fires for report_findings,
-# analytical_insufficiency_gate only for report_analytical_findings), so handing the
-# model both finalizers unconditionally does not change which gate fires for which
-# candidate type — it only removes the branch that built two separate tool lists.
-# Prompt selection (v3_agent vs v3_agent_analytical) still varies by query_shape.
-ALL_TOOLS = [
-    TOOL_REGISTRY["search_documents"].schema,
-    TOOL_REGISTRY["report_findings"].schema,
-    TOOL_REGISTRY["report_analytical_findings"].schema,
-]
-
-
-def is_terminal(name: str) -> bool:
-    reg = TOOL_REGISTRY.get(name)
-    return reg is not None and reg.terminal
-
-
-def gates_for(name: str) -> tuple[GateFn, ...]:
-    reg = TOOL_REGISTRY.get(name)
-    return reg.gates if reg is not None else ()
+# The loop partitions each turn on this set, so it must name every report tool across
+# *both* pools — a report tool missing here would be routed to the search path.
+REPORT_TOOL_NAMES = frozenset({"report_findings", "report_analytical_findings"})

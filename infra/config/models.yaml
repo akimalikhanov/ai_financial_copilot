@@ -48,7 +48,16 @@ models:
     # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
     # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
-    params_override: {temperature: 1.0, reasoning_effort: low, verbosity: low, max_tokens: 4000}
+    #
+    # reasoning_effort bumped to medium (was low): traces showed the agent loop opening
+    # wide aspect sets but never issuing gap-targeted follow-up searches or acting on its
+    # own medium/low confidence labels before reporting - a multi-step self-monitoring
+    # judgment low effort was skipping, not a prompt wording issue (see agent/loop.py
+    # analytical-shape traces from 2026-08-05). gpt-5.4-mini was tried first but OpenAI
+    # rejects reasoning_effort + tool calling together on /v1/chat/completions for that
+    # model (needs /v1/responses, which OpenAIAdapter doesn't implement) - stuck with
+    # gpt-5-mini, which supports this combination on chat/completions today.
+    params_override: {temperature: 1.0, reasoning_effort: medium, verbosity: low, max_tokens: 6000}
 
   - id: gpt-4o-mini
     label: "OpenAI GPT-4o-mini"

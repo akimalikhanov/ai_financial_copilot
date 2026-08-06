@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
@@ -22,7 +23,17 @@ from src.utils.config import get_query_transformer_model
 if TYPE_CHECKING:
     from src.services.llm_adapters.base_adapter import LLMResponseStats
 
-ConvergenceReason = Literal["natural", "convergence", "iteration_cap", "budget_cap", "timeout"]
+ConvergenceReason = Literal[
+    "natural",
+    "convergence",
+    "iteration_cap",
+    "budget_cap",
+    "timeout",
+    # D3/step 3: the loop, not a terminal tool call, now decides when a run is done.
+    "covered",  # every planned aspect/entity was reported on
+    "search_unavailable",  # every search this turn errored — a dead backend, not an empty corpus
+    "deadline",  # wall-clock bound for the whole run (turn_timeout_seconds bounds only one turn)
+]
 
 
 class AgentSettings(BaseModel):
@@ -34,15 +45,24 @@ class AgentSettings(BaseModel):
     max_concurrent_searches: int = Field(ge=1, le=16)
     max_chunks_per_entity: int = Field(ge=1)
     max_empty_analytical_rounds: int = Field(ge=0)
-    # Cap on how many times the thin-analytical-finalizer gate (3.ii/3.iii) may reject
-    # and force a re-prompt per request — uncapped rejection loops drove iteration_cap /
-    # high token spend with little correctness gain.
-    max_insufficiency_rejections: int = Field(ge=0)
     turn_timeout_seconds: float = Field(gt=0)
+    # Wall-clock bound on the whole run. `turn_timeout_seconds` bounds a single turn, so
+    # without this a run of slow-but-not-timing-out turns has no bound at all.
+    deadline_seconds: float = Field(gt=0)
     # Stage 1.5: per-shape override for analytical queries, which tend to need more
-    # search turns to corroborate/refute multiple hypotheses. Defaults to max_iterations
-    # so the prior is shape-invariant until an operator tunes it against eval data.
+    # search turns to corroborate/refute multiple hypotheses. Defaults to 8 — coverage-
+    # driven termination needs headroom above the extraction path's default of 5.
     max_iterations_analytical: int = Field(ge=1, le=20)
+    # 10b §4: prior conversation was permanent and token-unbounded in the agent
+    # transcript (≤50 messages, up to ~10-20k tokens on every turn). Cap it.
+    history_turns: int = Field(ge=0)
+    history_assistant_tokens: int = Field(ge=1)
+    # Ceiling on loop-minted plan entries. Near-duplicate sub_questions each mint their
+    # own id (no fuzzy matching), so this is what bounds the cost of that choice.
+    max_plan_items: int = Field(ge=1)
+    # Per-turn cap on revivals, so a search re-returning a large evicted set cannot
+    # reinflate what transcript compaction just shrank.
+    max_revivals_per_turn: int = Field(ge=0)
 
 
 def get_agent_settings() -> AgentSettings:
@@ -56,11 +76,13 @@ def get_agent_settings() -> AgentSettings:
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
         max_chunks_per_entity=int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
         max_empty_analytical_rounds=int(os.getenv("AGENT_MAX_EMPTY_ANALYTICAL_ROUNDS", "1")),
-        max_insufficiency_rejections=int(os.getenv("AGENT_MAX_INSUFFICIENCY_REJECTIONS", "1")),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
-        max_iterations_analytical=int(
-            os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", str(max_iterations))
-        ),
+        deadline_seconds=float(os.getenv("AGENT_DEADLINE_SECONDS", "180")),
+        max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "8")),
+        history_turns=int(os.getenv("AGENT_HISTORY_TURNS", "2")),
+        history_assistant_tokens=int(os.getenv("AGENT_HISTORY_ASSISTANT_TOKENS", "600")),
+        max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "8")),
+        max_revivals_per_turn=int(os.getenv("AGENT_MAX_REVIVALS_PER_TURN", "3")),
     )
 
 
@@ -73,8 +95,10 @@ class EffortPrior:
 
     max_iterations: int
     max_empty_rounds: int
-    max_insufficiency_rejections: int
     max_concurrent_searches: int
+    max_plan_items: int
+    max_revivals_per_turn: int
+    max_chunks_per_lookup: int
 
     @classmethod
     def for_shape(cls, settings: AgentSettings, shape: str | None) -> EffortPrior:
@@ -84,8 +108,10 @@ class EffortPrior:
         return cls(
             max_iterations=max_iterations,
             max_empty_rounds=settings.max_empty_analytical_rounds,
-            max_insufficiency_rejections=settings.max_insufficiency_rejections,
             max_concurrent_searches=settings.max_concurrent_searches,
+            max_plan_items=settings.max_plan_items,
+            max_revivals_per_turn=settings.max_revivals_per_turn,
+            max_chunks_per_lookup=settings.max_chunks_per_entity,
         )
 
 
@@ -94,6 +120,21 @@ class TokenSpend:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+
+
+@dataclass
+class AspectStats:
+    """Per-aspect search-attempt log, written in the turn's reduce loop.
+
+    Lives here rather than on the EvidenceLedger because a failed or empty search admits
+    no chunks and so leaves no ledger trace at all — the very case D6 must distinguish.
+    `errored == searches` means the backend was unreachable; `searches > 0` with
+    `new_chunks == 0` means the corpus genuinely lacks it.
+    """
+
+    searches: int = 0
+    errored: int = 0
+    new_chunks: int = 0
 
 
 @dataclass
@@ -120,12 +161,52 @@ class AgentRunState:
     searched_entities: set[str] = field(default_factory=set)
     spend: dict[str, TokenSpend] = field(default_factory=dict)
 
+    # --- decomposition plan: loop-minted aspect ids, same shape/role as expected_entities ---
+    plan: dict[str, str] = field(default_factory=dict)  # "A1" -> sub_question, insertion-ordered
+    reported_keys: set[str] = field(default_factory=set)  # raw keys the model reported on
+    aspect_stats: dict[str, AspectStats] = field(default_factory=dict)
+
     # --- control: loop counters + outcome ---
     iteration: int = 0
     empty_rounds: int = 0
-    insufficiency_rejections: int = 0
     tool_calls_total: int = 0
     convergence_reason: ConvergenceReason = "iteration_cap"
+    # Wall-clock bound for the whole run. `turn_timeout_seconds` bounds one turn, so
+    # without this a run of slow-but-not-timing-out turns has no bound at all.
+    deadline_seconds: float = 180.0
+    started_at: float = field(default_factory=perf_counter)
+
+    # --- step 9 instrumentation ---
+    report_calls_total: int = 0
+    turns_to_first_report: int | None = None
+    unknown_aspect_keys: int = 0
+    ungrounded_closes: int = 0
+    # Coverage as of the loop's last turn. Step 8 closes every remaining key with a gap,
+    # so measuring after that point would report 100% coverage on every run.
+    plan_covered_at_stop: int | None = None
+
+    @property
+    def addressed(self) -> set[str]:
+        """Keys that have actually produced output (D4) — a grounded finding or a stated gap.
+
+        Derived, never stored. 10b step 2 closes an aspect from the *raw* reported keys so
+        an unanswerable one doesn't get hammered to budget death, but `findings` only holds
+        *grounded* keys. Storing both invites them to disagree, and on disagreement
+        `Stop("covered")` would set `sealed=True` while serving an aspect that produced no
+        finding and no gap. Deriving makes that unrepresentable: an ungrounded report still
+        closes its key, but only via `drop_evidence_free_observations` writing the gap that
+        `closed_as_gap` records.
+        """
+        return self.findings.keys() | self.findings.closed_as_gap()
+
+    def unaccounted_keys(self) -> set[str]:
+        """Reported keys that produced neither a finding nor a gap — D4's reconciliation.
+
+        Non-empty means a report was ingested but vanished (an off-kind `record`, or refs
+        that resolved to nothing). The loop turns these into explicit gaps at `Stop`
+        rather than letting them close silently.
+        """
+        return self.reported_keys - self.addressed
 
     def record_spend(self, model_id: str, stats: LLMResponseStats | None) -> None:
         if stats is None:
@@ -140,6 +221,10 @@ class AgentRunState:
 
     def spend_within_budget(self) -> bool:
         return self.input_tokens_total() <= self.token_budget
+
+    def past_deadline(self) -> bool:
+        """Wall-clock bound for the whole run, checked at the end of each turn."""
+        return (perf_counter() - self.started_at) >= self.deadline_seconds
 
 
 @dataclass
@@ -159,6 +244,76 @@ class AgentLoopMeta:
     # Entities the loop actually called search_documents for — the synthesis boundary uses
     # this (not reported coverage) to label stubs for entities the agent never searched.
     searched_entities: frozenset[str] = field(default_factory=frozenset)
+    # Step 9: decomposition width/coverage and whether reporting was incremental. The
+    # kill criterion is report_calls_total ≈ 1 *and* plan_covered/plan_seeded no better
+    # than v3 — that means the mechanism is inert while costing an extra tool call.
+    plan_seeded: int = 0
+    plan_covered: int = 0
+    report_calls_total: int = 0
+    turns_to_first_report: int | None = None
+    unknown_aspect_keys: int = 0
+    ungrounded_close_rate: float = 0.0
+    # Tracked, never a kill criterion: a run that concludes each aspect once, correctly, is
+    # a success. Zero means reporting only ever appends — a revision needs later evidence
+    # to contradict an earlier conclusion.
+    revised_keys: int = 0
+
+
+def open_aspects(state: AgentRunState) -> list[str]:
+    """Plan entries that have not yet produced a finding or a stated gap, in mint order."""
+    addressed = state.addressed
+    return [a for a in state.plan if a not in addressed]
+
+
+def turn_snapshot(state: AgentRunState) -> dict:
+    """Coverage state as of *after* this turn's effects landed — structured, not prose.
+
+    A per-turn counterpart to `debug_snapshot`: the same underlying fields (`plan`,
+    `addressed`, `open_aspects`, `aspect_stats`), but cheap enough to attach to every
+    `agent_turn_N` span rather than only once at the run's end. Without this, Langfuse
+    shows each turn's *input* status (coverage before the turn ran, as the prose the model
+    read) but nothing structured about what changed after — reconstructing how plan
+    coverage evolved turn-over-turn means replaying tool-call args and report outputs by
+    hand. Field names deliberately match `debug_snapshot` so the two never drift apart.
+    """
+    addressed = state.addressed
+    return {
+        "plan": dict(state.plan),
+        "addressed": sorted(addressed),
+        "open_aspects": open_aspects(state),
+        "aspect_stats": {a: vars(s) for a, s in state.aspect_stats.items()},
+        "empty_rounds": state.empty_rounds,
+        "reported_keys": sorted(state.reported_keys),
+    }
+
+
+def render_status(state: AgentRunState) -> str | None:
+    """Coverage status, computed per call and appended last — never stored (10b §4a).
+
+    Keys and sub-questions only, never claim bodies: re-injecting bodies is the reverted
+    commit's "established findings block", whose only purpose was giving the model
+    something to copy during a coerced restatement. Being a computed view makes it the
+    single source of coverage truth — the report result's own open list goes stale, and
+    this wins by recency. The stall nudge lives here too rather than being appended once
+    and never removed.
+    """
+    if not state.plan:
+        return None
+    addressed = state.addressed
+    recorded = [a for a in state.plan if a in addressed]
+    still_open = [a for a in state.plan if a not in addressed]
+    parts: list[str] = []
+    if recorded:
+        parts.append("Recorded: " + ", ".join(recorded))
+    if still_open:
+        parts.append("Open: " + ", ".join(f"{a} ({state.plan[a]})" for a in still_open))
+    if state.empty_rounds:
+        parts.append(
+            "The last search returned no new evidence. The drivers you need are likely in "
+            "a different section (a footnote, reconciliation, or segment table) — "
+            "reformulate with terms targeting where the magnitudes are disclosed."
+        )
+    return " · ".join(parts) if parts else None
 
 
 def debug_snapshot(state: AgentRunState) -> dict:
@@ -182,13 +337,30 @@ def debug_snapshot(state: AgentRunState) -> dict:
         "transcript_message_count": len(state.transcript.messages),
         "searched_entities": sorted(state.searched_entities),
         "expected_entities": sorted(state.expected_entities),
+        "plan": dict(state.plan),
+        "addressed": sorted(state.addressed),
+        "open_aspects": open_aspects(state),
+        "unaccounted_keys": sorted(state.unaccounted_keys()),
+        "aspect_stats": {a: vars(s) for a, s in state.aspect_stats.items()},
         "empty_rounds": state.empty_rounds,
-        "insufficiency_rejections": state.insufficiency_rejections,
         "tool_calls_total": state.tool_calls_total,
+        # Step 9: is reporting incremental, or is the model one-shotting anyway?
+        "plan_seeded": len(state.plan),
+        "plan_covered": (
+            state.plan_covered_at_stop
+            if state.plan_covered_at_stop is not None
+            else len(state.plan.keys() & state.addressed)
+        ),
+        "report_calls_total": state.report_calls_total,
+        "turns_to_first_report": state.turns_to_first_report,
+        "unknown_aspect_keys": state.unknown_aspect_keys,
+        "ungrounded_closes": state.ungrounded_closes,
+        "revised_keys": sorted(state.findings.revised_keys()),
     }
 
 
 def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
+    closed = len(state.reported_keys)
     return AgentLoopMeta(
         iterations=iterations,
         tool_calls_total=state.tool_calls_total,
@@ -198,4 +370,15 @@ def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
         cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),
         searched_entities=frozenset(state.searched_entities),
+        plan_seeded=len(state.plan),
+        plan_covered=(
+            state.plan_covered_at_stop
+            if state.plan_covered_at_stop is not None
+            else len(state.plan.keys() & state.addressed)
+        ),
+        report_calls_total=state.report_calls_total,
+        turns_to_first_report=state.turns_to_first_report,
+        unknown_aspect_keys=state.unknown_aspect_keys,
+        ungrounded_close_rate=(state.ungrounded_closes / closed) if closed else 0.0,
+        revised_keys=len(state.findings.revised_keys()),
     )

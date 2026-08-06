@@ -1,16 +1,21 @@
 """The agent tool-calling loop.
 
-Turn control flow is explicit: `_run_turn` returns a `TurnOutcome` (`Continue`,
-`Finalize`, `Stop`) instead of the old ~8 scattered `convergence_reason = ...; break`
-sites threaded through one function. This is a real control-flow rewrite, not a
-mechanical move — see the doc's honesty note on this step.
+Turn control flow is explicit: `_run_turn` returns a `TurnOutcome` (`Continue` or `Stop`)
+instead of the old ~8 scattered `convergence_reason = ...; break` sites threaded through
+one function.
+
+Post-D3 there is one termination model and no terminal tool. Reports are incremental —
+`_apply_report` folds each into the `FindingsLedger` and returns a tool result — and the
+*loop* decides when the run is done, by checking plan coverage. That deletes the whole
+rejection subsystem (gates, `reject`, stubbed calls, retry budgets): nothing is ever
+un-done, so nothing has to be re-attempted, and the coercion-to-restate that forced the
+revert of `2d43ed8` has no reason to exist.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -24,6 +29,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
@@ -36,20 +42,24 @@ from src.repository.llm_request_repository import LLMRequestRepository, stats_to
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat.agent import gates as gates_module
 from src.services.chat.agent import tools as tools_module
 from src.services.chat.agent.evidence import EvidenceLedger
+from src.services.chat.agent.findings import Candidate, drop_evidence_free_observations
 from src.services.chat.agent.state import (
     AgentLoopMeta,
     AgentRunState,
+    AspectStats,
     ConvergenceReason,
     EffortPrior,
     build_meta,
     debug_snapshot,
     get_agent_settings,
+    open_aspects,
+    render_status,
+    turn_snapshot,
 )
 from src.services.chat.agent.tools import SearchDocumentsArgs
-from src.services.chat.agent.transcript import Transcript
+from src.services.chat.agent.transcript import Transcript, cap_history
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -61,7 +71,8 @@ from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.query_transformer import rewrite_query
-from src.utils.config import get_query_transformer_model
+from src.services.security.injection_detector import scan_user_input
+from src.utils.config import get_injection_scan_user_input_enabled, get_query_transformer_model
 
 if TYPE_CHECKING:
     from src.schemas.chat import ChatPipelineState
@@ -80,10 +91,14 @@ class _SearchResult:
     payloads: dict[UUID, ChunkPromptPayload]
     error_str: str | None = None
     rewrite_stats: LLMResponseStats | None = None
+    # D6 must not conflate "the corpus was unreachable" with "the model sent bad
+    # arguments" — only the former justifies Stop("search_unavailable") or a
+    # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
+    backend_failed: bool = False
 
 
 ExecuteSearchFn = Callable[
-    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", Redis, str, int],
+    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", Redis, str, int, bool],
     Awaitable[_SearchResult],
 ]
 
@@ -99,22 +114,58 @@ class Continue:
 
 
 @dataclass(frozen=True)
-class Finalize:
-    """Marker: a finalizer was accepted. The findings themselves are served from
-    `state.findings.projection()`, never from this object."""
-
-
-@dataclass(frozen=True)
 class Stop:
     reason: ConvergenceReason
 
 
-TurnOutcome = Continue | Finalize | Stop
+# No `Finalize`: post-D3 no tool call ends the run. The loop decides, so every exit is a
+# `Stop` with a reason — including `covered`, which is what a successful run now looks like.
+TurnOutcome = Continue | Stop
 
 
 # ---------------------------------------------------------------------------
 # Search execution
 # ---------------------------------------------------------------------------
+
+
+def _mint(plan: dict[str, str], sub_question: str | None, max_plan_items: int) -> str | None:
+    """Assign the aspect id for one search, minting a new one when the sub_question is new.
+
+    The loop mints rather than the model: a model-authored slug is a string-equality join
+    across turns on free text, and a small model writing `input_costs` on turn 1 and
+    `input_cost_inflation` on turn 3 lands the record under a phantom key while the real
+    aspect stays open forever. Copying a two-character token echoed back in the tool
+    result is a far easier instruction to follow.
+
+    Exact-match-after-normalization only — a near-duplicate mints a new id. The cost is one
+    redundant plan entry, bounded by `max_plan_items`; the alternative is a similarity
+    threshold with no defensible value. Returns None for a blank or over-cap sub_question:
+    those searches still execute, but untracked, so per-aspect stats under-report them.
+    """
+    q = " ".join((sub_question or "").split())
+    if not q:
+        return None
+    norm = q.lower()
+    for aid, existing in plan.items():
+        if " ".join(existing.lower().split()) == norm:
+            return aid
+    if len(plan) >= max_plan_items:
+        return None
+    aid = f"A{len(plan) + 1}"
+    plan[aid] = q
+    return aid
+
+
+def _sub_question_of(tc: ToolCallRef) -> str | None:
+    """The search call's `sub_question`, or None if absent/malformed.
+
+    Deliberately tolerant: a call whose arguments don't parse still executes (and fails
+    with its own error downstream), it just mints no aspect.
+    """
+    try:
+        return SearchDocumentsArgs.model_validate_json(tc.arguments).sub_question
+    except ValidationError:
+        return None
 
 
 async def _execute_search(
@@ -125,6 +176,7 @@ async def _execute_search(
     redis_app: Redis,
     request_id: str,
     iteration: int,
+    is_analytical: bool,
 ) -> _SearchResult:
     try:
         search_args = SearchDocumentsArgs.model_validate_json(tc.arguments)
@@ -158,7 +210,13 @@ async def _execute_search(
     _tool_started = perf_counter()
     await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
 
-    # Rewrite at tool boundary — cheap model, eval-independent
+    # Rewrite at tool boundary — cheap model, eval-independent. Skipped on the analytical
+    # path (10b step 5): there the tool model composes a targeted, hypothesis-shaped query
+    # per aspect, so the rewriter is a second model second-guessing it — it blurs specific
+    # causal terms into generic finance vocabulary, and costs 3-5 calls per turn on the
+    # critical path. BM25 loses its differentiated keyword_query; acceptable because the
+    # v5 prompt asks for keyword-dense queries without the company name, and retrieval is
+    # already scoped to this entity's doc_ids so a leaked entity term has ~zero IDF.
     scope_docs: list[ScopeDocSummary] = []
     if state.scope_result and state.scope_result.entity_manifest:
         for item in state.scope_result.entity_manifest:
@@ -173,69 +231,71 @@ async def _execute_search(
                 ]
                 break
 
-    lf = lf_client.get_client()
-    _search_lf_stack = contextlib.ExitStack()
-    if lf:
-        _search_lf_stack.enter_context(
-            lf.start_as_current_observation(
-                as_type="retriever",
-                name=f"tool_search_{entity}_{iteration}",
-                input={
-                    "entity": entity,
-                    "query": raw_query,
-                    # Show the resolved scope this search was constrained to, so the
-                    # trace makes clear which docs the agent could actually see.
-                    "scope_doc_ids": [str(d) for d in doc_ids] if doc_ids else "all",
-                    "scope_doc_count": len(doc_ids) if doc_ids else "all",
-                    "scoped_via_entity": entity in per_entity,
-                },
+    with lf_span(
+        f"tool_search_{entity}_{iteration}",
+        as_type="retriever",
+        input={
+            "entity": entity,
+            "query": raw_query,
+            # Show the resolved scope this search was constrained to, so the
+            # trace makes clear which docs the agent could actually see.
+            "scope_doc_ids": [str(d) for d in doc_ids] if doc_ids else "all",
+            "scope_doc_count": len(doc_ids) if doc_ids else "all",
+            "scoped_via_entity": entity in per_entity,
+        },
+    ) as obs:
+        rewrite_stats: LLMResponseStats | None = None
+        if is_analytical:
+            transformed = TransformedQuery(
+                semantic_query=raw_query, keyword_query=raw_query, fallback=False
             )
-        )
-
-    rewrite_stats: LLMResponseStats | None = None
-    try:
-        transformed, rewrite_stats = await rewrite_query(
-            raw_query,
-            scope_docs=scope_docs or None,
-            session=session,
-            parent_request_id=state.llm_request.id if state.llm_request else None,
-            conversation_id=state.conversation_id,
-            user_id=state.llm_request.user_id if state.llm_request else None,
-            extra_request_params={"entity": entity, "iteration": iteration, "source": "agent"},
-        )
-    except Exception:
-        logger.warning("agent_rewrite_failed", extra={"entity": entity, "query": raw_query})
-        transformed = TransformedQuery(
-            semantic_query=raw_query,
-            keyword_query=raw_query,
-            fallback=True,
-        )
-    try:
-        _, _, raw_chunks = await run_chat_rag_pipeline(
-            session,
-            transformed=transformed,
-            user_id=state.llm_request.user_id,  # type: ignore[union-attr]
-            doc_ids=doc_ids,
-            reranker=reranker,
-            # Always hybrid; top_k reads from VECTOR_SEARCH_TOP_K / KEYWORD_SEARCH_TOP_K env vars
-        )
-        if lf:
-            lf.update_current_span(output={"chunks_returned": len(raw_chunks)})
-    except Exception:
-        logger.warning("agent_search_failed", extra={"entity": entity})
-        if lf:
-            lf.update_current_span(output={"chunks_returned": 0, "error": True})
-        AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
-        AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
-        return _SearchResult(
-            entity=entity,
-            chunks=[],
-            payloads={},
-            error_str=f"Search failed for entity: {entity}",
-            rewrite_stats=rewrite_stats,
-        )
-    finally:
-        _search_lf_stack.close()
+        else:
+            try:
+                transformed, rewrite_stats = await rewrite_query(
+                    raw_query,
+                    scope_docs=scope_docs or None,
+                    session=session,
+                    parent_request_id=state.llm_request.id if state.llm_request else None,
+                    conversation_id=state.conversation_id,
+                    user_id=state.llm_request.user_id if state.llm_request else None,
+                    extra_request_params={
+                        "entity": entity,
+                        "iteration": iteration,
+                        "source": "agent",
+                    },
+                )
+            except Exception:
+                logger.warning("agent_rewrite_failed", extra={"entity": entity, "query": raw_query})
+                transformed = TransformedQuery(
+                    semantic_query=raw_query,
+                    keyword_query=raw_query,
+                    fallback=True,
+                )
+        try:
+            _, _, raw_chunks = await run_chat_rag_pipeline(
+                session,
+                transformed=transformed,
+                user_id=state.llm_request.user_id,  # type: ignore[union-attr]
+                doc_ids=doc_ids,
+                reranker=reranker,
+                # Always hybrid; top_k reads from VECTOR_SEARCH_TOP_K / KEYWORD_SEARCH_TOP_K env vars
+            )
+            if obs:
+                obs.update(output={"chunks_returned": len(raw_chunks)})
+        except Exception:
+            logger.warning("agent_search_failed", extra={"entity": entity})
+            if obs:
+                obs.update(output={"chunks_returned": 0, "error": True})
+            AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+            AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
+            return _SearchResult(
+                entity=entity,
+                chunks=[],
+                payloads={},
+                error_str=f"Search failed for entity: {entity}",
+                rewrite_stats=rewrite_stats,
+                backend_failed=True,
+            )
 
     chunks = [dc_replace(c, turn_index=iteration) for c in raw_chunks]
     payloads = await get_chunk_prompt_payloads(session, [c.chunk_id for c in chunks])
@@ -293,136 +353,142 @@ def _resolve_candidate_refs(
     return result
 
 
-def _log_finalizer_accept(
-    lf, candidate: AgentFindings | AnalyticalFindings, state: AgentRunState
-) -> None:
-    if not lf:
-        return
-    with contextlib.suppress(Exception):
-        if isinstance(candidate, AgentFindings):
-            findings_summary = [
-                {
-                    "entity": f.entity,
-                    "available": f.available,
-                    "value": f.value,
-                    "currency": f.currency,
-                    "unit": f.unit,
-                    "period_end": f.period_end,
-                    "source_chunks": f.source_chunks,
-                    "reason": f.reason,
-                }
-                for f in candidate.findings
-            ]
-            lf.update_current_span(
-                output={
-                    "metric_requested": candidate.metric_requested,
-                    "comparison_op": candidate.comparison_op,
-                    "findings": findings_summary,
-                },
-                metadata={
-                    "parse_ok": True,
-                    "findings_count": len(candidate.findings),
-                    "state": debug_snapshot(state),
-                },
-            )
-        else:
-            lf.update_current_span(
-                output={
-                    "question": candidate.question,
-                    "conclusion": candidate.conclusion,
-                    "gaps": candidate.gaps,
-                    "observations": [
-                        {
-                            "claim": o.claim,
-                            "confidence": o.confidence,
-                            "evidence_chunks": o.evidence_chunks,
-                        }
-                        for o in candidate.observations
-                    ],
-                },
-                metadata={
-                    "parse_ok": True,
-                    "observations_count": len(candidate.observations),
-                    "state": debug_snapshot(state),
-                },
-            )
+def _parse_report(tc: ToolCallRef) -> Candidate:
+    """Parse a report tool call against its Pydantic schema.
+
+    Raises ``pydantic.ValidationError`` on malformed JSON or a schema violation, surfaced
+    at the caller instead of silently constructing garbage via ``.get()``.
+    """
+    if tc.name == "report_findings":
+        return AgentFindings.model_validate_json(tc.arguments)
+    return AnalyticalFindings.model_validate_json(tc.arguments)
 
 
-async def _handle_finalizer(
-    finalizer_tc: ToolCallRef,
-    state: AgentRunState,
-    redis_app: Redis,
-    request_id: str,
-) -> TurnOutcome:
-    lf = lf_client.get_client()
-    _fin_lf_stack = contextlib.ExitStack()
-    if lf:
-        try:
-            fin_input = json.loads(finalizer_tc.arguments)
-        except Exception:
-            fin_input = {"raw": finalizer_tc.arguments[:500]}
-        _fin_lf_stack.enter_context(
-            lf.start_as_current_observation(as_type="span", name=finalizer_tc.name, input=fin_input)
+def _candidate_keys(candidate: Candidate) -> set[str]:
+    if isinstance(candidate, AgentFindings):
+        return {f.entity for f in candidate.findings}
+    return {o.aspect for o in candidate.observations}
+
+
+def _filter_to_keys(candidate: Candidate, keys: set[str]) -> Candidate:
+    if isinstance(candidate, AgentFindings):
+        return candidate.model_copy(
+            update={"findings": tuple(f for f in candidate.findings if f.entity in keys)}
         )
+    return candidate.model_copy(
+        update={"observations": tuple(o for o in candidate.observations if o.aspect in keys)}
+    )
+
+
+def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
+    """Advisory text, never a gate (D3).
+
+    Post-D3 there is no rejection to attach this to: it is appended to the report result
+    so the model can act on it, and ignoring it costs nothing but a weaker answer. Its one
+    surviving clause carries the real sufficiency signal — self-reported gaps are
+    deliberately *not* penalized (10b §1e), since firing on honesty trains the model to
+    stop reporting gaps at all.
+    """
+    if not findings.observations:
+        return None
+    if all(o.confidence == "low" for o in findings.observations):
+        return (
+            "Every observation so far is low-confidence. Search differently — likely a "
+            "footnote, reconciliation, or segment table — to corroborate."
+        )
+    return None
+
+
+def _render_report_result(state: AgentRunState, closed: set[str], unknown: set[str]) -> str:
+    """The tool result for one report: what landed, what didn't, and what is still open.
+
+    Deliberately echoes only *this turn's* change plus the open list. That open list goes
+    stale as the run proceeds, which is acceptable because the status view (appended last
+    on every subsequent call) is the single source of coverage truth and wins by recency.
+    """
+    parts: list[str] = []
+    if closed:
+        parts.append(f"Recorded {', '.join(sorted(closed))}.")
+    if unknown:
+        plural = len(unknown) != 1
+        parts.append(
+            f"{', '.join(repr(k) for k in sorted(unknown))} "
+            f"{'are' if plural else 'is'} not an open key and "
+            f"{'were' if plural else 'was'} not recorded. "
+            "Use the key shown in brackets in the search result, or issue search_documents "
+            "with a new sub_question first."
+        )
+    if not parts:
+        parts.append("Nothing was recorded — no known key was reported.")
+    still_open = open_aspects(state)
+    if still_open:
+        parts.append("Open: " + ", ".join(f"{a} ({state.plan[a]})" for a in still_open))
+    else:
+        parts.append("All planned items are now reported.")
+    projection = state.findings.projection()
+    if isinstance(projection, AnalyticalFindings):
+        advisory = _analytical_insufficiency(projection)
+        if advisory:
+            parts.append(advisory)
+    return " ".join(parts)
+
+
+def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str:
+    """Fold one report into the ledger and return its tool result.
+
+    Partial acceptance, never rejection (D3): unknown keys are dropped from the candidate
+    and named in the result; known ones land. Nothing is un-done, so there is no rejection
+    path, no stub and no restatement to coerce — which is precisely why the coverage
+    pressure `2d43ed8` had to revert is safe to apply here.
+    """
+    state.report_calls_total += 1
+    if state.turns_to_first_report is None:
+        state.turns_to_first_report = state.iteration
+
     try:
-        try:
-            raw_candidate = gates_module.parse_findings(finalizer_tc)
-        except ValidationError:
-            AGENT_TOOL_CALLS.labels(finalizer_tc.name, "error").inc()
-            logger.warning(
-                "agent_findings_parse_failed",
-                extra={"request_id": request_id, "raw_args": finalizer_tc.arguments[:500]},
-            )
-            if lf:
-                lf.update_current_span(
-                    level="ERROR",
-                    metadata={"parse_ok": False, "raw_args": finalizer_tc.arguments[:300]},
-                )
-            await add_event(
-                redis_app,
-                request_id,
-                "tool_call_completed",
-                {"entity": "__finalizer__", "error": True, "reason": "findings_parse_failed"},
-            )
-            return Stop("natural")
+        parsed = _parse_report(tc)
+    except ValidationError:
+        AGENT_TOOL_CALLS.labels(tc.name, "error").inc()
+        logger.warning(
+            "agent_report_parse_failed",
+            extra={"request_id": request_id, "raw_args": tc.arguments[:500]},
+        )
+        # A parse failure is a tool result, not the end of the run: non-terminal means the
+        # model gets told and retries, where today a malformed finalizer ends the run.
+        return (
+            f"{tc.name} arguments did not parse against the schema. "
+            "Re-issue the call with valid arguments."
+        )
 
-        candidate = _resolve_candidate_refs(raw_candidate, state, request_id)
-        if isinstance(candidate, AnalyticalFindings):
-            candidate = gates_module.drop_evidence_free_observations(candidate)
-        # Fold every finalizer attempt (accepted or rejected below) into the ledger —
-        # this is what gives a non-converged run real content to serve (degraded) and
-        # exercises the in-place revision path across retried attempts. C6's grounding
-        # filter lives in `record`, so ungrounded items are dropped, not admitted.
-        state.findings.ingest(candidate, state.evidence)
+    candidate = _resolve_candidate_refs(parsed, state, request_id)
+    raw_keys = _candidate_keys(candidate)
 
-        for gate in tools_module.gates_for(finalizer_tc.name):
-            reason = gate(candidate, state)
-            if reason is not None:
-                await gates_module.reject(
-                    reason=reason,
-                    finalizer_tc=finalizer_tc,
-                    candidate=candidate,
-                    state=state,
-                    redis_app=redis_app,
-                    request_id=request_id,
-                )
-                return Continue()
+    # Plan keys are loop-minted (extraction seeds them from expected_entities), so a key
+    # the loop never minted has no referent — it is named back rather than recorded.
+    known = raw_keys & state.plan.keys()
+    unknown = raw_keys - state.plan.keys()
+    if unknown:
+        state.unknown_aspect_keys += len(unknown)
+        candidate = _filter_to_keys(candidate, known)
 
-        # Accepted: only now does omission mean abandonment. Anything the accepted
-        # restatement dropped is pruned, but recorded as a gap so a silently vanished
-        # observation still reaches the answer as a stated limitation.
-        dropped = state.findings.prune_to(candidate)
-        if dropped:
-            state.findings.add_gap(
-                "Previously reported observations were dropped without resolution: "
-                + ", ".join(sorted(dropped))
-            )
-        AGENT_TOOL_CALLS.labels(finalizer_tc.name, "ok").inc()
-        state.sealed = True
-        _log_finalizer_accept(lf, candidate, state)
-        return Finalize()
-    finally:
-        _fin_lf_stack.close()
+    # Closed from the *raw* keys, before the grounding filter: a key the documents
+    # genuinely don't answer must close, or the loop hammers it to budget death. Grounded
+    # → a finding; ungrounded → a gap. Both close it, neither closes it silently (D4
+    # derives `addressed` from findings ∪ closed_as_gap).
+    state.reported_keys |= known
+    if isinstance(candidate, AnalyticalFindings):
+        before = len(candidate.observations)
+        candidate = drop_evidence_free_observations(candidate)
+        state.ungrounded_closes += before - len(candidate.observations)
+    state.findings.ingest(candidate, state.evidence)
+
+    # D4 reconciliation: anything reported but neither grounded nor gapped would otherwise
+    # close silently, serving a key that produced no output at all.
+    for key in sorted(known & state.unaccounted_keys()):
+        state.findings.add_gap(f"Reported but unsupported by retrieved evidence: {key}", closes=key)
+
+    AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
+    return _render_report_result(state, closed=known, unknown=unknown)
 
 
 # ---------------------------------------------------------------------------
@@ -444,46 +510,81 @@ async def _run_turn(
     search_sem: asyncio.Semaphore,
     execute_search: ExecuteSearchFn,
     rewrite_model_id: str,
-    max_chunks_per_lookup: int,
 ) -> TurnOutcome:
     iteration = state.iteration
     await add_event(redis_app, request_id, "agent_turn_started", {"iteration": iteration})
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
-    lf = lf_client.get_client()
-    _turn_lf_stack = contextlib.ExitStack()
-    if lf:
-        _turn_lf_stack.enter_context(
-            lf.start_as_current_observation(
-                as_type="span",
-                name=f"agent_turn_{iteration}",
-                input={
-                    "iteration": iteration,
-                    "messages": [
-                        {
-                            "role": m.role.value,
-                            "content": (m.content or "")[:500],
-                            "tool_call_id": m.tool_call_id,
-                            "tool_calls": (
-                                [
-                                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                                    for tc in m.tool_calls
-                                ]
-                                if m.tool_calls
-                                else None
-                            ),
-                        }
-                        for m in state.transcript.messages
-                    ],
-                },
-            )
+    # The status view is computed per call and appended last — never stored, so it never
+    # invalidates the cached prefix and never accumulates. It is the single source of
+    # coverage truth: nothing permanent in the transcript states coverage. It also doubles
+    # as this turn's trace input: the transcript up to here is what earlier turns' own
+    # spans already recorded (Langfuse nests them under the same agent_loop chain), so
+    # re-dumping all of `state.transcript.messages` on every turn would repeat turn 0's
+    # content N times by turn N for no new information.
+    status = render_status(state)
+    with lf_span(
+        f"agent_turn_{iteration}",
+        input={
+            "iteration": iteration,
+            "message_count": len(state.transcript.messages),
+            "status": status,
+        },
+    ) as obs:
+        return await _run_turn_inner(
+            state,
+            llm,
+            tools,
+            chat_state,
+            session,
+            session_factory,
+            reranker,
+            redis_app,
+            request_id,
+            is_analytical,
+            search_sem,
+            execute_search,
+            rewrite_model_id,
+            iteration,
+            status,
+            obs,
         )
 
+
+async def _run_turn_inner(
+    state: AgentRunState,
+    llm: RoutedLLM,
+    tools: list[dict],
+    chat_state: ChatPipelineState,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+    reranker: Reranker | None,
+    redis_app: Redis,
+    request_id: str,
+    is_analytical: bool,
+    search_sem: asyncio.Semaphore,
+    execute_search: ExecuteSearchFn,
+    rewrite_model_id: str,
+    iteration: int,
+    status: str | None,
+    obs: object,
+) -> TurnOutcome:
+    """Body of one turn, run inside `_run_turn`'s `agent_turn_{N}` span.
+
+    Split out only so the span in `_run_turn` can wrap it with a plain `with` (the span
+    needs `status` computed before it opens, to use as trimmed trace input instead of the
+    full transcript replay) while this keeps the turn's own try/finally for tool-call output.
+    """
     new_chunks = 0
     turn: AssistantTurnResult | None = None
+    results_by_id: dict[str, str] = {}
     try:
+        prompt_messages = [
+            *state.transcript.messages,
+            *([ChatMessage(role=Role.user, content=status)] if status else []),
+        ]
         turn = await asyncio.wait_for(
-            llm.complete_with_tools(state.transcript.messages, tools=tools, temperature=0.0),
+            llm.complete_with_tools(prompt_messages, tools=tools, temperature=0.0),
             timeout=state.turn_timeout_seconds,
         )
         if turn.stats:
@@ -515,41 +616,77 @@ async def _run_turn(
                     )
 
         if not turn.tool_calls:
+            # With no terminal tool this is a normal exit, not a rare one: the model
+            # emitted prose instead of a call. projection() still serves whatever the
+            # ledger accumulated (None only if nothing was ever reported).
             return Stop("natural")
 
-        finalizer_tc = next(
-            (tc for tc in turn.tool_calls if tools_module.is_terminal(tc.name)), None
-        )
-        if finalizer_tc is not None:
-            return await _handle_finalizer(finalizer_tc, state, redis_app, request_id)
+        reports = [tc for tc in turn.tool_calls if tc.name in tools_module.REPORT_TOOL_NAMES]
+        searches = [tc for tc in turn.tool_calls if tc.name not in tools_module.REPORT_TOOL_NAMES]
 
-        search_tcs = turn.tool_calls
-        state.tool_calls_total += len(search_tcs)
-        state.transcript.append_tool_calls(search_tcs)
+        # Rule 1: the assistant message is appended ONCE, verbatim, in emission order.
+        # Rule 2 (below): exactly one role=tool result per tool_call id. An assistant
+        # tool_calls entry without a matching result — or vice versa — is a 400 on every
+        # OpenAI-compatible provider. Both are easy to honour now that no branch executes
+        # some calls and discards others (the bug at the old loop.py:520-524).
+        state.transcript.append_tool_calls(turn.tool_calls)
+        state.tool_calls_total += len(turn.tool_calls)
+
+        # Mint before execution, so the tool result can echo the id the model must cite.
+        minted: dict[str, str | None] = {
+            tc.id: _mint(state.plan, _sub_question_of(tc), state.effort.max_plan_items)
+            for tc in searches
+        }
 
         async def _guarded_search(tc: ToolCallRef) -> _SearchResult:
             async with search_sem, session_factory() as task_session:
                 # A fresh session per concurrent search — the shared `session` is not
                 # safe for concurrent use under asyncio.gather (P0-1).
                 return await execute_search(
-                    tc, chat_state, task_session, reranker, redis_app, request_id, iteration
+                    tc,
+                    chat_state,
+                    task_session,
+                    reranker,
+                    redis_app,
+                    request_id,
+                    iteration,
+                    is_analytical,
                 )
 
-        results = await asyncio.gather(*[_guarded_search(tc) for tc in search_tcs])
+        results: list[_SearchResult] = []
+        if searches:
+            results = list(await asyncio.gather(*[_guarded_search(tc) for tc in searches]))
 
-        for tc, result in zip(search_tcs, results, strict=False):
+        backend_failures = 0
+        for tc, result in zip(searches, results, strict=False):
             if result.rewrite_stats:
                 state.record_spend(rewrite_model_id, result.rewrite_stats)
             entity_new = state.evidence.admit(result.chunks)
             new_chunks += entity_new
             if result.entity:
                 state.searched_entities.add(result.entity)
+
+            # D5: per-aspect search provenance, written at the one instant everything is
+            # in hand. A failed or empty search admits no chunks, so this cannot be
+            # reconstructed from the EvidenceLedger afterwards — which is exactly the
+            # case D6 has to tell apart.
+            aspect = minted.get(tc.id)
+            if aspect is not None:
+                stats = state.aspect_stats.setdefault(aspect, AspectStats())
+                stats.searches += 1
+                stats.new_chunks += entity_new
+                if result.backend_failed:
+                    stats.errored += 1
+            if result.backend_failed:
+                backend_failures += 1
+
             logger.debug(
                 "tool_call_completed",
                 extra={
                     "request_id": request_id,
                     "iteration": iteration,
                     "entity": result.entity,
+                    "aspect": aspect,
                     "chunks_returned": len(result.chunks),
                     "new_chunks_added": entity_new,
                 },
@@ -564,70 +701,104 @@ async def _run_turn(
                     "new_chunks_added": entity_new,
                 },
             )
-            # Assemble the tool-result context here (sequentially) so S-labels
-            # continue across searches instead of restarting at S1 each time.
+            # Assemble the tool-result context here (sequentially) so S-labels continue
+            # across searches instead of restarting at S1 each time.
             if result.error_str is not None:
-                tool_content = result.error_str
+                results_by_id[tc.id] = result.error_str
             else:
                 # P2 (audit finding): admit the full result above for provenance, but
                 # render only the top-N into the transcript — mid-loop, uncapped tool
                 # results were the single biggest per-turn token cost (~106k chars
                 # measured). The record stays complete; only the view is capped.
                 ctx = state.evidence.assign_labels(
-                    result.chunks[:max_chunks_per_lookup], result.payloads
+                    result.chunks[: state.effort.max_chunks_per_lookup],
+                    result.payloads,
+                    max_revivals=state.effort.max_revivals_per_turn,
                 )
-                tool_content = ctx.formatted_context or "(no results)"
+                body = ctx.formatted_context or "(no results)"
+                # The aspect id is echoed back so "reuse the key in brackets" is a copy
+                # from adjacent context, not a slug reconstructed from memory.
+                results_by_id[tc.id] = f"[{aspect}] {body}" if aspect else body
+
+        # Reports fold after searches but read nothing from them: the model composed these
+        # before seeing this turn's results, so it cannot cite them.
+        before_addressed = set(state.addressed)
+        for tc in reports:
+            results_by_id[tc.id] = _apply_report(tc, state, request_id)
+        closed_this_turn = state.addressed - before_addressed
+
+        # Rule 2: exactly one result per call id, in turn.tool_calls order.
+        for tc in turn.tool_calls:
             state.transcript.append(
-                ChatMessage(role=Role.tool, tool_call_id=tc.id, content=tool_content)
+                ChatMessage(
+                    role=Role.tool,
+                    tool_call_id=tc.id,
+                    content=results_by_id.get(tc.id, "(no result)"),
+                )
             )
 
-        if new_chunks == 0:
-            # For extraction/comparison, an empty round means the retrievable surface
-            # is exhausted — stop. For analytical queries, it means "this query found
-            # nothing new," which is a reason to search *differently*, not to finalize
-            # on thin evidence (doc Pattern 3, sub-task 3.i). Allow a bounded number of
-            # empty rounds to reformulate before falling back to convergence.
+        # --- termination, loop-owned (step 3) ---
+        # Ordering is load-bearing: minting happened before this, so a turn that closes the
+        # last open key *and* opens a new thread continues rather than stopping. Today the
+        # same emission stops the run and discards the model's own statement that a thread
+        # remains open.
+        if state.plan and not open_aspects(state):
+            state.sealed = True
+            return Stop("covered")
+
+        # A dead backend is not an empty corpus. Today it produces new_chunks == 0 and the
+        # model is told to "reformulate with different terms" while burning its budget.
+        if searches and backend_failures == len(searches):
+            return Stop("search_unavailable")
+
+        # Progress = new chunks *or* a key closed. A turn that settles a key from evidence
+        # already in hand is real progress; without this, resolving the last aspects from
+        # admitted evidence trips convergence one turn before coverage — the most likely
+        # spurious stop in this design.
+        if new_chunks == 0 and not closed_this_turn:
             state.empty_rounds += 1
             if not is_analytical or state.empty_rounds > state.effort.max_empty_rounds:
                 return Stop("convergence")
-            state.transcript.append(
-                ChatMessage(
-                    role=Role.user,
-                    content=(
-                        "That search returned no new evidence. Do not finalize yet — the "
-                        "drivers you need are likely in a different section (a footnote, "
-                        "reconciliation, or segment table). Reformulate search_documents with "
-                        "different terms targeting where the magnitudes are disclosed."
-                    ),
-                )
-            )
-            state.transcript.compress(state.evidence)
-            return Continue()
-
-        # P0-2: a productive round (new chunks admitted) resets the empty-round streak —
-        # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative.
-        state.empty_rounds = 0
+            # The stall nudge is no longer appended here: a permanent user message that
+            # accumulates one copy per empty round (10b §4, row 8). It moved into
+            # `render_status`, which is recomputed per call and keyed off `empty_rounds`.
+        else:
+            # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative (P0-2).
+            state.empty_rounds = 0
 
         if not state.spend_within_budget():
             return Stop("budget_cap")
+        if state.past_deadline():
+            return Stop("deadline")
 
         state.transcript.compress(state.evidence)
         return Continue()
     finally:
-        if lf:
-            lf.update_current_span(
+        if obs:
+            obs.update(  # type: ignore[attr-defined]
                 output={
                     "tool_calls": [
                         {"name": tc.name, "arguments": tc.arguments}
                         for tc in (turn.tool_calls if turn is not None and turn.tool_calls else [])
                     ],
+                    # The `role: tool` results this turn actually appended to the
+                    # transcript, keyed by tool_call_id — what the *next* turn's model
+                    # call will read back. Without this, the only place a search's
+                    # rendered excerpts or a report's fold-in result are visible is
+                    # buried inside the next turn's full llm.complete_with_tools
+                    # GENERATION input (present, but not this span's — nothing on
+                    # agent_turn_N itself showed what this turn actually produced).
+                    "tool_results": results_by_id,
+                    # Structured coverage state *after* this turn's effects landed — the
+                    # per-turn counterpart to the prose `status` string the model saw as
+                    # this span's input (which reflects state *before* the turn ran).
+                    "coverage_after": turn_snapshot(state),
                 },
                 metadata={
                     "token_spend_cumulative": state.input_tokens_total(),
                     "new_chunks": new_chunks,
                 },
             )
-        _turn_lf_stack.close()
 
 
 # ---------------------------------------------------------------------------
@@ -672,8 +843,13 @@ async def run_loop(
         else None
     )
     is_analytical = query_shape == "analytical"
-    tools = tools_module.ALL_TOOLS
-    prompt_name = "v3_agent_analytical" if is_analytical else "v3_agent"
+    # One branch, prompt and pool on the same line: a prompt naming a tool the model was
+    # not given is a broken run, so nothing may assign one without the other.
+    prompt_name, tools = (
+        ("v5_agent_analytical", tools_module.ANALYTICAL_TOOLS)
+        if is_analytical
+        else ("v3_agent", tools_module.EXTRACTION_TOOLS)
+    )
     effort = EffortPrior.for_shape(settings, query_shape)
     search_sem = asyncio.Semaphore(effort.max_concurrent_searches)
     rewrite_model_id = get_query_transformer_model()
@@ -683,9 +859,36 @@ async def run_loop(
     # before_seq=assistant_seq, which includes it) — drop it here since it's appended
     # explicitly below via chat_state.user_query_raw (post prompt-injection sanitization).
     history = (chat_state.context_messages or [])[:-1]
+    # Prior user turns reach the agent unsanitized: `history.append_user` writes the raw
+    # `req.content` at the API layer, while `scan_user_input` runs later in the worker and
+    # rewrites only the *current* turn. So a prior turn that scored "block" — one the
+    # pipeline refused to answer — still lands in the agent transcript verbatim, because
+    # it was written to the chat tail before the task ran. Scan them here (10b §4d):
+    # strip invisibles/role markers as the current turn gets, and drop a blocked turn
+    # outright rather than handing the agent the exact text the guardrail rejected.
+    scan = get_injection_scan_user_input_enabled()
+    history_messages: list[ChatMessage] = []
+    for m in history:
+        content = m.content or ""
+        if scan and m.role.value == "user" and content:
+            signal = scan_user_input(content)
+            if signal.severity == "block":
+                logger.info(
+                    "agent_history_turn_blocked",
+                    extra={"request_id": request_id, "matched_rules": signal.matched_rules},
+                )
+                continue
+            content = signal.sanitized_text
+        history_messages.append(ChatMessage(role=Role(m.role.value), content=content))
     messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
-        *[ChatMessage(role=Role(m.role.value), content=m.content or "") for m in history],
+        # Row 2 of 10b §4 was the largest unbounded cost in the turn: up to 50 prior
+        # messages, permanent, dwarfing the excerpts they contextualize.
+        *cap_history(
+            history_messages,
+            max_turns=settings.history_turns,
+            max_assistant_chars=settings.history_assistant_tokens * 4,
+        ),
     ]
 
     # Inject exact entity names from the router so the agent uses correct strings and
@@ -745,9 +948,19 @@ async def run_loop(
         effort=effort,
         token_budget=settings.token_budget,
         turn_timeout_seconds=settings.turn_timeout_seconds,
+        deadline_seconds=settings.deadline_seconds,
         transcript=Transcript(messages),
         expected_entities=expected_entities,
     )
+
+    # D3: one termination model. Extraction's plan is loop-authored — seeded from the
+    # entities the router resolved, keyed by entity name so the model reports under the
+    # name it was given. `missing_entity_gate` computed exactly this set as a rejection
+    # reason; now it is the same coverage check the analytical path uses. The analytical
+    # plan seeds itself from turn-1 search `sub_question`s instead.
+    if not is_analytical:
+        for name in sorted(expected_entities):
+            state.plan[name] = name
 
     iterations_run = 0
     for iteration in range(effort.max_iterations):
@@ -768,7 +981,6 @@ async def run_loop(
                 search_sem,
                 execute_search,
                 rewrite_model_id,
-                settings.max_chunks_per_entity,
             )
         except TimeoutError:
             logger.warning(
@@ -782,13 +994,35 @@ async def run_loop(
             state.convergence_reason = "timeout"
             break
 
-        if isinstance(outcome, Finalize):
-            state.convergence_reason = "natural"
-            break
         if isinstance(outcome, Stop):
             state.convergence_reason = outcome.reason
             break
         # Continue(): fall through to the next iteration
+
+    # Step 8: an aspect that never closed becomes a stated limitation rather than
+    # vanishing. `_render_observations_block` already renders gaps as "Unresolved (do not
+    # assert as fact)", so there is no synthesis-side change. Ordered before the degraded
+    # caveat so a non-converged run reads "here is specifically what is missing" rather
+    # than the generic caveat alone. Depends on §1c: without the gaps-union fix a later
+    # report with gaps=[] would wipe these before they are read.
+    # Snapshot coverage *before* the step-8 gaps below, which mark every remaining key
+    # addressed. Reading it afterwards would score an unresolved key as covered and make
+    # plan_covered/plan_seeded — step 9's kill criterion — permanently 1.0.
+    state.plan_covered_at_stop = len(state.plan.keys() & state.addressed)
+
+    for aspect in open_aspects(state):
+        stats = state.aspect_stats.get(aspect)
+        # D6: a permanently-open aspect whose every search errored is a backend failure,
+        # not an absence in the corpus. Saying "not in the documents" there would be
+        # confidently, silently wrong.
+        if stats is not None and stats.searches > 0 and stats.errored == stats.searches:
+            gap = f"Could not be checked — document search was unavailable: {state.plan[aspect]}"
+        else:
+            gap = f"Not resolved: {state.plan[aspect]}"
+        # Only the analytical envelope has a `gaps` field to carry these. On the extraction
+        # path an unreported entity is already surfaced by `_inject_unsearched_stubs`, and
+        # forcing a kind here would make an all-failed run project the wrong shape.
+        state.findings.add_gap(gap, closes=aspect, establishes_kind=is_analytical)
 
     await add_event(
         redis_app,

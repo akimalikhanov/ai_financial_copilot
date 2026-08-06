@@ -14,7 +14,7 @@ import contextlib
 from dataclasses import dataclass
 from uuid import UUID
 
-from src.observability import langfuse as lf_client
+from src.observability.langfuse import get_client as lf_get_client
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
 from src.schemas.query_router import DocumentScopeResult
 from src.schemas.retrieval import RAGContext
@@ -88,7 +88,6 @@ async def run_synthesis(
     # The fallback pool is what the model could actually read: falling back to excerpts
     # it never saw would let synthesis cite text no reasoning was ever grounded in.
     fallback = evidence.rendered_chunks()[:max_chunks_per_entity]
-    lf = lf_client.get_client()
 
     findings = agent_findings
     processed: ProcessedFindings | None = None
@@ -97,46 +96,45 @@ async def run_synthesis(
         if isinstance(findings, AgentFindings):
             findings = _inject_unsearched_stubs(findings, agent_meta, scope_result)
 
-            _lf_stack = contextlib.ExitStack()
+            # No dedicated span: this wraps a single `process_findings` call with no
+            # sub-structure of its own (the interesting nested work is `fx_conversion`,
+            # inside `process_findings`), so its input/output land on the enclosing
+            # `agent_loop` span instead of paying for another hop with no new information.
+            processed = await process_findings(findings, requested_currency=requested_currency)
+            lf = lf_get_client()
             if lf:
-                _lf_stack.enter_context(
-                    lf.start_as_current_observation(
-                        as_type="span",
-                        name="findings_processor",
-                        input={
-                            "metric_requested": findings.metric_requested,
-                            "comparison_op": findings.comparison_op,
-                            "findings": [f.model_dump() for f in findings.findings],
-                        },
-                    )
-                )
-            try:
-                processed = await process_findings(findings, requested_currency=requested_currency)
-                if lf:
+                with contextlib.suppress(Exception):
                     lf.update_current_span(
-                        output={
-                            "currency_converted": processed.currency_converted,
-                            "answer_entity": processed.answer_entity,
-                            "fx_rates_used": processed.fx_rates_used,
-                            "answer_note": processed.answer_note,
-                            "comparison_op": processed.comparison_op,
-                            "findings": [
-                                {
-                                    "entity": nf.finding.entity,
-                                    "normalized_value": nf.normalized_value,
-                                    "fx_rate": nf.fx_rate,
-                                    "native_value": nf.finding.value,
-                                    "currency": nf.finding.currency,
-                                    "unit": nf.finding.unit,
-                                    "period_end": nf.finding.period_end,
-                                    "available": nf.finding.available,
-                                }
-                                for nf in processed.findings
-                            ],
-                        },
+                        metadata={
+                            "findings_processor": {
+                                "input": {
+                                    "metric_requested": findings.metric_requested,
+                                    "comparison_op": findings.comparison_op,
+                                    "findings": [f.model_dump() for f in findings.findings],
+                                },
+                                "output": {
+                                    "currency_converted": processed.currency_converted,
+                                    "answer_entity": processed.answer_entity,
+                                    "fx_rates_used": processed.fx_rates_used,
+                                    "answer_note": processed.answer_note,
+                                    "comparison_op": processed.comparison_op,
+                                    "findings": [
+                                        {
+                                            "entity": nf.finding.entity,
+                                            "normalized_value": nf.normalized_value,
+                                            "fx_rate": nf.fx_rate,
+                                            "native_value": nf.finding.value,
+                                            "currency": nf.finding.currency,
+                                            "unit": nf.finding.unit,
+                                            "period_end": nf.finding.period_end,
+                                            "available": nf.finding.available,
+                                        }
+                                        for nf in processed.findings
+                                    ],
+                                },
+                            }
+                        }
                     )
-            finally:
-                _lf_stack.close()
 
         # Narrow the synthesis context to the chunks the agent actually cited in its
         # findings — those are the evidence it reasoned over. When findings cite nothing

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from src.services.llm_adapters.base_adapter import ChatMessage, Role, ToolCallRef
@@ -34,19 +33,13 @@ if TYPE_CHECKING:
 # label range as a breadcrumb.
 _LABEL_RE = re.compile(r'id="(S\d+)"')
 
+# Named locally rather than imported from tools.py: this module deliberately depends on
+# nothing in the agent package (it is a pure view over ChatMessage).
+_REPORT_TOOL_NAMES = frozenset({"report_findings", "report_analytical_findings"})
+
 
 def assistant_msg_with_tool_calls(tool_calls: list[ToolCallRef]) -> ChatMessage:
     return ChatMessage(role=Role.assistant, content=None, tool_calls=tuple(tool_calls))
-
-
-def stub_rejected_tool_call(tc: ToolCallRef) -> ToolCallRef:
-    """Strip a rejected finalizer call's claim/evidence payload before it re-enters history.
-
-    Otherwise the model keeps seeing its own rejected draft claims verbatim (assistant
-    tool-call messages survive compaction), inviting it to copy a stale claim into the
-    eventually-accepted call without re-deriving fresh evidence for it.
-    """
-    return replace(tc, arguments=json.dumps({"status": "rejected"}))
 
 
 def _summarize_evicted(content: str, call: ToolCallRef | None) -> str:
@@ -72,6 +65,38 @@ def _summarize_evicted(content: str, call: ToolCallRef | None) -> str:
     return f"[compacted] {body}"
 
 
+def cap_history(
+    messages: list[ChatMessage],
+    max_turns: int,
+    max_assistant_chars: int,
+) -> list[ChatMessage]:
+    """Trim prior conversation to the last `max_turns` user/assistant pairs.
+
+    Prior conversation was permanent and *token-unbounded* in the agent transcript — up
+    to 50 messages carried on every turn, dwarfing the system prompt and rivalling the
+    excerpts it exists to contextualize (10b §4, row 2). Assistant content is truncated
+    hardest: it is the model's own prose, recoverable-in-gist, while a prior user turn is
+    the only record of what was asked.
+    """
+    if max_turns <= 0:
+        return []
+    # A "turn" starts at its user message, so the window starts at the Nth-from-last user
+    # message — never mid-pair, which would carry an answer whose question was dropped.
+    user_idx = [i for i, m in enumerate(messages) if m.role == Role.user]
+    start = user_idx[-max_turns] if len(user_idx) > max_turns else 0
+    kept: list[ChatMessage] = []
+    for m in messages[start:]:
+        if m.role == Role.assistant and m.content and len(m.content) > max_assistant_chars:
+            m = ChatMessage(  # noqa: PLW2901 — truncated copy, the original is untouched
+                role=m.role,
+                content=m.content[:max_assistant_chars] + "…",
+                tool_calls=m.tool_calls,
+                tool_call_id=m.tool_call_id,
+            )
+        kept.append(m)
+    return kept
+
+
 def _compress_history(
     messages: list[ChatMessage], keep_last_n_turns: int
 ) -> tuple[list[ChatMessage], list[str]]:
@@ -88,8 +113,15 @@ def _compress_history(
     are compacted — error/rejection notices have no labels and pass through untouched, so
     the model never loses *why* something was rejected.
     """
+    # A turn boundary is an assistant message that issued at least one *search*. Counting
+    # report-only turns here would shift the cutoff and evict real excerpts a turn early —
+    # live now that reports are non-terminal and can arrive in their own turn (10b §4b).
     turn_starts: list[int] = [
-        i for i, m in enumerate(messages) if m.role == Role.assistant and m.tool_calls
+        i
+        for i, m in enumerate(messages)
+        if m.role == Role.assistant
+        and m.tool_calls
+        and any(tc.name not in _REPORT_TOOL_NAMES for tc in m.tool_calls)
     ]
     if len(turn_starts) <= keep_last_n_turns:
         return messages, []

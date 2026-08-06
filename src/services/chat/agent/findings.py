@@ -5,17 +5,16 @@ The third state store, beside `Transcript` (the model's view) and `EvidenceLedge
 addressed by a stable key — ``EntityFinding.entity`` or ``Observation.aspect`` — and
 updated in place.
 
-10a (this step): the loop populates it by parsing every finalizer attempt (accepted or
-rejected) via `ingest`, and projects it back for synthesis via `projection`. No
-model-facing ``record_*`` tools and no prompt change — that is 10b (Patterns 1/3).
-Because the ledger's readers (synthesis now; gates/carry-over later) are identical
-whether the loop or the model writes it, this seam makes those a behaviour addition, not
-a rewrite.
+Post-D3 the loop folds in every `report_*` call as it arrives — reports are incremental,
+not terminal — and projects the accumulation back for synthesis via `projection`.
 
 Contract C4: best-per-aspect by construction — `record` updates in place, so there is no
 best-of comparator. Contract C6: an item whose chunk refs don't resolve in the
 `EvidenceLedger` is dropped, not admitted (the model cannot land an ungrounded
 conclusion); the prior entry for that key is left intact.
+
+With the gates deleted, C6's grounding filter and `drop_evidence_free_observations` are
+the *only* remaining correctness filters on what reaches synthesis.
 """
 
 from __future__ import annotations
@@ -33,6 +32,8 @@ from src.schemas.agent_findings import (
 
 if TYPE_CHECKING:
     from src.services.chat.agent.evidence import EvidenceLedger
+
+Candidate = AgentFindings | AnalyticalFindings
 
 _DEGRADED_CAVEAT = (
     "The search did not fully converge; these findings are partial and may be incomplete."
@@ -71,6 +72,43 @@ def _is_grounded(finding: EntityFinding | Observation, evidence: EvidenceLedger)
     return _resolves([*finding.evidence_chunks, *(finding.refuted_by or [])], evidence)
 
 
+def finding_chunk_ids(findings: Candidate) -> set[str]:
+    """All chunk-id strings referenced by the findings."""
+    ids: set[str] = set()
+    if isinstance(findings, AgentFindings):
+        for f in findings.findings:
+            ids.update(f.source_chunks or [])
+    else:
+        for o in findings.observations:
+            ids.update(o.evidence_chunks or [])
+            ids.update(o.refuted_by or [])
+    return ids
+
+
+def drop_evidence_free_observations(findings: AnalyticalFindings) -> AnalyticalFindings:
+    """Route observations citing nothing at all into gaps instead of synthesis.
+
+    Post-D3 this and `_is_grounded` are the only correctness filters on what reaches
+    synthesis — the gates are gone, so grounding carries the whole load. An observation
+    citing `refuted_by` but no `evidence_chunks` is legitimately grounded (a refutation is
+    a finding), matching `_is_grounded`'s either-list rule.
+
+    Returns the findings with uncited claims moved into `gaps`. The aspect still closes:
+    an aspect the documents genuinely don't answer must not be hammered to budget death.
+    """
+    kept: list[Observation] = []
+    dropped_claims: list[str] = []
+    for o in findings.observations:
+        if o.evidence_chunks or o.refuted_by:
+            kept.append(o)
+        else:
+            dropped_claims.append(o.claim)
+    if not dropped_claims:
+        return findings
+    gaps = list(findings.gaps or []) + [f"Unsubstantiated claim: {c}" for c in dropped_claims]
+    return findings.model_copy(update={"observations": tuple(kept), "gaps": gaps})
+
+
 class FindingsLedger:
     def __init__(self) -> None:
         self._entries: dict[str, FindingEntry] = {}
@@ -83,6 +121,12 @@ class FindingsLedger:
         self._question: str | None = None
         self._conclusion: str | None = None
         self._gaps: list[str] | None = None
+        # D4: keys whose only output is a stated gap, keyed to the reason text that
+        # closed them (not just membership) — so a caller (e.g. retry logic) can join
+        # this against `AgentRunState.aspect_stats` without pattern-matching `_gaps`
+        # strings. `addressed` is derived from keys() | closed_as_gap(), so an aspect
+        # can never close silently.
+        self._closed_as_gap: dict[str, str] = {}
 
     def record(
         self, key: str, finding: EntityFinding | Observation, evidence: EvidenceLedger
@@ -111,16 +155,16 @@ class FindingsLedger:
     def ingest(
         self, candidate: AgentFindings | AnalyticalFindings, evidence: EvidenceLedger
     ) -> None:
-        """Fold one finalizer attempt (accepted or rejected) into the ledger, without pruning.
+        """Fold one report into the ledger. Accumulates; never prunes.
 
-        Restated keys update in place (revisions++); keys this attempt omits are left
-        alone. Pruning happens only in `prune_to`, called on the attempt that is actually
-        *accepted* — a rejected attempt is not a deliberate restatement, it's a draft the
-        model is about to be told to redo, and treating its omissions as abandonment
-        destroys established entries before any gate has even evaluated them.
+        Restated keys update in place (revisions++); keys this report omits are left
+        alone. Post-D3 reports are incremental rather than a single terminal restatement,
+        so omission carries no information at all — the model reports an aspect when its
+        evidence settles and never restates the others.
 
-        Envelope fields are last-write-wins but null-guarded: a later attempt that omits a
-        field must not erase the value an earlier one established.
+        Envelope fields are last-write-wins but null-guarded, and `gaps` unions rather than
+        replaces: a later report that omits a field, or carries `gaps=[]`, must not erase
+        what an earlier one established (§1b/§1c).
         """
         kind: Literal["agent", "analytical"] = (
             "agent" if isinstance(candidate, AgentFindings) else "analytical"
@@ -136,36 +180,60 @@ class FindingsLedger:
         else:
             self._kind = "analytical"
             self._question = candidate.question or self._question
-            self._conclusion = candidate.conclusion
-            self._gaps = list(candidate.gaps) if candidate.gaps else None
+            if candidate.conclusion is not None:
+                self._conclusion = candidate.conclusion
+            for g in candidate.gaps or ():
+                if g not in (self._gaps or ()):
+                    self._gaps = [*(self._gaps or []), g]
             items = [(o.aspect, o) for o in candidate.observations]
         for key, finding in items:
             self.record(key, finding, evidence)
 
-    def prune_to(self, candidate: AgentFindings | AnalyticalFindings) -> set[str]:
-        """Drop keys the *accepted* restatement abandoned. Returns the dropped keys.
+    def add_gap(
+        self, gap: str, *, closes: str | None = None, establishes_kind: bool = False
+    ) -> None:
+        """Append a loop-authored caveat to the served envelope's `gaps`.
 
-        A finalizer is a complete re-statement, so on the accepted call a key the model
-        omitted was deliberately abandoned and must not be resurrected into the served
-        projection (the same reason `transcript.py` strips rejected drafts). The caller
-        records the dropped keys as a gap, so the omission at least reaches the answer as
-        a stated limitation rather than vanishing.
+        `closes` names the aspect this gap accounts for (D4): a key that produced no
+        grounded finding is still *addressed* as long as its failure is stated. Recording
+        it here rather than inferring it later is what lets `addressed` be reconciled
+        against real output instead of taken on trust.
+
+        `establishes_kind` lets the loop's own step-8 gaps set `_kind` when the model never
+        landed a single report. Without it a run where every search failed projects `None`
+        — discarding the very gaps that explain *why* it failed, and falling back to raw
+        excerpts as though nothing had gone wrong.
         """
-        if isinstance(candidate, AgentFindings):
-            live = {f.entity for f in candidate.findings}
-        else:
-            live = {o.aspect for o in candidate.observations}
-        dropped = self._entries.keys() - live
-        for key in dropped:
-            del self._entries[key]
-        return dropped
+        if gap not in (self._gaps or ()):
+            self._gaps = [*(self._gaps or []), gap]
+        if closes is not None:
+            # Last-write-wins: a key closed more than once keeps its most recent reason.
+            self._closed_as_gap[closes] = gap
+        if establishes_kind and self._kind is None:
+            self._kind = "analytical"
 
-    def add_gap(self, gap: str) -> None:
-        """Append a loop-authored caveat to the served envelope's `gaps`."""
-        self._gaps = [*(self._gaps or []), gap]
+    def gap_reasons(self) -> dict[str, str]:
+        """Keys closed via a stated gap, mapped to the reason text that closed them —
+        the structured counterpart to `closed_as_gap()`'s bare key set, so a caller (e.g.
+        retry logic) can join this against `AgentRunState.aspect_stats` instead of
+        pattern-matching strings out of `_gaps`."""
+        return dict(self._closed_as_gap)
+
+    def closed_as_gap(self) -> set[str]:
+        """Keys that produced no finding but did produce a stated gap (D4)."""
+        return set(self._closed_as_gap)
 
     def keys(self) -> set[str]:
         return set(self._entries)
+
+    def revised_keys(self) -> set[str]:
+        """Keys whose finding was updated in place at least once (step 9).
+
+        Tracked, but never a kill criterion: a run that concludes each aspect once,
+        correctly, is a success. A revision is only expected when later evidence
+        contradicts an earlier conclusion.
+        """
+        return {k for k, e in self._entries.items() if e.revisions > 0}
 
     def entry(self, key: str) -> FindingEntry | None:
         return self._entries.get(key)

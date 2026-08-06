@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from time import perf_counter
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
 from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
@@ -29,32 +28,7 @@ from src.utils.config import (
     get_vector_search_top_k,
 )
 
-if TYPE_CHECKING:
-    from langfuse import Langfuse
-
-
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def _span(
-    lf: Langfuse | None,
-    name: str,
-    *,
-    as_type: str = "span",
-    input: object = None,
-    **metadata: object,
-):
-    if lf is None:
-        yield None
-        return
-    with lf.start_as_current_observation(
-        as_type=as_type,  # type: ignore[arg-type]
-        name=name,
-        input=input,
-        metadata=metadata or None,
-    ) as obs:
-        yield obs
 
 
 def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
@@ -144,9 +118,7 @@ async def run_chat_rag_pipeline(
     if reranker is None:
         reranker = get_reranker()
 
-    lf = lf_client.get_client()
-
-    with _span(lf, "embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
+    with lf_span("embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
         _t = perf_counter()
         vectors_list = await asyncio.to_thread(embed_chunks, [transformed.semantic_query])
         RAG_RETRIEVAL.labels("embed").observe(perf_counter() - _t)
@@ -159,8 +131,7 @@ async def run_chat_rag_pipeline(
             )
     semantic_vector = vectors_list[0]
 
-    with _span(
-        lf,
+    with lf_span(
         "hybrid_retrieve",
         as_type="retriever",
         input={
@@ -205,8 +176,7 @@ async def run_chat_rag_pipeline(
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
     texts_map = {cid: payloads[cid].prompt_text for cid in chunk_ids if cid in payloads}
-    with _span(
-        lf,
+    with lf_span(
         "rerank",
         as_type="retriever",
         input={
@@ -236,8 +206,7 @@ async def run_chat_rag_pipeline(
         fused=[_to_hit(c) for c in fused],
         reranked=[_to_hit(c) for c in reranked],
     )
-    with _span(
-        lf,
+    with lf_span(
         "assemble_context",
         input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked],
     ) as obs:
