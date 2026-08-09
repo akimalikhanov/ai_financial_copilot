@@ -81,6 +81,18 @@ AGENT_TOOL_DURATION = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
+# outcome: carried | none | dropped_hop_cap | dropped_scope
+FOLLOWUP_FINDINGS_CARRIED = Counter(
+    "followup_findings_carried_total",
+    "Prior-turn findings block reuse on non-retrieval turns",
+    ["outcome"],
+)
+# grounded: whether the direct answer had a carried block behind it
+FOLLOWUP_DIRECT_ANSWER = Counter(
+    "router_followup_direct_answer_total",
+    "Turns answered without retrieval",
+    ["grounded"],
+)
 GUARDRAIL_BLOCKS = Counter("guardrail_blocks_total", "Guardrail blocks", ["type"])
 PIPELINE_ERRORS = Counter("chat_pipeline_errors_total", "Chat pipeline failures", ["stage"])
 

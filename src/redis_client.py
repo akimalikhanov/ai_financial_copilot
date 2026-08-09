@@ -17,7 +17,9 @@ from src.utils.config import (
 )
 
 CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
-CHAT_TAIL_KEY_PREFIX = "chat:tail:"
+# v2: entries carry findings_block/answer_derived_from_carryover. Versioned so a rolling
+# deploy doesn't mix payload shapes (old workers reject unknown keys, extra="forbid").
+CHAT_TAIL_KEY_PREFIX = "chat:tail:v2:"
 INGESTION_STREAM_PREFIX = "ingestion:events:"
 
 

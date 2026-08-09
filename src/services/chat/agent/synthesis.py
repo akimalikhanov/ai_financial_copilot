@@ -36,6 +36,9 @@ class AgentRunResult:
     findings: AgentFindings | AnalyticalFindings | None
     processed: ProcessedFindings | None
     meta: AgentLoopMeta
+    # The rendered block alone, without the excerpts — carried to a follow-up turn so it
+    # can be answered without re-retrieving (see followup_direct_answer_plan.md).
+    findings_block: str | None = None
 
 
 def _inject_unsearched_stubs(
@@ -194,4 +197,5 @@ async def run_synthesis(
         findings=findings,
         processed=processed,
         meta=agent_meta,
+        findings_block=findings_block,
     )

@@ -454,6 +454,8 @@ CREATE TABLE IF NOT EXISTS messages (
 
   metadata           jsonb NOT NULL DEFAULT '{}'::jsonb,
   -- Flexible JSON: citations, tool info, UI flags, structured payloads.
+  -- Follow-up carry-over keys: findings_block (rendered block, carried to a later turn
+  -- so a reformat/restate follow-up needs no retrieval), answer_derived_from_carryover.
 
   trace              jsonb,
   -- Pipeline trace: stage timings, router decision, retrieval hits (IDs+scores). NULL for user messages.

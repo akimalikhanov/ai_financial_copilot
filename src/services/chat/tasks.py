@@ -7,7 +7,7 @@ import contextlib
 import json as _json
 import logging
 from time import perf_counter
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -23,6 +23,8 @@ from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
 from src.observability.metrics import (
     AGENT_ITERATIONS,
+    FOLLOWUP_DIRECT_ANSWER,
+    FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
     LLM_CACHE_HIT_TOKENS,
     LLM_COST,
@@ -61,11 +63,14 @@ from src.services.security.injection_detector import InjectionSignal, scan_user_
 from src.utils.config import (
     get_conversation_naming_config,
     get_db_url,
+    get_followup_max_inherit_hops,
     get_injection_scan_user_input_enabled,
     get_redis_app_url,
 )
 
 logger = logging.getLogger(__name__)
+
+FINDINGS_BLOCK_MAX_CHARS = 20_000
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
@@ -78,6 +83,49 @@ _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _router: LLMRouter | None = None
 _reranker: Reranker | None = None
+
+
+class _CarriedFindings(NamedTuple):
+    block: str | None
+    hops: int
+    doc_ids: list[str] | None
+    outcome: str  # carried | none | dropped_hop_cap | dropped_scope
+
+
+def _latest_findings_block(
+    messages: list[schemas.ChatMessage] | None,
+    current_doc_ids: list[str] | None = None,
+    *,
+    check_scope: bool = False,
+) -> _CarriedFindings:
+    """Carried findings block, the hop count it would have if inherited now, and why.
+
+    The block is dropped past `FOLLOWUP_MAX_INHERIT_HOPS`, or when the resolved document
+    scope has moved since it was produced — findings describing documents the user is no
+    longer asking about are worse than a re-retrieval. A drop leaves the router with no
+    carried data, so the follow-up re-retrieves.
+
+    `check_scope` is off for the router call, which runs before scope is resolved.
+    """
+    for m in reversed(messages or []):
+        if m.role == schemas.Role.assistant and m.findings_block:
+            next_hops = m.findings_block_hops + 1
+            if next_hops > get_followup_max_inherit_hops():
+                return _CarriedFindings(None, 0, None, "dropped_hop_cap")
+            if check_scope and _scope_moved(m.findings_block_doc_ids, current_doc_ids):
+                return _CarriedFindings(None, 0, None, "dropped_scope")
+            return _CarriedFindings(
+                m.findings_block, next_hops, m.findings_block_doc_ids, "carried"
+            )
+    return _CarriedFindings(None, 0, None, "none")
+
+
+def _scope_moved(before: list[str] | None, now: list[str] | None) -> bool:
+    """Whether the resolved document scope changed. None means "all documents", so it
+    compares equal only to itself — a narrowing from all-docs is a real change."""
+    if before is None or now is None:
+        return not (before is None and now is None)
+    return set(before) != set(now)
 
 
 def _parse_scope(raw: object) -> ChatScope | None:
@@ -460,13 +508,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             raw_scope = (user_db_msg.message_metadata or {}).get("scope") if user_db_msg else None
             chat_scope = _parse_scope(raw_scope)
 
+            # Scope isn't resolved yet, so the staleness check runs later, on the
+            # synthesis path — the router only needs to know the data exists.
+            prior_findings = _latest_findings_block(state.context_messages)
+            prior_findings_present = prior_findings.block is not None
             router_input = RouterInput(
                 query=state.user_query_raw,
                 scope=chat_scope,
+                # context_messages ends with the current user turn, which `query` already
+                # carries — drop it so the router isn't shown the same question twice.
                 conversation_history=[
                     {"role": m.role.value, "content": m.content}
-                    for m in (state.context_messages or [])
+                    for m in (state.context_messages or [])[:-1]
                 ],
+                prior_findings_block=prior_findings.block,
             )
             state.router_output, state.scope_result = await route_query(
                 router_input,
@@ -510,7 +565,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             if lf:
                 scope_summary = _scope_summary(chat_scope, state.scope_result)
                 lf.update_current_span(
-                    input={"query": state.user_query_raw},
+                    # The carried digest is the input a misroute has to be read against —
+                    # without it a bad follow-up decision is undiagnosable from the trace.
+                    input={
+                        "query": state.user_query_raw,
+                        "prior_findings_block": prior_findings.block,
+                    },
                     output={
                         "route": state.router_output.route,
                         "query_shape": getattr(state.router_output, "query_shape", None),
@@ -520,6 +580,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     },
                     metadata={
                         "scope": scope_summary,
+                        "prior_findings_present": prior_findings_present,
+                        "prior_findings_hops": prior_findings.hops,
                         "scope_source": state.scope_result.source if state.scope_result else None,
                         "scope_doc_ids": _scope_doc_ids,
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
@@ -662,6 +724,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
                 if agent_result.findings is not None:
                     agent_findings_json = agent_result.findings.model_dump_json()
+                # Runaway guard only: real blocks are ~2-4k (rows are bounded by scope,
+                # observations by max_plan_items). Clips at a line so a pathological
+                # model output can't blow up the router prompt on every later turn.
+                block = agent_result.findings_block
+                if block is not None and len(block) > FINDINGS_BLOCK_MAX_CHARS:
+                    block = block[:FINDINGS_BLOCK_MAX_CHARS].rsplit("\n", 1)[0] + "\n… (truncated)"
+                state.findings_block = block
                 if agent_result.processed is not None:
                     state.agent_answer_entity = agent_result.processed.answer_entity
                     state.agent_fx_rates = agent_result.processed.fx_rates_used
@@ -681,7 +750,31 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             else:
-                state.rag_context_str = "(No document context - general question.)"
+                # Answerable from what an earlier turn already retrieved — reformat,
+                # restate, or arithmetic on a rate the user supplied. No excerpts here,
+                # so the block is the only grounding the synthesis model gets.
+                carried = _latest_findings_block(
+                    state.context_messages, _scope_doc_ids, check_scope=True
+                )
+                FOLLOWUP_FINDINGS_CARRIED.labels(carried.outcome).inc()
+                if carried.block:
+                    state.rag_context_str = carried.block
+                    state.findings_block = carried.block
+                    state.findings_block_hops = carried.hops
+                    state.findings_block_doc_ids = carried.doc_ids
+                    state.answer_derived_from_carryover = True
+                else:
+                    state.rag_context_str = "(No document context - general question.)"
+                FOLLOWUP_DIRECT_ANSWER.labels("true" if carried.block else "false").inc()
+                logger.info(
+                    "followup_findings_carryover",
+                    extra={
+                        "request_id": request_id,
+                        "route": state.router_output.route,
+                        "outcome": carried.outcome,
+                        "hops": carried.hops,
+                    },
+                )
 
             top_score = (
                 state.rag_context.items[0].score
@@ -822,6 +915,24 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             for item in state.rag_context.items
                         ]
 
+                    # Carried to the next turn so a follow-up can be answered without
+                    # re-retrieving. Unsealed findings are not carried — a partial result
+                    # restated a turn later reads as settled fact.
+                    if state.findings_block and (
+                        state.agent_meta is None or state.agent_meta.sealed
+                    ):
+                        citation_meta["findings_block"] = state.findings_block
+                        citation_meta["findings_block_hops"] = state.findings_block_hops
+                        # A fresh run's block belongs to this turn's scope; a carried one
+                        # keeps the scope it was originally retrieved under.
+                        citation_meta["findings_block_doc_ids"] = (
+                            state.findings_block_doc_ids
+                            if state.answer_derived_from_carryover
+                            else _scope_doc_ids
+                        )
+                    if state.answer_derived_from_carryover:
+                        citation_meta["answer_derived_from_carryover"] = True
+
                     if agent_findings_json is not None:
                         citation_meta["agent_findings"] = agent_findings_json
                         # Persist the sealed/degraded marker beside the findings so a later
@@ -852,6 +963,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "scope_source": state.scope_result.source
                             if state.scope_result
                             else None,
+                            "prior_findings_present": prior_findings_present,
+                            "prior_findings_carried": state.answer_derived_from_carryover,
+                            "prior_findings_hops": state.findings_block_hops,
                         },
                     }
                     if state.agent_meta is not None:
@@ -988,6 +1102,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             state.conversation_id,
                             state.clean_content,
                             state.assistant_seq,
+                            findings_block=citation_meta.get("findings_block"),
+                            answer_derived_from_carryover=state.answer_derived_from_carryover,
+                            findings_block_hops=state.findings_block_hops,
+                            findings_block_doc_ids=citation_meta.get("findings_block_doc_ids"),
                         )
                     except Exception:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})

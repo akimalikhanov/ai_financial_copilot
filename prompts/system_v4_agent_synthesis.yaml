@@ -21,6 +21,15 @@ template: |
 
   The context you receive contains either a `[STRUCTURED FINDINGS]` block or an `[AGENT OBSERVATIONS]` block, followed by the retrieved source excerpts. Both blocks were produced by a deterministic search agent — treat their contents as authoritative pre-computed evidence.
 
+  ### Carried-over context (no excerpts)
+
+  If a block is present but there are **no** `<retrieved_excerpt>` blocks, this data was retrieved earlier in the conversation and the user is asking you to reformat, restate, or compute over it. In that case:
+
+  - Answer from the block alone. Do not claim a search was performed for this question.
+  - **Do not emit `[S1]`-style citations.** Any `[S...]` appearing inside the block — including in `evidence:` and `refuted_by:` lists — refers to excerpts that are not in front of you now. They are historical references, not citable sources: do not reproduce them anywhere in your answer. The "every fact needs a citation" rule does not apply on this path.
+  - Preserve any `Unresolved (do not assert as fact): ...` line as a caveat. Do not resolve it, and do not present it as settled.
+  - If the user asks for something the block does not contain — a metric that is not listed, another entity, another period, or **an exchange rate they did not supply** — say plainly that it is not in the data already retrieved and that answering it needs a new search. Do not estimate, infer, or recall the missing value.
+
   ---
 
   ## [STRUCTURED FINDINGS] path (extraction and comparison queries)

@@ -209,6 +209,13 @@ def get_chat_tail_max_messages() -> int:
     return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
 
 
+def get_followup_max_inherit_hops() -> int:
+    """How many turns a findings block may be inherited before it goes stale
+    (FOLLOWUP_MAX_INHERIT_HOPS, default 3). Past the cap the block is dropped, so the
+    router sees no carried data and the next follow-up re-retrieves."""
+    return int(os.getenv("FOLLOWUP_MAX_INHERIT_HOPS", "3"))
+
+
 # --- Redis ---
 def get_chat_queue_stream() -> str:
     """Redis stream key for chat queue (CHAT_QUEUE_STREAM, default chat:queue)."""
@@ -422,6 +429,19 @@ def get_embedding_dim() -> int | None:
 
 
 # --- RAG retrieval ---
+def get_query_router_prompt_version() -> str:
+    """Router prompt version (QUERY_ROUTER_PROMPT_VERSION, default v4). v3 has no
+    follow-up carry-over guidance — set it to roll back routing behavior."""
+    return os.getenv("QUERY_ROUTER_PROMPT_VERSION", "v4")
+
+
+def get_router_history_turns() -> int:
+    """User/assistant pairs of prior conversation shown to the router
+    (ROUTER_HISTORY_TURNS, default 3). Enough to resolve coreference; the findings
+    digest carries the substance."""
+    return int(os.getenv("ROUTER_HISTORY_TURNS", "3"))
+
+
 def get_query_router_model() -> str:
     """Model ID for query routing (QUERY_ROUTER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")

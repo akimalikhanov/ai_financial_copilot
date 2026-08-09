@@ -20,7 +20,12 @@ from src.services.prompts.prompt_loader import get_prompt_loader
 from src.services.prompts.prompt_renderer import get_prompt_renderer
 from src.services.router.parser import parse_router_response
 from src.services.router.scope_resolver import resolve_scope
-from src.utils.config import get_query_router_model, get_router_config
+from src.utils.config import (
+    get_query_router_model,
+    get_query_router_prompt_version,
+    get_router_config,
+    get_router_history_turns,
+)
 from src.utils.json_schema import build_response_format
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,36 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
     return text[:char_limit].rstrip() + "..."
 
 
+def _digest_findings_block(block: str, max_chars: int = 1500) -> str:
+    """Strip a findings block down to what the router needs to classify a follow-up.
+
+    Keeps the entity/metric/value lines; drops chunk refs, FX detail and grounding
+    markers, which cost tokens on every routed turn and carry no routing signal.
+    """
+    lines: list[str] = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("[") or line.startswith("Question:"):
+            continue
+        for sep in (" | chunks:", " | evidence:", " | from ", " | rate:"):
+            line = line.split(sep, 1)[0]
+        line = line.replace(" | native", "").replace(" | ⚠ UNVERIFIED", "")
+        lines.append(" ".join(line.split()))
+    digest = "\n".join(lines)
+    return digest[:max_chars] if len(digest) > max_chars else digest
+
+
+def _cap_turns(history: list[dict], max_turns: int) -> list[dict]:
+    """Keep the last `max_turns` user/assistant pairs. A turn starts at its user message,
+    so the window never opens on an answer whose question was dropped."""
+    if max_turns <= 0:
+        return []
+    user_idx = [i for i, t in enumerate(history) if t.get("role") == "user"]
+    if len(user_idx) <= max_turns:
+        return history
+    return history[user_idx[-max_turns] :]
+
+
 def _build_messages(
     inp: RouterInput, system: str, max_assistant_tokens: int = 150
 ) -> list[ChatMessage]:
@@ -66,7 +101,7 @@ def _build_messages(
     history_block = ""
     if inp.conversation_history:
         turns = []
-        for turn in inp.conversation_history:
+        for turn in _cap_turns(inp.conversation_history, get_router_history_turns()):
             role = turn.get("role", "user")
             content = turn.get("content", "")
             # Truncate assistant turns to stay within token budget
@@ -89,9 +124,21 @@ def _build_messages(
         elif inp.scope.mode in ("selectedDocs", "thisDoc"):
             scope_block = "Active document scope: specific documents explicitly selected by user\n"
 
+    findings_block = ""
+    if inp.prior_findings_block:
+        digest = _digest_findings_block(inp.prior_findings_block)
+        if digest:
+            findings_block = (
+                "Data already retrieved in this conversation "
+                "(available without new retrieval):\n" + digest + "\n\n"
+            )
+
     return [
         ChatMessage(role=Role.system, content=system),
-        ChatMessage(role=Role.user, content=f"{scope_block}{history_block}User query: {inp.query}"),
+        ChatMessage(
+            role=Role.user,
+            content=f"{scope_block}{findings_block}{history_block}User query: {inp.query}",
+        ),
     ]
 
 
@@ -129,7 +176,7 @@ async def route_query(
         return _FALLBACK, None
 
     try:
-        prompt = get_prompt_loader().load("query_router", "v3")
+        prompt = get_prompt_loader().load("query_router", get_query_router_prompt_version())
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("route_query_prompt_missing", extra={"model": model_id})

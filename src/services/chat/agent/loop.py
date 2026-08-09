@@ -75,6 +75,7 @@ from src.services.security.injection_detector import scan_user_input
 from src.utils.config import get_injection_scan_user_input_enabled, get_query_transformer_model
 
 if TYPE_CHECKING:
+    from src.schemas.chat import ChatMessage as SchemaChatMessage
     from src.schemas.chat import ChatPipelineState
     from src.services.llm_router import RoutedLLM
     from src.services.retrieval.reranker import Reranker
@@ -826,6 +827,40 @@ async def _run_turn_inner(
             )
 
 
+CARRYOVER_STUB = "[prior turn: restated earlier results in a different format]"
+
+
+def build_agent_history(
+    history: list[SchemaChatMessage],
+    *,
+    scan: bool,
+    request_id: str = "",
+) -> list[ChatMessage]:
+    """Project conversation history into the agent's transcript.
+
+    Contract F1: only role and content cross. `findings_block` cannot reach the agent —
+    ChatMessage here is the frozen/slotted adapter type with no such field — and an
+    answer derived from a carried block is stubbed, since its prose restates numbers the
+    agent has no evidence for.
+    """
+    out: list[ChatMessage] = []
+    for m in history:
+        content = m.content or ""
+        if m.role.value == "assistant" and m.answer_derived_from_carryover:
+            content = CARRYOVER_STUB
+        elif scan and m.role.value == "user" and content:
+            signal = scan_user_input(content)
+            if signal.severity == "block":
+                logger.info(
+                    "agent_history_turn_blocked",
+                    extra={"request_id": request_id, "matched_rules": signal.matched_rules},
+                )
+                continue
+            content = signal.sanitized_text
+        out.append(ChatMessage(role=Role(m.role.value), content=content))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -892,19 +927,7 @@ async def run_loop(
     # strip invisibles/role markers as the current turn gets, and drop a blocked turn
     # outright rather than handing the agent the exact text the guardrail rejected.
     scan = get_injection_scan_user_input_enabled()
-    history_messages: list[ChatMessage] = []
-    for m in history:
-        content = m.content or ""
-        if scan and m.role.value == "user" and content:
-            signal = scan_user_input(content)
-            if signal.severity == "block":
-                logger.info(
-                    "agent_history_turn_blocked",
-                    extra={"request_id": request_id, "matched_rules": signal.matched_rules},
-                )
-                continue
-            content = signal.sanitized_text
-        history_messages.append(ChatMessage(role=Role(m.role.value), content=content))
+    history_messages = build_agent_history(history, scan=scan, request_id=request_id)
     messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
         # Row 2 of 10b §4 was the largest unbounded cost in the turn: up to 50 prior

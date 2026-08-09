@@ -27,7 +27,12 @@ class ChatScope(BaseModel):
 class RouterInput(BaseModel):
     query: str
     scope: ChatScope | None = None
-    conversation_history: list[dict] = []  # last 3 pairs, assistant truncated to 150 tokens
+    # Full loaded tail; the router caps it to ROUTER_HISTORY_TURNS pairs and truncates
+    # assistant turns to 150 tokens when building its prompt.
+    conversation_history: list[dict] = []
+    # Prior turn's findings block: lets the router tell a follow-up answerable from
+    # already-retrieved data from one that needs a new value out of the corpus.
+    prior_findings_block: str | None = None
 
 
 class RouterOutput(BaseModel):

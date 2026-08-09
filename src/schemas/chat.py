@@ -35,6 +35,18 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    # Rendered findings/observations block, for the router and synthesis only.
+    # Contract F1: must never reach the agent transcript.
+    findings_block: str | None = None
+    # Answered from a carried block, so its prose restates earlier numbers —
+    # the agent gets a stub instead of the text (Contract F1).
+    answer_derived_from_carryover: bool = False
+    # Turns this block has been inherited for. 0 = produced by a fresh agent run.
+    findings_block_hops: int = 0
+    # Documents the block was retrieved under, so a later turn can tell whether the
+    # scope moved underneath it. Only meaningful when findings_block is set, where
+    # None means "all documents" rather than "unknown".
+    findings_block_doc_ids: list[str] | None = None
 
 
 @dataclass
@@ -64,6 +76,14 @@ class ChatPipelineState:
     agent_answer_entity: str | None = None
     agent_fx_rates: dict = field(default_factory=dict)
     agent_currency_converted: bool = False
+    # Rendered findings/observations block to persist for follow-up turns.
+    findings_block: str | None = None
+    # This turn was answered from a carried block rather than fresh retrieval.
+    answer_derived_from_carryover: bool = False
+    # Hop count to persist for this turn's block (0 when freshly retrieved).
+    findings_block_hops: int = 0
+    # Scope the block was retrieved under, persisted for the next turn's staleness check.
+    findings_block_doc_ids: list[str] | None = None
 
 
 class LLMResponseStats(BaseModel):
