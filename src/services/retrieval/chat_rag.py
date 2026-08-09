@@ -40,14 +40,22 @@ def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
     )
 
 
-async def _retrieve_with_timeout(coro, timeout: float | None = None) -> list:
-    """Run retrieval coroutine with timeout. Fail open: return [] on error/timeout."""
+async def _retrieve_with_timeout(coro, timeout: float | None = None) -> tuple[list, bool]:
+    """Run retrieval coroutine with timeout.
+
+    Fails open with ``[]`` so one dead backend cannot take down the request, but reports
+    it via ``ok=False``: callers must be able to tell "the corpus does not discuss this"
+    from "the index was unreachable" (P1-F), which an empty list alone cannot express.
+    """
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
     try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except (TimeoutError, Exception) as e:
+        return await asyncio.wait_for(coro, timeout=timeout), True
+    except TimeoutError as e:
+        logger.warning("retrieval_backend_failed", extra={"error": str(e), "reason": "timeout"})
+        return [], False
+    except Exception as e:
         logger.warning("retrieval_backend_failed", extra={"error": str(e)})
-        return []
+        return [], False
 
 
 async def _run_single_pass(
@@ -59,26 +67,27 @@ async def _run_single_pass(
     vector_top_k: int,
     keyword_top_k: int,
     search_mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
-) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk]]:
+) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk], bool]:
     """Run retrieval backends in parallel (skipping one when search_mode is single-backend).
 
-    Returns (vector_results, keyword_results, fused).
-    For single-backend modes, fused == the single backend's results (no RRF).
+    Returns (vector_results, keyword_results, fused, all_backends_failed).
+    For single-backend modes, fused == the single backend's results (no RRF), and
+    all_backends_failed reflects that one backend alone.
     """
     if search_mode == "vector":
-        vector_results = await _retrieve_with_timeout(
+        vector_results, vec_ok = await _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
             timeout,
         )
-        return vector_results, [], vector_results
+        return vector_results, [], vector_results, not vec_ok
     if search_mode == "keyword":
-        keyword_results = await _retrieve_with_timeout(
+        keyword_results, kw_ok = await _retrieve_with_timeout(
             opensearch_retrieve(keyword_query, user_id, doc_ids=doc_ids, top_k=keyword_top_k),
             timeout,
         )
-        return [], keyword_results, keyword_results
+        return [], keyword_results, keyword_results, not kw_ok
 
-    vector_results, keyword_results = await asyncio.gather(
+    (vector_results, vec_ok), (keyword_results, kw_ok) = await asyncio.gather(
         _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
             timeout,
@@ -89,7 +98,9 @@ async def _run_single_pass(
         ),
     )
     fused = fuse_rrf(vector_results, keyword_results)
-    return vector_results, keyword_results, fused
+    # Only a total outage is reported: with one backend alive the request still has real
+    # retrieval, and degrading it to "search unavailable" would be a false alarm.
+    return vector_results, keyword_results, fused, not (vec_ok or kw_ok)
 
 
 async def run_chat_rag_pipeline(
@@ -142,7 +153,7 @@ async def run_chat_rag_pipeline(
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        vec_r, kw_r, fused = await _run_single_pass(
+        vec_r, kw_r, fused, all_backends_failed = await _run_single_pass(
             semantic_vector,
             transformed.keyword_query,
             user_id,
@@ -170,6 +181,7 @@ async def run_chat_rag_pipeline(
         trace = RetrievalTrace(
             qdrant=[_to_hit(c) for c in vec_r],
             opensearch=[_to_hit(c) for c in kw_r],
+            all_backends_failed=all_backends_failed,
         )
         return RAGContext(formatted_context="", items=(), chunk_count=0), trace, []
 
@@ -205,6 +217,7 @@ async def run_chat_rag_pipeline(
         opensearch=[_to_hit(c) for c in kw_r],
         fused=[_to_hit(c) for c in fused],
         reranked=[_to_hit(c) for c in reranked],
+        all_backends_failed=all_backends_failed,
     )
     with lf_span(
         "assemble_context",

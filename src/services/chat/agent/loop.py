@@ -272,7 +272,7 @@ async def _execute_search(
                     fallback=True,
                 )
         try:
-            _, _, raw_chunks = await run_chat_rag_pipeline(
+            _, retrieval_trace, raw_chunks = await run_chat_rag_pipeline(
                 session,
                 transformed=transformed,
                 user_id=state.llm_request.user_id,  # type: ignore[union-attr]
@@ -282,6 +282,25 @@ async def _execute_search(
             )
             if obs:
                 obs.update(output={"chunks_returned": len(raw_chunks)})
+            # A total backend outage fails open inside the pipeline (empty results, no
+            # exception), so it reaches here looking exactly like "the corpus has nothing
+            # on this". Only the trace can tell the two apart.
+            if retrieval_trace.all_backends_failed:
+                logger.warning("agent_search_backends_down", extra={"entity": entity})
+                if obs:
+                    obs.update(output={"chunks_returned": 0, "error": True})
+                AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+                AGENT_TOOL_DURATION.labels("search_documents").observe(
+                    perf_counter() - _tool_started
+                )
+                return _SearchResult(
+                    entity=entity,
+                    chunks=[],
+                    payloads={},
+                    error_str=f"Search failed for entity: {entity}",
+                    rewrite_stats=rewrite_stats,
+                    backend_failed=True,
+                )
         except Exception:
             logger.warning("agent_search_failed", extra={"entity": entity})
             if obs:
@@ -485,7 +504,9 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
     # D4 reconciliation: anything reported but neither grounded nor gapped would otherwise
     # close silently, serving a key that produced no output at all.
     for key in sorted(known & state.unaccounted_keys()):
-        state.findings.add_gap(f"Reported but unsupported by retrieved evidence: {key}", closes=key)
+        state.findings.add_gap(
+            f"Reported but unsupported by retrieved evidence: {state.plan[key]}", closes=key
+        )
 
     AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
     return _render_report_result(state, closed=known, unknown=unknown)
@@ -743,7 +764,7 @@ async def _run_turn_inner(
         # same emission stops the run and discards the model's own statement that a thread
         # remains open.
         if state.plan and not open_aspects(state):
-            state.sealed = True
+            state.sealed_by_coverage = True
             return Stop("covered")
 
         # A dead backend is not an empty corpus. Today it produces new_chunks == 0 and the

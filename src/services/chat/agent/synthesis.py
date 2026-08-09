@@ -43,18 +43,32 @@ def _inject_unsearched_stubs(
     agent_meta: AgentLoopMeta,
     scope_result: DocumentScopeResult | None,
 ) -> AgentFindings:
-    """Defence-in-depth stub for entities the agent never searched.
+    """Defence-in-depth stub for every in-scope entity absent from the findings.
 
-    Uses ``searched_entities`` (what the loop actually did), not reported coverage, so an
-    entity that was searched but simply not reported in the finalizer isn't mislabeled
-    "not searched by agent" (P1-0).
+    Keyed on reported coverage, not ``searched_entities``: an entity that was searched but
+    never landed a finding (P0-A — e.g. every citation failed ``resolve_refs``) would
+    otherwise vanish from the findings block, the evidence selection and the answer with
+    no trace, silently turning a 2-entity comparison into a 1-entity argmax.
+    ``searched_entities`` still picks the reason, so a never-searched entity isn't
+    mislabeled as searched-but-ungrounded (P1-0). Keying on reported coverage also means a
+    model that self-reports "unavailable" without searching gets its own row and not a
+    duplicate stub (P2-G).
     """
     if scope_result is None or not scope_result.per_entity_doc_ids:
         return findings
+    reported = {f.entity for f in findings.findings}
     missing_stubs = tuple(
-        EntityFinding(entity=name, available=False, reason="not searched by agent")
+        EntityFinding(
+            entity=name,
+            available=False,
+            reason=(
+                "not searched by agent"
+                if name not in agent_meta.searched_entities
+                else "searched, but no value could be grounded in the retrieved excerpts"
+            ),
+        )
         for name in sorted(scope_result.per_entity_doc_ids.keys())
-        if name not in agent_meta.searched_entities
+        if name not in reported
     )
     if not missing_stubs:
         return findings

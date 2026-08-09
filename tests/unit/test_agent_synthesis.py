@@ -214,8 +214,10 @@ class TestStubInjection:
         assert stub.available is False
         assert stub.reason == "not searched by agent"
 
-    async def test_no_stub_for_searched_but_unreported_entity(self) -> None:
-        """P1-0: an entity the agent searched but didn't report must not be mislabeled."""
+    async def test_searched_but_unreported_entity_is_stubbed_as_ungrounded(self) -> None:
+        """P0-A: a searched-but-unreported entity must not vanish — that turns a 2-entity
+        comparison into a confident 1-entity argmax. P1-0: it must still not be labeled
+        "not searched by agent", since the agent did search it."""
         c1 = _chunk()
         ledger = _ledger(c1)
         findings = AgentFindings(
@@ -242,7 +244,44 @@ class TestStubInjection:
         )
 
         assert isinstance(result.findings, AgentFindings)
-        assert {f.entity for f in result.findings.findings} == {"Acme"}
+        assert {f.entity for f in result.findings.findings} == {"Acme", "Globex"}
+        stub = next(f for f in result.findings.findings if f.entity == "Globex")
+        assert stub.available is False
+        assert stub.reason == "searched, but no value could be grounded in the retrieved excerpts"
+
+    async def test_self_reported_unavailable_entity_is_not_duplicated(self) -> None:
+        """P2-G: an entity the model reports unavailable without searching keeps its own
+        row — the stub must not be appended alongside it."""
+        c1 = _chunk()
+        ledger = _ledger(c1)
+        findings = AgentFindings(
+            metric_requested="revenue",
+            findings=(
+                EntityFinding(
+                    entity="Acme", available=True, value=1.0, source_chunks=[str(c1.chunk_id)]
+                ),
+                EntityFinding(entity="Globex", available=False, reason="out of scope"),
+            ),
+        )
+        scope_result = DocumentScopeResult(
+            source="entity_resolved",
+            doc_ids=None,
+            per_entity_doc_ids={"Acme": [uuid4()], "Globex": [uuid4()]},
+        )
+
+        result = await synthesis.run_synthesis(
+            ledger,
+            findings,
+            _meta(frozenset({"Acme"})),
+            scope_result,
+            None,
+            max_chunks_per_entity=100,
+        )
+
+        assert isinstance(result.findings, AgentFindings)
+        globex = [f for f in result.findings.findings if f.entity == "Globex"]
+        assert len(globex) == 1
+        assert globex[0].reason == "out of scope"
 
 
 class TestSynthesisContextShape:

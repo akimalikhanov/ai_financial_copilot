@@ -9,8 +9,10 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from src.schemas.agent_findings import Observation
+from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.services.chat.agent.evidence import EvidenceLedger
+from src.services.chat.agent.findings import _DEGRADED_CAVEAT
+from src.services.chat.agent.loop import _apply_report
 from src.services.chat.agent.loop import _mint as _mint_with_cap
 from src.services.chat.agent.state import (
     AgentRunState,
@@ -19,7 +21,7 @@ from src.services.chat.agent.state import (
     open_aspects,
 )
 from src.services.chat.agent.transcript import Transcript
-from src.services.llm_adapters.base_adapter import LLMResponseStats
+from src.services.llm_adapters.base_adapter import LLMResponseStats, ToolCallRef
 from tests.unit.test_findings import _seed_evidence
 
 
@@ -221,3 +223,62 @@ class TestOpenAspects:
         assert state.findings.record("A1", ungrounded, state.evidence) is False
         assert open_aspects(state) == ["A1"]
         assert state.addressed == set()
+
+    def test_d4_gap_text_renders_the_sub_question_not_the_plan_key(self) -> None:
+        """The gap is user-facing: rendering the internal key would read "A1 was not
+        found in the uploaded documents"."""
+        state = _state(plan={"A1": "Why did gross margin fall?"})
+        tc = ToolCallRef(
+            id="c1",
+            name="report_analytical_findings",
+            arguments=AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="A1",
+                        claim="c",
+                        evidence_chunks=[str(uuid4())],
+                        confidence="high",
+                    ),
+                ),
+            ).model_dump_json(),
+        )
+
+        _apply_report(tc, state, "req-1")
+
+        assert state.findings._gaps == [
+            "Reported but unsupported by retrieved evidence: Why did gross margin fall?"
+        ]
+
+
+class TestSealed:
+    def test_empty_plan_is_trivially_sealed(self) -> None:
+        """P2-I: a plan is empty when extraction resolved no documents, or when an
+        analytical run's searches carried `sub_question: null`. Neither means the run fell
+        short — but `Stop("covered")` requires a plan, so the stored flag can never be set
+        and the run would report "didn't finish covering"."""
+        assert _state(plan={}).sealed is True
+
+    def test_open_plan_is_not_sealed(self) -> None:
+        state = _state(plan={"A1": "q1"})
+        assert state.sealed is False
+
+    def test_covered_plan_is_sealed(self) -> None:
+        state = _state(plan={"A1": "q1"})
+        state.sealed_by_coverage = True
+        assert state.sealed is True
+
+    def test_empty_plan_serves_findings_undegraded(self) -> None:
+        """The user-visible half: `projection(degraded=not sealed)` would otherwise append
+        "the search did not fully converge" to a complete answer."""
+        state = _state(plan={})
+        evidence, ids = _seed_evidence(1)
+        state.evidence = evidence
+        state.findings.record(
+            "A1",
+            Observation(aspect="A1", claim="c", evidence_chunks=[ids[0]], confidence="high"),
+            evidence,
+        )
+        projected = state.findings.projection(degraded=not state.sealed)
+        assert isinstance(projected, AnalyticalFindings)
+        assert _DEGRADED_CAVEAT not in (projected.gaps or [])

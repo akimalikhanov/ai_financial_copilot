@@ -36,7 +36,7 @@ class Observation(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     aspect: str = Field(
-        description="A short, stable key naming what this observation is about (e.g. 'revenue_driver', 'margin_trend') — the same aspect across turns updates the same conclusion.",
+        description='The bracketed aspect id shown in the search result you are reporting on (e.g. "A2"). Never invent one.',
     )
     claim: str
     evidence_chunks: list[str] = Field(

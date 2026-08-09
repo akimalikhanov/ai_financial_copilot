@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import DocumentScopeResult, RouterOutput
-from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
+from src.schemas.retrieval import ChunkPromptPayload, RetrievalTrace, RetrievedChunk
 from src.services.chat.agent.findings import drop_evidence_free_observations
 from src.services.chat.agent.loop import _SearchResult, run_loop
 from src.services.llm_adapters.base_adapter import AssistantTurnResult, Role, ToolCallRef
@@ -317,7 +317,7 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
         )
 
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
-        return None, None, [chunk]
+        return None, RetrievalTrace(), [chunk]
 
     async def _fake_payloads(*_a: Any, **_k: Any) -> dict:
         return payloads
@@ -347,6 +347,93 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1-F: the pipeline fails open on a dead index — zero chunks, no exception. Without
+    reading the trace the loop cannot tell that from "the corpus has nothing on this"."""
+    from src.services.chat.agent import loop as loop_module
+
+    state = _make_state()
+    # run_chat_rag_pipeline reads llm_request.user_id — without it the call raises before
+    # reaching the pipeline stub, and the generic except would mask the real result.
+    state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
+
+    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
+        return (
+            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
+            None,
+        )
+
+    async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
+        return None, RetrievalTrace(all_backends_failed=True), []
+
+    async def _fake_add_event(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
+    monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
+    monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
+
+    tc = ToolCallRef(
+        id="call_1",
+        name="search_documents",
+        arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
+    )
+    result = await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, False
+    )
+
+    assert result.backend_failed is True
+    assert result.chunks == []
+    assert result.error_str is not None
+
+
+@pytest.mark.asyncio
+async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of P1-F: a genuine empty corpus must stay distinguishable from an
+    outage, or every no-hit search would trip Stop("search_unavailable")."""
+    from src.services.chat.agent import loop as loop_module
+
+    state = _make_state()
+    # run_chat_rag_pipeline reads llm_request.user_id — without it the call raises before
+    # reaching the pipeline stub, and the generic except would mask the real result.
+    state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
+
+    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
+        return (
+            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
+            None,
+        )
+
+    async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
+        return None, RetrievalTrace(all_backends_failed=False), []
+
+    async def _fake_payloads(*_a: Any, **_k: Any) -> dict:
+        return {}
+
+    async def _fake_add_event(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
+    monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
+    monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", _fake_payloads)
+    monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
+
+    tc = ToolCallRef(
+        id="call_1",
+        name="search_documents",
+        arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
+    )
+    result = await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, False
+    )
+
+    assert result.backend_failed is False
+    assert result.chunks == []
+
+
+@pytest.mark.asyncio
 async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.MonkeyPatch) -> None:
     """Step 5: on the analytical path the model's own query goes to both channels
     unchanged — no rewrite call, so no second model second-guessing a targeted query."""
@@ -370,7 +457,7 @@ async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.Mon
 
     async def _fake_pipeline(*_a: Any, **kwargs: Any) -> Any:
         seen.append(kwargs["transformed"])
-        return None, None, [chunk]
+        return None, RetrievalTrace(), [chunk]
 
     async def _fake_payloads(*_a: Any, **_k: Any) -> dict:
         return payloads

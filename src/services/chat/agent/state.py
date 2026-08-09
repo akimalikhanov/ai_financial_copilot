@@ -156,7 +156,9 @@ class AgentRunState:
     # --- durable record: complete, never truncated ---
     evidence: EvidenceLedger = field(default_factory=EvidenceLedger)
     findings: FindingsLedger = field(default_factory=FindingsLedger)  # what we concluded (keyed)
-    sealed: bool = False  # did a finalizer commit the ledger (vs a degraded projection)
+    # Set when Stop("covered") closes every planned key. Read `sealed`, not this — an
+    # empty plan can never set it, and would otherwise report "didn't finish covering".
+    sealed_by_coverage: bool = False
     expected_entities: set[str] = field(default_factory=set)
     searched_entities: set[str] = field(default_factory=set)
     spend: dict[str, TokenSpend] = field(default_factory=dict)
@@ -198,6 +200,19 @@ class AgentRunState:
         `closed_as_gap` records.
         """
         return self.findings.keys() | self.findings.closed_as_gap()
+
+    @property
+    def sealed(self) -> bool:
+        """Did the run finish what it set out to cover (vs a degraded projection)?
+
+        A plan is empty in two legitimate cases — extraction whose entities resolved to no
+        documents, and an analytical run whose searches carried `sub_question: null` — and
+        neither means the run fell short. Reading `sealed_by_coverage` alone conflates
+        "nothing to cover" with "didn't finish covering" (P2-I), biasing the
+        `agent_findings_sealed` metric low and appending a "did not fully converge" caveat
+        to answers that were complete.
+        """
+        return not self.plan or self.sealed_by_coverage
 
     def unaccounted_keys(self) -> set[str]:
         """Reported keys that produced neither a finding nor a gap — D4's reconciliation.

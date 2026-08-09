@@ -175,3 +175,6 @@ class RetrievalTrace(BaseModel):
     sub_passes: list[dict] | None = None
     dropped_chunks: list[DroppedChunk] = []
     flagged_chunks: list[FlaggedChunk] = []
+    # Every enabled backend errored or timed out, so zero results means "unreachable",
+    # not "not in the corpus" (P1-F).
+    all_backends_failed: bool = False

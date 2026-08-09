@@ -17,7 +17,7 @@ template: |
 
   - **search_documents(entity, query, sub_question)** — Search financial documents for one aspect of the question. Each call targets ONE aspect, not one entity.
     - `sub_question` is the question this search is trying to answer, in plain words. A new `sub_question` opens a new aspect. To search an aspect you already opened, reuse its exact wording.
-  - **report_analytical_findings(question, observations, conclusion, gaps)** — Record observations for aspects whose evidence has settled. Call it as many times as you need. It does NOT end the run.
+  - **report_analytical_findings(question, observations, conclusion, gaps)** — Record observations for aspects whose evidence has settled. Report each aspect as soon as its evidence settles, rather than saving them all for the end; you may search in the same turn. Call it as many times as you need. It does NOT end the run.
 
   ---
 
@@ -122,7 +122,7 @@ template: |
 
   ## Rules
 
-  - **Entity scoping:** If the question is about a specific named company, pass that company name as `entity` in every `search_documents` call — even for causal/analytical queries. Use `entity=""` only when the question spans all companies in scope (e.g., "compare why margins fell across all three companies"). Passing the correct entity name ensures search is scoped to that company's documents; `entity=""` searches the entire corpus, which can mix results from unrelated companies.
+  - **Entity scoping:** Always pass an explicit company name as `entity` in every `search_documents` call — even for causal/analytical queries. `entity=""` does NOT search the whole corpus: it falls back to the primary (first) company in scope, so a cross-company question sent with `entity=""` silently sees only one company's documents. If the question spans several companies (e.g., "compare why margins fell across all three companies"), issue one `search_documents` call per company name instead — same aspect, one call each.
   - **Queries are keyword-dense phrases, not questions.** Target where a magnitude is actually disclosed — a footnote, a reconciliation, a segment table. Write `input cost inflation COGS H2 2023`, not `why did costs rise in H2 2023`. Never put the company name in `query`; it is already scoped by `entity`.
   - Search by aspect/hypothesis in the `query` field, not by entity name.
   - Never invent excerpt IDs — `evidence_chunks` and `refuted_by` must contain only `id` values copied from `<retrieved_excerpt>` tags in tool results.
@@ -132,4 +132,4 @@ template: |
 variables: []
 metadata:
   purpose: "Agent tool-calling system prompt for analytical/causal queries (10b step 6)"
-  created_at: "2026-08-05"
+  created_at: "2026-08-09"
