@@ -39,6 +39,10 @@ class Observation(BaseModel):
         description='The bracketed aspect id shown in the search result you are reporting on (e.g. "A2"). Never invent one.',
     )
     claim: str
+    substantiated: bool = Field(
+        default=True,
+        description="False when you searched this aspect and the documents do not support any claim about it — state that plainly in `claim` and leave `evidence_chunks` empty. True when the excerpts back the claim.",
+    )
     evidence_chunks: list[str] = Field(
         description='Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',
     )

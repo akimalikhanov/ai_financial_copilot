@@ -408,9 +408,13 @@ def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
     deliberately *not* penalized (10b §1e), since firing on honesty trains the model to
     stop reporting gaps at all.
     """
-    if not findings.observations:
+    # Stated negatives are excluded, not counted as low-confidence: nudging a re-search on
+    # an aspect the model has already settled as absent is the same "firing on honesty"
+    # this advisory exists to avoid, and `confidence` is meaningless on a negative.
+    substantiated = [o for o in findings.observations if o.substantiated]
+    if not substantiated:
         return None
-    if all(o.confidence == "low" for o in findings.observations):
+    if all(o.confidence == "low" for o in substantiated):
         return (
             "Every observation so far is low-confidence. Search differently — likely a "
             "footnote, reconciliation, or segment table — to corroborate."

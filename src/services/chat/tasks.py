@@ -703,7 +703,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 await session.commit()
                 return
 
-            prompt_version = "v3_agent_synthesis"
+            prompt_version = "v4_agent_synthesis"
 
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})

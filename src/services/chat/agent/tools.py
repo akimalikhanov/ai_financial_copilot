@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
+from src.schemas.agent_findings import AgentFindings, Observation
 from src.utils.json_schema import make_strict
 
 
@@ -85,12 +85,30 @@ REPORT_FINDINGS_TOOL = tool_schema(
     AgentFindings,
 )
 
+
+class _AnalyticalReportArgs(BaseModel):
+    """Schema-only: `AnalyticalFindings` without `gaps`.
+
+    Same reason as `_ExtractionSearchArgs` — `make_strict` forces every property into
+    `required`, so advertising `gaps` obliges the model to author one on every call. A
+    model-written gap is an unkeyed string: it closes no aspect, so the loop kept
+    searching an aspect the model had already declared dead, and it could contradict a
+    later grounded finding with no way to retract it. Negatives now go through
+    `Observation.substantiated`, which closes its key like any other entry. The field
+    stays on `AnalyticalFindings` — `projection()` still emits the loop's own keyed gaps.
+    """
+
+    question: str
+    observations: tuple[Observation, ...]
+    conclusion: str | None = None
+
+
 REPORT_ANALYTICAL_TOOL = tool_schema(
     "report_analytical_findings",
     "Report observations for aspects whose evidence has settled. "
     "You may call this more than once, and may search in the same turn — "
     "report each aspect as soon as you can, rather than saving them all for the end.",
-    AnalyticalFindings,
+    _AnalyticalReportArgs,
 )
 
 ANALYTICAL_TOOLS = [SEARCH_ANALYTICAL_TOOL, REPORT_ANALYTICAL_TOOL]

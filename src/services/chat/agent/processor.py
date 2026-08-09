@@ -9,6 +9,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from typing import Literal
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from src.observability.langfuse import span as lf_span
 from src.observability.metrics import CITATION_REFS_DROPPED
 from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
 from src.schemas.retrieval import RAGContext
+from src.services.chat.agent.number_grounding import NumberGrounding, to_millions, verify_value
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class NormalizedFinding:
         float | None
     )  # in target_currency; equals finding.value if no conversion needed
     fx_rate: float | None  # rate applied; None if same currency or no conversion
+    number_grounding: NumberGrounding = NumberGrounding.UNVERIFIABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,20 +62,6 @@ class ProcessedFindings:
     metric_requested: str | None = None
     target_currency: str | None = None
     comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
-
-
-_UNIT_TO_MILLIONS: dict[str | None, float] = {
-    "B": 1_000.0,
-    "M": 1.0,
-    "K": 0.001,
-    "": 0.000_001,  # absolute / units
-    None: 1.0,  # assume millions when unspecified
-}
-
-
-def _to_millions(value: float, unit: str | None) -> float:
-    """Scale value to millions for unit-safe comparison."""
-    return value * _UNIT_TO_MILLIONS.get(unit, 1.0)
 
 
 def _normalizer_enabled() -> bool:
@@ -115,9 +104,16 @@ _DEFAULT_COMPARISON_CURRENCY = "USD"
 async def process_findings(
     findings: AgentFindings,
     requested_currency: str | None = None,
+    chunk_texts: dict[str, str] | None = None,
 ) -> ProcessedFindings:
     """FX-normalize and rank an extraction run's entity findings. Analytical runs have no
-    values to normalize — `run_synthesis` renders those directly and never calls this."""
+    values to normalize — `run_synthesis` renders those directly and never calls this.
+
+    `chunk_texts` (chunk-UUID string -> sanitized rendered text) enables Pattern 4a's
+    number-grounding check: does the cited excerpt actually contain the asserted value?
+    Omitted (the default), every finding's `number_grounding` stays `UNVERIFIABLE` — this
+    is purely additive instrumentation, never a filter (see `number_grounding.py`).
+    """
     available = [f for f in findings.findings if f.available and f.value is not None]
     op = findings.comparison_op
     is_comparison = op in ("argmin", "argmax")
@@ -271,13 +267,29 @@ async def process_findings(
         if rankable:
 
             def key_fn(n: NormalizedFinding) -> float:
-                return _to_millions(n.normalized_value, n.finding.unit)  # type: ignore[arg-type]
+                return to_millions(n.normalized_value, n.finding.unit)  # type: ignore[arg-type]
 
             best = min(rankable, key=key_fn) if op == "argmin" else max(rankable, key=key_fn)
             answer_entity = best.finding.entity
 
     if len(available) == 1 and len(findings.findings) > 1 and answer_note is None:
         answer_note = "only one entity had available data"
+
+    if chunk_texts is not None:
+        # Verify against the finding's native value — the chunk states what the filing
+        # states, never our FX arithmetic (`normalized_value`). Checking the converted
+        # figure would make every converted finding read as a false "not_found".
+        normalized = [
+            dc_replace(
+                n,
+                number_grounding=verify_value(
+                    n.finding.value,
+                    n.finding.unit,
+                    [chunk_texts[c] for c in (n.finding.source_chunks or []) if c in chunk_texts],
+                ),
+            )
+            for n in normalized
+        ]
 
     return ProcessedFindings(
         findings=tuple(normalized),
@@ -346,6 +358,14 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
         # Drop refs with no excerpt in the synthesis context — leaking a raw ref here
         # would let the model cite an ID the citation pipeline can't resolve.
         chunks_str = _map_refs(f.source_chunks or [], rag_context)
+        # Only the anomaly is worth a marker — flagging every row trains the synthesis
+        # model to skip it (Pattern 4a, number half; see the plan doc §2.1 for why this
+        # is advisory rather than a filter).
+        flag = (
+            " | ⚠ UNVERIFIED: value not located in cited excerpt"
+            if nf.number_grounding is NumberGrounding.NOT_FOUND
+            else ""
+        )
         if not f.available or f.value is None:
             reason = f.reason or "not found in retrieved context"
             lines.append(f"{f.entity:<22} | N/A | not available: {reason}")
@@ -357,14 +377,14 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
             rate_note = " (approx — date unavailable)" if date_used == "latest" else ""
             lines.append(
                 f"{f.entity:<22} | {converted:<14} | from {native:<16} | rate: {nf.fx_rate:.4f}{rate_note}"
-                f" | period: {f.period_end or '—'} | chunks: {chunks_str}"
+                f" | period: {f.period_end or '—'} | chunks: {chunks_str}{flag}"
             )
         else:
             cur = f.currency or ""
             val_str = f"{cur} {f.value:,.1f}{unit_str}" if cur else f"{f.value:,.1f}{unit_str}"
             lines.append(
                 f"{f.entity:<22} | {val_str:<14} | native"
-                f" | period: {f.period_end or '—'} | chunks: {chunks_str}"
+                f" | period: {f.period_end or '—'} | chunks: {chunks_str}{flag}"
             )
 
     lines.append("[END STRUCTURED FINDINGS]")
@@ -375,6 +395,12 @@ def _render_observations_block(findings: AnalyticalFindings, rag_context: RAGCon
     lines = ["[AGENT OBSERVATIONS]", f"Question: {findings.question}", ""]
 
     for i, obs in enumerate(findings.observations, 1):
+        # A stated negative has no evidence to cite and no confidence worth reporting —
+        # rendering it as a low-confidence claim would invite the synthesis model to
+        # hedge it into a weak positive instead of reporting the absence.
+        if not obs.substantiated:
+            lines.append(f"{i}. [not disclosed] {obs.claim}")
+            continue
         chunks_str = _map_refs(obs.evidence_chunks, rag_context)
         refuted_str = _map_refs(obs.refuted_by or [], rag_context)
         lines.append(

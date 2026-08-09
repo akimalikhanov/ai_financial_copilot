@@ -12,6 +12,7 @@ reference, so `next_ref` label allocation stays deterministic under concurrent s
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
@@ -174,6 +175,18 @@ class EvidenceLedger:
         """Sanitized payloads cached at render time — no second hydration (D2). Every
         chunk synthesis can select was rendered, so a cached payload always exists."""
         return {cid: self._payloads[cid] for cid in chunk_ids if cid in self._payloads}
+
+    def texts_for(self, chunk_ids: Iterable[str]) -> dict[str, str]:
+        """Sanitized rendered text keyed by chunk-UUID *string* — the form findings carry
+        after refs are resolved to UUIDs. Number grounding (Pattern 4a) reads this; the
+        payloads are already cached, so this is zero-I/O like `payloads_for` (D2)."""
+        out: dict[str, str] = {}
+        for raw in chunk_ids:
+            with contextlib.suppress(ValueError):
+                payload = self._payloads.get(UUID(raw))
+                if payload is not None:
+                    out[raw] = payload.prompt_text
+        return out
 
     def ordered_chunks(self) -> list[RetrievedChunk]:
         """Every admitted chunk, best-scoring first, globally. `assemble_rag_context`

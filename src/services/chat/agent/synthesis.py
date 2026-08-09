@@ -114,7 +114,12 @@ async def run_synthesis(
             # sub-structure of its own (the interesting nested work is `fx_conversion`,
             # inside `process_findings`), so its input/output land on the enclosing
             # `agent_loop` span instead of paying for another hop with no new information.
-            processed = await process_findings(findings, requested_currency=requested_currency)
+            cited_chunk_ids = {c for f in findings.findings for c in (f.source_chunks or [])}
+            processed = await process_findings(
+                findings,
+                requested_currency=requested_currency,
+                chunk_texts=evidence.texts_for(cited_chunk_ids),
+            )
             lf = lf_get_client()
             if lf:
                 with contextlib.suppress(Exception):
@@ -142,6 +147,7 @@ async def run_synthesis(
                                             "unit": nf.finding.unit,
                                             "period_end": nf.finding.period_end,
                                             "available": nf.finding.available,
+                                            "number_grounding": nf.number_grounding.value,
                                         }
                                         for nf in processed.findings
                                     ],

@@ -96,8 +96,8 @@ def _build_args() -> argparse.Namespace:
     p.add_argument("--model", default="gpt-4o-mini")
     p.add_argument(
         "--prompt-version",
-        default="v3_agent_synthesis",
-        help="System prompt version for the synthesis step (e.g. v3_agent_synthesis, v3_bracket)",
+        default="v4_agent_synthesis",
+        help="System prompt version for the synthesis step (e.g. v4_agent_synthesis, v3_bracket)",
     )
     p.add_argument("--judge-model", default=None)
     p.add_argument("--user-id", default=None)

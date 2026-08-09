@@ -11,7 +11,8 @@ import pytest
 import respx
 
 from src.schemas.agent_findings import AgentFindings, EntityFinding
-from src.services.chat.agent.processor import _normalize_date, _to_millions, process_findings
+from src.services.chat.agent.number_grounding import NumberGrounding
+from src.services.chat.agent.processor import _normalize_date, process_findings, to_millions
 
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 
@@ -38,19 +39,19 @@ class TestNormalizeDate:
 
 class TestToMillions:
     def test_billion_scales_by_1000(self) -> None:
-        assert _to_millions(2.0, "B") == 2000.0
+        assert to_millions(2.0, "B") == 2000.0
 
     def test_million_scales_by_1(self) -> None:
-        assert _to_millions(2.0, "M") == 2.0
+        assert to_millions(2.0, "M") == 2.0
 
     def test_thousand_scales_by_0_001(self) -> None:
-        assert _to_millions(2.0, "K") == pytest.approx(0.002)
+        assert to_millions(2.0, "K") == pytest.approx(0.002)
 
     def test_empty_string_scales_by_1e_minus_6(self) -> None:
-        assert _to_millions(2_000_000.0, "") == pytest.approx(2.0)
+        assert to_millions(2_000_000.0, "") == pytest.approx(2.0)
 
     def test_none_unit_scales_by_1(self) -> None:
-        assert _to_millions(2.0, None) == 2.0
+        assert to_millions(2.0, None) == 2.0
 
 
 def _finding(entity: str, value: float | None, currency: str | None, **overrides) -> EntityFinding:
@@ -194,3 +195,57 @@ class TestComparisonOp:
         )
         result = await process_findings(findings)
         assert result.answer_note == "only one entity had available data"
+
+
+class TestNumberGroundingWiring:
+    @pytest.mark.asyncio
+    async def test_no_chunk_texts_stays_unverifiable(self) -> None:
+        findings = AgentFindings(
+            metric_requested="revenue",
+            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
+            comparison_op="none",
+        )
+        result = await process_findings(findings)
+        assert result.findings[0].number_grounding is NumberGrounding.UNVERIFIABLE
+
+    @pytest.mark.asyncio
+    async def test_missing_chunk_text_is_unverifiable_not_not_found(self) -> None:
+        findings = AgentFindings(
+            metric_requested="revenue",
+            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
+            comparison_op="none",
+        )
+        result = await process_findings(findings, chunk_texts={})
+        assert result.findings[0].number_grounding is NumberGrounding.UNVERIFIABLE
+
+    @pytest.mark.asyncio
+    async def test_grounded_when_native_value_in_cited_text(self) -> None:
+        findings = AgentFindings(
+            metric_requested="revenue",
+            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
+            comparison_op="none",
+        )
+        result = await process_findings(findings, chunk_texts={"c1": "Total revenue was 100.0"})
+        assert result.findings[0].number_grounding is NumberGrounding.GROUNDED
+
+    @pytest.mark.asyncio
+    async def test_verifies_native_value_not_fx_converted_value(self) -> None:
+        """Regression guard: checking `normalized_value` instead of the native value would
+        make every converted finding read as a false NOT_FOUND, since the converted figure
+        never appears in the filing text."""
+        findings = AgentFindings(
+            metric_requested="revenue",
+            findings=(_finding("A", 100.0, "EUR", source_chunks=["c1"]),),
+            comparison_op="none",
+        )
+        with respx.mock:
+            respx.get(url__startswith=FRANKFURTER_BASE).mock(
+                return_value=httpx.Response(200, json={"rates": {"USD": 1.1}})
+            )
+            result = await process_findings(
+                findings,
+                requested_currency="USD",
+                chunk_texts={"c1": "Total revenue was EUR 100.0"},
+            )
+        assert result.findings[0].normalized_value == pytest.approx(110.0)
+        assert result.findings[0].number_grounding is NumberGrounding.GROUNDED

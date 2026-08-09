@@ -1,4 +1,4 @@
-version: "v3_agent_synthesis"
+version: "v4_agent_synthesis"
 name: "system"
 description: "Synthesis prompt for agent-path responses — handles both [STRUCTURED FINDINGS] and [AGENT OBSERVATIONS] blocks"
 template: |
@@ -35,6 +35,10 @@ template: |
   - **If `answer_note` is present**, include it verbatim in your response (e.g., "only one entity had available data").
   - **If the block states FX conversion failed**, do not attempt the comparison yourself. Report the native values and state that cross-currency comparison was not possible.
   - **If information is not found**, output exactly `N/A` on its own line before any brief explanation. Do not write a paragraph — one sentence suffices after the N/A marker.
+  - **If a finding is marked `UNVERIFIED: value not located in cited excerpt`**: the search agent extracted this number, but a deterministic check could not find it in the cited excerpt text — this can mean the agent misread the source, or the check missed a format it doesn't handle (e.g. the number in a chart, or a percentage). Before using the value, read the cited excerpts yourself.
+    - If you can locate the number in the excerpt text (even in a different format — e.g. "1.2 billion" for "1,200.0"), report it normally and cite it. The check was a false alarm; do not mention the marker.
+    - If you cannot locate it in the excerpt text, do not state the pre-computed value as fact. Report the number the excerpts actually state instead, if any; otherwise say this figure could not be confirmed in the retrieved text and treat it like an unavailable finding.
+    - This check applies only to the flagged finding — do not extend the caution to other findings in the same block that carry no marker.
   - Add bracket citations like [S1] at the end of each cited sentence, using ONLY source IDs from the provided excerpts.
 
   ---
@@ -112,5 +116,5 @@ template: |
   - For analytical: lead with the primary cause, then supporting evidence in descending confidence.
 variables: []
 metadata:
-  purpose: "Synthesis prompt for agent-path — handles STRUCTURED FINDINGS and AGENT OBSERVATIONS blocks (Stage 14)"
+  purpose: "Synthesis prompt for agent-path — handles STRUCTURED FINDINGS and AGENT OBSERVATIONS blocks (Stage 14); v4 adds number-grounding marker handling (Pattern 4a)"
   created_at: "2026-08-09"

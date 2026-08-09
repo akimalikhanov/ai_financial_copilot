@@ -69,6 +69,12 @@ def _is_grounded(finding: EntityFinding | Observation, evidence: EvidenceLedger)
         if not finding.available:
             return True
         return _resolves(finding.source_chunks, evidence)
+    # The analytical counterpart: a stated negative ("searched, the documents don't
+    # disclose this") is a real conclusion about its aspect and cites nothing by
+    # definition. Without this it could only be expressed as an unkeyed gap string, which
+    # closes no aspect — so the loop kept searching what the model had already settled.
+    if not finding.substantiated:
+        return True
     return _resolves([*finding.evidence_chunks, *(finding.refuted_by or [])], evidence)
 
 
@@ -86,27 +92,25 @@ def finding_chunk_ids(findings: Candidate) -> set[str]:
 
 
 def drop_evidence_free_observations(findings: AnalyticalFindings) -> AnalyticalFindings:
-    """Route observations citing nothing at all into gaps instead of synthesis.
+    """Drop observations that assert a substantiated claim while citing nothing.
 
     Post-D3 this and `_is_grounded` are the only correctness filters on what reaches
     synthesis — the gates are gone, so grounding carries the whole load. An observation
     citing `refuted_by` but no `evidence_chunks` is legitimately grounded (a refutation is
     a finding), matching `_is_grounded`'s either-list rule.
 
-    Returns the findings with uncited claims moved into `gaps`. The aspect still closes:
-    an aspect the documents genuinely don't answer must not be hammered to budget death.
+    `substantiated=False` is exempt: that is a stated negative, which cites nothing by
+    design and is kept as a real entry under its aspect key. So what remains here is only
+    the pure hallucination case — a claim asserting support it never produced. Dropping it
+    writes no gap: D4 reconciliation in `_apply_report` already closes the key, and the
+    claim text is exactly what must not reach a user-facing caveat.
     """
-    kept: list[Observation] = []
-    dropped_claims: list[str] = []
-    for o in findings.observations:
-        if o.evidence_chunks or o.refuted_by:
-            kept.append(o)
-        else:
-            dropped_claims.append(o.claim)
-    if not dropped_claims:
+    kept = tuple(
+        o for o in findings.observations if o.evidence_chunks or o.refuted_by or not o.substantiated
+    )
+    if len(kept) == len(findings.observations):
         return findings
-    gaps = list(findings.gaps or []) + [f"Unsubstantiated claim: {c}" for c in dropped_claims]
-    return findings.model_copy(update={"observations": tuple(kept), "gaps": gaps})
+    return findings.model_copy(update={"observations": kept})
 
 
 class FindingsLedger:

@@ -422,14 +422,16 @@ class TestEnvelopeNullGuard:
 
     def test_later_attempt_with_empty_gaps_preserves_earlier_gaps(self) -> None:
         # A later report with gaps=[] must not wipe gaps a prior attempt (or add_gap)
-        # already recorded — union, not replace.
+        # already recorded — union, not replace. The model no longer authors gaps (they
+        # are off the advertised schema; negatives go through `substantiated=False`), but
+        # the envelope field still round-trips the loop's own keyed gaps.
         evidence, ids = _seed_evidence(1)
         ledger = FindingsLedger()
         obs_a = Observation(aspect="A", claim="c1", evidence_chunks=[ids[0]], confidence="high")
         obs_b = Observation(aspect="B", claim="c2", evidence_chunks=[ids[0]], confidence="high")
         ledger.ingest(
             AnalyticalFindings(
-                question="q", gaps=["Unsubstantiated claim: x"], observations=(obs_a,)
+                question="q", gaps=["Not resolved: why margin fell"], observations=(obs_a,)
             ),
             evidence,
         )
@@ -437,4 +439,4 @@ class TestEnvelopeNullGuard:
 
         served = ledger.projection()
         assert isinstance(served, AnalyticalFindings)
-        assert served.gaps == ["Unsubstantiated claim: x"]
+        assert served.gaps == ["Not resolved: why margin fell"]

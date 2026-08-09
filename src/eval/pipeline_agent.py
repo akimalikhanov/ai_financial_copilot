@@ -67,7 +67,7 @@ async def run_one(
     session: AsyncSession,
     user_id: UUID,
     model_id: str,
-    prompt_version: str = "v3_agent_synthesis",
+    prompt_version: str = "v4_agent_synthesis",
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     verbosity: str | None = None,

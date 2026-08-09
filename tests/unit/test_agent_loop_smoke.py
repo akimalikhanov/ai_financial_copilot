@@ -482,8 +482,9 @@ async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.Mon
     assert seen[0].keyword_query == "input cost inflation COGS 2023"
 
 
-def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
-    """An observation with no evidence is routed into gaps instead of reaching synthesis."""
+def test_drop_evidence_free_observations_drops_uncited_claim_without_writing_a_gap() -> None:
+    """A claim asserting support it never produced is dropped. No gap is written: D4
+    already closes the key, and the claim text is what must not reach a user caveat."""
     findings = AnalyticalFindings(
         question="q",
         observations=(
@@ -497,7 +498,27 @@ def test_drop_evidence_free_observations_moves_claim_to_gaps() -> None:
     )
     result = drop_evidence_free_observations(findings)
     assert [o.claim for o in result.observations] == ["Grounded claim"]
-    assert any("Ungrounded claim" in g for g in result.gaps or [])
+    assert not result.gaps
+
+
+def test_drop_evidence_free_observations_keeps_stated_negatives() -> None:
+    """`substantiated=False` cites nothing by design — it is a settled answer about its
+    aspect, not an unsupported claim, and must survive to close its key."""
+    findings = AnalyticalFindings(
+        question="q",
+        observations=(
+            Observation(
+                aspect="A4",
+                claim="The filings do not disclose any FX impact.",
+                substantiated=False,
+                evidence_chunks=[],
+                confidence="high",
+            ),
+        ),
+    )
+    result = drop_evidence_free_observations(findings)
+    assert len(result.observations) == 1
+    assert not result.gaps
 
 
 def test_drop_evidence_free_observations_keeps_refutation_only() -> None:

@@ -282,3 +282,67 @@ class TestSealed:
         projected = state.findings.projection(degraded=not state.sealed)
         assert isinstance(projected, AnalyticalFindings)
         assert _DEGRADED_CAVEAT not in (projected.gaps or [])
+
+
+class TestStatedNegatives:
+    """`Observation.substantiated=False` is the analytical counterpart to
+    `EntityFinding(available=False)` — the typed channel for "searched, not disclosed"."""
+
+    def _report(self, state, *observations) -> None:
+        tc = ToolCallRef(
+            id="c",
+            name="report_analytical_findings",
+            arguments=AnalyticalFindings(question="q", observations=observations).model_dump_json(),
+        )
+        _apply_report(tc, state, "req")
+
+    def test_negative_closes_its_aspect_without_a_gap(self) -> None:
+        """Before the typed channel, the only way to state a negative was a `gaps` string,
+        which closed nothing — the loop kept searching an aspect the model had settled."""
+        state = _state(plan={"A4": "Did FX move the margin?"})
+        self._report(
+            state,
+            Observation(
+                aspect="A4",
+                claim="The filings do not quantify FX impact.",
+                substantiated=False,
+                evidence_chunks=[],
+                confidence="high",
+            ),
+        )
+        assert open_aspects(state) == []
+        assert state.findings._gaps is None
+        # Not an ungrounded close: honesty must not be counted as hallucination, or
+        # `ungrounded_close_rate` conflates the two.
+        assert state.ungrounded_closes == 0
+
+    def test_later_substantiation_overwrites_the_negative(self) -> None:
+        """P1-B dissolved: per-aspect state lives in the keyed entry store, so a negative
+        superseded by real evidence is overwritten — there is no gap left to retract."""
+        state = _state(plan={"A4": "Did FX move the margin?"})
+        evidence, ids = _seed_evidence(1)
+        state.evidence = evidence
+        self._report(
+            state,
+            Observation(
+                aspect="A4",
+                claim="No FX disclosure found.",
+                substantiated=False,
+                evidence_chunks=[],
+                confidence="high",
+            ),
+        )
+        self._report(
+            state,
+            Observation(
+                aspect="A4",
+                claim="FX was a 3.1pp headwind.",
+                substantiated=True,
+                evidence_chunks=[ids[0]],
+                confidence="high",
+            ),
+        )
+        projected = state.findings.projection(degraded=False)
+        assert isinstance(projected, AnalyticalFindings)
+        assert [o.claim for o in projected.observations] == ["FX was a 3.1pp headwind."]
+        assert not projected.gaps
