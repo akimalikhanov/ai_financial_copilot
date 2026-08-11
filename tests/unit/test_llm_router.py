@@ -23,15 +23,21 @@ from typing import Any
 import pytest
 
 import src.services.llm_router as llm_router_mod
-from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponse, Role
+from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponse, LLMStreamChunk, Role
 from src.services.llm_router import (
+    FallbackStream,
     LLMRouter,
     RoutedLLM,
     _build_adapter,
     _merge_params,
     _normalize_base_url,
 )
-from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
+from src.services.llm_runtime.exceptions import (
+    LLMInvalidRequestError,
+    LLMNotFoundError,
+    LLMServerError,
+    LLMServiceUnavailableError,
+)
 
 
 # -------------------------
@@ -100,6 +106,27 @@ class RecordingAdapter:
         async def _gen():
             yield {"chunk": 1}
             yield {"chunk": 2}
+
+        return _gen()
+
+
+class RaisingAdapter:
+    """Adapter double whose stream() raises before yielding anything, unless
+    `yield_first` is set, in which case it yields once, then raises."""
+
+    def __init__(self, error: Exception, *, yield_first: bool = False):
+        self._error = error
+        self._yield_first = yield_first
+
+    async def complete(self, messages, **params):  # noqa: ARG002
+        raise self._error
+
+    def stream(self, messages, **params):  # noqa: ARG002
+        async def _gen():
+            if self._yield_first:
+                yield LLMStreamChunk(text="partial")
+            raise self._error
+            yield  # pragma: no cover - unreachable, satisfies generator shape
 
         return _gen()
 
@@ -421,3 +448,129 @@ class TestLLMRouter:
         router.get("gemini")
         assert ("google", "gemini") in calls
         assert len(calls) == 2
+
+
+# -------------------------
+# LLMRouter.get_with_fallback
+# -------------------------
+class TestGetWithFallback:
+    @pytest.fixture
+    def router_config(self):
+        return {
+            "defaults": {"stream": True, "params": {}},
+            "models": [
+                {
+                    "id": "gemini",
+                    "provider": "google",
+                    "model_name": "gemini-2.5-flash",
+                    "fallback_model": "gpt-4o-mini",
+                },
+                {"id": "gpt-4o-mini", "provider": "openai", "model_name": "gpt-4o-mini"},
+                {"id": "no-fallback", "provider": "openai", "model_name": "gpt-4"},
+                {
+                    "id": "dangling-fallback",
+                    "provider": "openai",
+                    "model_name": "gpt-4",
+                    "fallback_model": "does-not-exist",
+                },
+            ],
+        }
+
+    def test_returns_primary_and_fallback(self, router_config):
+        router = LLMRouter(router_config)
+        chain = router.get_with_fallback("gemini")
+        assert [m.model_id for m in chain] == ["gemini", "gpt-4o-mini"]
+
+    def test_no_fallback_configured_returns_single_element(self, router_config):
+        router = LLMRouter(router_config)
+        chain = router.get_with_fallback("no-fallback")
+        assert [m.model_id for m in chain] == ["no-fallback"]
+
+    def test_dangling_fallback_id_ignored(self, router_config):
+        router = LLMRouter(router_config)
+        chain = router.get_with_fallback("dangling-fallback")
+        assert [m.model_id for m in chain] == ["dangling-fallback"]
+
+    def test_unknown_primary_raises(self, router_config):
+        router = LLMRouter(router_config)
+        with pytest.raises(LLMNotFoundError):
+            router.get_with_fallback("unknown")
+
+
+# -------------------------
+# FallbackStream
+# -------------------------
+class TestFallbackStream:
+    def _routed(self, model_id: str, adapter) -> RoutedLLM:
+        return RoutedLLM(
+            adapter=adapter,  # type: ignore
+            provider="fake",
+            model_id=model_id,
+            default_params={},
+            default_stream=True,
+            capabilities={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_primary_succeeds_fallback_never_touched(self):
+        primary = self._routed("primary", RecordingAdapter())
+        fallback = self._routed("fallback", RecordingAdapter())
+        messages = [ChatMessage(role=Role.user, content="hi")]
+
+        stream = FallbackStream([primary, fallback], messages)
+        chunks = [c async for c in stream]
+
+        assert len(chunks) == 2
+        assert stream.served is primary
+
+    @pytest.mark.asyncio
+    async def test_falls_back_on_pre_chunk_retryable_error(self):
+        err = LLMServiceUnavailableError("503", status_code=503)
+        primary = self._routed("primary", RaisingAdapter(err))
+        fallback = self._routed("fallback", RecordingAdapter())
+        messages = [ChatMessage(role=Role.user, content="hi")]
+
+        stream = FallbackStream([primary, fallback], messages)
+        chunks = [c async for c in stream]
+
+        assert len(chunks) == 2
+        assert stream.served is fallback
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_after_partial_content_yielded(self):
+        err = LLMServiceUnavailableError("503", status_code=503)
+        primary = self._routed("primary", RaisingAdapter(err, yield_first=True))
+        fallback = self._routed("fallback", RecordingAdapter())
+        messages = [ChatMessage(role=Role.user, content="hi")]
+
+        stream = FallbackStream([primary, fallback], messages)
+        with pytest.raises(LLMServiceUnavailableError):
+            [c async for c in stream]
+
+        # Never advanced past the model that already streamed content.
+        assert stream.served is primary
+
+    @pytest.mark.asyncio
+    async def test_last_model_in_chain_raises_when_it_fails(self):
+        err = LLMServiceUnavailableError("503", status_code=503)
+        primary = self._routed("primary", RaisingAdapter(err))
+        fallback = self._routed("fallback", RaisingAdapter(err))
+        messages = [ChatMessage(role=Role.user, content="hi")]
+
+        stream = FallbackStream([primary, fallback], messages)
+        with pytest.raises(LLMServiceUnavailableError):
+            [c async for c in stream]
+
+        assert stream.served is fallback
+
+    @pytest.mark.asyncio
+    async def test_single_model_chain_raises_immediately(self):
+        err = LLMInvalidRequestError("bad request", status_code=400)
+        primary = self._routed("primary", RaisingAdapter(err))
+        messages = [ChatMessage(role=Role.user, content="hi")]
+
+        stream = FallbackStream([primary], messages)
+        with pytest.raises(LLMInvalidRequestError):
+            [c async for c in stream]
+
+        assert stream.served is primary

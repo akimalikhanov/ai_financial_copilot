@@ -60,6 +60,7 @@ from src.services.chat.agent.state import (
 )
 from src.services.chat.agent.tools import SearchDocumentsArgs
 from src.services.chat.agent.transcript import Transcript, cap_history
+from src.services.chat.events import build_activity_event
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -96,6 +97,10 @@ class _SearchResult:
     # arguments" — only the former justifies Stop("search_unavailable") or a
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
     backend_failed: bool = False
+    # The `tool_call_started` activity event's id, so completion correlates by id
+    # rather than by entity name — None when no started event was ever emitted
+    # (invalid tool-call arguments, resolved before entity/id assignment).
+    activity_id: str | None = None
 
 
 ExecuteSearchFn = Callable[
@@ -209,7 +214,13 @@ async def _execute_search(
         doc_ids = state.scope_result.doc_ids if state.scope_result else None
 
     _tool_started = perf_counter()
-    await add_event(redis_app, request_id, "tool_call_started", {"entity": entity})
+    activity_id, start_data = build_activity_event(
+        "tool_call_started",
+        label=entity,
+        parent_id=f"round-{iteration}",
+        detail={"tool": "search"},
+    )
+    await add_event(redis_app, request_id, "activity", start_data)
 
     # Rewrite at tool boundary — cheap model, eval-independent. Skipped on the analytical
     # path (10b step 5): there the tool model composes a targeted, hypothesis-shaped query
@@ -301,6 +312,7 @@ async def _execute_search(
                     error_str=f"Search failed for entity: {entity}",
                     rewrite_stats=rewrite_stats,
                     backend_failed=True,
+                    activity_id=activity_id,
                 )
         except Exception:
             logger.warning("agent_search_failed", extra={"entity": entity})
@@ -315,6 +327,7 @@ async def _execute_search(
                 error_str=f"Search failed for entity: {entity}",
                 rewrite_stats=rewrite_stats,
                 backend_failed=True,
+                activity_id=activity_id,
             )
 
     chunks = [dc_replace(c, turn_index=iteration) for c in raw_chunks]
@@ -322,7 +335,11 @@ async def _execute_search(
     AGENT_TOOL_CALLS.labels("search_documents", "ok").inc()
     AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
     return _SearchResult(
-        entity=entity, chunks=chunks, payloads=payloads, rewrite_stats=rewrite_stats
+        entity=entity,
+        chunks=chunks,
+        payloads=payloads,
+        rewrite_stats=rewrite_stats,
+        activity_id=activity_id,
     )
 
 
@@ -431,8 +448,22 @@ def _render_report_result(state: AgentRunState, closed: set[str], unknown: set[s
     on every subsequent call) is the single source of coverage truth and wins by recency.
     """
     parts: list[str] = []
-    if closed:
-        parts.append(f"Recorded {', '.join(sorted(closed))}.")
+    # Split on what actually landed, not on what was claimed: with no mid-loop gap
+    # reconciliation an ungrounded report leaves its key open, and telling the model it
+    # was "recorded" would be the one message that stops it retrying the aspect.
+    addressed = state.addressed
+    landed = sorted(closed & addressed)
+    dropped = sorted(closed - addressed)
+    if landed:
+        parts.append(f"Recorded {', '.join(landed)}.")
+    if dropped:
+        plural = len(dropped) != 1
+        parts.append(
+            f"{', '.join(dropped)} {'were' if plural else 'was'} not recorded — "
+            f"{'their' if plural else 'its'} observations cited no chunk from the evidence "
+            f"you retrieved. Re-report citing chunk labels from a search result, or, if the "
+            f"documents do not support the aspect, report it with substantiated: false."
+        )
     if unknown:
         plural = len(unknown) != 1
         parts.append(
@@ -495,10 +526,10 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
         state.unknown_aspect_keys += len(unknown)
         candidate = _filter_to_keys(candidate, known)
 
-    # Closed from the *raw* keys, before the grounding filter: a key the documents
-    # genuinely don't answer must close, or the loop hammers it to budget death. Grounded
-    # → a finding; ungrounded → a gap. Both close it, neither closes it silently (D4
-    # derives `addressed` from findings ∪ closed_as_gap).
+    # Recorded from the *raw* keys, before the grounding filter, so the report result can
+    # name back what the model claimed to close. Note this only tracks the attempt: a key
+    # is `addressed` (D4) solely via findings ∪ closed_as_gap, so an ungrounded report
+    # leaves its key open rather than closing it here.
     state.reported_keys |= known
     if isinstance(candidate, AnalyticalFindings):
         before = len(candidate.observations)
@@ -506,12 +537,12 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
         state.ungrounded_closes += before - len(candidate.observations)
     state.findings.ingest(candidate, state.evidence)
 
-    # D4 reconciliation: anything reported but neither grounded nor gapped would otherwise
-    # close silently, serving a key that produced no output at all.
-    for key in sorted(known & state.unaccounted_keys()):
-        state.findings.add_gap(
-            f"Reported but unsupported by retrieved evidence: {state.plan[key]}", closes=key
-        )
+    # No mid-loop gap reconciliation. Gapping a reported-but-ungrounded key here would
+    # close it → `addressed` → `Stop("covered")` → `sealed_by_coverage`, promoting a run
+    # that produced no grounded output for that aspect to the same trust level as a
+    # converged one. Left open, the aspect stays searchable, and the end-of-run sweep in
+    # `run_loop` writes its gap after `plan_covered_at_stop` is snapshotted — so `sealed`
+    # correctly stays False.
 
     AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
     return _render_report_result(state, closed=known, unknown=unknown)
@@ -538,7 +569,13 @@ async def _run_turn(
     rewrite_model_id: str,
 ) -> TurnOutcome:
     iteration = state.iteration
-    await add_event(redis_app, request_id, "agent_turn_started", {"iteration": iteration})
+    _, round_data = build_activity_event(
+        "round_started",
+        event_id=f"round-{iteration}",
+        label=f"Round {iteration + 1}",
+        detail={"iteration": iteration},
+    )
+    await add_event(redis_app, request_id, "activity", round_data)
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
     # The status view is computed per call and appended last — never stored, so it never
@@ -717,16 +754,13 @@ async def _run_turn_inner(
                     "new_chunks_added": entity_new,
                 },
             )
-            await add_event(
-                redis_app,
-                request_id,
-                "tool_call_completed",
-                {
-                    "entity": result.entity,
-                    "chunks_returned": len(result.chunks),
-                    "new_chunks_added": entity_new,
-                },
-            )
+            if result.activity_id is not None:
+                _, end_data = build_activity_event(
+                    "tool_call_ended",
+                    event_id=result.activity_id,
+                    detail={"chunks_returned": len(result.chunks), "new_chunks_added": entity_new},
+                )
+                await add_event(redis_app, request_id, "activity", end_data)
             # Assemble the tool-result context here (sequentially) so S-labels continue
             # across searches instead of restarting at S1 each time.
             if result.error_str is not None:
@@ -750,7 +784,16 @@ async def _run_turn_inner(
         # before seeing this turn's results, so it cannot cite them.
         before_addressed = set(state.addressed)
         for tc in reports:
+            report_id, report_start = build_activity_event(
+                "tool_call_started",
+                label="Recording findings",
+                parent_id=f"round-{iteration}",
+                detail={"tool": "report"},
+            )
+            await add_event(redis_app, request_id, "activity", report_start)
             results_by_id[tc.id] = _apply_report(tc, state, request_id)
+            _, report_end = build_activity_event("tool_call_ended", event_id=report_id)
+            await add_event(redis_app, request_id, "activity", report_end)
         closed_this_turn = state.addressed - before_addressed
 
         # Rule 2: exactly one result per call id, in turn.tool_calls order.
@@ -1014,11 +1057,23 @@ async def run_loop(
     for iteration in range(effort.max_iterations):
         state.iteration = iteration
         iterations_run = iteration + 1
+        # An aspect whose evidence is already admitted but never written up dies as
+        # "Not resolved" at the iteration cap. Withholding search on the last turn — the
+        # turn that was going to run anyway — gives the model one pass to convert what it
+        # already holds, at no extra cost. `tool_choice` stays "auto": if the model emits
+        # prose instead, the turn returns Stop("natural") and accumulated findings still
+        # serve, so this fails safe.
+        final_turn = iteration == effort.max_iterations - 1
+        turn_tools = (
+            [t for t in tools if t["function"]["name"] in tools_module.REPORT_TOOL_NAMES]
+            if final_turn
+            else tools
+        )
         try:
             outcome = await _run_turn(
                 state,
                 llm,
-                tools,
+                turn_tools,
                 chat_state,
                 session,
                 session_factory,
@@ -1072,11 +1127,13 @@ async def run_loop(
         # forcing a kind here would make an all-failed run project the wrong shape.
         state.findings.add_gap(gap, closes=aspect, establishes_kind=is_analytical)
 
-    await add_event(
-        redis_app,
-        request_id,
+    logger.debug(
         "agent_synthesis_starting",
-        {"total_chunks": len(state.evidence), "iterations": iterations_run},
+        extra={
+            "request_id": request_id,
+            "total_chunks": len(state.evidence),
+            "iterations": iterations_run,
+        },
     )
 
     meta = build_meta(state, iterations_run)

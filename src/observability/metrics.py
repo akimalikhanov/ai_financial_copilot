@@ -48,6 +48,10 @@ RAG_RETRIEVAL = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
 )
 RAG_CHUNKS = Histogram("rag_chunks_retrieved", "Chunks per query", ["retriever"])
+RAG_CHUNKS_UNHYDRATED = Counter(
+    "rag_chunks_unhydrated_total",
+    "Retrieved chunks skipped at assembly: no Postgres row (stale Qdrant/OpenSearch entry)",
+)
 RAG_CONTEXT_TOKENS = Histogram(
     "rag_context_tokens",
     "Context tokens",

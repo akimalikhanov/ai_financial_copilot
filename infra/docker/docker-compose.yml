@@ -762,9 +762,9 @@ services:
       <<: *app-env
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom_ingestion
       LOG_FILE: ""
-      HF_HOME: /root/.cache/huggingface
+      HF_HOME: /home/appuser/.cache/huggingface
     volumes:
-      - hf-model-cache:/root/.cache/huggingface
+      - hf-model-cache:/home/appuser/.cache/huggingface
     command: ["python", "-m", "src.workers.ingestion_worker"]
     deploy:
       resources:

@@ -1,6 +1,7 @@
 # llm_router_runtime.py
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -16,8 +17,10 @@ from src.services.llm_adapters.base_adapter import (
 )
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
-from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
+from src.services.llm_runtime.exceptions import LLMError, LLMNotFoundError, LLMServerError
 from src.utils.config import load_models_config
+
+logger = logging.getLogger(__name__)
 
 
 def _role_str(role: Any) -> str:
@@ -219,6 +222,47 @@ class RoutedLLM:
             return self.complete(messages, **params)
 
 
+class FallbackStream:
+    """Streams from the first model in `chain` that responds; advances to the
+    next model only if the previous one raised before yielding any content
+    (so partial output already sent to the user is never duplicated/lost).
+
+    `served` reflects whichever model actually produced the response — check
+    it after iteration if the caller needs to log/persist the serving model.
+    """
+
+    def __init__(self, chain: Sequence[RoutedLLM], messages: Sequence[ChatMessage], **params: Any):
+        self._chain = chain
+        self._messages = messages
+        self._params = params
+        self.served: RoutedLLM = chain[0]
+
+    async def __aiter__(self) -> AsyncGenerator[LLMStreamChunk, None]:
+        last_err: LLMError | None = None
+        for i, llm in enumerate(self._chain):
+            self.served = llm
+            got_chunk = False
+            try:
+                async for chunk in llm.stream(self._messages, **self._params):
+                    got_chunk = True
+                    yield chunk
+                return
+            except LLMError as e:
+                last_err = e
+                if got_chunk or i == len(self._chain) - 1:
+                    raise
+                logger.warning(
+                    "llm_fallback",
+                    extra={
+                        "from_model": llm.model_id,
+                        "to_model": self._chain[i + 1].model_id,
+                        "error": type(e).__name__,
+                    },
+                )
+        if last_err:
+            raise last_err
+
+
 class LLMRouter:
     def __init__(self, config: Mapping[str, Any]):
         self._config = config
@@ -242,12 +286,21 @@ class LLMRouter:
 
         self._models: dict[str, RoutedLLM] = {}
 
+    def default_params_for(self, model_id: str) -> dict[str, Any]:
+        """Merged default params (global defaults + per-model params_override) without
+        building the model's adapter, so it's safe to call for unconfigured providers."""
+        cfg = self._model_cfgs.get(model_id)
+        if cfg is None:
+            raise LLMNotFoundError(f"Unknown model_id: {model_id}")
+        params = dict(self._global_default_params)
+        params.update(cfg.get("params_override") or {})
+        return params
+
     def _build_routed(self, model_id: str, m: Mapping[str, Any]) -> RoutedLLM:
         provider = m["provider"]
         adapter = _build_adapter(provider, m)
 
-        params = dict(self._global_default_params)
-        params.update(m.get("params_override") or {})
+        params = self.default_params_for(model_id)
 
         return RoutedLLM(
             adapter=adapter,
@@ -274,6 +327,15 @@ class LLMRouter:
         routed = self._build_routed(model_id, cfg)
         self._models[model_id] = routed
         return routed
+
+    def get_with_fallback(self, model_id: str) -> list[RoutedLLM]:
+        """Primary model followed by its configured `fallback_model`, if any.
+        Always at least length 1."""
+        chain = [self.get(model_id)]
+        fallback_id = self._model_cfgs[model_id].get("fallback_model")
+        if fallback_id and fallback_id in self._model_cfgs:
+            chain.append(self.get(fallback_id))
+        return chain
 
     def list_models(self) -> list[str]:
         return sorted(self._model_cfgs.keys())

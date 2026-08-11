@@ -184,15 +184,20 @@ async def delete_document(
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "documents")
     opensearch_index = os.getenv("OPENSEARCH_INDEX", "chunks")
 
+    # Index cleanup must succeed before the Postgres row goes: a swallowed failure here
+    # (backend down/restarting) leaves chunks indexed with no row to hydrate them, and
+    # nothing ever collects them. Failing the request keeps the document deletable later.
     try:
         qdrant_ingest.delete_by_document(qdrant_collection, document_id)
-    except Exception:
-        logger.warning("delete_document.qdrant_failed", extra={"document_id": str(document_id)})
-
-    try:
         opensearch_ingest.delete_by_document(opensearch_index, document_id)
     except Exception:
-        logger.warning("delete_document.opensearch_failed", extra={"document_id": str(document_id)})
+        logger.exception(
+            "delete_document.index_cleanup_failed", extra={"document_id": str(document_id)}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Search index cleanup failed; document not deleted. Please retry.",
+        ) from None
 
     s3_keys = {
         get_s3_raw_bucket(): [doc.storage_key],

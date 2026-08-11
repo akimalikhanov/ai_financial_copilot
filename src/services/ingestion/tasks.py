@@ -147,7 +147,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     stage_order: list[str] = []
-    stage_total = 12 if get_table_summarizer_enabled() else 11
+    stage_total = 13 if get_table_summarizer_enabled() else 12
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
@@ -334,8 +334,6 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             if await DocumentRepository(session).get_by_id(doc_uuid) is None:
                 raise LookupError(f"Document {document_id} no longer exists")
             chunk_repo = ChunkRepository(session)
-            old_db_chunks = await chunk_repo.list_by_document(doc_uuid)
-            old_chunk_ids = [c.id for c in old_db_chunks]
             db_chunks = await chunk_repo.create_many(doc_uuid, chunks)
             await session.commit()
 
@@ -381,6 +379,16 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         await asyncio.gather(
             asyncio.to_thread(qdrant_ingest.ensure_collection, "documents", dim),
             asyncio.to_thread(opensearch_ingest.ensure_index, "chunks"),
+        )
+
+        # -- purge any prior generation of this document's chunks ------------
+        # By document_id and *before* indexing, so re-ingestion is idempotent wherever a
+        # prior attempt died. The old chunk-id list came from Postgres and ran after
+        # indexing, so a rollback erased the only record of what needed cleaning.
+        await _log_stage("purge_stale_chunks")
+        await asyncio.gather(
+            asyncio.to_thread(qdrant_ingest.delete_by_document, "documents", document_id),
+            asyncio.to_thread(opensearch_ingest.delete_by_document, "chunks", document_id),
         )
 
         # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
@@ -435,11 +443,6 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "application/jsonl",
                 bucket=get_s3_chunks_bucket(),
             ),
-        )
-
-        await asyncio.gather(
-            asyncio.to_thread(qdrant_ingest.delete_by_chunk_ids, "documents", old_chunk_ids),
-            asyncio.to_thread(opensearch_ingest.bulk_delete, "chunks", old_chunk_ids),
         )
 
         # -- finalize -> ready ----------------------------------------------

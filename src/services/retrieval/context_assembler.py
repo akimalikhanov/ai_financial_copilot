@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from uuid import UUID
 
+from src.observability.metrics import RAG_CHUNKS_UNHYDRATED
 from src.schemas.retrieval import (
     REF_PLACEHOLDER,
     ChunkPromptPayload,
@@ -18,6 +20,8 @@ from src.schemas.retrieval import (
 )
 from src.services.security.injection_detector import InjectionSignal, scan_retrieved_chunk
 from src.utils.config import get_injection_scan_chunks_enabled
+
+logger = logging.getLogger(__name__)
 
 
 def _dedup_chunks(chunks: Sequence[RetrievedChunk]) -> list[RetrievedChunk]:
@@ -76,7 +80,14 @@ def assemble_rag_context(
     for chunk in selected:
         payload = payloads.get(chunk.chunk_id)
         if payload is None:
-            raise ValueError(f"Missing ChunkPromptPayload for chunk_id={chunk.chunk_id}")
+            # Indexed in Qdrant/OpenSearch but no Postgres row. Skip, don't raise: one
+            # stale entry must not fail the whole assembly.
+            RAG_CHUNKS_UNHYDRATED.inc()
+            logger.warning(
+                "context_assembler.unhydrated_chunk",
+                extra={"chunk_id": str(chunk.chunk_id)},
+            )
+            continue
 
         # Scan the body only — prompt_text includes a header line "[Sn | doc | p.X]"
         # that adds benign tokens and dilutes instructional_density scores.

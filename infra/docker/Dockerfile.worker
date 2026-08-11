@@ -43,8 +43,8 @@ COPY src/ ./src/
 COPY prompts/ ./prompts/
 COPY infra/config/ ./infra/config/
 
-RUN mkdir -p /tmp/prom_chat /tmp/prom_ingestion && \
-    chown appuser /tmp/prom_chat /tmp/prom_ingestion
+RUN mkdir -p /tmp/prom_chat /tmp/prom_ingestion /home/appuser/.cache/huggingface && \
+    chown -R appuser /tmp/prom_chat /tmp/prom_ingestion /home/appuser
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app" \

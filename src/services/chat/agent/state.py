@@ -78,10 +78,10 @@ def get_agent_settings() -> AgentSettings:
         max_empty_analytical_rounds=int(os.getenv("AGENT_MAX_EMPTY_ANALYTICAL_ROUNDS", "1")),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
         deadline_seconds=float(os.getenv("AGENT_DEADLINE_SECONDS", "180")),
-        max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "8")),
+        max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "7")),
         history_turns=int(os.getenv("AGENT_HISTORY_TURNS", "2")),
         history_assistant_tokens=int(os.getenv("AGENT_HISTORY_ASSISTANT_TOKENS", "600")),
-        max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "8")),
+        max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "6")),
         max_revivals_per_turn=int(os.getenv("AGENT_MAX_REVIVALS_PER_TURN", "3")),
     )
 
@@ -215,11 +215,14 @@ class AgentRunState:
         return not self.plan or self.sealed_by_coverage
 
     def unaccounted_keys(self) -> set[str]:
-        """Reported keys that produced neither a finding nor a gap — D4's reconciliation.
+        """Reported keys that produced neither a finding nor a gap — a debug signal.
 
         Non-empty means a report was ingested but vanished (an off-kind `record`, or refs
-        that resolved to nothing). The loop turns these into explicit gaps at `Stop`
-        rather than letting them close silently.
+        that resolved to nothing). These keys stay *open*: reconciling them into gaps
+        mid-loop would close them → `addressed` → `Stop("covered")` → `sealed`, serving an
+        aspect that produced no output at the trust level of a converged run. Left open,
+        the aspect stays searchable and the end-of-run sweep gaps it after
+        `plan_covered_at_stop` is snapshotted.
         """
         return self.reported_keys - self.addressed
 
@@ -327,6 +330,21 @@ def render_status(state: AgentRunState) -> str | None:
             "The last search returned no new evidence. The drivers you need are likely in "
             "a different section (a footnote, reconciliation, or segment table) — "
             "reformulate with terms targeting where the magnitudes are disclosed."
+        )
+    # Deliberately no "you have evidence but recorded nothing" nudge. Tried and reverted:
+    # turn 1 with nothing recorded is the normal state of a run about to drill down, so it
+    # traded the second search pass for an early report (traces af7363d9 vs df7654f6).
+    # Final turn: search tools are withheld, so the only move left is converting admitted
+    # evidence into observations. Deliberately routes the pressure into `substantiated:
+    # false` rather than into closure — a coerced substantiated claim citing a real but
+    # irrelevant label passes `_is_grounded`, closes its aspect, and silently promotes an
+    # iteration-capped run to `sealed`, dropping the "did not fully converge" caveat.
+    if state.iteration == state.effort.max_iterations - 1:
+        parts.append(
+            "Final turn — no further searches will run. Report every open aspect from the "
+            "evidence you have already retrieved. If an aspect is not supported by what "
+            "you have, report it with `substantiated: false` and state the absence in "
+            "`claim`. Anything left unreported is recorded as unresolved."
         )
     return " · ".join(parts) if parts else None
 

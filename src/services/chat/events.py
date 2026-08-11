@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
+import uuid
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,6 +81,41 @@ def error_event(exc: Exception, user_message: str | None = None) -> dict:
         "message": str(exc),
         "user_message": user_message or _GENERIC_USER_ERROR,
     }
+
+
+ActivityKind = Literal[
+    "stage_started",
+    "stage_ended",
+    "tool_call_started",
+    "tool_call_ended",
+    "round_started",
+]
+
+
+def build_activity_event(
+    kind: ActivityKind,
+    *,
+    event_id: str | None = None,
+    label: str | None = None,
+    parent_id: str | None = None,
+    detail: dict | None = None,
+) -> tuple[str, dict]:
+    """Build an `activity` event payload. Returns (id, event_data) — the id is the
+    caller's handle for emitting the matching `_ended` event later (e.g. `stage_ended`
+    or `tool_call_ended` reference the `_started` event's id, not its label), so
+    correlation doesn't depend on label/entity string matching under concurrency.
+
+    Pass `event_id` when closing a previously-started activity — it must be the id
+    returned for that activity's `_started` event, not a fresh one."""
+    event_id = event_id or str(uuid.uuid4())
+    data: dict = {"kind": kind, "id": event_id, "ts": time.time()}
+    if parent_id is not None:
+        data["parent_id"] = parent_id
+    if label is not None:
+        data["label"] = label
+    if detail is not None:
+        data["detail"] = detail
+    return event_id, data
 
 
 def _provenance_bbox_hints(provenance: ChunkProvenance | None) -> list[dict] | None:

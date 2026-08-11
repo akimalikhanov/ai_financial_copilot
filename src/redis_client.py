@@ -221,6 +221,31 @@ async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[s
     return event_id
 
 
+async def get_activity_log(redis: Redis, request_id: str) -> list[dict]:
+    """Replay the request's events stream and return the ordered `activity` events.
+
+    Read back rather than accumulated in-process: `activity` events are emitted from
+    both the pipeline (tasks.py) and the agent loop (agent/loop.py), and the stream is
+    already the single ordered record of everything either one sent — reading it back
+    avoids threading an accumulator across that module boundary.
+    """
+    stream_key = events_stream_key(request_id)
+    entries = await redis.xrange(stream_key)
+    activity: list[dict] = []
+    for _entry_id, fields in entries:
+        raw = fields.get("payload")
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "activity":
+            event = {k: v for k, v in event.items() if k != "type"}
+            activity.append(event)
+    return activity
+
+
 # Sliding-window rate limit for chat (LLM cost protection).
 # Uses Redis server time so the limiter is consistent across all API nodes (no clock drift).
 _SLIDING_WINDOW_LUA = """

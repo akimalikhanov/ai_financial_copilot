@@ -1,7 +1,7 @@
 defaults:
   params:
     temperature: 0.2
-    max_tokens: 2000
+    max_tokens: 6000
     # seed: null
     # reasoning_effort: null
     # verbosity: null
@@ -26,7 +26,11 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
-    params_override: {temperature: 1.0, max_tokens: 2000, verbosity: high, reasoning_effort: high}
+    params_override: {temperature: 1.0, max_tokens: 6000, verbosity: high, reasoning_effort: high}
+    # Same-provider fallback: smallest quality drop, still a reasoning-tier model.
+    # Covers capacity/rollout issues on the gpt-5.2 SKU specifically, not a full
+    # OpenAI outage. See llm_router.py LLMRouter.get_with_fallback / FallbackStream.
+    fallback_model: gpt-5-mini
 
   - id: gpt-5-mini
     label: "OpenAI GPT-5-mini"
@@ -58,6 +62,10 @@ models:
     # model (needs /v1/responses, which OpenAIAdapter doesn't implement) - stuck with
     # gpt-5-mini, which supports this combination on chat/completions today.
     params_override: {temperature: 1.0, reasoning_effort: medium, verbosity: low, max_tokens: 6000}
+    # Same-provider fallback for the agent tool-calling loop (AGENT_TOOL_MODEL).
+    # gpt-4o-mini has no reasoning_effort/verbosity tuning, so agent reasoning
+    # quality drops, but the loop keeps functioning instead of failing outright.
+    fallback_model: gpt-4o-mini
 
   - id: gpt-4o-mini
     label: "OpenAI GPT-4o-mini"
@@ -77,6 +85,10 @@ models:
       streaming: true
       tool_calling: true
     params_override: {}
+    # Cross-provider fallback: mutual pair with gemini-2.5-flash's fallback below,
+    # so each model covers the other's outage. Costs more than gpt-4o-mini per
+    # token, but only while the fallback is actually in use.
+    fallback_model: gemini-2.5-flash
 
   # === Google Gemini adapters ===
 
@@ -98,6 +110,10 @@ models:
       streaming: true
       tool_calling: true
     params_override: {}
+    # If gemini-2.5-flash errors on a retryable condition (e.g. 503), fall back
+    # to this model rather than failing the whole chat turn. See llm_router.py
+    # LLMRouter.get_with_fallback / FallbackStream.
+    fallback_model: gpt-4o-mini
 
   # === Local vLLM adapters ===
   - id: qwen3-8b

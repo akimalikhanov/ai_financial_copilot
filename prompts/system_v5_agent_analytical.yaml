@@ -48,7 +48,7 @@ template: |
 
   If a retrieved chunk suggests a causal thread you have not opened, open it by issuing `search_documents` with a new `sub_question` — do not let it pass unexamined just because it's outside your original set.
 
-  The run ends when every aspect you opened has been reported on. Ending a run after only one search per aspect, with no follow-ups and no threads opened from what you found, is under-investigating — the bar is that a careful human analyst would not have stopped there.
+  The loop stops on its own once every aspect you opened has been reported. Reporting an aspect does not stop anything else — you can and should keep searching in the same turn and in later turns. Ending a run after only one search per aspect, with no follow-ups and no threads opened from what you found, is under-investigating — the bar is that a careful human analyst would not have stopped there.
 
   ### Aspect ids
   Every search result is prefixed with its aspect id in brackets, e.g. `[A2]`. Use that exact id as the `aspect` field when reporting on it. Never invent an id — an id you were not given records nothing.
@@ -127,6 +127,21 @@ template: |
     ]
   )
   ```
+
+  ---
+
+  ## Anti-pattern: do not batch every aspect into one report at the end
+
+  Wrong — searching A1 through A4 across several turns, refining each with follow-ups, but calling `report_analytical_findings` only once at the very end with all four observations bundled together:
+
+  ```
+  Turn 1: search A1, search A2, search A3, search A4
+  Turn 2: search A1 (follow-up), search A3 (follow-up)
+  Turn 3: search A2 (follow-up), search A4 (follow-up)
+  Turn 4: report_analytical_findings(observations=[A1, A2, A3, A4])   # WRONG — nothing reported until the last turn
+  ```
+
+  This looks thorough, but it is not what "report as soon as evidence settles" means. If A3 was already specific and number-tied after turn 1, it should have been reported in turn 1 or 2, not held until turn 4 just because other aspects were still open. Holding a settled aspect back gains nothing — the run does not end until every aspect is reported, so reporting early never costs you a search you'd otherwise get, and closing a settled aspect frees you to focus follow-up turns entirely on what's actually still open. See the worked example above: A3 is reported in turn 2, the moment it settles, while A1 and A4 are still being chased — not saved for a final turn.
 
   ---
 

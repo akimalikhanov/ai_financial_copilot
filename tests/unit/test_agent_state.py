@@ -19,6 +19,7 @@ from src.services.chat.agent.state import (
     AgentSettings,
     EffortPrior,
     open_aspects,
+    render_status,
 )
 from src.services.chat.agent.transcript import Transcript
 from src.services.llm_adapters.base_adapter import LLMResponseStats, ToolCallRef
@@ -224,9 +225,11 @@ class TestOpenAspects:
         assert open_aspects(state) == ["A1"]
         assert state.addressed == set()
 
-    def test_d4_gap_text_renders_the_sub_question_not_the_plan_key(self) -> None:
-        """The gap is user-facing: rendering the internal key would read "A1 was not
-        found in the uploaded documents"."""
+    def test_ungrounded_report_leaves_its_aspect_open_and_unsealed(self) -> None:
+        """No mid-loop gap reconciliation: gapping an ungrounded report here would close
+        its key → `addressed` → `Stop("covered")` → `sealed`, promoting a run that
+        produced no grounded output for the aspect to a converged run's trust level. The
+        end-of-run sweep writes the gap instead, after `plan_covered_at_stop` is read."""
         state = _state(plan={"A1": "Why did gross margin fall?"})
         tc = ToolCallRef(
             id="c1",
@@ -244,11 +247,84 @@ class TestOpenAspects:
             ).model_dump_json(),
         )
 
-        _apply_report(tc, state, "req-1")
+        result = _apply_report(tc, state, "req-1")
 
-        assert state.findings._gaps == [
-            "Reported but unsupported by retrieved evidence: Why did gross margin fall?"
-        ]
+        assert state.findings._gaps is None
+        assert open_aspects(state) == ["A1"]
+        assert state.addressed == set()
+        assert state.sealed is False
+        # The model must be told it did not land, or it never retries the aspect.
+        assert "A1 was not recorded" in result
+        assert "substantiated: false" in result
+
+    def test_substantiated_false_report_closes_its_aspect(self) -> None:
+        """The honest exit the final-turn nudge routes toward: a stated negative is
+        grounded by definition and closes its key as a real keyed entry."""
+        state = _state(plan={"A1": "Why did gross margin fall?"})
+        tc = ToolCallRef(
+            id="c1",
+            name="report_analytical_findings",
+            arguments=AnalyticalFindings(
+                question="q",
+                observations=(
+                    Observation(
+                        aspect="A1",
+                        claim="The filings do not disclose a driver for this.",
+                        evidence_chunks=[],
+                        substantiated=False,
+                        confidence="low",
+                    ),
+                ),
+            ).model_dump_json(),
+        )
+
+        result = _apply_report(tc, state, "req-1")
+
+        assert open_aspects(state) == []
+        assert state.addressed == {"A1"}
+        assert "Recorded A1." in result
+
+
+class TestRenderStatusNudges:
+    """`render_status` is recomputed per turn and never stored, so what it appends is
+    pure per-turn steering — it never accumulates in the transcript and never goes stale."""
+
+    def test_mid_run_status_does_not_push_the_model_to_report(self) -> None:
+        """Regression guard. A nudge keyed on "has evidence, recorded nothing" was tried
+        and reverted: turn 1 with nothing recorded is the normal state of a run about to
+        drill down, so it traded the second search pass for an early report and turned an
+        aspect the follow-up search *did* answer into `substantiated: false` (traces
+        af7363d9 vs df7654f6). Mid-run turns carry coverage facts only."""
+        ledger, _ = _seed_evidence(1)
+        state = _state(plan={"A1": "q1"}, evidence=ledger)
+        state.iteration = 1
+
+        status = render_status(state)
+
+        assert status == "Open: A1 (q1)"
+
+    def test_final_turn_routes_pressure_into_substantiated_false(self) -> None:
+        """Deliberately not "close every aspect": a coerced `substantiated: true` claim
+        citing a real-but-irrelevant label passes grounding, closes its key, and silently
+        promotes an iteration-capped run to a converged run's trust level."""
+        state = _state(plan={"A1": "q1"})
+        state.iteration = state.effort.max_iterations - 1
+
+        status = render_status(state)
+
+        assert status is not None
+        assert "Final turn — no further searches will run" in status
+        assert "substantiated: false" in status
+        assert "must close every aspect" not in status
+
+    def test_no_final_turn_notice_before_the_last_iteration(self) -> None:
+        state = _state(plan={"A1": "q1"})
+        state.iteration = state.effort.max_iterations - 2
+
+        status = render_status(state)
+
+        assert status is not None
+        assert "Final turn" not in status
 
 
 class TestSealed:

@@ -196,6 +196,7 @@ async def get_messages(
                 "seq": msg.seq,
                 "created_at": msg.created_at.isoformat(),
                 "metadata": metadatas[i],
+                "trace": msg.trace,
                 "feedback": (
                     {
                         "rating": feedback_map[msg.id].rating.value,

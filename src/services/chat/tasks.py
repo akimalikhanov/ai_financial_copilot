@@ -34,7 +34,7 @@ from src.observability.metrics import (
     RAG_CONTEXT_TOKENS,
     ROUTER_DECISIONS,
 )
-from src.redis_client import add_event
+from src.redis_client import add_event, get_activity_log
 from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
@@ -46,6 +46,7 @@ from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
     ThinkingStripper,
+    build_activity_event,
     build_all_references,
     build_references_list,
     build_usage_event,
@@ -55,7 +56,7 @@ from src.services.chat.events import (
 )
 from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
-from src.services.llm_router import LLMRouter, get_router
+from src.services.llm_router import FallbackStream, LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
@@ -75,6 +76,17 @@ FINDINGS_BLOCK_MAX_CHARS = 20_000
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
     "agent_loop": "chain",
+}
+
+_STAGE_LABELS: dict[str, str] = {
+    "load_and_validate_request": "Loading request",
+    "build_conversation_context": "Building context",
+    "scan_user_input": "Scanning input",
+    "route_query": "Routing query",
+    "agent_loop": "Searching documents",
+    "render_prompt": "Rendering prompt",
+    "stream_llm_response": "Generating answer",
+    "persist_and_emit": "Finalizing",
 }
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
@@ -302,29 +314,26 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     agent_findings_json: str | None = None  # set by agent branch; used in persist
-    # 7 stages, plus scan_user_input when the guardrail is on.
-    stage_total = 7 + int(get_injection_scan_user_input_enabled())
-    stage_index = 0
     current_stage = "initializing"
+    current_stage_event_id: str | None = None
 
     async def _log_stage(stage_name: str, **extra_fields: Any) -> None:
-        nonlocal stage_index, current_stage, stage_start, _stage_stack
+        nonlocal current_stage, current_stage_event_id, stage_start, _stage_stack
         if current_stage != "initializing":
             stage_times[current_stage] = round(perf_counter() - stage_start, 3)
             _stage_stack.close()
-        stage_index += 1
-        current_stage = f"{stage_index:02d}_{stage_name}"
+            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            await add_event(redis_app, request_id, "activity", end_data)
+        current_stage = stage_name
         stage_start = perf_counter()
         logger.info(
-            f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
+            f"pipeline.stage {stage_name}",
             extra={"request_id": request_id, "stage": stage_name, **extra_fields},
         )
-        await add_event(
-            redis_app,
-            request_id,
-            "stage",
-            {"stage": stage_name, "index": stage_index, "total": stage_total},
+        current_stage_event_id, start_data = build_activity_event(
+            "stage_started", label=_STAGE_LABELS.get(stage_name, stage_name.replace("_", " "))
         )
+        await add_event(redis_app, request_id, "activity", start_data)
         _stage_stack = contextlib.ExitStack()
         if lf:
             _stage_stack.enter_context(
@@ -788,13 +797,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             # ~4 chars/token heuristic — a cheap, bounded proxy for synthesis context size.
             RAG_CONTEXT_TOKENS.observe(len(state.rag_context_str or "") / 4)
             try:
-                llm = router.get(llm_request.model)
+                llm_chain = router.get_with_fallback(llm_request.model)
             except Exception as e:
                 logger.exception("llm_router_error", extra={"request_id": request_id})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
                 return
+            llm = llm_chain[0]
 
             prompt_version = "v4_agent_synthesis"
 
@@ -843,8 +853,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 k: v for k, v in state.params.items() if k not in ("temperature", "max_tokens")
             }
 
-            stream = llm.stream(
-                messages=state.adapter_messages,
+            stream = FallbackStream(
+                llm_chain,
+                state.adapter_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **extra,
@@ -868,6 +879,17 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         )
                     for span in result.completed_spans:
                         await add_event(redis_app, request_id, "citation_span", span_to_dict(span))
+
+                if stream.served is not llm:
+                    # Fallback fired: record the model that actually answered, not the
+                    # one originally requested, so cost/token metrics and the persisted
+                    # request row aren't attributed to a model that never responded.
+                    llm = stream.served
+                    llm_request.model = llm.model_id
+                    logger.warning(
+                        "llm_fallback_served",
+                        extra={"request_id": request_id, "served_model": llm.model_id},
+                    )
 
                 if chunk is not None:
                     final_result = parser.finalize()
@@ -952,6 +974,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     trace_payload: dict = {
                         "v": 1,
                         "stage_times": stage_times,
+                        "activity": await get_activity_log(redis_app, request_id),
                         "total_time": total_time,
                         "router": {
                             "decision": state.router_output.route,
@@ -1183,9 +1206,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         )
 
     except Exception as exc:
-        # current_stage is "NN_stage_name" (or "initializing") — strip the ordinal
-        # prefix so the label stays stable across stage reordering.
-        PIPELINE_ERRORS.labels(current_stage.split("_", 1)[-1]).inc()
+        PIPELINE_ERRORS.labels(current_stage).inc()
         logger.exception(
             "pipeline.failed_at_stage",
             extra={"request_id": request_id, "stage": current_stage},
@@ -1200,6 +1221,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         await add_event(redis_app, request_id, "error", error_event(exc))
         raise
     finally:
+        if current_stage != "initializing" and current_stage_event_id is not None:
+            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            await add_event(redis_app, request_id, "activity", end_data)
         _stage_stack.close()
         _gen_stack.close()
         _lf_stack.close()

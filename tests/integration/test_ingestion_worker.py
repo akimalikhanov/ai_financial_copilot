@@ -118,10 +118,10 @@ def _mock_ingestion_services():
         patch("src.services.ingestion.chunker.chunk_document") as mock_chunk,
         patch("src.services.ingestion.embedder.embed_chunks") as mock_embed,
         patch("src.services.ingestion.qdrant_ingest.ensure_collection") as mock_qdrant_ensure,
-        patch("src.services.ingestion.qdrant_ingest.delete_by_chunk_ids") as mock_qdrant_delete,
+        patch("src.services.ingestion.qdrant_ingest.delete_by_document") as mock_qdrant_delete,
         patch("src.services.ingestion.qdrant_ingest.upsert_chunks") as mock_qdrant_upsert,
         patch("src.services.ingestion.opensearch_ingest.ensure_index") as mock_os_ensure,
-        patch("src.services.ingestion.opensearch_ingest.bulk_delete") as mock_os_delete,
+        patch("src.services.ingestion.opensearch_ingest.delete_by_document") as mock_os_delete,
         patch("src.services.ingestion.opensearch_ingest.bulk_index") as mock_os_bulk,
     ):
         mock_s3_download.return_value = Path("/tmp/fake_doc.pdf")

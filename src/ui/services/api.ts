@@ -106,20 +106,23 @@ export interface MetadataEvent {
   route: string | null;
 }
 
-export interface StageEvent {
-  stage: string;
-  index: number;
-  total: number;
-}
+/** Unified event replacing the old StageEvent/ToolCallStarted/CompletedEvent/agent_turn_started/
+ * agent_synthesis_starting shapes. `_started` kinds carry `label`; `_ended` kinds are correlated
+ * to their `_started` counterpart via `id`, not by label/entity matching. */
+export type ActivityKind =
+  | 'stage_started'
+  | 'stage_ended'
+  | 'tool_call_started'
+  | 'tool_call_ended'
+  | 'round_started';
 
-export interface ToolCallStartedEvent {
-  entity: string;
-}
-
-export interface ToolCallCompletedEvent {
-  entity: string;
-  chunks_returned: number;
-  new_chunks_added: number;
+export interface ActivityEvent {
+  kind: ActivityKind;
+  id: string;
+  parent_id?: string;
+  label?: string;
+  detail?: Record<string, unknown>;
+  ts: number;
 }
 
 export interface ConversationTitleEvent {
@@ -268,9 +271,17 @@ const parseSseEvent = (rawEvent: string): SseEvent | null => {
 
 // --- Models API ---
 
+export interface ModelDefaultParams {
+  temperature?: number;
+  max_tokens?: number;
+  reasoning_effort?: 'low' | 'medium' | 'high' | null;
+  verbosity?: 'low' | 'medium' | 'high' | null;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
+  default_params: ModelDefaultParams;
 }
 
 export interface ModelsResponse {
@@ -648,6 +659,7 @@ export interface MessageResponse {
   seq: number;
   created_at: string;
   metadata?: Record<string, unknown>;
+  trace?: { activity?: ActivityEvent[] } | null;
   feedback?: MessageFeedbackPayload | null;
 }
 
@@ -774,14 +786,12 @@ export const chatStreamSubscribe = async (
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
-  onStage?: (stage: StageEvent) => void,
-  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
-  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
 ): Promise<void> => {
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage, onToolCallStarted, onToolCallCompleted, onConversationTitle
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onActivity, onConversationTitle
     );
     if (result === 'done' || result === 'server-error') return;
     // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
@@ -809,9 +819,7 @@ async function _doStreamAttempt(
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
-  onStage?: (stage: StageEvent) => void,
-  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
-  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
 ): Promise<'done' | 'server-error' | 'connection-error'> {
   const params = new URLSearchParams({ request_id: requestId });
@@ -890,20 +898,9 @@ async function _doStreamAttempt(
           } catch { /* ignore malformed */ }
           continue;
         }
-        // Handle stage progress events
-        if (parsed.event === 'stage') {
-          try {
-            const s = JSON.parse(parsed.data) as StageEvent;
-            onStage?.(s);
-          } catch { /* ignore malformed */ }
-          continue;
-        }
-        if (parsed.event === 'tool_call_started') {
-          try { onToolCallStarted?.(JSON.parse(parsed.data) as ToolCallStartedEvent); } catch { /* ignore */ }
-          continue;
-        }
-        if (parsed.event === 'tool_call_completed') {
-          try { onToolCallCompleted?.(JSON.parse(parsed.data) as ToolCallCompletedEvent); } catch { /* ignore */ }
+        // Handle agent/pipeline activity events (stage + round + tool-call lifecycle)
+        if (parsed.event === 'activity') {
+          try { onActivity?.(JSON.parse(parsed.data) as ActivityEvent); } catch { /* ignore malformed */ }
           continue;
         }
         if (parsed.event === 'conversation_title') {

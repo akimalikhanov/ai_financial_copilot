@@ -342,8 +342,9 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
     )
 
     assert result.entity == "Acme"
-    started = [p for n, p in events if n == "tool_call_started"]
-    assert started and started[0]["entity"] == "Acme"
+    started = [p for n, p in events if n == "activity" and p["kind"] == "tool_call_started"]
+    assert started and started[0]["label"] == "Acme"
+    assert result.activity_id == started[0]["id"]
 
 
 @pytest.mark.asyncio

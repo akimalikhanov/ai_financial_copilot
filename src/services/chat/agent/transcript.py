@@ -163,7 +163,7 @@ class Transcript:
     def append_tool_calls(self, tool_calls: list[ToolCallRef]) -> None:
         self.messages.append(assistant_msg_with_tool_calls(tool_calls))
 
-    def compress(self, evidence: EvidenceLedger | None = None, keep_last_n_turns: int = 1) -> None:
+    def compress(self, evidence: EvidenceLedger | None = None, keep_last_n_turns: int = 2) -> None:
         """Evict bulky tool-result context from all but the most recent turn(s).
 
         Aggressive by default (`keep_last_n_turns=1`): only the latest turn's rendered
