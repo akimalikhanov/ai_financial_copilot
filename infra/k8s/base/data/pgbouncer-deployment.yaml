@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgbouncer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgbouncer
+    spec:
+      initContainers:
+        # Replaces compose's `depends_on: {postgres: {condition: service_healthy}}`.
+        # Re-run on every pod restart, not just once at first start — stronger than
+        # compose's depends_on, but still not a substitute for retries at runtime.
+        - name: wait-for-postgres
+          image: postgres:16.11-alpine       # reuse an image that already has the client
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER"; do
+                echo "waiting for postgres:5432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.24.1-p1
+          command: ["/bin/sh", "/pgbouncer-entrypoint.sh"]
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+          envFrom:
+            - configMapRef: { name: postgres-config }   # POSTGRES_DB, APP_DB, APP_DB_USER, LANGFUSE_DB, LANGFUSE_DB_USER
+            - secretRef:    { name: postgres-secret }   # POSTGRES_USER/PASSWORD, APP_DB_PASSWORD, LANGFUSE_DB_PASSWORD
+          env:
+            # Where Postgres is reachable from PgBouncer
+            - name: PGB_POSTGRES_HOST
+              value: postgres
+            - name: PGB_POSTGRES_PORT
+              value: "5432"
+            # PgBouncer listen
+            - name: PGB_LISTEN_ADDR
+              value: "0.0.0.0"
+            - name: PGB_LISTEN_PORT
+              value: "6432"
+          volumeMounts:
+            - name: pgbouncer-entrypoint
+              mountPath: /pgbouncer-entrypoint.sh
+              subPath: pgbouncer-entrypoint.sh
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -p 6432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c 'SELECT 1' >/dev/null
+            periodSeconds: 5      # compose: interval 5s
+            timeoutSeconds: 3     # compose: timeout 3s
+            failureThreshold: 10  # compose: retries 10
+          resources:
+            requests: { cpu: "60m", memory: "32Mi" }
+            limits:   { cpu: "250m", memory: "128Mi" }   # compose: cpus 0.25 / mem_limit 128m
+      volumes:
+        - name: pgbouncer-entrypoint
+          configMap:
+            name: pgbouncer-entrypoint
+            defaultMode: 0o755          # entrypoint script must be executable

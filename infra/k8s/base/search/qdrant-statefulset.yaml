@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: copilot
+spec:
+  serviceName: qdrant-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qdrant
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qdrant
+    spec:
+      # Qdrant runs as non-root in newer images; local-path volumes are created
+      # root-owned, so without this the container hits "Permission denied" on
+      # /qdrant/storage. Same fix ClickHouse needs later (compose pins user: "101:101").
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.16.3
+          ports:
+            - name: http
+              containerPort: 6333
+            - name: grpc
+              containerPort: 6334
+          volumeMounts:
+            - name: data
+              mountPath: /qdrant/storage
+          # qdrant's image ships no curl/wget, which is exactly why compose needed the
+          # qdrant-hc busybox sidecar polling /readyz from outside the container. httpGet
+          # probes are executed by the kubelet, not inside the container, so the sidecar
+          # and its depends_on: condition: service_healthy chain don't need to exist here.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 6333 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /healthz, port: 6333 }
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "500m", memory: "1536Mi" }
+            limits:   { cpu: "2",    memory: "3Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

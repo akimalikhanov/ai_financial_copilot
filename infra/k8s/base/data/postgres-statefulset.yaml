@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: copilot
+spec:
+  serviceName: postgres-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.11-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - configMapRef: { name: postgres-config }   # POSTGRES_DB, APP_DB, APP_DB_USER, LANGFUSE_DB, LANGFUSE_DB_USER
+            - secretRef:    { name: postgres-secret }   # POSTGRES_USER/PASSWORD, APP_DB_PASSWORD, LANGFUSE_DB_PASSWORD
+          env:
+            # The image writes PGDATA at the volume root; local-path volumes are
+            # not empty (lost+found is absent here, but keep the subdir habit —
+            # it is mandatory on EBS in Stage 19).
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10     # compose: start_period 20s
+            periodSeconds: 5            # compose: interval 5s
+            timeoutSeconds: 3           # compose: timeout 3s
+            failureThreshold: 10        # compose: retries 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi" }   # compose: cpus 2.00 / mem_limit 2g
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+            defaultMode: 0o755          # ENTRYPOINT only executes *.sh that are executable
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

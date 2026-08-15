@@ -44,7 +44,7 @@ CLAUDE.md
 experiments/
 infra/docker/garage/secrets/*
 docs/
-data/
+/data/
 specs/
 
 test.txt

@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: copilot
+
+resources:
+  - ../../base
+
+commonLabels:
+  app.kubernetes.io/part-of: copilot
+
+secretGenerator:
+  - name: postgres-secret
+    envs: [secrets/postgres.env]        # gitignored
+  - name: redis-secret
+    envs: [secrets/redis.env]           # gitignored; shared by redis-app and redis-broker
+  # later phases add: clickhouse-secret, langfuse-secret,
+  # garage-secret, grafana-secret, app-secret
+
+generatorOptions:
+  disableNameSuffixHash: false          # keep hashing ON (that's the point)
+
+patches:
+  - path: patches/small-pvcs.yaml
+    target: { kind: StatefulSet }

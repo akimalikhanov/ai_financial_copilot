@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-broker-headless
+  namespace: copilot
+spec:
+  clusterIP: None            # headless: no VIP, DNS returns pod IPs directly
+  selector:
+    app.kubernetes.io/name: redis-broker
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-broker              # <- REDIS_BROKER_HOST, the name the api/workers dial
+  namespace: copilot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis-broker
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
