@@ -4,4 +4,21 @@ kind: Kustomization
 resources:
   - qdrant-service.yaml
   - qdrant-statefulset.yaml
-  # later phases add: opensearch, opensearch-dashboards, elasticsearch, es-bootstrap Job
+  - opensearch-service.yaml
+  - opensearch-statefulset.yaml
+  # opensearch-dashboards lives in the kind overlay (dev-only), not here
+  - elasticsearch-service.yaml
+  - elasticsearch-statefulset.yaml
+  - es-bootstrap-job.yaml
+
+# es-bootstrap/*.{sh,json} are copies of infra/docker/elasticsearch/{bootstrap.sh,ilm-policy.json,
+# index-template.json}, kept under this kustomization root so configMapGenerator never needs
+# --load-restrictor LoadRestrictionsNone. infra/docker/elasticsearch/ remains the source of truth:
+# run `make k8s-sync-es-bootstrap` after editing any of them. `make lint` (and CI) runs
+# `make k8s-check-es-bootstrap` to fail loudly on drift instead of silently diverging.
+configMapGenerator:
+  - name: es-bootstrap-scripts
+    files:
+      - es-bootstrap/bootstrap.sh
+      - es-bootstrap/ilm-policy.json
+      - es-bootstrap/index-template.json

@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opensearch
+  namespace: copilot
+spec:
+  serviceName: opensearch-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opensearch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensearch
+    spec:
+      # vm.max_map_count is a node-wide kernel setting (Lucene mmaps segment files),
+      # not a per-container one — compose relied on the Docker host already having it
+      # set. There's no per-pod equivalent in K8s, so an initContainer sets it on the
+      # node directly, once, before the main container starts. Elasticsearch (Phase 7)
+      # benefits from the same node-wide setting without repeating this.
+      # `capabilities.add: [SYS_ADMIN]` alone is not enough: runc masks /proc/sys as
+      # read-only for every non-privileged container regardless of granted capabilities
+      # (verified — SYS_ADMIN-only fails with "Read-only file system"). privileged: true
+      # is what actually removes that masking. See docs/notes/k8s-memory-management-kind-vs-eks.md.
+      initContainers:
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.19.0
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: OPENSEARCH_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"
+            # compose also set bootstrap.memory_lock: true + ulimits.memlock: -1 to mlock
+            # the heap against swapping. K8s has no per-pod ulimits field at all, so that
+            # can't be ported — dropped here (see docs/notes/k8s-memory-management-kind-vs-eks.md).
+            - name: DISABLE_SECURITY_PLUGIN     # DEV ONLY
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 9200
+            - name: metrics
+              containerPort: 9600
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/opensearch/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -q '\"status\"'"]
+            initialDelaySeconds: 60      # compose: start_period 60s
+            periodSeconds: 20            # compose: interval 20s
+            timeoutSeconds: 10           # compose: timeout 10s
+            failureThreshold: 10         # compose: retries 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -q '\"status\"'"]
+            initialDelaySeconds: 60
+            periodSeconds: 30            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            # requests ~= heap (1g) + JVM/off-heap overhead; limits mirror the compose ceiling.
+            requests: { cpu: "750m",  memory: "1280Mi" }
+            limits:   { cpu: "1500m", memory: "1536Mi" }   # compose: cpus 1.50 / mem_limit 1536m
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

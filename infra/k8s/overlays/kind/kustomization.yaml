@@ -4,6 +4,8 @@ namespace: copilot
 
 resources:
   - ../../base
+  - opensearch-dashboards-deployment.yaml
+  - opensearch-dashboards-service.yaml
 
 commonLabels:
   app.kubernetes.io/part-of: copilot
@@ -13,12 +15,24 @@ secretGenerator:
     envs: [secrets/postgres.env]        # gitignored
   - name: redis-secret
     envs: [secrets/redis.env]           # gitignored; shared by redis-app and redis-broker
-  # later phases add: clickhouse-secret, langfuse-secret,
-  # garage-secret, grafana-secret, app-secret
+  - name: garage-secret
+    envs: [secrets/garage.env]          # gitignored
+  # later phases add: clickhouse-secret, langfuse-secret, grafana-secret, app-secret
 
 generatorOptions:
   disableNameSuffixHash: false          # keep hashing ON (that's the point)
 
 patches:
+  # Scoped by name (not blanket kind) because Kustomize's strategic-merge on
+  # volumeClaimTemplates has no recognized merge key for this field — a patch's list *replaces*
+  # the whole array on any object it targets, rather than merging by name. That's fine for every
+  # StatefulSet here with exactly one "data" claim, but would silently drop garage's second
+  # ("meta") claim if this patch also matched it — see patches/garage-small-pvcs.yaml.
   - path: patches/small-pvcs.yaml
-    target: { kind: StatefulSet }
+    target:
+      kind: StatefulSet
+      name: "^(postgres|redis-app|redis-broker|qdrant|opensearch|elasticsearch)$"
+  - path: patches/garage-small-pvcs.yaml
+    target:
+      kind: StatefulSet
+      name: garage

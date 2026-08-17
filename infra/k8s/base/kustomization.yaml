@@ -5,4 +5,5 @@ resources:
   - namespace.yaml
   - data
   - search
-  # later phases add: storage, langfuse, observability, app
+  - storage
+  # later phases add: langfuse, observability, app

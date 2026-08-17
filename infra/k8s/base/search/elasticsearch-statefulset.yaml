@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: copilot
+spec:
+  serviceName: elasticsearch-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: elasticsearch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: elasticsearch
+    spec:
+      # Same vm.max_map_count node-wide sysctl OpenSearch needs (Phase 6) — Elasticsearch
+      # is also Lucene-backed. If both land on the same kind node the setting is already
+      # applied, but keep this here so the StatefulSet is correct standalone too.
+      # privileged: true is required — capabilities.add: [SYS_ADMIN] alone is not enough,
+      # see the comment on opensearch-statefulset.yaml's identical initContainer.
+      initContainers:
+        - name: sysctl
+          image: busybox:1.36
+          command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.18.1
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: xpack.security.enabled     # DEV ONLY
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+          ports:
+            - name: http
+              containerPort: 9200
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+            initialDelaySeconds: 60      # compose: start_period 60s
+            periodSeconds: 15            # compose: interval 15s
+            timeoutSeconds: 10           # compose: timeout 10s
+            failureThreshold: 10         # compose: retries 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+            initialDelaySeconds: 60
+            periodSeconds: 30            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            # requests ~= heap (512m) + JVM/off-heap overhead; limits mirror the compose ceiling.
+            requests: { cpu: "500m", memory: "768Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }   # compose: cpus 1.00 / mem_limit 1g
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
