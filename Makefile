@@ -60,6 +60,29 @@ docker-rebuild:
 	cd infra/docker && docker compose --env-file ../../.env up -d --build
 	docker image prune -f
 
+# :dev tag (not :latest) — imagePullPolicy: IfNotPresent means the kind node reuses whatever
+# was last loaded rather than trying (and failing, no registry) to pull. Must re-run
+# k8s-load-api after every rebuild since the tag never changes.
+.PHONY: docker-build-api
+docker-build-api:
+	docker build -f infra/docker/Dockerfile.api -t copilot/api:dev .
+
+.PHONY: k8s-load-api
+k8s-load-api:
+	kind load docker-image copilot/api:dev --name copilot
+
+# NGINX_CONF_VARIANT=nginx.k8s.conf: plain proxy_pass (no Compose-only resolver trick,
+# see src/ui/nginx.k8s.conf). Must re-run after any frontend source or nginx.k8s.conf change.
+.PHONY: docker-build-frontend
+docker-build-frontend:
+	docker build -f infra/docker/Dockerfile.frontend \
+	  --build-arg NGINX_CONF_VARIANT=nginx.k8s.conf \
+	  -t copilot/frontend:dev .
+
+.PHONY: k8s-load-frontend
+k8s-load-frontend:
+	kind load docker-image copilot/frontend:dev --name copilot
+
 .PHONY: k8s-up
 k8s-up:
 	kind create cluster --config infra/k8s/kind-cluster.yaml
@@ -146,4 +169,22 @@ k8s-secrets:
 	    echo "AWS_SECRET_ACCESS_KEY=$$SECRET_KEY"; \
 	  } >> $(K8S_SECRETS)/app.env; \
 	  echo "wrote AWS_* creds into $(K8S_SECRETS)/app.env"; }
+	@# Phase 10 (app tier): JWT_SECRET is generated fresh; APP_DB_PASSWORD/REDIS_PASSWORD are
+	@# copied from the postgres/redis secret files generated above (single source of truth,
+	@# api container just needs its own secretRef with the same values). LLM provider keys and
+	@# the Langfuse keypair are external/not-yet-generated — left blank for manual entry.
+	@grep -q '^JWT_SECRET=' $(K8S_SECRETS)/app.env || { \
+	  APP_DB_PASSWORD="$$(grep '^APP_DB_PASSWORD=' $(K8S_SECRETS)/postgres.env | cut -d= -f2)"; \
+	  REDIS_PASSWORD="$$(grep '^REDIS_PASSWORD=' $(K8S_SECRETS)/redis.env | cut -d= -f2)"; \
+	  { echo "JWT_SECRET=$$(openssl rand -base64 32 | tr -d '/+=')"; \
+	    echo "OPENAI_API_KEY="; \
+	    echo "GOOGLE_API_KEY="; \
+	    echo "HF_TOKEN="; \
+	    echo "APP_DB_USER=app"; \
+	    echo "APP_DB_PASSWORD=$$APP_DB_PASSWORD"; \
+	    echo "REDIS_PASSWORD=$$REDIS_PASSWORD"; \
+	    echo "LANGFUSE_PUBLIC_KEY="; \
+	    echo "LANGFUSE_SECRET_KEY="; \
+	  } >> $(K8S_SECRETS)/app.env; \
+	  echo "wrote JWT_SECRET/APP_DB_*/REDIS_PASSWORD into $(K8S_SECRETS)/app.env (fill in LLM/Langfuse keys manually)"; }
 	@# ... one such block per secret file; extend in Phases 15, 16

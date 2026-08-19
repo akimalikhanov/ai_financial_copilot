@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+    spec:
+      # Replaces compose's five `depends_on: {condition: service_healthy|service_started}`
+      # entries. qdrant-hc is gone (Phase 5 retired the sidecar; qdrant's own readinessProbe
+      # covers it) and fluent-bit is gone (Phase 14's DaemonSet tails node logs, so the app no
+      # longer needs the collector up first — a genuine robustness improvement over compose).
+      initContainers:
+        - name: wait-for-pgbouncer
+          image: postgres:16.11-alpine       # reuse an image that already has the client
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h pgbouncer -p 6432 -U "$APP_DB_USER"; do
+                echo "waiting for pgbouncer:6432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-app
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-app -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-app:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-broker
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-broker -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-broker:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-opensearch
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://opensearch:9200/_cluster/health >/dev/null 2>&1; do
+                echo "waiting for opensearch:9200"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-garage
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              # Garage's S3 endpoint 403s unauthenticated GETs (by design, no anonymous
+              # access) — that's proof it's up and answering, so don't use curl -f here.
+              until curl -sS -o /dev/null http://garage:3900; do
+                echo "waiting for garage:3900"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: api
+          image: copilot/api:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          # Order matters: later entries win, explicit env: below beats all of these.
+          # Same precedence compose's env_file + environment: override gives.
+          envFrom:
+            - configMapRef: { name: app-config }      # tuning knobs
+            - configMapRef: { name: app-endpoints }    # in-cluster hosts/ports
+            - secretRef:    { name: app-secret }       # credentials
+          env:
+            - name: LOG_FILE
+              value: ""
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30    # compose start_period: 30s
+            periodSeconds: 15          # compose interval: 15s
+            failureThreshold: 5        # compose retries: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "2Gi" }   # compose: cpus 2.00 / mem_limit 2g
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api             # in-cluster DNS name; also what port-forward targets
+  namespace: copilot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

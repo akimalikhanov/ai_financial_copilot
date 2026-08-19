@@ -6,6 +6,7 @@ resources:
   - ../../base
   - opensearch-dashboards-deployment.yaml
   - opensearch-dashboards-service.yaml
+  - ingress.yaml
 
 commonLabels:
   app.kubernetes.io/part-of: copilot
@@ -17,7 +18,9 @@ secretGenerator:
     envs: [secrets/redis.env]           # gitignored; shared by redis-app and redis-broker
   - name: garage-secret
     envs: [secrets/garage.env]          # gitignored
-  # later phases add: clickhouse-secret, langfuse-secret, grafana-secret, app-secret
+  - name: app-secret
+    envs: [secrets/app.env]             # gitignored
+  # later phases add: clickhouse-secret, langfuse-secret, grafana-secret
 
 generatorOptions:
   disableNameSuffixHash: false          # keep hashing ON (that's the point)

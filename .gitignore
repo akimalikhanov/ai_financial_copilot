@@ -58,3 +58,5 @@ scripts/
 src/eval/rescore_drivers.py
 infra/docker/export_volumes.sh
 infra/docker/import_volumes.sh
+.agents
+skills-lock.json

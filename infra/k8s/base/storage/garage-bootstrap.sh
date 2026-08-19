@@ -81,6 +81,14 @@ else
   echo "Key '$KEY_NAME' imported."
 fi
 
+# is expanded to:
+# curl -fsS -X POST \
+#   -H "Authorization: Bearer <token>" \
+#   -H "Content-Type: application/json" \
+#   -d '{"accessKeyId":"...","secretAccessKey":"...","name":"app-key"}' \
+#   "http://garage:3903/v2/ImportKey"
+
+
 # Allow key on buckets
 BUCKETS_JSON="$(api_get /v2/ListBuckets)"
 for b in $BUCKETS; do
