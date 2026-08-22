@@ -60,32 +60,121 @@ docker-rebuild:
 	cd infra/docker && docker compose --env-file ../../.env up -d --build
 	docker image prune -f
 
-# :dev tag (not :latest) — imagePullPolicy: IfNotPresent means the kind node reuses whatever
-# was last loaded rather than trying (and failing, no registry) to pull. Must re-run
-# k8s-load-api after every rebuild since the tag never changes.
+# Local registry (docs/notes/gpu-on-local-k8s-review.md §9) replacing `kind load`, which
+# re-imports the whole image on every rebuild. SHA tags make IfNotPresent correct by construction.
+GIT_SHA ?= $(shell git rev-parse --short HEAD)
+REGISTRY := localhost:5001
+
+.PHONY: k8s-registry
+k8s-registry:
+	@docker inspect kind-registry >/dev/null 2>&1 || \
+	  docker run -d --restart=always -p "127.0.0.1:5001:5000" --name kind-registry registry:3
+	@docker network inspect kind >/dev/null 2>&1 && \
+	  { docker network connect kind kind-registry 2>/dev/null || true; } || \
+	  echo "kind network not found yet — connect after k8s-up: docker network connect kind kind-registry"
+
 .PHONY: docker-build-api
 docker-build-api:
-	docker build -f infra/docker/Dockerfile.api -t copilot/api:dev .
+	docker build -f infra/docker/Dockerfile.api -t $(REGISTRY)/copilot/api:$(GIT_SHA) .
 
-.PHONY: k8s-load-api
-k8s-load-api:
-	kind load docker-image copilot/api:dev --name copilot
+.PHONY: k8s-push-api
+k8s-push-api:
+	docker push $(REGISTRY)/copilot/api:$(GIT_SHA)
 
 # NGINX_CONF_VARIANT=nginx.k8s.conf: plain proxy_pass (no Compose-only resolver trick,
-# see src/ui/nginx.k8s.conf). Must re-run after any frontend source or nginx.k8s.conf change.
+# see src/ui/nginx.k8s.conf).
 .PHONY: docker-build-frontend
 docker-build-frontend:
 	docker build -f infra/docker/Dockerfile.frontend \
 	  --build-arg NGINX_CONF_VARIANT=nginx.k8s.conf \
-	  -t copilot/frontend:dev .
+	  -t $(REGISTRY)/copilot/frontend:$(GIT_SHA) .
 
-.PHONY: k8s-load-frontend
-k8s-load-frontend:
-	kind load docker-image copilot/frontend:dev --name copilot
+.PHONY: k8s-push-frontend
+k8s-push-frontend:
+	docker push $(REGISTRY)/copilot/frontend:$(GIT_SHA)
 
+# Shared image for both workers (Dockerfile.worker); they differ only by the `command:`
+# in their Deployments, exactly as compose differentiates them by `command:`.
+.PHONY: docker-build-worker
+docker-build-worker:
+	docker build -f infra/docker/Dockerfile.worker -t $(REGISTRY)/copilot/worker:$(GIT_SHA) .
+
+.PHONY: k8s-push-worker
+k8s-push-worker:
+	docker push $(REGISTRY)/copilot/worker:$(GIT_SHA)
+
+# Generated-only sibling of overlays/kind holding just the images: transformer — `kustomize
+# edit set image` rewrites the whole file, which would destroy overlays/kind's hand comments.
+# Never apply overlays/kind directly: it carries base's placeholder `copilot/*:dev` names,
+# which resolve nowhere now that images live in the registry. K8S_OVERLAY is the only apply
+# path, and every target that applies it depends on k8s-set-images to generate it first.
+K8S_OVERLAY := infra/k8s/overlays/kind-deploy
+
+.PHONY: k8s-set-images
+k8s-set-images:
+	@mkdir -p $(K8S_OVERLAY)
+	@printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - ../kind\n' \
+	  > $(K8S_OVERLAY)/kustomization.yaml
+	cd $(K8S_OVERLAY) && kustomize edit set image \
+	  copilot/api=$(REGISTRY)/copilot/api:$(GIT_SHA) \
+	  copilot/frontend=$(REGISTRY)/copilot/frontend:$(GIT_SHA) \
+	  copilot/worker=$(REGISTRY)/copilot/worker:$(GIT_SHA)
+
+# Full build+push+deploy loop; use individual docker-build-*/k8s-push-* targets to iterate on one service.
+.PHONY: k8s-deploy
+k8s-deploy: docker-build-api docker-build-frontend docker-build-worker
+	$(MAKE) k8s-push-api k8s-push-frontend k8s-push-worker k8s-set-images
+	kubectl apply -k $(K8S_OVERLAY)
+
+# Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run
+# after editing the Dockerfile; tag must match kind-cluster.yaml's `image:`.
+.PHONY: k8s-node-image
+k8s-node-image:
+	docker build -t copilot/kind-node:v1.36.1-nvidia1.18.1 \
+	  -f infra/k8s/node-image/Dockerfile infra/k8s/node-image
+
+# Creates the cluster with GPU access (custom node image + extraMounts) and the GPU device
+# plugin. Host-side GPU prereqs are one-time per machine; see k8s-gpu-preflight below.
 .PHONY: k8s-up
-k8s-up:
+k8s-up: k8s-gpu-preflight
 	kind create cluster --config infra/k8s/kind-cluster.yaml
+	$(MAKE) k8s-registry
+	$(MAKE) k8s-gpu-plugin
+
+# Verifies the host-side GPU prerequisites before creating a cluster, so failures surface
+# here with an actionable message instead of as a Pending pod an hour later.
+.PHONY: k8s-gpu-preflight
+k8s-gpu-preflight:
+	@command -v nvidia-ctk >/dev/null || { echo "FAIL: nvidia-container-toolkit not installed"; exit 1; }
+	@nvidia-smi -L >/dev/null 2>&1 || { echo "FAIL: nvidia-smi cannot see a GPU"; exit 1; }
+	@docker info 2>/dev/null | grep -q 'Runtimes:.*nvidia' || \
+	  { echo "FAIL: docker has no 'nvidia' runtime. Run: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"; exit 1; }
+	@docker info 2>/dev/null | grep -q 'Default Runtime: nvidia' || \
+	  { echo "FAIL: docker default runtime is not nvidia — kind creates its node container without a GPU otherwise."; \
+	     echo "      Run: sudo nvidia-ctk runtime configure --runtime=docker --set-as-default && sudo systemctl restart docker"; exit 1; }
+	@grep -q '^[[:space:]]*accept-nvidia-visible-devices-as-volume-mounts[[:space:]]*=[[:space:]]*true' \
+	  /etc/nvidia-container-runtime/config.toml || \
+	  { echo "FAIL: accept-nvidia-visible-devices-as-volume-mounts is not true."; \
+	     echo "      Run: sudo nvidia-ctk config --set accept-nvidia-visible-devices-as-volume-mounts=true --in-place"; exit 1; }
+	@# envvar-when-unprivileged is the self-grant bypass path and must be false.
+	@grep -q '^[[:space:]]*accept-nvidia-visible-devices-envvar-when-unprivileged[[:space:]]*=[[:space:]]*false' \
+	  /etc/nvidia-container-runtime/config.toml || \
+	  { echo "FAIL: accept-nvidia-visible-devices-envvar-when-unprivileged is not false — any pod can self-grant the GPU."; \
+	     echo "      Run: sudo nvidia-ctk config --set accept-nvidia-visible-devices-envvar-when-unprivileged=false --in-place && sudo systemctl restart docker"; exit 1; }
+	@echo "GPU preflight OK"
+
+# Applied outside the kind overlay: it targets kube-system, and the overlay's
+# `namespace: copilot` + commonLabels would rewrite its namespace and mutate the
+# DaemonSet's immutable selector.
+.PHONY: k8s-gpu-plugin
+k8s-gpu-plugin:
+	kubectl apply -f infra/k8s/overlays/kind/gpu/device-plugin.yaml
+	@echo "waiting for nvidia.com/gpu to appear on the node..."
+	@for i in $$(seq 1 60); do \
+	  if [ -n "$$(kubectl get node copilot-control-plane -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>/dev/null)" ]; then \
+	    echo "GPU allocatable: $$(kubectl get node copilot-control-plane -o jsonpath='{.status.allocatable.nvidia\.com/gpu}')"; exit 0; fi; \
+	  sleep 2; done; \
+	  echo "TIMEOUT: nvidia.com/gpu never became allocatable. kubectl -n kube-system logs -l name=nvidia-device-plugin-ds"; exit 1
 
 .PHONY: k8s-down
 k8s-down:
@@ -128,10 +217,14 @@ k8s-check-es-bootstrap:
 # Jobs are immutable (spec.template can't change in place); delete-then-apply is the explicit
 # re-run path recommended in Phase 8, mirroring how `docker compose run --rm garage-bootstrap`
 # is already a manual step.
+#
+# Depends on k8s-set-images so this applies the same registry-tagged overlay k8s-deploy does.
+# Applying overlays/kind directly here would revert every app image to base's placeholder
+# `copilot/*:dev`, which no longer exists on the node or in the registry -> ErrImagePull.
 .PHONY: k8s-bootstrap
-k8s-bootstrap:
+k8s-bootstrap: k8s-set-images
 	kubectl delete job es-bootstrap garage-bootstrap --ignore-not-found
-	kubectl apply -k infra/k8s/overlays/kind
+	kubectl apply -k $(K8S_OVERLAY)
 
 K8S_SECRETS := infra/k8s/overlays/kind/secrets
 

@@ -1,0 +1,92 @@
+# NVIDIA device plugin — makes `nvidia.com/gpu` a schedulable resource on the kind node.
+# Stock upstream manifest, pinned + time-sliced. Toolkit/containerd setup lives in the node
+# image (infra/k8s/node-image/), so no driver-library hostPath mounts are needed here.
+# See docs/notes/gpu-in-kubernetes.md §2-§3 and docs/notes/gpu-on-local-k8s-review.md §4.3.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      # The kind control-plane node carries the standard control-plane taint. On a
+      # single-node cluster that node IS the only node, so without this toleration the
+      # DaemonSet schedules zero pods and no GPU is ever advertised.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      # Only land on nodes actually labelled as having a GPU (set in kind-cluster.yaml).
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: nvidia-device-plugin-ctr
+          image: nvcr.io/nvidia/k8s-device-plugin:v0.19.3
+          env:
+            # Read the time-slicing config from the ConfigMap mounted below.
+            - name: CONFIG_FILE
+              value: /config/config.yaml
+            # Without this the plugin can fail to detect devices in a containerized node.
+            - name: PASS_DEVICE_SPECS
+              value: "true"
+            - name: DEVICE_LIST_STRATEGY
+              value: volume-mounts     # pairs with accept-nvidia-visible-devices-as-volume-mounts
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+            - name: config
+              mountPath: /config
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "256Mi" }
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: config
+          configMap:
+            name: nvidia-device-plugin-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvidia-device-plugin-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    version: v1
+    sharing:
+      # TIME-SLICING. The default device-plugin model hands out whole physical GPUs
+      # exclusively: with one GPU, the first pod to request nvidia.com/gpu:1 takes it and
+      # every other GPU pod sits Pending forever. This machine has exactly one RTX 3080
+      # (16 GiB) that is already shared with the two host TEI servers (~2.7 GiB), so
+      # exclusive allocation is the wrong model here.
+      #
+      # `replicas: 3` advertises the one physical GPU as 3 schedulable units — exactly the
+      # number of in-cluster GPU consumers: worker-ingestion, tei, tei-embedder. The NVIDIA
+      # driver context-switches between the processes that land on them. Caveats, which are
+      # acceptable on a single-user dev cluster but would NOT be in production:
+      #   - No memory isolation. Under time-slicing the replica count is the *only* admission
+      #     control there is — the scheduler cannot see VRAM. Advertising more replicas than
+      #     intended consumers invites an extra GPU pod to schedule with no room for it and
+      #     OOM with no scheduling signal to explain why. Keep this equal to the consumer count.
+      #   - No fault isolation: one pod's CUDA fault can disturb the others.
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 3

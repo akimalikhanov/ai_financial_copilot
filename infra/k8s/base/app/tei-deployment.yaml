@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tei-data
+  namespace: copilot
+spec:
+  # Compose's shared `tei_data:/data` volume (~4.8 GiB across bge-m3 + bge-reranker-v2-m3 +
+  # a stale gte-reranker-modernbert-base neither service uses). One PVC per Deployment
+  # rather than a shared volume: /data is namespaced by model so sharing would work, but
+  # per-Deployment keeps the failure domain isolated and matches the hf-model-cache pattern.
+  # Without this, TEI re-downloads its model from HuggingFace on every pod restart and the
+  # readiness probe fails for minutes each time.
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei
+  namespace: copilot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tei
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tei
+        app.kubernetes.io/component: tei
+    spec:
+      containers:
+        - name: tei
+          image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0
+          # Model id is a command arg, not interpolated from env like compose's ${VAR:-default} —
+          # K8s does no such substitution, so the value is inlined directly (kept in sync with
+          # RERANKER_MODEL_NAME in app-config.env, which the app itself reads).
+          args:
+            - --model-id
+            - BAAI/bge-reranker-v2-m3
+            - --dtype
+            - float16
+            - --max-batch-tokens
+            - "16384"
+            - --max-batch-requests
+            - "16"
+            - --max-client-batch-size
+            - "64"
+            - --payload-limit
+            - "10000000"
+          ports:
+            - name: http
+              containerPort: 80
+          envFrom:
+            - secretRef: { name: app-secret }   # HF_TOKEN
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # TEI serves /health natively — no exec-probe workaround needed, unlike the Celery
+          # workers. Startup still needs headroom: cold start downloads the model to the PVC.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "2000m", memory: "8Gi" }
+          # GPU is deliberately NOT requested here — same reasoning as worker-ingestion-deployment.yaml.
+          # The kind overlay adds nvidia.com/gpu + the nodeSelector: overlays/kind/patches/tei-gpu.yaml.
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tei-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tei
+  namespace: copilot
+spec:
+  selector:
+    app.kubernetes.io/name: tei
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

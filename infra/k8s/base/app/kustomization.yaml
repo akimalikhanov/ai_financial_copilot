@@ -4,6 +4,10 @@ kind: Kustomization
 resources:
   - api-deployment.yaml
   - frontend-deployment.yaml
+  - worker-chat-deployment.yaml
+  - worker-ingestion-deployment.yaml
+  - tei-deployment.yaml
+  - tei-embedder-deployment.yaml
 
 configMapGenerator:
   - name: app-config

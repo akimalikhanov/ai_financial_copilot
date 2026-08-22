@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hf-model-cache
+  namespace: copilot
+spec:
+  # Compose's `hf-model-cache` named volume. A PVC, not an emptyDir: Docling/HF model
+  # downloads are GBs and slow, and re-downloading them on every pod restart would make
+  # ingestion unusable. A plain Deployment can mount a PVC directly — no StatefulSet needed
+  # at replicas=1 (and ReadWriteOnce is fine because there is exactly one consumer).
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 35Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-ingestion
+  namespace: copilot
+spec:
+  replicas: 1
+  # The HF cache PVC is ReadWriteOnce, so a rolling update's new pod would deadlock waiting
+  # for the old pod to release the volume. Recreate tears the old one down first.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingestion_worker
+  template:
+    metadata:
+      labels:
+        # `ingestion_worker`, not `worker-ingestion` — matches the compose prometheus.yml
+        # job_name that the committed Grafana dashboards query. See worker-chat-deployment.yaml.
+        app.kubernetes.io/name: ingestion_worker
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+        prometheus.io/path: "/metrics"
+    spec:
+      initContainers:
+        - name: wait-for-pgbouncer
+          image: postgres:16.11-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h pgbouncer -p 6432 -U "$APP_DB_USER"; do
+                echo "waiting for pgbouncer:6432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-broker
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-broker -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-broker:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-app
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-app -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-app:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-opensearch
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://opensearch:9200/_cluster/health >/dev/null 2>&1; do
+                echo "waiting for opensearch:9200"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-garage
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              # Garage 403s unauthenticated GETs by design — that IS proof it's answering,
+              # so no curl -f here (same as api-deployment.yaml).
+              until curl -sS -o /dev/null http://garage:3900; do
+                echo "waiting for garage:3900"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: worker-ingestion
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.workers.ingestion_worker"]
+          ports:
+            - name: metrics
+              containerPort: 9101
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: app-secret }
+          env:
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom_ingestion
+            - name: LOG_FILE
+              value: ""
+            # /home/appuser, NOT /root — Dockerfile.worker runs as the non-root `appuser`
+            # (uid 1001) and pre-creates this path. Pointing at /root would be unwritable.
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+          volumeMounts:
+            - name: prom-multiproc
+              mountPath: /tmp/prom_ingestion
+            - name: hf-model-cache
+              mountPath: /home/appuser/.cache/huggingface
+          # `celery inspect ping` spawns a fresh interpreter that imports torch+docling, then
+          # waits on a broadcast reply — it cannot finish in 10s while both children are busy
+          # parsing, so compose's 10s/30s values flap the pod to 0/1 during every real ingest
+          # (and burn CPU on imports that get SIGKILLed). Long timeout, long period.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1
+            initialDelaySeconds: 60
+            periodSeconds: 120
+            timeoutSeconds: 60
+            failureThreshold: 5
+          resources:
+            requests: { cpu: "500m", memory: "1536Mi" }
+            limits:   { cpu: "4000m", memory: "6Gi" }   # compose: cpus 4.00 / mem_limit 6g
+          # GPU is deliberately NOT requested here. Compose reserves an nvidia device for
+          # this service, but a base manifest that hard-requires nvidia.com/gpu is
+          # unschedulable on any cluster without a device plugin — the pod would sit
+          # Pending forever with "Insufficient nvidia.com/gpu" rather than degrade to CPU.
+          # The kind overlay adds the GPU request (and the nodeSelector) as a patch:
+          # overlays/kind/patches/worker-ingestion-gpu.yaml. See docs/notes/gpu-in-kubernetes.md.
+      volumes:
+        - name: prom-multiproc
+          emptyDir: {}
+        - name: hf-model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-ingestion
+  namespace: copilot
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ingestion_worker
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: 9101

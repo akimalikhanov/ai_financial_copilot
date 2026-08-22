@@ -7,9 +7,22 @@ resources:
   - opensearch-dashboards-deployment.yaml
   - opensearch-dashboards-service.yaml
   - ingress.yaml
+  # NOT listed here: gpu/device-plugin.yaml. It lives in kube-system and is applied
+  # separately by `make k8s-gpu-plugin`, because this overlay's `commonLabels` and
+  # `namespace: copilot` would rewrite the DaemonSet's namespace and inject a label into
+  # its immutable selector.
 
-commonLabels:
-  app.kubernetes.io/part-of: copilot
+# Replaces the deprecated `commonLabels:`, which forced includeSelectors:true.
+#
+# includeSelectors:false is deliberate: every Deployment/StatefulSet/Service in base already
+# declares a complete selector on app.kubernetes.io/name, so nothing is gained by also
+# injecting part-of into selectors. includeTemplates:true still puts the label on pod
+# metadata, so it remains available for querying and for Prometheus SD.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: copilot
+    includeSelectors: false
+    includeTemplates: true
 
 secretGenerator:
   - name: postgres-secret
@@ -39,3 +52,22 @@ patches:
     target:
       kind: StatefulSet
       name: garage
+  # Adds nvidia.com/gpu:1 + the GPU nodeSelector to worker-ingestion, tei, and tei-embedder —
+  # the three consumers sharing the device plugin's time-sliced GPU (replicas: 3 in
+  # gpu/device-plugin.yaml). Overlay-only so base stays schedulable on a GPU-less cluster.
+  - path: patches/worker-ingestion-gpu.yaml
+    target:
+      kind: Deployment
+      name: worker-ingestion
+  - path: patches/tei-gpu.yaml
+    target:
+      kind: Deployment
+      name: tei
+  - path: patches/tei-embedder-gpu.yaml
+    target:
+      kind: Deployment
+      name: tei-embedder
+  # NOTE: hf-model-cache is deliberately NOT shrunk by a small-PVC patch like the
+  # StatefulSet volumes above. The real cache on this machine is ~6.2 GiB (Docling layout +
+  # EasyOCR + the bge tokenizer), so the 15 GiB request in base is already right-sized;
+  # cutting it to 2 GiB would fail ingestion partway through a model download.

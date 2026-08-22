@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-chat
+  namespace: copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chat_worker
+  template:
+    metadata:
+      labels:
+        # NOTE: the label value is `chat_worker`, not `worker-chat`, on purpose. Phase 13's
+        # Prometheus relabel rule copies this label into the `job` label, and the six committed
+        # Grafana dashboards query job="chat_worker" (the compose prometheus.yml job_name).
+        # Renaming this breaks every chat-worker panel.
+        app.kubernetes.io/name: chat_worker
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Same depends_on port as api-deployment.yaml. fluent-bit is gone (Phase 14 tails node
+      # logs instead of receiving pushes) and qdrant-hc is gone (Phase 5 retired the sidecar).
+      initContainers:
+        - name: wait-for-pgbouncer
+          image: postgres:16.11-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h pgbouncer -p 6432 -U "$APP_DB_USER"; do
+                echo "waiting for pgbouncer:6432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-broker
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-broker -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-broker:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-app
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-app -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-app:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-opensearch
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://opensearch:9200/_cluster/health >/dev/null 2>&1; do
+                echo "waiting for opensearch:9200"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: worker-chat
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.workers.chat_worker"]
+          ports:
+            # Nothing dials this; it exists so Phase 13's pod SD has a named target and so
+            # `kubectl port-forward` works without guessing.
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: app-secret }
+          env:
+            # Celery prefork children each write their own metric shard here; the parent's
+            # HTTP server reads the directory. Must be set before prometheus_client is
+            # imported — src/workers/chat_worker.py does that ordering, same as `make worker`.
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom_chat
+            - name: LOG_FILE
+              value: ""
+          volumeMounts:
+            - name: prom-multiproc
+              mountPath: /tmp/prom_chat
+          # Celery serves no HTTP health endpoint; $HOSTNAME is the pod name, which is exactly
+          # the Celery node name. Timeout raised well above compose's 10s: the probe spawns a
+          # fresh interpreter that imports the whole app before it can ping, which does not fit
+          # in 10s under load. See worker-ingestion-deployment.yaml.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - python -m celery -A src.celery_app:celery_app inspect ping -d celery@$HOSTNAME >/dev/null 2>&1
+            initialDelaySeconds: 40
+            periodSeconds: 120
+            timeoutSeconds: 60
+            failureThreshold: 5
+          resources:
+            requests: { cpu: "250m", memory: "768Mi" }
+            limits:   { cpu: "2000m", memory: "3Gi" }   # compose: cpus 2.00 / mem_limit 3g
+      volumes:
+        # emptyDir, not a PVC: pod-scoped lifetime is exactly right for multiprocess metric
+        # shards. Stale shards surviving a restart would double-count. Counters resetting on
+        # restart is expected and harmless — the dashboards use rate().
+        - name: prom-multiproc
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-chat
+  namespace: copilot
+spec:
+  # Headless: nothing load-balances to a worker, but a Service gives Phase 13's Prometheus
+  # service discovery a stable object to target and makes port-forward straightforward.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: chat_worker
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100

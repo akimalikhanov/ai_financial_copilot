@@ -1,0 +1,16 @@
+# Gives the reranker TEI deployment the host GPU. See worker-ingestion-gpu.yaml for the
+# full rationale (extended resources, base-vs-overlay split, why nodeSelector matters).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei
+spec:
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: tei
+          resources:
+            limits:
+              nvidia.com/gpu: 1

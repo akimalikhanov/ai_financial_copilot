@@ -12,6 +12,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       # Replaces compose's five `depends_on: {condition: service_healthy|service_started}`
       # entries. qdrant-hc is gone (Phase 5 retired the sidecar; qdrant's own readinessProbe

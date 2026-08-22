@@ -7,4 +7,5 @@ resources:
   - search
   - storage
   - app
-  # later phases add: langfuse, observability
+  - observability
+  # later phases add: langfuse
