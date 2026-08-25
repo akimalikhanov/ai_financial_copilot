@@ -33,7 +33,12 @@ secretGenerator:
     envs: [secrets/garage.env]          # gitignored
   - name: app-secret
     envs: [secrets/app.env]             # gitignored
-  # later phases add: clickhouse-secret, langfuse-secret, grafana-secret
+  - name: grafana-secret
+    envs: [secrets/grafana.env]         # gitignored
+  - name: clickhouse-secret
+    envs: [secrets/clickhouse.env]      # gitignored; read by both ClickHouse and Langfuse
+  - name: langfuse-secret
+    envs: [secrets/langfuse.env]        # gitignored
 
 generatorOptions:
   disableNameSuffixHash: false          # keep hashing ON (that's the point)
@@ -47,7 +52,7 @@ patches:
   - path: patches/small-pvcs.yaml
     target:
       kind: StatefulSet
-      name: "^(postgres|redis-app|redis-broker|qdrant|opensearch|elasticsearch)$"
+      name: "^(postgres|redis-app|redis-broker|qdrant|opensearch|elasticsearch|clickhouse)$"
   - path: patches/garage-small-pvcs.yaml
     target:
       kind: StatefulSet

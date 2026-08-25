@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-worker
+  namespace: copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: langfuse-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: langfuse-worker
+    spec:
+      initContainers:
+        - name: wait-for-deps
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              for t in postgres:5432 clickhouse:8123 redis-app:6379 garage:3900; do
+                until nc -z "${t%:*}" "${t#*:}"; do echo "waiting for $t"; sleep 2; done
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: langfuse-worker
+          image: docker.io/langfuse/langfuse-worker:3
+          envFrom:
+            - configMapRef: { name: langfuse-common }
+            - secretRef:    { name: clickhouse-secret }
+            - secretRef:    { name: langfuse-secret }
+          # No Service and no probes — compose had neither. The worker only consumes the
+          # Redis ingestion queue; nothing dials it.
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }   # compose: cpus 1.00 / mem_limit 1g

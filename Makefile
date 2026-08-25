@@ -61,8 +61,17 @@ docker-rebuild:
 	docker image prune -f
 
 # Local registry (docs/notes/gpu-on-local-k8s-review.md §9) replacing `kind load`, which
-# re-imports the whole image on every rebuild. SHA tags make IfNotPresent correct by construction.
-GIT_SHA ?= $(shell git rev-parse --short HEAD)
+# re-imports the whole image on every rebuild. SHA tags make IfNotPresent correct by
+# construction — but only if the tag actually changes on every rebuild. `git rev-parse HEAD`
+# doesn't: uncommitted edits rebuild under the *same* tag, so kind's node-local containerd
+# (IfNotPresent) keeps serving whatever it already cached for that tag and silently ignores
+# the new content. GIT_SHA is therefore HEAD's SHA plus a hash of the working tree's actual
+# diff (tracked modifications + untracked files) — any saved edit changes the tag, committed
+# or not, so a rebuild is always a genuinely new image the node is forced to pull.
+GIT_SHA ?= $(shell echo "$$(git rev-parse --short HEAD)-$$( \
+	{ git diff HEAD -- . ':!infra/k8s/overlays/kind-deploy'; \
+	  git ls-files -o --exclude-standard -z | xargs -0 -I{} cat {} 2>/dev/null; \
+	} | sha256sum | cut -c1-8)")
 REGISTRY := localhost:5001
 
 .PHONY: k8s-registry
@@ -121,9 +130,15 @@ k8s-set-images:
 	  copilot/worker=$(REGISTRY)/copilot/worker:$(GIT_SHA)
 
 # Full build+push+deploy loop; use individual docker-build-*/k8s-push-* targets to iterate on one service.
+#
+# model-preload is deleted first because a Job's spec.template is immutable and its image tag
+# changes on every rebuild — applying over a completed Job is a hard error that would fail the
+# whole deploy. Recreating it is cheap: once the PVC holds the weights the Job is a no-op that
+# exits in seconds, which also re-warms the cache if the PVC was ever wiped.
 .PHONY: k8s-deploy
 k8s-deploy: docker-build-api docker-build-frontend docker-build-worker
 	$(MAKE) k8s-push-api k8s-push-frontend k8s-push-worker k8s-set-images
+	kubectl delete job model-preload -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
 
 # Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run
@@ -140,6 +155,17 @@ k8s-up: k8s-gpu-preflight
 	kind create cluster --config infra/k8s/kind-cluster.yaml
 	$(MAKE) k8s-registry
 	$(MAKE) k8s-gpu-plugin
+	$(MAKE) k8s-ingress-nginx
+
+# Cluster-level add-on, not part of the app (make k8s-deploy's kustomize apply never touches
+# it): installs once per cluster lifetime and survives every future k8s-deploy. Only needed
+# again after kind delete cluster. kind-cluster.yaml already has the extraPortMappings
+# (80/443) and ingress-ready=true node label this manifest's controller expects.
+.PHONY: k8s-ingress-nginx
+k8s-ingress-nginx:
+	kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+	kubectl wait --namespace ingress-nginx --for=condition=ready pod \
+	  --selector=app.kubernetes.io/component=controller --timeout=120s
 
 # Verifies the host-side GPU prerequisites before creating a cluster, so failures surface
 # here with an actionable message instead of as a Pending pod an hour later.
@@ -223,8 +249,21 @@ k8s-check-es-bootstrap:
 # `copilot/*:dev`, which no longer exists on the node or in the registry -> ErrImagePull.
 .PHONY: k8s-bootstrap
 k8s-bootstrap: k8s-set-images
-	kubectl delete job es-bootstrap garage-bootstrap --ignore-not-found
+	kubectl delete job es-bootstrap garage-bootstrap -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
+
+# Warms the hf-model-cache PVC with Docling's picture-description VLM. Without it, the first
+# PDF upload after a fresh cluster stalls inside the Celery task on a multi-GB HuggingFace
+# download, which the UI reports as a failed ingest. Run once per cluster lifetime (the PVC
+# survives pod restarts); re-runs are cheap no-ops once the snapshot is cached.
+#
+# Same delete-then-apply shape as k8s-bootstrap: Jobs are immutable, and k8s-set-images is
+# required so the Job gets the registry-tagged worker image rather than base's `copilot/*:dev`.
+.PHONY: k8s-preload-models
+k8s-preload-models: k8s-set-images
+	kubectl delete job model-preload -n copilot --ignore-not-found
+	kubectl apply -k $(K8S_OVERLAY)
+	kubectl wait --namespace copilot --for=condition=complete job/model-preload --timeout=3600s
 
 K8S_SECRETS := infra/k8s/overlays/kind/secrets
 
@@ -280,4 +319,56 @@ k8s-secrets:
 	    echo "LANGFUSE_SECRET_KEY="; \
 	  } >> $(K8S_SECRETS)/app.env; \
 	  echo "wrote JWT_SECRET/APP_DB_*/REDIS_PASSWORD into $(K8S_SECRETS)/app.env (fill in LLM/Langfuse keys manually)"; }
-	@# ... one such block per secret file; extend in Phases 15, 16
+	@test -f $(K8S_SECRETS)/grafana.env || { \
+	  { echo "GRAFANA_USER=admin"; \
+	    echo "GRAFANA_PASS=$$(openssl rand -base64 24 | tr -d '/+=')"; \
+	  } > $(K8S_SECRETS)/grafana.env; chmod 600 $(K8S_SECRETS)/grafana.env; \
+	  echo "generated $(K8S_SECRETS)/grafana.env"; }
+	@# Phase 16: ClickHouse credentials. Read by the ClickHouse StatefulSet *and* by both
+	@# Langfuse pods from this same Secret, so the two can never drift apart.
+	@test -f $(K8S_SECRETS)/clickhouse.env || { \
+	  { echo "CLICKHOUSE_USER=clickhouse"; \
+	    echo "CLICKHOUSE_PASSWORD=$$(openssl rand -base64 32 | tr -d '/+=')"; \
+	  } > $(K8S_SECRETS)/clickhouse.env; chmod 600 $(K8S_SECRETS)/clickhouse.env; \
+	  echo "generated $(K8S_SECRETS)/clickhouse.env"; }
+	@# Phase 16: Langfuse. Mirrors infra/scripts/langfuse_bootstrap.sh. Connection URLs are
+	@# composed here (rather than assembled in the pod) because Langfuse wants single DSN
+	@# strings and K8s env can't interpolate one Secret key into another.
+	@test -f $(K8S_SECRETS)/langfuse.env || { \
+	  LANGFUSE_DB_PASSWORD="$$(grep '^LANGFUSE_DB_PASSWORD=' $(K8S_SECRETS)/postgres.env | cut -d= -f2)"; \
+	  REDIS_PASSWORD="$$(grep '^REDIS_PASSWORD=' $(K8S_SECRETS)/redis.env | cut -d= -f2)"; \
+	  CH_USER="$$(grep '^CLICKHOUSE_USER=' $(K8S_SECRETS)/clickhouse.env | cut -d= -f2)"; \
+	  CH_PASS="$$(grep '^CLICKHOUSE_PASSWORD=' $(K8S_SECRETS)/clickhouse.env | cut -d= -f2)"; \
+	  S3_KEY="$$(grep '^garage_s3_access_key_id=' $(K8S_SECRETS)/garage.env | cut -d= -f2)"; \
+	  S3_SECRET="$$(grep '^garage_s3_secret_access_key=' $(K8S_SECRETS)/garage.env | cut -d= -f2)"; \
+	  PK="pk-lf-$$(cat /proc/sys/kernel/random/uuid)"; \
+	  SK="sk-lf-$$(cat /proc/sys/kernel/random/uuid)"; \
+	  { echo "DATABASE_URL=postgresql://langfuse:$$LANGFUSE_DB_PASSWORD@postgres:5432/langfuse"; \
+	    echo "CLICKHOUSE_MIGRATION_URL=clickhouse://$$CH_USER:$$CH_PASS@clickhouse:9000"; \
+	    echo "REDIS_AUTH=$$REDIS_PASSWORD"; \
+	    echo "NEXTAUTH_SECRET=$$(openssl rand -base64 32)"; \
+	    echo "SALT=$$(openssl rand -base64 24)"; \
+	    echo "ENCRYPTION_KEY=$$(openssl rand -hex 32)"; \
+	    for scope in EVENT_UPLOAD MEDIA_UPLOAD BATCH_EXPORT; do \
+	      echo "LANGFUSE_S3_$${scope}_ACCESS_KEY_ID=$$S3_KEY"; \
+	      echo "LANGFUSE_S3_$${scope}_SECRET_ACCESS_KEY=$$S3_SECRET"; \
+	    done; \
+	    echo "LANGFUSE_INIT_ORG_ID=$$(cat /proc/sys/kernel/random/uuid)"; \
+	    echo "LANGFUSE_INIT_ORG_NAME=AI Financial Copilot"; \
+	    echo "LANGFUSE_INIT_PROJECT_ID=$$(cat /proc/sys/kernel/random/uuid)"; \
+	    echo "LANGFUSE_INIT_PROJECT_NAME=copilot"; \
+	    echo "LANGFUSE_INIT_PROJECT_PUBLIC_KEY=$$PK"; \
+	    echo "LANGFUSE_INIT_PROJECT_SECRET_KEY=$$SK"; \
+	    echo "LANGFUSE_INIT_USER_EMAIL=admin@copilot.local"; \
+	    echo "LANGFUSE_INIT_USER_NAME=admin"; \
+	    echo "LANGFUSE_INIT_USER_PASSWORD=$$(openssl rand -base64 16 | tr -d '/+=')"; \
+	  } > $(K8S_SECRETS)/langfuse.env; chmod 600 $(K8S_SECRETS)/langfuse.env; \
+	  echo "generated $(K8S_SECRETS)/langfuse.env"; }
+	@# The app tier authenticates to Langfuse with the seeded project's key pair, so the two
+	@# blank placeholders written into app.env in Phase 10 are filled from langfuse.env here.
+	@grep -q '^LANGFUSE_PUBLIC_KEY=.' $(K8S_SECRETS)/app.env || { \
+	  PK="$$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' $(K8S_SECRETS)/langfuse.env | cut -d= -f2)"; \
+	  SK="$$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' $(K8S_SECRETS)/langfuse.env | cut -d= -f2)"; \
+	  sed -i "s|^LANGFUSE_PUBLIC_KEY=.*|LANGFUSE_PUBLIC_KEY=$$PK|; s|^LANGFUSE_SECRET_KEY=.*|LANGFUSE_SECRET_KEY=$$SK|" \
+	    $(K8S_SECRETS)/app.env; \
+	  echo "wrote LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY into $(K8S_SECRETS)/app.env"; }

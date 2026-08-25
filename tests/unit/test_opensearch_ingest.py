@@ -24,6 +24,10 @@ class FakeIndices:
 class FakeClient:
     def __init__(self, index_exists: bool = False) -> None:
         self.indices = FakeIndices(index_exists)
+        self.delete_by_query_calls: list[dict] = []
+
+    def delete_by_query(self, **kwargs) -> None:
+        self.delete_by_query_calls.append(kwargs)
 
 
 class TestEnsureIndex:
@@ -87,3 +91,17 @@ class TestBulkDelete:
         actions = calls[0][0][1]
         assert actions[0]["_op_type"] == "delete"
         assert actions[0]["_id"] == str(cid)
+
+
+class TestDeleteByDocument:
+    def test_noop_when_index_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(index_exists=False)
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
+        opensearch_ingest.delete_by_document("chunks", uuid4())  # must not raise
+        assert client.delete_by_query_calls == []
+
+    def test_deletes_when_index_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(index_exists=True)
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
+        opensearch_ingest.delete_by_document("chunks", uuid4())
+        assert len(client.delete_by_query_calls) == 1

@@ -313,7 +313,13 @@ async def ingestion_stream(
         except asyncio.CancelledError:
             raise
         except Exception:
-            yield _sse_event("error", {"message": "Stream read failed"})
+            # A Redis read failure says nothing about the ingestion itself, which keeps running
+            # in the worker. Emitting `error` here would make the UI mark a healthy document as
+            # failed. End the stream instead and let the client reconnect and re-read status.
+            logger.exception(
+                "ingestion_stream.read_failed", extra={"document_id": str(document_id)}
+            )
+            return
 
     return StreamingResponse(
         event_stream(),

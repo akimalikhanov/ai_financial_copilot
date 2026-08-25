@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-preload
+  namespace: copilot
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: preload
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          # Warms the HF cache PVC before any ingest runs. Docling pulls the picture-description
+          # VLM lazily on the first PDF, inside the Celery task — so without this the first
+          # upload blocks on a multi-GB download while the UI shows it as stuck.
+          command:
+            - python
+            - -c
+            - |
+              import os
+              from huggingface_hub import snapshot_download
+
+              repo = os.environ["DOCLING_PICTURE_VLM_MODEL"]
+              print(f"preloading {repo} into {os.environ['HF_HOME']}", flush=True)
+              path = snapshot_download(repo)
+              print(f"done: {path}", flush=True)
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef:    { name: app-secret }   # HF_TOKEN
+          env:
+            # HF_HUB_DISABLE_XET comes from app-config — without it this download crawls.
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+          volumeMounts:
+            - name: hf-model-cache
+              mountPath: /home/appuser/.cache/huggingface
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "4Gi" }
+      volumes:
+        - name: hf-model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache

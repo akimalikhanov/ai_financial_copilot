@@ -235,7 +235,7 @@ async def chat_stream_subscribe(
                             continue
                         event_type = data.get("type", "message")
                         sse_data = {k: v for k, v in data.items() if k != "type"}
-                        yield _sse_event(event_type, sse_data)
+                        yield _sse_event(event_type, sse_data, event_id=eid)
                         if event_type == "usage" and sse_data.get("persisted"):
                             return
                         if event_type == "error":

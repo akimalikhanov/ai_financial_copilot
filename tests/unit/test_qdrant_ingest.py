@@ -16,6 +16,7 @@ class FakeClient:
         self.created_collections: list[dict] = []
         self.created_indexes: list[tuple] = []
         self.upsert_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
 
     def collection_exists(self, collection_name: str) -> bool:  # noqa: ARG002
         return self._collection_exists
@@ -30,6 +31,9 @@ class FakeClient:
 
     def upsert(self, **kwargs) -> None:
         self.upsert_calls.append(kwargs)
+
+    def delete(self, **kwargs) -> None:
+        self.delete_calls.append(kwargs)
 
 
 class TestEnsureCollection:
@@ -80,3 +84,17 @@ class TestUpsertChunks:
 
         assert len(client.upsert_calls) == 1
         assert len(client.upsert_calls[0]["points"]) == 1
+
+
+class TestDeleteByDocument:
+    def test_noop_when_collection_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(collection_exists=False)
+        monkeypatch.setattr(qdrant_ingest, "get_client", lambda: client)
+        qdrant_ingest.delete_by_document("docs", uuid4())  # must not raise
+        assert client.delete_calls == []
+
+    def test_deletes_when_collection_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(collection_exists=True)
+        monkeypatch.setattr(qdrant_ingest, "get_client", lambda: client)
+        qdrant_ingest.delete_by_document("docs", uuid4())
+        assert len(client.delete_calls) == 1

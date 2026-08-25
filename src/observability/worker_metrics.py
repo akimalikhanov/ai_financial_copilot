@@ -14,14 +14,27 @@ import logging
 import os
 import threading
 import time
-from wsgiref.simple_server import make_server
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from celery.signals import task_postrun, task_prerun, task_retry
-from prometheus_client import CollectorRegistry, make_wsgi_app, multiprocess, start_http_server
+from prometheus_client import CollectorRegistry, make_wsgi_app, multiprocess
 
 from src.observability.metrics import CELERY_DURATION, CELERY_QUEUE, CELERY_TASKS
 
 logger = logging.getLogger(__name__)
+
+
+class _QuietWSGIRequestHandler(WSGIRequestHandler):
+    """Drops the per-request access log line.
+
+    Prometheus scrapes this server every 15s; wsgiref writes straight to stderr
+    (bypassing the `logging` module), which otherwise floods pod logs with
+    "GET /metrics 200" on every scrape. Errors still surface via handle_error.
+    """
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 — stdlib signature
+        pass
+
 
 # task_id -> start perf_counter, to measure duration in task_postrun
 _task_starts: dict[str, float] = {}
@@ -92,10 +105,11 @@ def start_worker_metrics(port: int, queues: tuple[str, ...]) -> None:
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
         app = make_wsgi_app(registry)
-        httpd = make_server("", port, app)
-        threading.Thread(target=httpd.serve_forever, name="metrics-server", daemon=True).start()
     else:
-        start_http_server(port)
+        app = make_wsgi_app()
+
+    httpd = make_server("", port, app, handler_class=_QuietWSGIRequestHandler)
+    threading.Thread(target=httpd.serve_forever, name="metrics-server", daemon=True).start()
 
     threading.Thread(
         target=_sample_queue_depth, args=(queues,), name="celery-queue-sampler", daemon=True

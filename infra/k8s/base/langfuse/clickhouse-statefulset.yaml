@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: copilot
+spec:
+  serviceName: clickhouse-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse
+    spec:
+      # compose pinned `user: "101:101"` so the image's clickhouse user could write the
+      # bind-mounted volume. fsGroup is the part that matters here: local-path volumes are
+      # created root-owned, and fsGroup chowns the mount to the group the container runs as.
+      securityContext:
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server:24.12-alpine
+          envFrom:
+            - secretRef: { name: clickhouse-secret }   # CLICKHOUSE_USER, CLICKHOUSE_PASSWORD
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: cluster-config
+              # subPath: drop a single file into config.d/ without shadowing the image's
+              # other files in that directory.
+              mountPath: /etc/clickhouse-server/config.d/langfuse-cluster.xml
+              subPath: langfuse-cluster.xml
+              readOnly: true
+          readinessProbe:
+            # compose used a wget exec; the kubelet does HTTP itself, so no shell needed.
+            httpGet: { path: /ping, port: 8123 }
+            initialDelaySeconds: 30      # compose: start_period 30s
+            periodSeconds: 10            # compose: interval 10s
+            timeoutSeconds: 5            # compose: timeout 5s
+            failureThreshold: 10         # compose: retries 10
+          livenessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            initialDelaySeconds: 60
+            periodSeconds: 30            # laxer than readiness — avoid killing a slow-starting store
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits:   { cpu: "2",    memory: "4Gi" }   # compose: cpus 2.00 / mem_limit 4g
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: clickhouse-cluster-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

@@ -145,7 +145,7 @@ spec:
             failureThreshold: 5
           resources:
             requests: { cpu: "500m", memory: "1536Mi" }
-            limits:   { cpu: "4000m", memory: "6Gi" }   # compose: cpus 4.00 / mem_limit 6g
+            limits:   { cpu: "4000m", memory: "12Gi" }   # compose: cpus 4.00 / mem_limit 12g
           # GPU is deliberately NOT requested here. Compose reserves an nvidia device for
           # this service, but a base manifest that hard-requires nvidia.com/gpu is
           # unschedulable on any cluster without a device plugin — the pod would sit

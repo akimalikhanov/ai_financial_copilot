@@ -246,13 +246,23 @@ def configure_worker_logging() -> None:
 _request_logger = logging.getLogger("api.request")
 
 
+_UNLOGGED_PATHS = frozenset({"/metrics", "/metrics/", "/healthz"})
+
+
 async def request_logging_middleware(request: Request, call_next) -> Response:
     """
     Unified request middleware that:
     1. Sets up request context with ID and timing
     2. Calls the route handler
     3. Emits a single JSON log with all accumulated metadata
+
+    Skips logging/metrics bookkeeping for /metrics and /healthz — Prometheus and
+    liveness probes hit these every few seconds and carry no business signal, so
+    logging them would just flood output with zero-value noise.
     """
+    if request.url.path in _UNLOGGED_PATHS:
+        return await call_next(request)
+
     request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid4())
 
     ctx = RequestContext(

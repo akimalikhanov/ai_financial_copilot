@@ -33,6 +33,12 @@ spec:
         app.kubernetes.io/name: tei
         app.kubernetes.io/component: tei
     spec:
+      # Kubernetes injects a `{SVCNAME}_PORT=tcp://<ip>:<port>` env var per Service in the
+      # namespace (Docker-links compat). The `prometheus` Service collides with TEI's own
+      # `PROMETHEUS_PORT` env var, which its binary parses directly as --prometheus-port —
+      # crashes with "invalid digit found in string" on that tcp:// value. Disabling
+      # service-link injection avoids the collision; nothing here relies on it.
+      enableServiceLinks: false
       containers:
         - name: tei
           image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0

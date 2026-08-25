@@ -12,9 +12,10 @@ from src.schemas import chat as schemas
 from src.services.llm_runtime.exceptions import LLMError
 
 
-def _sse_event(event: str, data: dict[str, Any]) -> str:
+def _sse_event(event: str, data: dict[str, Any], event_id: str | None = None) -> str:
     """Format Server-Sent Event."""
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{id_line}event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
 
 
 def _error_to_schema(error: LLMError) -> schemas.ErrorResponse:

@@ -28,6 +28,9 @@ spec:
         app.kubernetes.io/name: tei-embedder
         app.kubernetes.io/component: tei
     spec:
+      # See tei-deployment.yaml: the `prometheus` Service's auto-injected PROMETHEUS_PORT
+      # collides with TEI's own env var of the same name and crashes the binary.
+      enableServiceLinks: false
       containers:
         - name: tei-embedder
           image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0

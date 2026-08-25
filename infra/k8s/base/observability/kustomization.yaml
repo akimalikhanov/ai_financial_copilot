@@ -5,10 +5,28 @@ resources:
   - prometheus-rbac.yaml
   - prometheus-deployment.yaml
   - prometheus-service.yaml
+  - fluent-bit-rbac.yaml
+  - fluent-bit-daemonset.yaml
+  - grafana-deployment.yaml
+  - grafana-service.yaml
 
 configMapGenerator:
   - name: prometheus-config
     files: [prometheus.yml]
+  - name: fluent-bit-config
+    files: [fluent-bit.conf, parsers.conf]
+  - name: grafana-datasources
+    files: [grafana/datasources.yaml]
+  - name: grafana-dashboard-provider
+    files: [grafana/dashboard-provider.yaml]
+  - name: grafana-dashboards
+    files:
+      - grafana/dashboards/api-overview.json
+      - grafana/dashboards/worker-health.json
+      - grafana/dashboards/agentic-rag.json
+      - grafana/dashboards/cost-tokens.json
+      - grafana/dashboards/logs-explorer.json
+      - grafana/dashboards/eval-canary.json
 
 generatorOptions:
   disableNameSuffixHash: false

@@ -8,4 +8,4 @@ resources:
   - storage
   - app
   - observability
-  # later phases add: langfuse
+  - langfuse

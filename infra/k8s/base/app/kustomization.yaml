@@ -8,6 +8,7 @@ resources:
   - worker-ingestion-deployment.yaml
   - tei-deployment.yaml
   - tei-embedder-deployment.yaml
+  - model-preload-job.yaml
 
 configMapGenerator:
   - name: app-config

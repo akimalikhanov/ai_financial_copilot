@@ -73,10 +73,14 @@ def upsert_chunks(
 
 
 def delete_by_document(collection: str, doc_id: UUID | str) -> None:
-    """Delete all vectors for a document."""
+    """Delete all vectors for a document. No-op if the collection doesn't exist."""
     from qdrant_client.http.models import FieldCondition, Filter, MatchValue
 
-    get_client().delete(
+    client = get_client()
+    if not client.collection_exists(collection_name=collection):
+        return
+
+    client.delete(
         collection_name=collection,
         points_selector=Filter(
             must=[

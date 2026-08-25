@@ -325,6 +325,7 @@ interface StageSnapshot {
 function applyActivityEvent(snap: StageSnapshot, ev: ActivityEvent): StageSnapshot {
   switch (ev.kind) {
     case 'stage_started':
+      if (snap.stages.some(r => r.event.id === ev.id)) return snap;
       return { ...snap, stages: [...snap.stages, { event: ev }] };
     case 'stage_ended':
       return {
@@ -334,8 +335,10 @@ function applyActivityEvent(snap: StageSnapshot, ev: ActivityEvent): StageSnapsh
         ),
       };
     case 'round_started':
+      if (snap.rounds.some(r => r.event.id === ev.id)) return snap;
       return { ...snap, rounds: [...snap.rounds, { event: ev }] };
     case 'tool_call_started':
+      if (snap.toolCalls.some(r => r.event.id === ev.id)) return snap;
       return { ...snap, toolCalls: [...snap.toolCalls, { event: ev }] };
     case 'tool_call_ended':
       return {
@@ -809,7 +812,22 @@ export default function App() {
 
   const refreshDocs = useCallback(async () => {
     const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
-    setDocs(docsRes.documents.map(toUiDoc));
+    setDocs(prev => {
+      const stages = new Map(prev.map(d => [d.id, d]));
+      return docsRes.documents.map(raw => {
+        const doc = toUiDoc(raw);
+        // Carry the live stage across a refresh for anything still ingesting: this also runs
+        // when a dropped stream re-reads status, and dropping it would blank the progress text.
+        const prevDoc = stages.get(doc.id);
+        if (doc.status !== 'Processing' || !prevDoc) return doc;
+        return {
+          ...doc,
+          ingestionStage: prevDoc.ingestionStage,
+          ingestionStageIndex: prevDoc.ingestionStageIndex,
+          ingestionStageTotal: prevDoc.ingestionStageTotal,
+        };
+      });
+    });
     setFilterOptions(opts);
   }, []);
 
@@ -840,6 +858,9 @@ export default function App() {
                 d.id === doc.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
               ));
             },
+            // Transport drop, not a failed ingest: re-read the real status while the stream
+            // reconnects, so a dropped connection can't mark a healthy document as Error.
+            () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
           );
           unsubs.push(unsub);
         }
@@ -879,6 +900,8 @@ export default function App() {
           d.id === uploaded.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
         ));
       },
+      // See the mount-time subscription above: a dropped stream is not a failed ingest.
+      () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
     );
   }, [refreshDocs]);
 

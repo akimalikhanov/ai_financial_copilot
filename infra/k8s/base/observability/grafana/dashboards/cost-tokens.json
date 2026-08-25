@@ -1,0 +1,206 @@
+{
+  "title": "Cost & Tokens",
+  "uid": "cost-tokens",
+  "description": "Product owner / engineering lead: real-time LLM spend, token breakdown, cache effectiveness, per-model SLOs, and top users.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(llm_tokens_total, model)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Real-Time Spend (Prometheus)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "Cost Rate (USD/h) by Model",
+      "type": "timeseries",
+      "description": "Live spend — catch runaway cost spikes within minutes.",
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_cost_usd_total{model=~\"$model\"}[1h])) by (model) * 3600",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 3,
+      "title": "Cache Hit Token Rate by Model",
+      "type": "timeseries",
+      "description": "Prompt caching effectiveness — cache misses that should be hits are wasted spend.",
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_cache_hit_tokens_total{model=~\"$model\"}[1h])) by (model)",
+          "legendFormat": "cached {{model}}"
+        },
+        {
+          "expr": "sum(rate(llm_tokens_total{direction=\"input\",model=~\"$model\"}[1h])) by (model)",
+          "legendFormat": "input {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Authoritative Ledger (PostgreSQL)",
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "title": "Daily Cost by Model (USD)",
+      "type": "barchart",
+      "description": "Authoritative ledger — survives restarts, billing source of truth.",
+      "gridPos": { "x": 0, "y": 10, "w": 12, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('day', created_at) AS time, model AS metric, sum(cost_usd) AS cost_usd FROM llm_requests WHERE $__timeFilter(created_at) GROUP BY 1, 2 ORDER BY 1, 2;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "axisLabel": "" }
+        }
+      },
+      "options": {
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0,
+        "stacking": "normal",
+        "legend": { "displayMode": "table", "placement": "right" }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Token Breakdown by Model",
+      "type": "table",
+      "description": "Identify prompt-heavy vs completion-heavy models. (Cache-hit tokens are Prometheus-only — see the Cache Hit Token Rate panel; llm_requests has no cache column.)",
+      "gridPos": { "x": 12, "y": 10, "w": 12, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT model, sum(prompt_tokens) AS prompt_tokens, sum(completion_tokens) AS completion_tokens, COALESCE(sum(reasoning_tokens), 0) AS reasoning_tokens, sum(total_tokens) AS total_tokens FROM llm_requests WHERE $__timeFilter(created_at) GROUP BY model ORDER BY sum(cost_usd) DESC NULLS LAST;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "options": { "sortBy": [{ "displayName": "prompt_tokens", "desc": true }] }
+    },
+    {
+      "id": 7,
+      "title": "Cost per Request Type",
+      "type": "table",
+      "description": "Router sub-call overhead as percentage of total spend.",
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT request_type, count(*) AS requests, round(avg(cost_usd)::numeric, 6) AS avg_cost_usd, round(avg(total_tokens)::numeric) AS avg_tokens FROM llm_requests WHERE $__timeFilter(created_at) GROUP BY request_type ORDER BY avg_cost_usd DESC;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "avg_cost_usd" }, "properties": [{ "id": "unit", "value": "currencyUSD" }] }
+        ]
+      }
+    },
+    {
+      "id": 8,
+      "title": "p95 Latency & TTFT by Model (ms)",
+      "type": "table",
+      "description": "Model-level SLO — compare providers on latency vs cost tradeoff.",
+      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT model, round(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric) AS p95_latency_ms, round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ttft_ms)::numeric) AS p95_ttft_ms, count(*) AS requests FROM llm_requests WHERE $__timeFilter(created_at) GROUP BY model ORDER BY p95_latency_ms DESC NULLS LAST;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      },
+      "options": { "sortBy": [{ "displayName": "p95_latency_ms", "desc": true }] }
+    },
+    {
+      "id": 9,
+      "title": "LLM Error Rate by Model",
+      "type": "table",
+      "description": "Provider reliability — which model fails most.",
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT model, error_code, count(*) AS occurrences FROM llm_requests WHERE error_code IS NOT NULL AND $__timeFilter(created_at) GROUP BY model, error_code ORDER BY occurrences DESC LIMIT 50;"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "sortBy": [{ "displayName": "occurrences", "desc": true }] }
+    },
+    {
+      "id": 10,
+      "title": "Top Users by Spend",
+      "type": "table",
+      "description": "Abuse detection and per-user quota planning.",
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT user_id::text, count(*) AS requests, round(sum(cost_usd)::numeric, 4) AS total_cost_usd, round(avg(cost_usd)::numeric, 6) AS avg_cost_usd FROM llm_requests WHERE $__timeFilter(created_at) GROUP BY user_id ORDER BY total_cost_usd DESC NULLS LAST LIMIT 20;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_cost_usd" }, "properties": [{ "id": "unit", "value": "currencyUSD" }] },
+          { "matcher": { "id": "byName", "options": "avg_cost_usd" }, "properties": [{ "id": "unit", "value": "currencyUSD" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "total_cost_usd", "desc": true }] }
+    }
+  ]
+}

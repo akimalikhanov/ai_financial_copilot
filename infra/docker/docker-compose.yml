@@ -795,7 +795,7 @@ services:
       retries: 5
       start_period: 60s
     cpus: "4.00"
-    mem_limit: 6g
+    mem_limit: 12g
     <<: *app-logging
     networks: [backend]
 
