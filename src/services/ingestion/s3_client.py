@@ -15,8 +15,17 @@ from src.utils.config import (
     get_s3_access_key,
     get_s3_bucket,
     get_s3_endpoint_url,
+    get_s3_pictures_bucket,
     get_s3_raw_bucket,
     get_s3_secret_key,
+)
+
+# Of the 13 recorded ingestion failures in the loadtest audit, all were S3 connection
+# timeouts — botocore's default retry mode doesn't reliably cover those. "standard" mode
+# retries on connect/read timeouts and connection errors, not just throttling/5xx.
+_CLIENT_CONFIG = Config(
+    response_checksum_validation="when_required",
+    retries={"max_attempts": 5, "mode": "standard"},
 )
 
 
@@ -29,6 +38,15 @@ def _sanitize_filename(filename: str) -> str:
 def build_raw_storage_key(user_id: UUID, doc_id: UUID, filename: str) -> str:
     """Deterministic raw PDF storage key, computable before the upload happens."""
     return f"raw/{user_id}/{doc_id}/{_sanitize_filename(filename)}"
+
+
+def build_picture_crop_key(document_id: str, self_ref: str) -> str:
+    """Deterministic picture-crop storage key, computable before the upload happens.
+
+    `self_ref` is a Docling JSON-pointer like "#/pictures/3"; the leading "#/" is stripped
+    so the key reads as "{document_id}/pictures/3.png" rather than carrying a "#" segment.
+    """
+    return f"{document_id}/{self_ref.lstrip('#/')}.png"
 
 
 async def upload_pdf(
@@ -51,7 +69,7 @@ async def upload_pdf(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
-        config=Config(response_checksum_validation="when_required"),
+        config=_CLIENT_CONFIG,
     ) as client:
         with contextlib.suppress(Exception):
             fileobj.seek(0)
@@ -79,7 +97,7 @@ async def download_file(storage_key: str, *, bucket: str | None = None) -> Path:
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
-        config=Config(response_checksum_validation="when_required"),
+        config=_CLIENT_CONFIG,
     ) as client:
         resp = await client.get_object(Bucket=target_bucket, Key=storage_key)
         body = resp["Body"]
@@ -110,7 +128,7 @@ async def upload_bytes(
         region_name="garage",
         aws_access_key_id=get_s3_access_key(),
         aws_secret_access_key=get_s3_secret_key(),
-        config=Config(response_checksum_validation="when_required"),
+        config=_CLIENT_CONFIG,
     ) as client:
         await client.put_object(
             Bucket=target_bucket,
@@ -118,5 +136,45 @@ async def upload_bytes(
             Body=data,
             ContentType=content_type,
             ContentLength=len(data),
+        )
+    return key
+
+
+async def upload_picture_crop(
+    document_id: str,
+    self_ref: str,
+    data: bytes,
+    *,
+    label: str | None = None,
+    confidence: float | None = None,
+) -> str:
+    """Upload one picture crop PNG to the pictures bucket.
+
+    Tags the object with its Phase-4 classification label/confidence as S3 user metadata
+    (not a separate index file) so Phase 11's router can `head_object` to decide how to
+    route a picture without downloading and opening the image.
+    """
+    key = build_picture_crop_key(document_id, self_ref)
+    metadata: dict[str, str] = {}
+    if label is not None:
+        metadata["classification-label"] = label
+    if confidence is not None:
+        metadata["classification-confidence"] = f"{confidence:.4f}"
+    session = aioboto3.Session()
+    async with session.client(  # pyright: ignore[reportGeneralTypeIssues]
+        "s3",
+        endpoint_url=get_s3_endpoint_url(),
+        region_name="garage",
+        aws_access_key_id=get_s3_access_key(),
+        aws_secret_access_key=get_s3_secret_key(),
+        config=_CLIENT_CONFIG,
+    ) as client:
+        await client.put_object(
+            Bucket=get_s3_pictures_bucket(),
+            Key=key,
+            Body=data,
+            ContentType="image/png",
+            ContentLength=len(data),
+            Metadata=metadata,
         )
     return key

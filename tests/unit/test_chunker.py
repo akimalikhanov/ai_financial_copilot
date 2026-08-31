@@ -12,7 +12,7 @@ from __future__ import annotations
 from docling_core.transforms.chunker.doc_chunk import DocChunk, DocMeta
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.base import BaseTokenizer
-from docling_core.types.doc.document import TextItem
+from docling_core.types.doc.document import PictureItem, TextItem
 from docling_core.types.doc.labels import DocItemLabel
 
 from src.services.ingestion.chunker import AnnualReportSerializerProvider, CustomHybridChunker
@@ -136,3 +136,64 @@ class TestInferChunkType:
         assert _infer_chunk_type([table, picture]) == "table"
         assert _infer_chunk_type([picture]) == "picture"
         assert _infer_chunk_type([]) == "text"
+
+    def test_prose_plus_picture_is_text_not_picture(self) -> None:
+        # A merged chunk holding a text item alongside a picture is prose that happens
+        # to contain a figure, not a "picture chunk" — it must not lose its prose.
+        from src.services.ingestion.chunker import _infer_chunk_type
+
+        text = _FakeDocItem(DocItemLabel.TEXT)
+        picture = _FakeDocItem(DocItemLabel.PICTURE)
+        assert _infer_chunk_type([text, picture]) == "text"
+
+
+def _picture_doc_chunk(text: str, ref: str, heading: str = "Section") -> DocChunk:
+    item = PictureItem(self_ref=ref, label=DocItemLabel.PICTURE)
+    meta = DocMeta(doc_items=[item], headings=[heading], origin=None)
+    return DocChunk(text=text, meta=meta)
+
+
+class TestPictureDescriptionSubstitution:
+    """Phase 2: the chunker substitutes descriptions into `<!-- image -->` placeholders
+    without destroying surrounding prose. See docs/stages/ingestion-optimization-implementation.md
+    Phase 2."""
+
+    def test_prose_plus_picture_keeps_the_prose(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=5, max_merge_multiplier=10.0)
+        prose = _doc_chunk("Revenue grew across all segments this year.", "#/texts/0")
+        picture = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        merged = _run_chunk(chunker, [prose, picture], monkeypatch)
+        assert len(merged) == 1
+
+        text = chunker.contextualize(
+            chunk=merged[0], pic_descriptions={"#/pictures/0": "Bar chart of revenue by segment."}
+        )
+        assert "Revenue grew across all segments this year." in text
+        assert "Bar chart of revenue by segment." in text
+        assert "<!-- image -->" not in text
+
+    def test_two_pictures_keep_both_descriptions(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=50, max_merge_multiplier=10.0)
+        pic1 = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        pic2 = _picture_doc_chunk("<!-- image -->", "#/pictures/1")
+        merged = _run_chunk(chunker, [pic1, pic2], monkeypatch)
+        assert len(merged) == 1
+
+        descriptions = {
+            "#/pictures/0": "Line chart of quarterly EPS.",
+            "#/pictures/1": "Pie chart of revenue by region.",
+        }
+        text = chunker.contextualize(chunk=merged[0], pic_descriptions=descriptions)
+        assert "Line chart of quarterly EPS." in text
+        assert "Pie chart of revenue by region." in text
+        assert "<!-- image -->" not in text
+
+    def test_picture_with_no_description_indexes_no_placeholder(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=5, max_merge_multiplier=10.0)
+        picture = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        result = _run_chunk(chunker, [picture], monkeypatch)
+        assert len(result) == 1
+
+        text = chunker.contextualize(chunk=result[0], pic_descriptions={})
+        assert "<!-- image -->" not in text
+        assert "Section" in text  # heading survives; only the placeholder is dropped

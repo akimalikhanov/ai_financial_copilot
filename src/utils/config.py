@@ -284,6 +284,11 @@ def get_s3_chunks_bucket() -> str:
     return os.getenv("S3_CHUNKS_BUCKET", "chunks")
 
 
+def get_s3_pictures_bucket() -> str:
+    """Bucket for persisted picture crops (S3_PICTURES_BUCKET, default pictures)."""
+    return os.getenv("S3_PICTURES_BUCKET", "pictures")
+
+
 def get_s3_access_key() -> str:
     """S3/Garage access key (AWS_ACCESS_KEY_ID). Required for uploads."""
     val = os.getenv("AWS_ACCESS_KEY_ID")
@@ -328,13 +333,23 @@ def get_docling_generate_picture_images() -> bool:
     return _parse_bool(os.getenv("DOCLING_GENERATE_PICTURE_IMAGES"), False)
 
 
+def get_docling_do_picture_classification() -> bool:
+    """DOCLING_DO_PICTURE_CLASSIFICATION (default: true).
+
+    Warm (post `torch.compile` autotune) it runs at ~3.4 ms/picture; the labels feed
+    Phase 11's per-class enrichment routing.
+    """
+    return _parse_bool(os.getenv("DOCLING_DO_PICTURE_CLASSIFICATION"), True)
+
+
 def get_docling_generate_page_images() -> bool:
+    """DOCLING_GENERATE_PAGE_IMAGES (default: false).
+
+    Page images are not needed for picture description: the VLM crops from the page
+    backend (kept alive via `keep_backend`), not from a rendered page PNG. Full-page
+    images are exported with `ImageRefMode.PLACEHOLDER` and discarded, so leaving this
+    off costs nothing even with picture description on.
     """
-    DOCLING_GENERATE_PAGE_IMAGES (default: false).
-    When do_picture_description is true, this is forced to true (VLM needs page images).
-    """
-    if get_docling_do_picture_description():
-        return True
     return _parse_bool(os.getenv("DOCLING_GENERATE_PAGE_IMAGES"), False)
 
 
@@ -354,12 +369,104 @@ def get_docling_picture_vlm_prompt() -> str:
 
 
 def get_docling_document_timeout() -> float:
-    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0)."""
+    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0).
+
+    Bounds Docling's page loop only. Assembly, reading order and enrichment run outside it —
+    see get_docling_parse_timeout() for the wall-clock ceiling on the whole parse.
+    """
     val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "300")
     try:
         return float(val)
     except ValueError:
         return 300.0
+
+
+def get_docling_parse_timeout() -> float:
+    """DOCLING_PARSE_TIMEOUT_SECONDS in seconds (default: 600.0).
+
+    Wall-clock ceiling on the entire parse, unlike DOCLING_DOCUMENT_TIMEOUT.
+    """
+    val = os.getenv("DOCLING_PARSE_TIMEOUT_SECONDS", "600")
+    try:
+        return float(val)
+    except ValueError:
+        return 600.0
+
+
+def get_docling_ocr_fallback_enabled() -> bool:
+    """DOCLING_OCR_FALLBACK_ENABLED (default: true).
+
+    Re-parse with forced full-page OCR when a parse yields garbled text. Plain DOCLING_DO_OCR
+    does not cover this case: Docling only OCRs regions lacking a text layer, and a broken-font
+    PDF has one — it is just wrong.
+    """
+    return os.getenv("DOCLING_OCR_FALLBACK_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def get_docling_ocr_document_timeout() -> float:
+    """DOCLING_OCR_DOCUMENT_TIMEOUT in seconds (default: 1800.0).
+
+    Page-loop timeout for the forced-OCR fallback converter only. Full-page OCR runs ~4.3s a
+    page against ~0.6s for a normal parse, so the standard DOCLING_DOCUMENT_TIMEOUT truncates
+    the very documents the fallback exists to rescue.
+    """
+    val = os.getenv("DOCLING_OCR_DOCUMENT_TIMEOUT", "1800")
+    try:
+        return float(val)
+    except ValueError:
+        return 1800.0
+
+
+def get_docling_text_quality_threshold() -> float:
+    """DOCLING_TEXT_QUALITY_THRESHOLD (default: 0.02).
+
+    Minimum stopword ratio for a parse to count as readable. Real documents measured 0.06+,
+    a broken-font one measured 0.0003.
+    """
+    try:
+        return float(os.getenv("DOCLING_TEXT_QUALITY_THRESHOLD", "0.02"))
+    except ValueError:
+        return 0.02
+
+
+def get_docling_device() -> str:
+    """DOCLING_DEVICE (default: cuda). Passed to AcceleratorOptions; Docling also accepts
+    a specific index such as "cuda:1"."""
+    return os.getenv("DOCLING_DEVICE", "cuda")
+
+
+def get_docling_ocr_use_gpu() -> bool:
+    """DOCLING_OCR_USE_GPU (default: true).
+
+    Independent of DOCLING_DEVICE: EasyOcrOptions.use_gpu is its own flag, not derived
+    from the accelerator device.
+    """
+    return _parse_bool(os.getenv("DOCLING_OCR_USE_GPU"), True)
+
+
+def get_docling_images_scale() -> float:
+    """DOCLING_IMAGES_SCALE (default: 2.0). Resolution multiplier for generated page/picture
+    images."""
+    val = os.getenv("DOCLING_IMAGES_SCALE", "2.0")
+    try:
+        return float(val)
+    except ValueError:
+        return 2.0
+
+
+def get_docling_artifacts_path() -> Path | None:
+    """DOCLING_ARTIFACTS_PATH — local directory with pre-downloaded Docling model weights
+    (layout, TableFormer, picture classifier), populated by model-preload-job.yaml.
+
+    Unset (default) falls back to Docling's lazy per-repo HuggingFace download, which
+    still lands in HF_HOME but only starts once a Celery task actually needs the model.
+    """
+    val = os.getenv("DOCLING_ARTIFACTS_PATH")
+    return Path(val) if val else None
 
 
 def get_chunking_tokenizer_model() -> str:
@@ -415,6 +522,34 @@ def get_embedder_timeout_seconds() -> float:
         return float(os.getenv("EMBEDDER_TIMEOUT_SECONDS", "30.0"))
     except ValueError:
         return 30.0
+
+
+def get_embedder_batch_size() -> int:
+    """EMBEDDER_BATCH_SIZE — inputs per TEI request (default: 64).
+
+    Must not exceed TEI's --max-client-batch-size; the embedder clamps to the server's
+    reported value rather than trusting this.
+    """
+    try:
+        return max(1, int(os.getenv("EMBEDDER_BATCH_SIZE", "64")))
+    except ValueError:
+        return 64
+
+
+def get_embedder_concurrency() -> int:
+    """EMBEDDER_CONCURRENCY — in-flight TEI requests per embed call (default: 4)."""
+    try:
+        return max(1, int(os.getenv("EMBEDDER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+def get_embedding_device() -> str:
+    """EMBEDDING_DEVICE for the local SentenceTransformer provider (default: cpu).
+
+    Only consulted when EMBEDDING_PROVIDER=local; TEI and OpenAI place the model themselves.
+    """
+    return os.getenv("EMBEDDING_DEVICE", "cpu")
 
 
 def get_embedding_dim() -> int | None:

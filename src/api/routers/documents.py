@@ -64,6 +64,7 @@ async def list_documents(
             created_at=d.created_at,
             extracted_title=d.extracted_title,
             page_count=d.page_count,
+            parse_status=d.parse_status,
             metadata=d.document_metadata,
         )
         for d in docs

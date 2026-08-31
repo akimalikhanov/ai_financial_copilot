@@ -6,6 +6,8 @@ export interface Document {
   type: string;
   pages: number;
   status: 'Ready' | 'Processing' | 'Error';
+  // True when Docling reported partial_success: indexed, but some pages failed to parse.
+  partialParse?: boolean;
   tags: string[];
   ingestionStage?: string;
   ingestionStageIndex?: number;

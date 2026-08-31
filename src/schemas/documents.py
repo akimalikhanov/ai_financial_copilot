@@ -32,6 +32,8 @@ class DocumentListItem(BaseModel):
     created_at: datetime
     extracted_title: str | None
     page_count: int | None
+    # Docling ConversionStatus. Anything but "success" means the indexed content is incomplete.
+    parse_status: str | None
     metadata: dict
 
 

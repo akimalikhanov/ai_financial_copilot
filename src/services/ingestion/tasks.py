@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 from uuid import UUID
 
 from celery.exceptions import Retry, SoftTimeLimitExceeded
@@ -39,6 +41,7 @@ from src.services.llm_router import get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_db_url,
+    get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
     get_redis_app_url,
@@ -124,6 +127,48 @@ def _export_artifacts(document) -> tuple[bytes, bytes]:
         return json_p.read_bytes(), md_p.read_bytes()
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def _extract_picture_crops(document) -> list[dict[str, Any]]:
+    """Encode each picture's in-memory crop to PNG bytes, with its top classification
+    label if Docling produced one (do_picture_classification, see docling_parser.py).
+
+    Crops only exist here because generate_picture_images=True keeps them on the
+    DoclingDocument through parse; export_docling_artifacts strips them via
+    ImageRefMode.PLACEHOLDER, so this has to run before the document is discarded.
+    """
+    crops: list[dict[str, Any]] = []
+    for pic in document.pictures:
+        if pic.image is None:
+            continue
+        try:
+            pil_image = pic.image.pil_image
+            if pil_image is None:
+                raise ValueError("pil_image decode returned None")
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            label: str | None = None
+            confidence: float | None = None
+            if pic.meta is not None and pic.meta.classification is not None:
+                main = pic.meta.classification.get_main_prediction()
+                label, confidence = main.class_name, main.confidence
+            crops.append(
+                {
+                    "self_ref": pic.self_ref,
+                    "data": buf.getvalue(),
+                    "label": label,
+                    "confidence": confidence,
+                }
+            )
+        except Exception:
+            # A crop is a re-runnable convenience artifact (Phase 5), not required for
+            # this document to become searchable — never fail the pipeline over one.
+            logger.warning(
+                "pipeline.picture_crop_encode_failed",
+                extra={"self_ref": pic.self_ref},
+                exc_info=True,
+            )
+    return crops
 
 
 async def _run_pipeline(document_id: str) -> None:  # noqa: C901
@@ -242,11 +287,30 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- parse with Docling (CPU/GPU-bound) -----------------------------
         await _log_stage("parse_pdf_docling")
-        parse_result = await _timed("parse", asyncio.to_thread(docling_parser.parse, pdf_path))
+        # Docling's own document_timeout bounds its page loop only; assembly, reading order and
+        # enrichment run outside it. This is the wall-clock ceiling on the whole parse. A thread
+        # cannot be killed, so the abandoned parse runs on until it finishes or Celery's hard
+        # time limit reaps the child; the document fails now rather than hanging.
+        parse_timeout = get_docling_parse_timeout()
+        try:
+            parse_result = await _timed(
+                "parse",
+                asyncio.wait_for(
+                    asyncio.to_thread(docling_parser.parse, pdf_path), timeout=parse_timeout
+                ),
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
+                f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
+            ) from exc
 
         # -- export artifacts (CPU-bound serialization) --------------------
         await _log_stage("export_docling_artifacts")
-        json_bytes, md_bytes = await asyncio.to_thread(_export_artifacts, parse_result.document)
+        (json_bytes, md_bytes), picture_crops = await asyncio.gather(
+            asyncio.to_thread(_export_artifacts, parse_result.document),
+            asyncio.to_thread(_extract_picture_crops, parse_result.document),
+        )
 
         # -- update metadata + upload artifacts (parallel I/O) --------------
         await _log_stage("save_metadata_and_upload_artifacts")
@@ -268,6 +332,24 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 )
                 await session.commit()
 
+        async def _upload_crop(crop: dict[str, Any]) -> None:
+            # A crop is a re-runnable convenience artifact (Phase 5), not required for
+            # this document to become searchable — never fail the pipeline over one.
+            try:
+                await s3_client.upload_picture_crop(
+                    document_id,
+                    crop["self_ref"],
+                    crop["data"],
+                    label=crop["label"],
+                    confidence=crop["confidence"],
+                )
+            except Exception:
+                logger.warning(
+                    "pipeline.picture_crop_upload_failed",
+                    extra={"document_id": document_id, "self_ref": crop["self_ref"]},
+                    exc_info=True,
+                )
+
         await asyncio.gather(
             _save_metadata(),
             s3_client.upload_bytes(
@@ -282,6 +364,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 "text/markdown",
                 bucket=get_s3_rendered_bucket(),
             ),
+            *(_upload_crop(crop) for crop in picture_crops),
         )
 
         # -- chunk document (CPU-bound) -------------------------------------

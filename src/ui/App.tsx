@@ -133,6 +133,7 @@ const toUiDoc = (d: DocumentListItemResponse): Document => ({
   type: (d.metadata?.type as string | undefined) ?? '',
   pages: d.page_count ?? 0,
   status: mapDocStatus(d.status),
+  partialParse: d.parse_status != null && d.parse_status !== 'success',
   tags: [],
 });
 
@@ -1860,6 +1861,14 @@ export default function App() {
                         <div className="flex items-center gap-2">
                           <FileText size={16} className="text-[var(--text-faint)] shrink-0" />
                           <span className="truncate max-w-[280px]">{doc.title}</span>
+                          {doc.partialParse && (
+                            <span
+                              className="text-[var(--warning)] shrink-0 flex"
+                              title="Some pages failed to parse. Answers from this document may be missing content."
+                            >
+                              <AlertTriangle size={14} aria-label="Partial parse" />
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company || '—'}</td>

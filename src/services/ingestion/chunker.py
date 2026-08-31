@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
@@ -30,10 +31,42 @@ from src.utils.config import (
 if TYPE_CHECKING:
     from docling_core.types.doc.document import DoclingDocument
 
+logger = logging.getLogger(__name__)
+
+_IMAGE_PLACEHOLDER = "<!-- image -->"
+
 
 def _pg_sanitize(text: str) -> str:
     """Strip characters PostgreSQL UTF-8 rejects (null bytes from PDF form fields)."""
     return text.replace("\x00", "")
+
+
+def _picture_refs(doc_chunk: DocChunk) -> list[str]:
+    """self_refs of this chunk's picture doc_items, in document order."""
+    return [
+        item.self_ref
+        for item in doc_chunk.meta.doc_items
+        if getattr(item, "label", None) == DocItemLabel.PICTURE and getattr(item, "self_ref", None)
+    ]
+
+
+def _substitute_placeholders(
+    text: str, refs: Iterator[str], pic_descriptions: dict[str, str]
+) -> str:
+    """Replace each `<!-- image -->` occurrence with that picture's description, in order.
+
+    A picture with no description drops the placeholder entirely rather than indexing it.
+    `refs` is consumed positionally, one ref per occurrence.
+    """
+    if _IMAGE_PLACEHOLDER not in text:
+        return text
+    parts = text.split(_IMAGE_PLACEHOLDER)
+    rendered = [parts[0]]
+    for part in parts[1:]:
+        ref = next(refs, None)
+        rendered.append(pic_descriptions.get(ref, "") if ref else "")
+        rendered.append(part)
+    return "".join(rendered)
 
 
 class AnnualReportSerializerProvider(ChunkingSerializerProvider):
@@ -114,14 +147,17 @@ class CustomHybridChunker(HybridChunker):
 
         yield from out
 
-    def contextualize(self, chunk: BaseChunk) -> str:
+    def contextualize(
+        self, chunk: BaseChunk, pic_descriptions: dict[str, str] | None = None
+    ) -> str:
         doc_chunk = DocChunk.model_validate(chunk)
         pieces = self._pieces_by_key.get(self._chunk_key(doc_chunk), [self._piece(doc_chunk)])
+        refs = iter(_picture_refs(doc_chunk))
 
         rendered: list[str] = []
         for piece in pieces:
             headings = self._unique(cast(Iterable[str], piece["headings"]))
-            text = cast(str, piece["text"])
+            text = _substitute_placeholders(cast(str, piece["text"]), refs, pic_descriptions or {})
 
             if headings:
                 rendered.append("\n".join(f"[SECTION] {h}" for h in headings))
@@ -226,9 +262,10 @@ def parse_chunk_metadata(chunk: BaseChunk) -> dict[str, Any]:
 
 
 def _infer_chunk_type(doc_items: Iterable[Any]) -> str:
-    if any(getattr(item, "label", None) == DocItemLabel.TABLE for item in doc_items):
+    labels = [getattr(item, "label", None) for item in doc_items]
+    if DocItemLabel.TABLE in labels:
         return "table"
-    if any(getattr(item, "label", None) == DocItemLabel.PICTURE for item in doc_items):
+    if labels and all(label == DocItemLabel.PICTURE for label in labels):
         return "picture"
     return "text"
 
@@ -268,12 +305,21 @@ def _build_picture_descriptions(document: DoclingDocument) -> dict[str, str]:
     return result
 
 
-def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[dict[str, Any]]:
+def chunk_document(
+    document: DoclingDocument,
+    document_id: UUID | str,
+    pic_descriptions: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Chunk a DoclingDocument with the custom HybridChunker.
 
     Returns a list of dicts ready for ChunkRepository.create_many().
     Each chunk includes document_id for tracing and Qdrant payload.
+
+    `pic_descriptions` maps a picture's `self_ref` to its VLM description text. When
+    omitted it is built from `document.pictures`; callers that already have crops and
+    descriptions without a parsed `DoclingDocument` (e.g. a re-run over persisted crops)
+    can pass it directly.
     """
     tokenizer = _get_tokenizer()
     chunker = CustomHybridChunker(
@@ -284,7 +330,8 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         max_merge_multiplier=get_chunking_max_merge_multiplier(),
     )
     doc_id_str = str(document_id)
-    pic_descriptions = _build_picture_descriptions(document)
+    if pic_descriptions is None:
+        pic_descriptions = _build_picture_descriptions(document)
     rows: list[dict[str, Any]] = []
 
     for i, chunk in enumerate(chunker.chunk(dl_doc=document)):
@@ -295,22 +342,20 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         page_span = chunk_meta["page_span"]
         labels = sorted({label for item in doc_items if (label := _label_to_str(item)) is not None})
 
-        raw_text = chunk.text
-        if chunk_type == "picture":
-            for ref in chunk_meta["doc_item_refs"]:
-                if ref in pic_descriptions:
-                    raw_text = pic_descriptions[ref]
-                    break
+        picture_refs = _picture_refs(doc_chunk)
+        placeholder_count = chunk.text.count(_IMAGE_PLACEHOLDER)
+        if placeholder_count != len(picture_refs):
+            logger.warning(
+                "chunk %d has %d image placeholders but %d picture doc_items "
+                "(document_id=%s); substitution will misalign",
+                i,
+                placeholder_count,
+                len(picture_refs),
+                doc_id_str,
+            )
 
-        # For picture chunks with a VLM description, build enriched_text manually
-        # (chunker.contextualize would return the useless "<!-- image -->" placeholder)
-        if chunk_type == "picture" and raw_text != chunk.text:
-            headings = chunk_meta["headings"] or []
-            parts = [f"[SECTION] {h}" for h in headings]
-            parts.append(raw_text)
-            enriched_text = "\n".join(parts)
-        else:
-            enriched_text = chunker.contextualize(chunk=chunk)
+        raw_text = _substitute_placeholders(chunk.text, iter(picture_refs), pic_descriptions)
+        enriched_text = chunker.contextualize(chunk=chunk, pic_descriptions=pic_descriptions)
 
         raw_text = _pg_sanitize(raw_text)
         enriched_text = _pg_sanitize(enriched_text)

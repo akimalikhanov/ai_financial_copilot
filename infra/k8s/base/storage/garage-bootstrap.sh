@@ -51,7 +51,7 @@ else
   echo "Layout already assigned, skipping."
 fi
 
-BUCKETS_CSV="${GARAGE_BUCKETS:-pdfs,docling,rendered,chunks,langfuse}"
+BUCKETS_CSV="${GARAGE_BUCKETS:-pdfs,docling,rendered,chunks,pictures,langfuse}"
 BUCKETS="$(printf '%s' "$BUCKETS_CSV" | tr ',' ' ')"
 
 for b in $BUCKETS; do

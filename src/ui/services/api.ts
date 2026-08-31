@@ -427,6 +427,7 @@ export interface DocumentListItemResponse {
   created_at: string;
   extracted_title: string | null;
   page_count: number | null;
+  parse_status: string | null;
   metadata: Record<string, unknown>;
 }
 

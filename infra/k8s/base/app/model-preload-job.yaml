@@ -13,20 +13,22 @@ spec:
         - name: preload
           image: copilot/worker:dev
           imagePullPolicy: IfNotPresent
-          # Warms the HF cache PVC before any ingest runs. Docling pulls the picture-description
-          # VLM lazily on the first PDF, inside the Celery task — so without this the first
-          # upload blocks on a multi-GB download while the UI shows it as stuck.
+          # Warms the model cache PVC before any ingest runs. Without this, layout,
+          # TableFormer and the picture classifier are resolved lazily on the first PDF,
+          # inside the Celery task, so the first upload blocks on a multi-GB download while
+          # the UI shows it as stuck. `docling-tools models download` lays models out under
+          # --output-dir as a model-repo-folder tree (not the HF snapshot-cache format), so
+          # the worker is pointed at this same directory via DOCLING_ARTIFACTS_PATH
+          # (docling_parser.py) rather than falling back to HF_HOME's lazy per-repo download.
           command:
-            - python
-            - -c
-            - |
-              import os
-              from huggingface_hub import snapshot_download
-
-              repo = os.environ["DOCLING_PICTURE_VLM_MODEL"]
-              print(f"preloading {repo} into {os.environ['HF_HOME']}", flush=True)
-              path = snapshot_download(repo)
-              print(f"done: {path}", flush=True)
+            - docling-tools
+            - models
+            - download
+            - --output-dir
+            - $(DOCLING_ARTIFACTS_PATH)
+            - layout
+            - tableformer
+            - picture_classifier
           envFrom:
             - configMapRef: { name: app-config }
             - secretRef:    { name: app-secret }   # HF_TOKEN

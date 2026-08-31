@@ -330,9 +330,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     command:
       - --model-id
       - ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
@@ -365,9 +367,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     command:
       - --model-id
       - ${EMBEDDER_MODEL_NAME:-BAAI/bge-m3}
@@ -770,9 +774,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     depends_on:
       pgbouncer:
         condition: service_healthy
