@@ -462,7 +462,7 @@ class TestGetWithFallback:
                 {
                     "id": "gemini",
                     "provider": "google",
-                    "model_name": "gemini-2.5-flash",
+                    "model_name": "gemini-3.7-flash",
                     "fallback_model": "gpt-4o-mini",
                 },
                 {"id": "gpt-4o-mini", "provider": "openai", "model_name": "gpt-4o-mini"},

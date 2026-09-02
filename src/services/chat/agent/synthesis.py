@@ -78,6 +78,21 @@ def _inject_unsearched_stubs(
     return findings.model_copy(update={"findings": findings.findings + missing_stubs})
 
 
+# Prepended to the synthesis context when every search errored. Without it a dead
+# retrieval backend is indistinguishable from an empty corpus: the context collapses to
+# "(No document context.)" and synthesis reports "not found in the uploaded documents",
+# telling the user their documents lack a fact they may well contain.
+RETRIEVAL_UNAVAILABLE_BANNER = (
+    "[RETRIEVAL UNAVAILABLE]\n"
+    "Document search failed for this request — every search returned a backend error, so "
+    "NO excerpts could be retrieved. This is a temporary system failure, NOT evidence that "
+    "the documents lack the requested information.\n"
+    "Tell the user document search is temporarily unavailable and ask them to retry. Do NOT "
+    "state or imply the information was not found in the documents, and do NOT output the "
+    "`N/A` not-found marker."
+)
+
+
 def _cited_chunk_ids(findings: AgentFindings | AnalyticalFindings) -> set[UUID]:
     cited_ids: set[UUID] = set()
     if isinstance(findings, AgentFindings):
@@ -190,6 +205,12 @@ async def run_synthesis(
         if findings_block is not None
         else rag_context.formatted_context or "(No document context.)"
     )
+
+    # Leads the context so the instruction is read before any (possibly empty) evidence.
+    # Whatever partial findings a pre-failure turn landed still follow it — the banner
+    # reframes an absence of excerpts, it does not discard evidence already in hand.
+    if agent_meta.convergence_reason == "search_unavailable":
+        synthesis_context = RETRIEVAL_UNAVAILABLE_BANNER + "\n\n" + synthesis_context
 
     return AgentRunResult(
         rag_context=rag_context,

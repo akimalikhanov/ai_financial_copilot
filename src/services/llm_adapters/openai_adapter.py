@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
@@ -17,11 +18,13 @@ from .base_adapter import (
     AssistantTurnResult,
     ChatMessage,
     ChatRequest,
+    ImagePart,
     LLMAdapter,
     LLMResponse,
     LLMResponseStats,
     LLMStreamChunk,
     ToolCallRef,
+    reject_images,
 )
 
 
@@ -128,9 +131,28 @@ class OpenAIAdapter(LLMAdapter):
         )
 
     @staticmethod
-    def _serialize_msg(m: ChatMessage) -> dict[str, Any]:
+    def _serialize_image(img: ImagePart) -> dict[str, Any]:
+        """One image_url content part. vLLM implements the same schema, and accepts and
+        ignores `detail`, so this needs no provider branching."""
+        b64 = base64.b64encode(img.data).decode("ascii")
+        image_url: dict[str, Any] = {"url": f"data:{img.mime_type};base64,{b64}"}
+        if img.detail != "auto":
+            image_url["detail"] = img.detail
+        return {"type": "image_url", "image_url": image_url}
+
+    @classmethod
+    def _serialize_msg(cls, m: ChatMessage) -> dict[str, Any]:
         d: dict[str, Any] = {"role": m.role}
-        d["content"] = m.content if m.content is not None else ""
+        if m.images:
+            # Multimodal turns take a content parts list. The text part is omitted entirely
+            # when there is no text: an image-only message is valid, "" is not a useful part.
+            parts: list[dict[str, Any]] = []
+            if m.content:
+                parts.append({"type": "text", "text": m.content})
+            parts.extend(cls._serialize_image(img) for img in m.images)
+            d["content"] = parts
+        else:
+            d["content"] = m.content if m.content is not None else ""
         if m.name:
             d["name"] = m.name
         if m.tool_call_id:
@@ -219,6 +241,7 @@ class OpenAIAdapter(LLMAdapter):
         verbosity: Literal["high", "medium", "low"] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[LLMStreamChunk, None]:
+        reject_images(messages, f"{self.__class__.__name__}.stream")
         req = self._build_request(
             messages,
             model=model,
@@ -255,6 +278,7 @@ class OpenAIAdapter(LLMAdapter):
         tools: list[dict[str, Any]],
         **kwargs: Any,
     ) -> AssistantTurnResult:
+        reject_images(messages, f"{self.__class__.__name__}.complete_with_tools")
         req = self._build_request(messages, **kwargs)
         kw = self._build_kwargs(req)
         kw["tools"] = tools

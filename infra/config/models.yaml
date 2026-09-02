@@ -26,6 +26,7 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      vision: true
     params_override: {temperature: 1.0, max_tokens: 6000, verbosity: high, reasoning_effort: high}
     # Same-provider fallback: smallest quality drop, still a reasoning-tier model.
     # Covers capacity/rollout issues on the gpt-5.2 SKU specifically, not a full
@@ -49,6 +50,7 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      vision: true
     # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
     # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
@@ -84,33 +86,36 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      vision: true
     params_override: {}
-    # Cross-provider fallback: mutual pair with gemini-2.5-flash's fallback below,
+    # Cross-provider fallback: mutual pair with gemini-3.7-flash's fallback below,
     # so each model covers the other's outage. Costs more than gpt-4o-mini per
     # token, but only while the fallback is actually in use.
-    fallback_model: gemini-2.5-flash
+    fallback_model: gemini-3.7-flash
 
   # === Google Gemini adapters ===
 
-  - id: gemini-2.5-flash
-    label: "Gemini 2.5 Flash"
+  - id: gemini-3.7-flash
+    label: "Gemini 3.7 Flash"
     provider: google
-    model_name: "gemini-2.5-flash"
+    model_name: "gemini-3.7-flash"
     pricing:
       currency: USD
       unit: per_1k_tokens
-      input: ${GEMINI_FLASH_INPUT_PRICE:-0.00030}
-      output: ${GEMINI_FLASH_OUTPUT_PRICE:-0.00250}
-      cached_input: ${GEMINI_FLASH_CACHE_PRICE:-0.00003}
+      input: ${GEMINI_FLASH_INPUT_PRICE:-0.00075}
+      output: ${GEMINI_FLASH_OUTPUT_PRICE:-0.00375}
+      cached_input: ${GEMINI_FLASH_CACHE_PRICE:-0.000075}
       cached_output: null
       rounding: exact
-      effective: 2025-09-01
-      notes: "Paid tier (per 1M: $0.30 in, $2.50 out, caching $0.03)."
+      effective: 2026-09-01
+      # Promotional pricing: doubles on 2027-01-01 to $1.50 in, $7.50 out, $0.15 caching.
+      notes: "Paid tier (per 1M: $0.75 in, $3.75 out, caching $0.075) through 2026-12-31."
     capabilities:
       streaming: true
       tool_calling: true
+      vision: true
     params_override: {}
-    # If gemini-2.5-flash errors on a retryable condition (e.g. 503), fall back
+    # If gemini-3.7-flash errors on a retryable condition (e.g. 503), fall back
     # to this model rather than failing the whole chat turn. See llm_router.py
     # LLMRouter.get_with_fallback / FallbackStream.
     fallback_model: gpt-4o-mini
@@ -133,4 +138,6 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      # Text-only checkpoint; the vision variant is a separate model (Qwen3-VL).
+      vision: false
     params_override: {max_tokens: 1024}

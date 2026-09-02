@@ -197,3 +197,53 @@ class TestPictureDescriptionSubstitution:
         text = chunker.contextualize(chunk=result[0], pic_descriptions={})
         assert "<!-- image -->" not in text
         assert "Section" in text  # heading survives; only the placeholder is dropped
+
+
+class TestSerializerMetaSuppression:
+    """Phase 11: docling's MarkdownMetaSerializer renders every meta field straight into the
+    serialized text. Left alone that emits the enricher's description a second time (once as
+    meta, once via placeholder substitution) plus the classifier label as prose. These run the
+    real serializer over a real DoclingDocument — the stub DocChunks above cannot catch it."""
+
+    @staticmethod
+    def _doc_with_described_picture():
+        from docling_core.types.doc.document import (
+            DescriptionMetaField,
+            DoclingDocument,
+            PictureClassificationMetaField,
+            PictureClassificationPrediction,
+            PictureMeta,
+        )
+
+        doc = DoclingDocument(name="t")
+        doc.add_text(label=DocItemLabel.TEXT, text="GROUP ONLINE REVENUE $M")
+        picture = doc.add_picture()
+        picture.meta = PictureMeta(
+            description=DescriptionMetaField(
+                text="Combined column and line chart, RECORD SALES $223m.", created_by="gpt-5-mini"
+            ),
+            classification=PictureClassificationMetaField(
+                predictions=[
+                    PictureClassificationPrediction(class_name="line_chart", confidence=0.9)
+                ]
+            ),
+        )
+        return doc
+
+    def test_description_is_not_emitted_alongside_the_placeholder(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        # The placeholder survives so _substitute_placeholders can write the description exactly
+        # once, in the picture's position.
+        assert text.count("<!-- image -->") == 1
+        assert "RECORD SALES $223m" not in text
+
+    def test_classification_label_is_not_emitted_as_prose(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        assert "Line chart" not in text
+
+    def test_surrounding_text_is_untouched(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        assert "GROUP ONLINE REVENUE $M" in text

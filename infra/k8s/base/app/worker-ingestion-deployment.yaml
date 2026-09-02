@@ -103,6 +103,18 @@ spec:
               done
           resources:
             requests: { cpu: "10m", memory: "16Mi" }
+        # Embedder only — ingestion never calls the reranker.
+        - name: wait-for-tei-embedder
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://tei-embedder:80/health >/dev/null 2>&1; do
+                echo "waiting for tei-embedder:80"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
       containers:
         - name: worker-ingestion
           image: copilot/worker:dev

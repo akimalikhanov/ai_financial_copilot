@@ -32,11 +32,14 @@ def _chunk(score: float = 1.0) -> RetrievedChunk:
     )
 
 
-def _meta(searched_entities: frozenset[str] = frozenset()) -> AgentLoopMeta:
+def _meta(
+    searched_entities: frozenset[str] = frozenset(),
+    convergence_reason: str = "natural",
+) -> AgentLoopMeta:
     return AgentLoopMeta(
         iterations=1,
         tool_calls_total=1,
-        convergence_reason="natural",
+        convergence_reason=convergence_reason,  # type: ignore[arg-type]
         searched_entities=searched_entities,
     )
 
@@ -315,3 +318,55 @@ class TestSynthesisContextShape:
         )
         assert expected
         assert result.synthesis_context.endswith(result.rag_context.formatted_context)
+
+
+class TestRetrievalUnavailable:
+    """A dead retrieval backend must not be served as an empty corpus.
+
+    The failure this guards (trace 54da45b4…): every search errored, the loop stopped
+    `search_unavailable` with zero chunks, and synthesis answered "not found in the
+    uploaded documents" — telling the user their documents lack a fact they may contain.
+    """
+
+    async def test_banner_leads_context_when_every_search_errored(self) -> None:
+        result = await synthesis.run_synthesis(
+            EvidenceLedger(),
+            None,
+            _meta(convergence_reason="search_unavailable"),
+            None,
+            None,
+            max_chunks_per_entity=100,
+        )
+
+        assert result.synthesis_context.startswith(synthesis.RETRIEVAL_UNAVAILABLE_BANNER)
+
+    async def test_banner_absent_on_a_genuinely_empty_corpus(self) -> None:
+        """Same zero-chunk shape, but the searches ran — this one really is "not found"."""
+        result = await synthesis.run_synthesis(
+            EvidenceLedger(),
+            None,
+            _meta(convergence_reason="convergence"),
+            None,
+            None,
+            max_chunks_per_entity=100,
+        )
+
+        assert synthesis.RETRIEVAL_UNAVAILABLE_BANNER not in result.synthesis_context
+
+    async def test_banner_precedes_evidence_gathered_before_the_failure(self) -> None:
+        """Partial findings are reframed, not discarded: a run that landed chunks and
+        then lost the backend still serves what it has, under the banner."""
+        chunk = _chunk()
+        ledger = _ledger(chunk)
+
+        result = await synthesis.run_synthesis(
+            ledger,
+            None,
+            _meta(convergence_reason="search_unavailable"),
+            None,
+            None,
+            max_chunks_per_entity=100,
+        )
+
+        assert result.synthesis_context.startswith(synthesis.RETRIEVAL_UNAVAILABLE_BANNER)
+        assert "Some chunk text." in result.synthesis_context

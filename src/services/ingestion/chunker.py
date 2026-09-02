@@ -69,6 +69,13 @@ def _substitute_placeholders(
     return "".join(rendered)
 
 
+# Meta fields docling renders straight into the chunk text (MarkdownMetaSerializer), which we
+# suppress: `description` is written by picture_enricher and belongs at the placeholder, not
+# ahead of it — leaving both on emits it twice. `classification` renders the classifier label
+# ("Line chart", "Photograph") as prose, which is noise once a real description exists.
+_BLOCKED_META_NAMES = frozenset({"description", "classification"})
+
+
 class AnnualReportSerializerProvider(ChunkingSerializerProvider):
     """Serialize table chunks as markdown tables with stable image placeholders."""
 
@@ -76,7 +83,10 @@ class AnnualReportSerializerProvider(ChunkingSerializerProvider):
         return ChunkingDocSerializer(
             doc=doc,
             table_serializer=MarkdownTableSerializer(),
-            params=MarkdownParams(image_placeholder="<!-- image -->"),
+            params=MarkdownParams(
+                image_placeholder=_IMAGE_PLACEHOLDER,
+                blocked_meta_names=set(_BLOCKED_META_NAMES),
+            ),
         )
 
 

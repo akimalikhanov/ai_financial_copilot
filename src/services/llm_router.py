@@ -27,10 +27,28 @@ def _role_str(role: Any) -> str:
     return role.value if hasattr(role, "value") else role
 
 
+def _trace_content(m: ChatMessage) -> Any:
+    """Text, or an OpenAI-style content parts list when the message carries images.
+
+    The shape matters: Langfuse's media manager walks the payload for strings that look like
+    base64 data URIs, uploads them to its own object storage and leaves a reference token, so
+    the crop is viewable in the trace and the blob never reaches ClickHouse. Reusing the
+    OpenAI serializer keeps the trace identical to the wire payload on that provider, and
+    puts the data URI where Langfuse looks for it on every other one.
+    """
+    if not m.images:
+        return m.content or ""
+    parts: list[dict[str, Any]] = []
+    if m.content:
+        parts.append({"type": "text", "text": m.content})
+    parts.extend(OpenAIAdapter._serialize_image(img) for img in m.images)
+    return parts
+
+
 def _trace_message(m: ChatMessage) -> dict[str, Any]:
     """Serialize a message for a Langfuse observation input, preserving tool-call
     structure so tool-calling turns are legible in the trace (not a bare content: "")."""
-    out: dict[str, Any] = {"role": _role_str(m.role), "content": m.content or ""}
+    out: dict[str, Any] = {"role": _role_str(m.role), "content": _trace_content(m)}
     if m.tool_call_id:
         out["tool_call_id"] = m.tool_call_id
     if m.tool_calls:

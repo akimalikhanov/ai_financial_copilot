@@ -632,6 +632,47 @@ def get_table_summarizer_batch_size() -> int:
     return int(os.getenv("TABLE_SUMMARIZER_BATCH_SIZE", "3"))
 
 
+def get_picture_enricher_enabled() -> bool:
+    """Whether picture description enrichment is enabled (PICTURE_ENRICHER_ENABLED, default: false).
+
+    Defaults off: it adds paid vision calls per document, so it must be turned on deliberately.
+    With it off, ingestion output is identical to the Phase 4 lean-parse baseline.
+    """
+    return os.getenv("PICTURE_ENRICHER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def get_picture_enricher_model() -> str:
+    """Model for the chart/diagram lane (PICTURE_ENRICHER_MODEL, default: gpt-5-mini).
+    Must exist in models.yaml with capabilities.vision true."""
+    return os.getenv("PICTURE_ENRICHER_MODEL", "gpt-5-mini")
+
+
+def get_picture_enricher_cheap_model() -> str:
+    """Model for the one-line caption lane (PICTURE_ENRICHER_CHEAP_MODEL, default: gpt-4o-mini).
+    Must exist in models.yaml with capabilities.vision true."""
+    return os.getenv("PICTURE_ENRICHER_CHEAP_MODEL", "gpt-4o-mini")
+
+
+def get_picture_enricher_batch_size() -> int:
+    """Pictures per LLM call (PICTURE_ENRICHER_BATCH_SIZE, default: 3). Each picture is a
+    base64 image part, so batches are large requests — raise this cautiously."""
+    return int(os.getenv("PICTURE_ENRICHER_BATCH_SIZE", "3"))
+
+
+def get_picture_enricher_min_confidence() -> float:
+    """Classification confidence below which a picture is routed to the generic caption lane
+    instead of its label's lane (PICTURE_ENRICHER_MIN_CONFIDENCE, default: 0.5)."""
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_MIN_CONFIDENCE", "0.5"))
+    except ValueError:
+        return 0.5
+
+
 def get_rag_top_k() -> int:
     return int(os.getenv("RAG_TOP_K", "15"))
 

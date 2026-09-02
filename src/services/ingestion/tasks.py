@@ -32,6 +32,8 @@ from src.services.ingestion.chunker import reset_tokenizer
 from src.services.ingestion.docling_parser import reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
 from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
+from src.services.ingestion.picture_enricher import enrich_pictures as _enrich_pictures
+from src.services.ingestion.picture_enricher import reset as reset_picture_enricher
 from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
 from src.services.ingestion.table_summarizer import reset as reset_table_summarizer
 from src.services.ingestion.table_summarizer import (
@@ -44,6 +46,7 @@ from src.utils.config import (
     get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
+    get_picture_enricher_enabled,
     get_redis_app_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
@@ -82,6 +85,7 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     reset_tokenizer()
     reset_embedding_clients()
     reset_table_summarizer()
+    reset_picture_enricher()
     get_router.cache_clear()
     get_prompt_loader.cache_clear()
     reset_qdrant_client()
@@ -192,7 +196,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     stage_order: list[str] = []
-    stage_total = 13 if get_table_summarizer_enabled() else 12
+    stage_total = 12 + get_table_summarizer_enabled() + get_picture_enricher_enabled()
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
@@ -304,6 +308,25 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
                 f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
             ) from exc
+
+        # -- describe pictures with a vision model (network-bound) ---------
+        # Must run before export and before chunking: it writes pic.meta.description, which
+        # the exported JSON carries and the chunker substitutes for `<!-- image -->`.
+        if get_picture_enricher_enabled():
+            await _log_stage("enrich_pictures")
+            try:
+                described = await _enrich_pictures(parse_result.document)
+                logger.info(
+                    "pipeline.pictures_enriched",
+                    extra={"document_id": document_id, "described": described},
+                )
+            except Exception:
+                # Enrichment degrades to Phase 4 quality; it never fails a document.
+                logger.warning(
+                    "pipeline.picture_enrichment_failed",
+                    extra={"document_id": document_id},
+                    exc_info=True,
+                )
 
         # -- export artifacts (CPU-bound serialization) --------------------
         await _log_stage("export_docling_artifacts")

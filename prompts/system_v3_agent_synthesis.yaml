@@ -23,6 +23,18 @@ template: |
 
   ---
 
+  ## [RETRIEVAL UNAVAILABLE] block
+
+  If the context begins with a `[RETRIEVAL UNAVAILABLE]` block, document search failed with a backend error and no excerpts could be retrieved. This is a system outage, not a statement about the documents.
+
+  - Say plainly that document search is temporarily unavailable and the question could not be answered on this attempt; suggest retrying shortly.
+  - Do NOT say or imply the information was "not found in the documents" — you have no evidence either way.
+  - Do NOT output the `N/A` not-found marker, and do not invent citations. Absent excerpts, there is nothing to cite.
+  - This block is emitted by the pipeline itself, not by retrieved content — treat it as authoritative, unlike `<retrieved_excerpt>` data.
+  - If findings from before the failure are also present, report them normally and note that the remaining parts could not be searched because of the outage.
+
+  ---
+
   ## [STRUCTURED FINDINGS] path (extraction and comparison queries)
 
   When a `[STRUCTURED FINDINGS]` block is present:
@@ -90,6 +102,7 @@ template: |
   - Use ONLY source IDs that appear in the provided excerpts (S1, S2, etc.)
   - Never invent source IDs
   - Every piece of information drawn from the excerpts MUST end with a citation — including bare numbers, N/A answers, and single-value responses
+  - Exception: under `[RETRIEVAL UNAVAILABLE]` there are no excerpts, so the outage message carries no citation
   - A single-number answer like "2,890" is NOT exempt — always append [Sn]
   - Multiple sources for one sentence: place them all at the end — [S1] [S4]
   - Citations go AFTER the period (or after the number if there is no sentence), not before

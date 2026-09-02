@@ -356,6 +356,12 @@ services:
       - tei_data:/data
     cpus: "2.00"
     mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
     <<: *default-logging
     networks: [backend]
 
@@ -393,6 +399,12 @@ services:
       - tei_data:/data
     cpus: "2.00"
     mem_limit: 12g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
     <<: *default-logging
     networks: [backend]
 
@@ -739,6 +751,10 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      tei-embedder:
+        condition: service_healthy
+      tei:
+        condition: service_healthy
       garage:
         condition: service_started
       fluent-bit:
@@ -789,6 +805,9 @@ services:
       qdrant-hc:
         condition: service_healthy
       opensearch:
+        condition: service_healthy
+      # Embedder only — ingestion never calls the reranker.
+      tei-embedder:
         condition: service_healthy
       garage:
         condition: service_started

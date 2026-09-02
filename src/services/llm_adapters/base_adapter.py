@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 
 class Role(str, Enum):
@@ -30,12 +30,34 @@ class AssistantTurnResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ImagePart:
+    """One image attached to a message. Raw bytes, not base64: Gemini wants bytes and
+    OpenAI wants a data URI, so each adapter encodes for its own wire format."""
+
+    data: bytes
+    mime_type: str  # "image/png" for the picture crops written in the ingestion pipeline
+    # Resolution knob. Maps to OpenAI's image_url.detail and Gemini's Part.media_resolution;
+    # "auto" leaves it to the provider. The main cost lever on image-heavy workloads.
+    detail: Literal["auto", "low", "high"] = "auto"
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: Role
     content: str | None = None  # None valid for assistant tool-call turns
     name: str | None = None  # tool name (or function name)
     tool_call_id: str | None = None  # ties tool result to assistant tool call
     tool_calls: tuple[ToolCallRef, ...] | None = None
+    # Images ride alongside content rather than widening it to a parts union, so the six
+    # existing `m.content or ""` consumers keep working unchanged. complete() only.
+    images: tuple[ImagePart, ...] | None = None
+
+
+def reject_images(messages: Sequence[ChatMessage], surface: str) -> None:
+    """Raise if any message carries images. Only complete() supports them; failing here
+    beats discovering months later that a description was silently text-only."""
+    if any(m.images for m in messages):
+        raise ValueError(f"{surface} does not support image content; use complete()")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +138,7 @@ class LLMAdapter(ABC):
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[LLMStreamChunk, None]:
+        reject_images(messages, f"{self.__class__.__name__}.stream")
         req = ChatRequest(
             messages=tuple(messages),
             model=model or self.default_model,
@@ -131,6 +154,8 @@ class LLMAdapter(ABC):
         tools: list[dict],
         **kwargs: Any,
     ) -> AssistantTurnResult:
+        # No reject_images guard here: this stub raises for every call already. The guard
+        # goes in the subclasses that actually implement tool calling.
         raise NotImplementedError(f"{self.__class__.__name__} does not support tool calling")
 
     @abstractmethod
