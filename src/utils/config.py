@@ -673,6 +673,25 @@ def get_picture_enricher_min_confidence() -> float:
         return 0.5
 
 
+def get_picture_enricher_min_completion_tokens() -> int:
+    """Floor for a picture batch's completion budget (PICTURE_ENRICHER_MIN_COMPLETION_TOKENS,
+    default: 4000). On reasoning models the budget covers reasoning too, so a short tail batch
+    scaled purely by size can be consumed before any JSON is emitted."""
+    try:
+        return int(os.getenv("PICTURE_ENRICHER_MIN_COMPLETION_TOKENS", "4000"))
+    except ValueError:
+        return 4000
+
+
+def get_picture_enricher_reasoning_effort() -> str:
+    """Reasoning effort for the picture enricher lanes (PICTURE_ENRICHER_REASONING_EFFORT,
+    default: low). Ignored by non-GPT-5 models. Set to "none" to disable."""
+    value = os.getenv("PICTURE_ENRICHER_REASONING_EFFORT", "low").strip().lower()
+    if value not in {"none", "minimal", "low", "medium", "high"}:
+        return "low"
+    return value
+
+
 def get_rag_top_k() -> int:
     return int(os.getenv("RAG_TOP_K", "15"))
 

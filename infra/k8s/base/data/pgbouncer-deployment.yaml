@@ -12,6 +12,9 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: pgbouncer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9127"
     spec:
       initContainers:
         # Replaces compose's `depends_on: {postgres: {condition: service_healthy}}`.
@@ -67,6 +70,23 @@ spec:
           resources:
             requests: { cpu: "60m", memory: "32Mi" }
             limits:   { cpu: "250m", memory: "128Mi" }   # compose: cpus 0.25 / mem_limit 128m
+        - name: pgbouncer-exporter
+          image: prometheuscommunity/pgbouncer-exporter:v0.10.2
+          ports:
+            - name: metrics
+              containerPort: 9127
+          env:
+            # admin_users = POSTGRES_USER (see pgbouncer-entrypoint.sh) — must connect as that
+            # user against the `pgbouncer` admin database to read SHOW POOLS/STATS.
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD } }
+            - name: PGBOUNCER_EXPORTER_CONNECTION_STRING
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:6432/pgbouncer?sslmode=disable"
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "100m", memory: "32Mi" }
       volumes:
         - name: pgbouncer-entrypoint
           configMap:

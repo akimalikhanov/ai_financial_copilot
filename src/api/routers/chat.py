@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from time import perf_counter
 from typing import cast
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
 from src.models.llm_request import LLMRequest
 from src.models.message import MessageRole
+from src.observability.metrics import SSE_STREAM_DURATION, SSE_STREAMS_OPEN
 from src.redis_client import events_stream_key
 from src.repository import (
     ConversationRepository,
@@ -200,8 +202,11 @@ async def chat_stream_subscribe(
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        yield ": ok\n\n"
+        SSE_STREAMS_OPEN.labels("chat").inc()
+        _started = perf_counter()
+        outcome = "client_closed"
         try:
+            yield ": ok\n\n"
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=10)
                 if not result:
@@ -209,6 +214,7 @@ async def chat_stream_subscribe(
                     if empty_polls >= 3:
                         req = await llm_request_repo.get_by_id(request_id)
                         if req and req.status == "failed":
+                            outcome = "error"
                             yield _sse_event(
                                 "error",
                                 {
@@ -237,13 +243,19 @@ async def chat_stream_subscribe(
                         sse_data = {k: v for k, v in data.items() if k != "type"}
                         yield _sse_event(event_type, sse_data, event_id=eid)
                         if event_type == "usage" and sse_data.get("persisted"):
+                            outcome = "complete"
                             return
                         if event_type == "error":
+                            outcome = "error"
                             return
         except asyncio.CancelledError:
             raise
         except Exception:
+            outcome = "error"
             yield _sse_event("error", {"error": "Stream read failed"})
+        finally:
+            SSE_STREAMS_OPEN.labels("chat").dec()
+            SSE_STREAM_DURATION.labels("chat", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(
         event_stream(),

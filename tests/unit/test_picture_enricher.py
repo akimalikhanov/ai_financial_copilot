@@ -149,20 +149,25 @@ class TestRouting:
         assert await picture_enricher.enrich_pictures(doc) == 1
         assert len(lanes["caption"].calls) == 1
 
-    async def test_missing_classification_is_captioned(self, lanes: dict[str, _StubLLM]) -> None:
+    async def test_missing_classification_takes_the_strong_lane(
+        self, lanes: dict[str, _StubLLM]
+    ) -> None:
+        """Unclassified reads as "other": unknown, not known-to-be-a-photo. A stat-tile panel
+        classifies as "other", and captioning one drops every printed figure on it."""
         doc = _doc(None)
         assert await picture_enricher.enrich_pictures(doc) == 1
-        assert len(lanes["caption"].calls) == 1
+        assert len(lanes["chart"].calls) == 1
 
-    async def test_low_confidence_chart_is_demoted_to_caption(
+    async def test_low_confidence_chart_takes_the_strong_lane(
         self, lanes: dict[str, _StubLLM], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Trusting a 0.2-confidence bar_chart would spend a high-detail call on a guess."""
+        """A 0.2-confidence bar_chart is demoted to "other" — still the strong lane, since the
+        one thing the low confidence rules out is trusting it to be a chart."""
         monkeypatch.setenv("PICTURE_ENRICHER_MIN_CONFIDENCE", "0.5")
         doc = _doc(("bar_chart", 0.2))
         await picture_enricher.enrich_pictures(doc)
-        assert lanes["chart"].calls == []
-        assert len(lanes["caption"].calls) == 1
+        assert len(lanes["chart"].calls) == 1
+        assert lanes["caption"].calls == []
 
     async def test_picture_without_a_crop_is_skipped(self, lanes: dict[str, _StubLLM]) -> None:
         doc = _doc(("bar_chart", 0.9))
@@ -322,11 +327,32 @@ class TestRetry:
 
 
 class TestTokenBudget:
-    async def test_budget_scales_with_batch_size(self, lanes: dict[str, _StubLLM]) -> None:
-        """1200/picture, not 400: on GPT-5 models this budget also covers reasoning tokens."""
-        doc = _doc(("bar_chart", 0.9), ("bar_chart", 0.9))
+    async def test_budget_scales_with_batch_size(
+        self, lanes: dict[str, _StubLLM], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """1200/picture, not 400: on GPT-5 models this budget also covers reasoning tokens.
+        The floor is lowered here so the per-picture rate is what is actually under test."""
+        monkeypatch.setenv("PICTURE_ENRICHER_MIN_COMPLETION_TOKENS", "1000")
+        doc = _doc(("bar_chart", 0.9), ("bar_chart", 0.9), ("bar_chart", 0.9))
         await picture_enricher.enrich_pictures(doc)
-        assert lanes["chart"].calls[0]["params"]["max_tokens"] == 2400
+        assert lanes["chart"].calls[0]["params"]["max_tokens"] == 3600
+
+    async def test_short_batch_gets_the_floor(
+        self, lanes: dict[str, _StubLLM], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lane's last batch is short, but reasoning does not shrink with it. Scaling by size
+        alone gave a 1-picture tail 1200 tokens, which reasoning could consume whole — an empty
+        body that the retry then paid for twice."""
+        monkeypatch.setenv("PICTURE_ENRICHER_MIN_COMPLETION_TOKENS", "2000")
+        doc = _doc(("bar_chart", 0.9))
+        await picture_enricher.enrich_pictures(doc)
+        assert lanes["chart"].calls[0]["params"]["max_tokens"] == 2000
+
+    async def test_reasoning_effort_is_sent(self, lanes: dict[str, _StubLLM]) -> None:
+        doc = _doc(("bar_chart", 0.9), ("screenshot", 0.9))
+        await picture_enricher.enrich_pictures(doc)
+        assert lanes["chart"].calls[0]["params"]["reasoning_effort"] == "low"
+        assert lanes["caption"].calls[0]["params"]["reasoning_effort"] == "low"
 
 
 class TestDegradation:

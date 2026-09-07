@@ -20,8 +20,15 @@ spec:
           # --output-dir as a model-repo-folder tree (not the HF snapshot-cache format), so
           # the worker is pointed at this same directory via DOCLING_ARTIFACTS_PATH
           # (docling_parser.py) rather than falling back to HF_HOME's lazy per-repo download.
+          #
+          # `python -m docling.cli.tools`, not the `docling-tools` console script: that
+          # script's shebang bakes in the builder stage's absolute venv path
+          # (/build/.venv/bin/python3), which doesn't exist in the runtime image (venv is
+          # copied to /app/.venv) — exec fails with "no such file or directory".
           command:
-            - docling-tools
+            - python
+            - -m
+            - docling.cli.tools
             - models
             - download
             - --output-dir

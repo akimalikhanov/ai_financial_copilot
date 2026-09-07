@@ -7,6 +7,7 @@ resources:
   - opensearch-dashboards-deployment.yaml
   - opensearch-dashboards-service.yaml
   - ingress.yaml
+  - gpu/dcgm-exporter.yaml
   # NOT listed here: gpu/device-plugin.yaml. It lives in kube-system and is applied
   # separately by `make k8s-gpu-plugin`, because this overlay's `commonLabels` and
   # `namespace: copilot` would rewrite the DaemonSet's namespace and inject a label into

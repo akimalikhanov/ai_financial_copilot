@@ -226,6 +226,71 @@
       }
     },
     {
+      "id": 14,
+      "type": "row",
+      "title": "GPU (kind only — dcgm-exporter DaemonSet)",
+      "gridPos": { "x": 0, "y": 45, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 15,
+      "title": "GPU Utilization",
+      "type": "timeseries",
+      "description": "Time-sliced across worker-ingestion, tei, and tei-embedder — no per-pod attribution, only per-GPU.",
+      "gridPos": { "x": 0, "y": 46, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "legendFormat": "gpu{{gpu}} {{modelName}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 16,
+      "title": "GPU Memory Used vs Free",
+      "type": "timeseries",
+      "description": "Framebuffer usage — watch for OOM headroom across the three time-sliced consumers.",
+      "gridPos": { "x": 8, "y": 46, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "legendFormat": "gpu{{gpu}} used"
+        },
+        {
+          "expr": "DCGM_FI_DEV_FB_FREE * 1024 * 1024",
+          "legendFormat": "gpu{{gpu}} free"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 17,
+      "title": "GPU Temperature",
+      "type": "timeseries",
+      "description": "Thermal throttling risk.",
+      "gridPos": { "x": 16, "y": 46, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "legendFormat": "gpu{{gpu}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "celsius", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 13,
       "title": "Worker Error Logs",
       "type": "logs",

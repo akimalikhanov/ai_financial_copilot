@@ -159,6 +159,104 @@
         "sortOrder": "Descending",
         "wrapLogMessage": false
       }
+    },
+    {
+      "id": 6,
+      "title": "Saturation",
+      "type": "row",
+      "description": "How full the system is — the signal that predicts failure before latency does.",
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 }
+    },
+    {
+      "id": 7,
+      "title": "SSE Streams Open",
+      "type": "timeseries",
+      "description": "Currently open chat/ingestion streams. Was structurally impossible to see before Phase 0 (naive middleware records duration at call_next return, before the body streams).",
+      "gridPos": { "x": 0, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sse_streams_open", "legendFormat": "{{endpoint}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 8,
+      "title": "Chat Queue Wait p95",
+      "type": "timeseries",
+      "description": "Enqueue -> task start. Rising wait with flat latency elsewhere means the worker pool is the bottleneck, not the LLM.",
+      "gridPos": { "x": 8, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chat_queue_wait_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 queue wait"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 9,
+      "title": "PgBouncer Clients Waiting",
+      "type": "timeseries",
+      "description": "cl_waiting from SHOW POOLS. Any non-zero value means clients are queuing for a server connection — must stay at 0 (Phase 1 acceptance).",
+      "gridPos": { "x": 16, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(pgbouncer_pools_client_waiting_connections) by (database)",
+          "legendFormat": "{{database}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 10,
+      "title": "Redis Memory vs Limit",
+      "type": "timeseries",
+      "description": "redis-app / redis-broker memory against the container limit — watch this during an 8h soak (Phase 2 acceptance: flat, not growing).",
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "redis_memory_used_bytes",
+          "legendFormat": "{{instance}} used"
+        },
+        {
+          "expr": "redis_memory_max_bytes",
+          "legendFormat": "{{instance}} maxmemory"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 11,
+      "title": "OpenSearch Container Memory",
+      "type": "timeseries",
+      "description": "Container working set vs the 2560Mi limit (Phase 0.1). Was measured at 99.7% of the old 1536Mi limit at idle.",
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"copilot\", pod=~\"opensearch-.*\", container=\"opensearch\"}) by (pod)",
+          "legendFormat": "{{pod}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     }
   ]
 }

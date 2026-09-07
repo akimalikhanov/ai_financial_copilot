@@ -632,6 +632,10 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
+      # `copilot-logs` may only ever exist as the ILM rollover alias. Without this, fluent-bit
+      # racing es-bootstrap auto-creates it as a plain index and the alias can never be
+      # created. Everything else still auto-creates.
+      action.auto_create_index: "-copilot-logs,+*"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     volumes:
       - es_data:/usr/share/elasticsearch/data

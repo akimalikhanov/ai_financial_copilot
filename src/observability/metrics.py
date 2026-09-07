@@ -28,6 +28,24 @@ HTTP_IN_PROGRESS = Gauge(
     ["method", "endpoint"],
 )
 
+# --- SSE streams ---
+# Naive middleware records duration/in-progress at call_next return, which for a
+# StreamingResponse is when headers are ready, not when the body finishes — so these are
+# instrumented directly in the generator instead of via HTTP_DURATION/HTTP_IN_PROGRESS.
+SSE_STREAMS_OPEN = Gauge("sse_streams_open", "Currently open SSE streams", ["endpoint"])
+SSE_STREAM_DURATION = Histogram(
+    "sse_stream_duration_seconds",
+    "SSE stream lifetime",
+    ["endpoint", "outcome"],
+    # Answers run 12s mean / 43s p95, so the default 10s-capped buckets are useless here.
+    buckets=(1, 5, 10, 30, 60, 120, 300, 600),
+)
+CHAT_QUEUE_WAIT = Histogram(
+    "chat_queue_wait_seconds",
+    "Enqueue -> task start",
+    buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
+)
+
 # --- Celery ---
 CELERY_TASKS = Counter("celery_tasks_total", "Celery tasks", ["task_name", "state"])
 CELERY_DURATION = Histogram(

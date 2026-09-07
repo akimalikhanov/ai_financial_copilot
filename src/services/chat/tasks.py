@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json as _json
 import logging
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, NamedTuple
 from uuid import UUID
@@ -23,6 +24,7 @@ from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
 from src.observability.metrics import (
     AGENT_ITERATIONS,
+    CHAT_QUEUE_WAIT,
     FOLLOWUP_DIRECT_ANSWER,
     FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
@@ -379,6 +381,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     redis_app, request_id, "error", error_event(LookupError("Request not found"))
                 )
                 return
+
+            CHAT_QUEUE_WAIT.observe((datetime.now(UTC) - llm_request.created_at).total_seconds())
 
             state.llm_request = llm_request
             state.conversation_id = llm_request.conversation_id

@@ -14,6 +14,9 @@ spec:
       labels:
         app.kubernetes.io/name: redis-broker
         app.kubernetes.io/component: redis
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
     spec:
       containers:
         - name: redis-broker
@@ -56,6 +59,20 @@ spec:
           resources:
             requests: { cpu: "125m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }   # compose: cpus 0.50 / mem_limit 512m
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.67.0
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: "redis://localhost:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-secret, key: REDIS_PASSWORD }
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
   volumeClaimTemplates:
     - metadata:
         name: data

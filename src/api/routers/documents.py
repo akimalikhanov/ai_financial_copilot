@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncGenerator
+from time import perf_counter
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -20,6 +21,7 @@ from sqlalchemy import text
 from src.api.deps import CurrentUserDep, RedisDep
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep
+from src.observability.metrics import SSE_STREAM_DURATION, SSE_STREAMS_OPEN
 from src.redis_client import ingestion_stream_key
 from src.repository import DocumentRepository
 from src.schemas.documents import (
@@ -273,8 +275,11 @@ async def ingestion_stream(
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        yield ": ok\n\n"
+        SSE_STREAMS_OPEN.labels("ingestion").inc()
+        _started = perf_counter()
+        outcome = "client_closed"
         try:
+            yield ": ok\n\n"
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=20)
                 if not result:
@@ -283,9 +288,11 @@ async def ingestion_stream(
                         # Worker may have died — check DB status
                         fresh = await repo.get_by_id(document_id)
                         if fresh and fresh.status == "ready":
+                            outcome = "complete"
                             yield _sse_event("done", {})
                             return
                         if fresh and fresh.status == "failed":
+                            outcome = "error"
                             yield _sse_event(
                                 "error", {"message": fresh.processing_error or "Ingestion failed"}
                             )
@@ -310,6 +317,7 @@ async def ingestion_stream(
                         sse_data = {k: v for k, v in data.items() if k != "type"}
                         yield _sse_event(event_type, sse_data)
                         if event_type in ("done", "error"):
+                            outcome = "complete" if event_type == "done" else "error"
                             return
         except asyncio.CancelledError:
             raise
@@ -317,10 +325,14 @@ async def ingestion_stream(
             # A Redis read failure says nothing about the ingestion itself, which keeps running
             # in the worker. Emitting `error` here would make the UI mark a healthy document as
             # failed. End the stream instead and let the client reconnect and re-read status.
+            outcome = "error"
             logger.exception(
                 "ingestion_stream.read_failed", extra={"document_id": str(document_id)}
             )
             return
+        finally:
+            SSE_STREAMS_OPEN.labels("ingestion").dec()
+            SSE_STREAM_DURATION.labels("ingestion", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(
         event_stream(),

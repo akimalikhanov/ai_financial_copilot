@@ -25,8 +25,10 @@ from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_picture_enricher_batch_size,
     get_picture_enricher_cheap_model,
+    get_picture_enricher_min_completion_tokens,
     get_picture_enricher_min_confidence,
     get_picture_enricher_model,
+    get_picture_enricher_reasoning_effort,
 )
 from src.utils.json_schema import build_response_format
 
@@ -35,10 +37,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Lanes, keyed by the 16 labels docling's document figure classifier actually emits. Anything
-# unlisted (including a label from a future model revision) falls through to CAPTION, so a new
-# class degrades to a cheap caption rather than to silence.
-CHART_LABELS = frozenset({"bar_chart", "line_chart", "pie_chart", "flow_chart"})
+# Lanes, keyed by the 16 labels docling's document figure classifier actually emits. "other" is
+# the catch-all the classifier assigns when a picture doesn't fit any of its named classes —
+# financial-report stat-tile/KPI infographic panels land here, and they are exactly as
+# numbers-dense as a chart, so they get the chart lane's high-detail image and number-preserving
+# prompt rather than the caption lane's one-sentence, no-numbers treatment. Anything else unlisted
+# (including a label from a future model revision) still falls through to CAPTION, so a genuinely
+# new class degrades to a cheap caption rather than to silence.
+CHART_LABELS = frozenset({"bar_chart", "line_chart", "pie_chart", "flow_chart", "other"})
 # No model call: these carry no retrievable content, and a description of a signature or a
 # decorative icon is noise that gets embedded and BM25-indexed as document text.
 SKIP_LABELS = frozenset({"logo", "icon", "signature", "stamp", "qr_code", "bar_code"})
@@ -46,6 +52,9 @@ SKIP_LABELS = frozenset({"logo", "icon", "signature", "stamp", "qr_code", "bar_c
 _MIME = "image/png"  # what export writes; see tasks._extract_picture_crops
 # One retry: the chart lane occasionally returns HTTP 200 with an empty body.
 _MAX_ATTEMPTS = 2
+# Completion budget per picture, floored by PICTURE_ENRICHER_MIN_COMPLETION_TOKENS so that a
+# short tail batch is not starved.
+_TOKENS_PER_PICTURE = 1200
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,15 +237,18 @@ async def _describe_batch(
         ChatMessage(role=Role.system, content=system_prompt),
         _build_message(batch, detail),
     ]
+    # On GPT-5 models max_tokens maps to max_completion_tokens, which counts reasoning tokens
+    # too, and reasoning does not shrink with the batch — hence the floor, and the low effort.
+    max_tokens = max(get_picture_enricher_min_completion_tokens(), _TOKENS_PER_PICTURE * len(batch))
+    reasoning_effort = get_picture_enricher_reasoning_effort()
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             resp = await llm.complete(
                 messages,
                 _lf_name=f"picture_enricher.{lane}",
                 temperature=0.0,
-                # On GPT-5 models this maps to max_completion_tokens, which counts reasoning
-                # tokens too — the description gets what is left after reasoning.
-                max_tokens=1200 * len(batch),
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
                 response_format=response_format,
             )
         except Exception:

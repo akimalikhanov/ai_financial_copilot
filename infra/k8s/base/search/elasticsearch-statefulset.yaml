@@ -33,6 +33,11 @@ spec:
               value: single-node
             - name: xpack.security.enabled     # DEV ONLY
               value: "false"
+            # `copilot-logs` may only ever exist as the ILM rollover alias. Without this,
+            # a log writer racing es-bootstrap auto-creates it as a plain index, and the
+            # alias can then never be created. Everything else still auto-creates.
+            - name: action.auto_create_index
+              value: "-copilot-logs,+*"
             - name: ES_JAVA_OPTS
               value: "-Xms512m -Xmx512m"
           ports:

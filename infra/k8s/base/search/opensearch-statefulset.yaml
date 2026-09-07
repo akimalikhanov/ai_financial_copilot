@@ -67,7 +67,9 @@ spec:
           resources:
             # requests ~= heap (1g) + JVM/off-heap overhead; limits mirror the compose ceiling.
             requests: { cpu: "750m",  memory: "1280Mi" }
-            limits:   { cpu: "1500m", memory: "1536Mi" }   # compose: cpus 1.50 / mem_limit 1536m
+            limits:   { cpu: "1500m", memory: "2560Mi" }   # was 1536Mi — measured 1.496GiB at idle
+            # with -Xms1g -Xmx1g. Heap stays 1g; container limit ~2x heap gives the JVM room for
+            # Lucene mmap, thread stacks, metaspace and NIO direct buffers outside the heap.
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -46,6 +46,11 @@ default_pool_size = 30
 min_pool_size = 0
 max_client_conn = 200
 
+# Without these, the admin console is unreachable and SHOW POOLS fails — the top suspected
+# bottleneck (pool saturation) has no telemetry at all. Must match the user connecting.
+admin_users = ${POSTGRES_USER}
+stats_users = ${POSTGRES_USER}
+
 server_reset_query = DISCARD ALL
 ignore_startup_parameters = extra_float_digits
 

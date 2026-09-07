@@ -29,3 +29,29 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_name]
         action: replace
         target_label: pod
+
+  # Container resource metrics (container_memory_working_set_bytes, etc.) for the Grafana
+  # dashboards' "Container Memory" panels. No pod exposes these itself — they're cgroup
+  # stats the kubelet's cAdvisor aggregates from outside the container — so the
+  # annotation-scraped kubernetes-pods job above can't reach them. Proxied through the API
+  # server rather than scraped from each kubelet directly (role: node + :10250): kind's
+  # kubelet serving certs aren't valid for that address, while the in-cluster CA/token
+  # already trusts kubernetes.default.svc. Needs the nodes/proxy RBAC grant in
+  # prometheus-rbac.yaml.
+  - job_name: kubernetes-cadvisor
+    scheme: https
+    metrics_path: /metrics/cadvisor
+    kubernetes_sd_configs:
+      - role: node
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      insecure_skip_verify: true
+    bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor

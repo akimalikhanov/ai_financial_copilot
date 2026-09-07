@@ -1,0 +1,43 @@
+# NVIDIA DCGM exporter — GPU utilization/memory/temperature as Prometheus metrics. Runs in the
+# `copilot` namespace (unlike device-plugin.yaml, which must stay in kube-system) so the
+# existing pod-annotation Prometheus SD picks it up with no scrape-config changes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: copilot
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dcgm-exporter
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dcgm-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      # Only land on the node the device plugin advertises nvidia.com/gpu on.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+          ports:
+            - name: metrics
+              containerPort: 9400
+          securityContext:
+            privileged: true
+          resources:
+            requests: { cpu: "50m", memory: "256Mi" }
+            limits:   { cpu: "250m", memory: "512Mi" }   # 256Mi OOMKilled it right after DCGM init

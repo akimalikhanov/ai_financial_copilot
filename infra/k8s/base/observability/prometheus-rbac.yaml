@@ -12,6 +12,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services", "endpoints", "nodes"]
     verbs: ["get", "list", "watch"]
+  # Lets the kubernetes-cadvisor job in prometheus.yml reach /metrics/cadvisor via the API
+  # server's node proxy (kubernetes.default.svc/api/v1/nodes/<node>/proxy/metrics/cadvisor).
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
