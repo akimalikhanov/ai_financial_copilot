@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Literal
@@ -166,12 +167,15 @@ async def rewrite_query(
     last_stats: LLMResponseStats | None = None
     for attempt in range(2):
         try:
-            resp = await llm.complete(
-                messages=messages,
-                _lf_name="rewrite_query",
-                temperature=cfg["temperature"],
-                max_tokens=int(cfg["max_tokens"]),
-                response_format=response_format,
+            resp = await asyncio.wait_for(
+                llm.complete(
+                    messages=messages,
+                    _lf_name="rewrite_query",
+                    temperature=cfg["temperature"],
+                    max_tokens=int(cfg["max_tokens"]),
+                    response_format=response_format,
+                ),
+                timeout=float(cfg["timeout"]),
             )
         except Exception as e:
             logger.exception("rewrite_query_llm_error", extra={"error": str(e)})

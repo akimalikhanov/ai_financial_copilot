@@ -209,6 +209,72 @@ def get_chat_tail_max_messages() -> int:
     return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
 
 
+def get_chat_events_maxlen() -> int:
+    """Cap on entries in one chat SSE stream (CHAT_EVENTS_MAXLEN, default 5000).
+
+    A runaway guard, not the accumulation fix (that is the TTL below). Must stay above the
+    real entry count: get_activity_log() rebuilds the persisted trace by replaying the whole
+    stream with XRANGE, so trimming below it silently truncates that trace. Measured max is
+    2,258 entries.
+    """
+    return int(os.getenv("CHAT_EVENTS_MAXLEN", "5000"))
+
+
+def get_chat_events_ttl() -> int:
+    """TTL applied to a finished request's chat SSE stream (CHAT_EVENTS_TTL, default 3600).
+
+    Long enough for a browser reconnect (Last-Event-ID replay), short enough to bound growth.
+    """
+    return int(os.getenv("CHAT_EVENTS_TTL", "3600"))
+
+
+def get_llm_timeout_seconds() -> float:
+    """Per-request LLM timeout (LLM_TIMEOUT_SECONDS, default 120.0).
+
+    Not passing a timeout does not mean "no limit" — it means the SDK default, which is 600s
+    for openai-python. Must fit inside the agent turn timeout (60s) for tool calls and inside
+    the Celery soft limit (900s) for synthesis.
+    """
+    return float(os.getenv("LLM_TIMEOUT_SECONDS", "120.0"))
+
+
+def get_llm_connect_timeout_seconds() -> float:
+    """Connection-establishment timeout (LLM_CONNECT_TIMEOUT_SECONDS, default 5.0).
+
+    Separate from the read timeout: failing to *reach* a provider should be detected in
+    seconds, not minutes.
+    """
+    return float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "5.0"))
+
+
+def get_llm_max_retries() -> int:
+    """SDK-level retries (LLM_MAX_RETRIES, default 1).
+
+    Attempts multiply across layers: the openai default of 2 retries (3 attempts) times the
+    app-level parse retry in query_transformer/router is 6 HTTP calls for one rewrite.
+    """
+    return int(os.getenv("LLM_MAX_RETRIES", "1"))
+
+
+def get_max_open_streams() -> int:
+    """SSE streams one API pod serves before /readyz sheds traffic (MAX_OPEN_STREAMS,
+    default 200).
+
+    A local capacity signal, not a global one: it counts this process's own streams, so a pod
+    at the cap leaves the endpoint list while its peers keep serving.
+    """
+    return int(os.getenv("MAX_OPEN_STREAMS", "200"))
+
+
+def get_readiness_redis_timeout_seconds() -> float:
+    """Budget for the /readyz Redis ping (READINESS_REDIS_TIMEOUT_SECONDS, default 2.0).
+
+    Must stay well under the probe's own timeoutSeconds, or the probe times out before the
+    handler can answer and the failure reads as "app hung" rather than "Redis slow".
+    """
+    return float(os.getenv("READINESS_REDIS_TIMEOUT_SECONDS", "2.0"))
+
+
 def get_followup_max_inherit_hops() -> int:
     """How many turns a findings block may be inherited before it goes stale
     (FOLLOWUP_MAX_INHERIT_HOPS, default 3). Past the cap the block is dropped, so the
@@ -681,6 +747,47 @@ def get_picture_enricher_min_completion_tokens() -> int:
         return int(os.getenv("PICTURE_ENRICHER_MIN_COMPLETION_TOKENS", "4000"))
     except ValueError:
         return 4000
+
+
+def get_picture_enricher_concurrency() -> int:
+    """In-flight enricher batches across both lanes (PICTURE_ENRICHER_CONCURRENCY, default: 4).
+
+    These are network waits, so overlapping them is nearly free — but the cap is shared by both
+    lanes, since the provider rate limit is per-account, not per-lane. Deliberately conservative;
+    raise only after watching for 429s.
+    """
+    try:
+        return max(1, int(os.getenv("PICTURE_ENRICHER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+def get_picture_enricher_stage_timeout() -> float:
+    """Wall-clock budget for the whole enrichment stage (PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS,
+    default: 300).
+
+    Enrichment runs after the parse, so DOCLING_PARSE_TIMEOUT_SECONDS does not cover it; without
+    this only Celery's soft limit would, which fails the whole document. Timing out here leaves
+    the pictures described so far in place — the chunker drops the rest.
+    """
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+
+
+def get_picture_enricher_max_image_px() -> int:
+    """Longest edge a crop is downscaled to before sending (PICTURE_ENRICHER_MAX_IMAGE_PX,
+    default: 1536). 0 disables resizing.
+
+    Crops are base64-inlined, which inflates by 4/3, so an un-resized p95 crop costs ~864 KiB on
+    the wire and a 3-image batch ~2.6 MiB. Vision models downsample to their own tile grid
+    anyway, so sending more pixels than this buys nothing.
+    """
+    try:
+        return max(0, int(os.getenv("PICTURE_ENRICHER_MAX_IMAGE_PX", "1536")))
+    except ValueError:
+        return 1536
 
 
 def get_picture_enricher_reasoning_effort() -> str:

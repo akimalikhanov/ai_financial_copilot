@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, cast
 
 from src.services.llm_runtime.exception_mapper import map_google_error
+from src.utils.config import get_llm_max_retries, get_llm_timeout_seconds
 from src.utils.llm_utils import (
     calc_cost_google,
     compute_tps,
@@ -48,9 +49,23 @@ class GeminiAdapter(LLMAdapter):
         super().__init__(default_model=default_model)
 
         from google import genai
+        from google.genai import types as genai_types
 
+        # google-genai defaults to 5 attempts and no request timeout. Note `timeout` here is
+        # in milliseconds, unlike every other timeout in this codebase; `attempts` counts the
+        # original request, so max_retries + 1.
+        http_options = genai_types.HttpOptions(
+            timeout=int(get_llm_timeout_seconds() * 1000),
+            retry_options=genai_types.HttpRetryOptions(
+                attempts=get_llm_max_retries() + 1,
+            ),
+        )
         # If api_key is None, genai.Client() will read GEMINI_API_KEY from env.
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self._client = (
+            genai.Client(api_key=api_key, http_options=http_options)
+            if api_key
+            else genai.Client(http_options=http_options)
+        )
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

@@ -12,12 +12,15 @@ state the chunker already drops — enrichment degrades to Phase 4 quality, neve
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
+from src.observability.metrics import PICTURE_ENRICHER, PICTURE_ENRICHER_DURATION
 from src.schemas.picture_enricher import PictureDescriptionResponse
 from src.services.llm_adapters.base_adapter import ChatMessage, ImagePart, Role
 from src.services.llm_router import RoutedLLM, get_router
@@ -25,6 +28,7 @@ from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_picture_enricher_batch_size,
     get_picture_enricher_cheap_model,
+    get_picture_enricher_concurrency,
     get_picture_enricher_min_completion_tokens,
     get_picture_enricher_min_confidence,
     get_picture_enricher_model,
@@ -92,6 +96,15 @@ def _ensure_initialized() -> None:
             raise ValueError(
                 f"picture enricher model {model!r} is not marked vision-capable in models.yaml"
             )
+
+
+def validate_config() -> None:
+    """Resolve models and prompts now, raising on a misconfiguration.
+
+    Called at worker start so a bad PICTURE_ENRICHER_MODEL fails the pod loudly instead of
+    degrading every document forever behind the call site's bare `except Exception`.
+    """
+    _ensure_initialized()
 
 
 def reset() -> None:
@@ -183,7 +196,7 @@ def _build_message(batch: list[_Candidate], detail: str) -> ChatMessage:
     )
 
 
-def _parse(raw: str, size: int) -> dict[int, str] | None:
+def _parse(raw: str, size: int, lane: str = "unknown") -> dict[int, str] | None:
     """Parse structured output into {1-based picture id: description}, dropping blanks.
 
     Returns None when the response could not be parsed at all — an empty body or malformed
@@ -192,7 +205,10 @@ def _parse(raw: str, size: int) -> dict[int, str] | None:
     unreadable image, and retrying it would just pay twice for the same answer.
     """
     if not raw.strip():
-        logger.warning("picture_enricher.empty_response")
+        # The signature of a starved completion budget: HTTP 200, no body, because reasoning
+        # spent the whole allowance. Counted so 6.1's floor can be shown to have worked.
+        PICTURE_ENRICHER.labels(lane, "empty").inc(size)
+        logger.warning("picture_enricher.empty_response", extra={"lane": lane})
         return None
     try:
         parsed = PictureDescriptionResponse.model_validate(json.loads(raw))
@@ -242,7 +258,11 @@ async def _describe_batch(
     max_tokens = max(get_picture_enricher_min_completion_tokens(), _TOKENS_PER_PICTURE * len(batch))
     reasoning_effort = get_picture_enricher_reasoning_effort()
     for attempt in range(1, _MAX_ATTEMPTS + 1):
+        started = perf_counter()
         try:
+            # temperature is not dead code: the adapter discards it only for GPT-5 models
+            # (openai_adapter._is_gpt_5_model). The chart lane ignores it; the caption lane —
+            # gpt-4o-mini by default — genuinely runs at 0.0. Both lanes share this call site.
             resp = await llm.complete(
                 messages,
                 _lf_name=f"picture_enricher.{lane}",
@@ -258,9 +278,11 @@ async def _describe_batch(
                 exc_info=True,
             )
         else:
-            descriptions = _parse(resp.text, len(batch))
+            descriptions = _parse(resp.text, len(batch), lane)
             if descriptions is not None:
                 return descriptions
+        finally:
+            PICTURE_ENRICHER_DURATION.labels(lane).observe(perf_counter() - started)
         if attempt < _MAX_ATTEMPTS:
             logger.info(
                 "picture_enricher.batch_retry",
@@ -278,8 +300,14 @@ async def _run_lane(
     detail: str,
     batch_size: int,
     lane: str,
+    sem: asyncio.Semaphore,
 ) -> int:
-    """Describe one lane's pictures in batches, writing meta.description in place."""
+    """Describe one lane's pictures in batches, writing meta.description in place.
+
+    Batches run concurrently under `sem` — they are network waits, so overlapping them costs
+    nothing but the semaphore. The semaphore is passed in rather than created here so both
+    lanes share one budget: the provider's rate limit is per-account, not per-lane.
+    """
     if not candidates:
         return 0
 
@@ -288,20 +316,49 @@ async def _run_lane(
     response_format = build_response_format(
         "picture_descriptions", PictureDescriptionResponse.model_json_schema()
     )
+
+    batches = [candidates[i : i + batch_size] for i in range(0, len(candidates), batch_size)]
+
+    async def _one(
+        start: int, batch: list[_Candidate]
+    ) -> tuple[int, list[_Candidate], dict[int, str] | None]:
+        """Return the batch alongside its result: descriptions are matched to pictures by
+        identity, never by position in the gather output."""
+        async with sem:
+            descriptions = await _describe_batch(
+                batch,
+                llm=llm,
+                model=model,
+                system_prompt=system_prompt,
+                detail=detail,
+                lane=lane,
+                response_format=response_format,
+            )
+        return start, batch, descriptions
+
+    # return_exceptions=True is what preserves "degrade, never fail" under gather: without it
+    # one raising batch cancels its siblings and takes down the whole lane.
+    results = await asyncio.gather(
+        *(_one(i * batch_size, b) for i, b in enumerate(batches)),
+        return_exceptions=True,
+    )
+
     written = 0
-    for start in range(0, len(candidates), batch_size):
-        batch = candidates[start : start + batch_size]
-        descriptions = await _describe_batch(
-            batch,
-            llm=llm,
-            model=model,
-            system_prompt=system_prompt,
-            detail=detail,
-            lane=lane,
-            response_format=response_format,
-        )
+    for result in results:
+        if isinstance(result, BaseException):
+            # _describe_batch swallows call failures itself, so reaching here means something
+            # unexpected — a cancellation, or a bug. Isolate it to its own batch.
+            logger.warning(
+                "picture_enricher.batch_raised",
+                extra={"lane": lane, "model": model},
+                exc_info=result,
+            )
+            continue
+
+        start, batch, descriptions = result
         if descriptions is None:
             # Per-batch isolation: the contract is that enrichment degrades, never fails.
+            PICTURE_ENRICHER.labels(lane, "failed").inc(len(batch))
             logger.warning(
                 "picture_enricher.batch_failed",
                 extra={
@@ -313,6 +370,7 @@ async def _run_lane(
             )
             continue
 
+        described = 0
         for local_id, candidate in enumerate(batch, start=1):
             text = descriptions.get(local_id)
             if not text:
@@ -321,7 +379,12 @@ async def _run_lane(
             if pic.meta is None:
                 pic.meta = PictureMeta()
             pic.meta.description = DescriptionMetaField(text=text, created_by=model)
-            written += 1
+            described += 1
+        written += described
+        PICTURE_ENRICHER.labels(lane, "described").inc(described)
+        # Parsed fine but the model declined to describe these — its escape hatch for an
+        # unreadable image, which is a different outcome from a failed call.
+        PICTURE_ENRICHER.labels(lane, "skipped").inc(len(batch) - described)
     return written
 
 
@@ -356,24 +419,32 @@ async def enrich_pictures(document: DoclingDocument) -> int:
         },
     )
 
-    written = await _run_lane(
-        charts,
-        llm=_chart_llm,
-        model=_chart_model,
-        system_prompt=_chart_prompt,
-        detail="high",
-        batch_size=batch_size,
-        lane="chart",
+    # One semaphore across both lanes: the rate limit that matters is the provider account's,
+    # not each lane's. Creating it per-lane would let 2x the intended calls in flight.
+    sem = asyncio.Semaphore(get_picture_enricher_concurrency())
+    chart_written, caption_written = await asyncio.gather(
+        _run_lane(
+            charts,
+            llm=_chart_llm,
+            model=_chart_model,
+            system_prompt=_chart_prompt,
+            detail="high",
+            batch_size=batch_size,
+            lane="chart",
+            sem=sem,
+        ),
+        _run_lane(
+            captions,
+            llm=_caption_llm,
+            model=_caption_model,
+            system_prompt=_caption_prompt,
+            detail="low",
+            batch_size=batch_size,
+            lane="caption",
+            sem=sem,
+        ),
     )
-    written += await _run_lane(
-        captions,
-        llm=_caption_llm,
-        model=_caption_model,
-        system_prompt=_caption_prompt,
-        detail="low",
-        batch_size=batch_size,
-        lane="caption",
-    )
+    written = chart_written + caption_written
 
     logger.info(
         "picture_enricher.done",

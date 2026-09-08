@@ -16,10 +16,14 @@ from sqlalchemy import func, select
 
 from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
 from src.api.exceptions import _sse_event
-from src.db import DbSessionDep
+from src.db import DbSessionDep, get_session_factory
 from src.models.llm_request import LLMRequest
 from src.models.message import MessageRole
-from src.observability.metrics import SSE_STREAM_DURATION, SSE_STREAMS_OPEN
+from src.observability.metrics import (
+    SSE_STREAM_DURATION,
+    sse_stream_closed,
+    sse_stream_opened,
+)
 from src.redis_client import events_stream_key
 from src.repository import (
     ConversationRepository,
@@ -196,13 +200,29 @@ async def chat_stream_subscribe(
     conversation = await conversation_repo.get_by_id(llm_request.conversation_id)
     if not conversation or conversation.user_id != current_user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+
+    # Release the pgbouncer server connection before the stream starts. `session` is injected
+    # via get_current_user whether or not this signature asks for it, and FastAPI holds yield
+    # dependencies until the streaming body finishes — so this commit is the only thing that
+    # ends the transaction. Everything below needs only plain UUIDs.
+    await session.commit()
+
     last_id = request.headers.get("Last-Event-ID") or after_event_id
     stream_key = events_stream_key(str(request_id))
+    session_factory = get_session_factory()
+
+    async def _failure_message() -> str | None:
+        """Short-lived session for the liveness re-check — opened only when needed."""
+        async with session_factory() as s:
+            req = await LLMRequestRepository(s).get_by_id(request_id)
+            if req and req.status == "failed":
+                return req.error_message or "Processing failed"
+            return None
 
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        SSE_STREAMS_OPEN.labels("chat").inc()
+        sse_stream_opened("chat")
         _started = perf_counter()
         outcome = "client_closed"
         try:
@@ -212,14 +232,14 @@ async def chat_stream_subscribe(
                 if not result:
                     empty_polls += 1
                     if empty_polls >= 3:
-                        req = await llm_request_repo.get_by_id(request_id)
-                        if req and req.status == "failed":
+                        failure_message = await _failure_message()
+                        if failure_message is not None:
                             outcome = "error"
                             yield _sse_event(
                                 "error",
                                 {
                                     "error_type": "WorkerError",
-                                    "message": req.error_message or "Processing failed",
+                                    "message": failure_message,
                                 },
                             )
                             return
@@ -254,7 +274,7 @@ async def chat_stream_subscribe(
             outcome = "error"
             yield _sse_event("error", {"error": "Stream read failed"})
         finally:
-            SSE_STREAMS_OPEN.labels("chat").dec()
+            sse_stream_closed("chat")
             SSE_STREAM_DURATION.labels("chat", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(

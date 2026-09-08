@@ -20,8 +20,13 @@ from sqlalchemy import text
 
 from src.api.deps import CurrentUserDep, RedisDep
 from src.api.exceptions import _sse_event
-from src.db import DbSessionDep
-from src.observability.metrics import SSE_STREAM_DURATION, SSE_STREAMS_OPEN
+from src.db import DbSessionDep, get_session_factory
+from src.models.document import Document
+from src.observability.metrics import (
+    SSE_STREAM_DURATION,
+    sse_stream_closed,
+    sse_stream_opened,
+)
 from src.redis_client import ingestion_stream_key
 from src.repository import DocumentRepository
 from src.schemas.documents import (
@@ -149,7 +154,6 @@ async def upload_document(
             doc_id=doc_id,
             filename=filename,
             fileobj=file.file,
-            content_length=file_size,
         )
     except Exception:
         await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": doc_id})
@@ -191,8 +195,10 @@ async def delete_document(
     # (backend down/restarting) leaves chunks indexed with no row to hydrate them, and
     # nothing ever collects them. Failing the request keeps the document deletable later.
     try:
-        qdrant_ingest.delete_by_document(qdrant_collection, document_id)
-        opensearch_ingest.delete_by_document(opensearch_index, document_id)
+        await asyncio.gather(
+            asyncio.to_thread(qdrant_ingest.delete_by_document, qdrant_collection, document_id),
+            asyncio.to_thread(opensearch_ingest.delete_by_document, opensearch_index, document_id),
+        )
     except Exception:
         logger.exception(
             "delete_document.index_cleanup_failed", extra={"document_id": str(document_id)}
@@ -269,13 +275,23 @@ async def ingestion_stream(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # Release the pgbouncer server connection before the stream starts — the yield
+    # dependency is held until the streaming body finishes otherwise.
+    await session.commit()
+
     stream_key = ingestion_stream_key(str(document_id))
     last_id = "0-0"
+    session_factory = get_session_factory()
+
+    async def _fetch_status() -> Document | None:
+        """Short-lived session for the periodic liveness re-check."""
+        async with session_factory() as s:
+            return await DocumentRepository(s).get_by_id(document_id)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        SSE_STREAMS_OPEN.labels("ingestion").inc()
+        sse_stream_opened("ingestion")
         _started = perf_counter()
         outcome = "client_closed"
         try:
@@ -286,7 +302,7 @@ async def ingestion_stream(
                     empty_polls += 1
                     if empty_polls >= 4:
                         # Worker may have died — check DB status
-                        fresh = await repo.get_by_id(document_id)
+                        fresh = await _fetch_status()
                         if fresh and fresh.status == "ready":
                             outcome = "complete"
                             yield _sse_event("done", {})
@@ -331,7 +347,7 @@ async def ingestion_stream(
             )
             return
         finally:
-            SSE_STREAMS_OPEN.labels("ingestion").dec()
+            sse_stream_closed("ingestion")
             SSE_STREAM_DURATION.labels("ingestion", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(

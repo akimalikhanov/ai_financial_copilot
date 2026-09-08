@@ -39,6 +39,10 @@ spec:
         prometheus.io/port: "9101"
         prometheus.io/path: "/metrics"
     spec:
+      # Above CELERY_TASK_SOFT_TIME_LIMIT_SECONDS (360), same reasoning as worker-chat: a warm
+      # shutdown must be able to finish the longest task Celery allows. Ingestion is already
+      # attempt-capped (INGEST_MAX_ATTEMPTS), but a redelivered parse still costs a GPU slot.
+      terminationGracePeriodSeconds: 420
       initContainers:
         - name: wait-for-pgbouncer
           image: postgres:16.11-alpine

@@ -702,18 +702,37 @@ async def _run_turn_inner(
         }
 
         async def _guarded_search(tc: ToolCallRef) -> _SearchResult:
-            async with search_sem, session_factory() as task_session:
-                # A fresh session per concurrent search — the shared `session` is not
-                # safe for concurrent use under asyncio.gather (P0-1).
-                return await execute_search(
-                    tc,
-                    chat_state,
-                    task_session,
-                    reranker,
-                    redis_app,
-                    request_id,
-                    iteration,
-                    is_analytical,
+            try:
+                async with asyncio.timeout(state.turn_timeout_seconds):
+                    async with search_sem, session_factory() as task_session:
+                        # A fresh session per concurrent search — the shared `session` is
+                        # not safe for concurrent use under asyncio.gather (P0-1).
+                        return await execute_search(
+                            tc,
+                            chat_state,
+                            task_session,
+                            reranker,
+                            redis_app,
+                            request_id,
+                            iteration,
+                            is_analytical,
+                        )
+            except TimeoutError:
+                logger.warning(
+                    "agent_search_timeout",
+                    extra={
+                        "request_id": request_id,
+                        "iteration": iteration,
+                        "timeout_s": state.turn_timeout_seconds,
+                    },
+                )
+                AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+                return _SearchResult(
+                    entity="",
+                    chunks=[],
+                    payloads={},
+                    error_str="search timed out — the search backend did not respond in time.",
+                    backend_failed=True,
                 )
 
         results: list[_SearchResult] = []
@@ -1055,6 +1074,12 @@ async def run_loop(
 
     iterations_run = 0
     for iteration in range(effort.max_iterations):
+        # Checked before the turn as well as after it: the post-turn check at the end of
+        # _run_turn cannot stop a turn that starts at t=deadline-1s and then runs a full
+        # turn timeout plus a search fan-out on top of it.
+        if state.past_deadline():
+            state.convergence_reason = "deadline"
+            break
         state.iteration = iteration
         iterations_run = iteration + 1
         # An aspect whose evidence is already admitted but never written up dies as

@@ -34,6 +34,9 @@ from src.services.ingestion.embedder import reset_clients as reset_embedding_cli
 from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
 from src.services.ingestion.picture_enricher import enrich_pictures as _enrich_pictures
 from src.services.ingestion.picture_enricher import reset as reset_picture_enricher
+from src.services.ingestion.picture_enricher import (
+    validate_config as validate_picture_enricher_config,
+)
 from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
 from src.services.ingestion.table_summarizer import reset as reset_table_summarizer
 from src.services.ingestion.table_summarizer import (
@@ -47,6 +50,7 @@ from src.utils.config import (
     get_embedding_dim,
     get_embedding_model,
     get_picture_enricher_enabled,
+    get_picture_enricher_stage_timeout,
     get_redis_app_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
@@ -90,6 +94,8 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     get_prompt_loader.cache_clear()
     reset_qdrant_client()
     reset_opensearch_client()
+    if get_picture_enricher_enabled():
+        validate_picture_enricher_config()
     if _worker_loop is None or _worker_loop.is_closed():
         _worker_loop = asyncio.new_event_loop()
     if _redis_ingestion is None:
@@ -315,10 +321,18 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         if get_picture_enricher_enabled():
             await _log_stage("enrich_pictures")
             try:
-                described = await _enrich_pictures(parse_result.document)
+                described = await asyncio.wait_for(
+                    _enrich_pictures(parse_result.document),
+                    timeout=get_picture_enricher_stage_timeout(),
+                )
                 logger.info(
                     "pipeline.pictures_enriched",
                     extra={"document_id": document_id, "described": described},
+                )
+            except TimeoutError:
+                logger.warning(
+                    "pipeline.picture_enrichment_timeout",
+                    extra={"document_id": document_id},
                 )
             except Exception:
                 # Enrichment degrades to Phase 4 quality; it never fails a document.

@@ -354,6 +354,9 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   request_type       text NOT NULL DEFAULT 'chat',
   -- Discriminator: 'chat' (default, main assistant response) or 'router' (query routing sub-call).
 
+  attempt_count      integer NOT NULL DEFAULT 0,
+  -- Number of times the chat pipeline has been attempted (caps acks_late redelivery loops).
+
   trace_id           text
   -- Langfuse trace id (equals chat request_id). Links DB row to Langfuse trace.
 );
@@ -779,6 +782,11 @@ COMMENT ON CONSTRAINT llm_requests_user_message_fk ON llm_requests IS
   'FK to user message that triggered this request.';
 COMMENT ON CONSTRAINT llm_requests_assistant_message_fk ON llm_requests IS
   'FK to pre-created assistant message placeholder.';
+
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 0;
+COMMENT ON COLUMN llm_requests.attempt_count IS
+  'Number of times the chat pipeline has been attempted (caps acks_late redelivery loops).';
 
 -- ============================================================================
 -- Add user_id FKs to users (conversations, messages, llm_requests)

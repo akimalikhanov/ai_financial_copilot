@@ -40,6 +40,32 @@ SSE_STREAM_DURATION = Histogram(
     # Answers run 12s mean / 43s p95, so the default 10s-capped buckets are useless here.
     buckets=(1, 5, 10, 30, 60, 120, 300, 600),
 )
+
+# /readyz needs this count to decide whether the pod is at capacity, and the Gauge cannot
+# supply it: the API runs with PROMETHEUS_MULTIPROC_DIR set (Dockerfile.api), where a Gauge
+# holds no readable in-process value — reading it means touching prometheus_client internals.
+# A plain int in this process is the honest source for a local capacity check anyway; the
+# Gauge stays the source for scraping. Single-threaded event loop, so no lock is needed.
+_open_streams: dict[str, int] = {}
+
+
+def sse_stream_opened(endpoint: str) -> None:
+    """Record an SSE stream opening. Bumps the scrape Gauge and the /readyz counter together."""
+    SSE_STREAMS_OPEN.labels(endpoint).inc()
+    _open_streams[endpoint] = _open_streams.get(endpoint, 0) + 1
+
+
+def sse_stream_closed(endpoint: str) -> None:
+    """Record an SSE stream closing. Must be called from a `finally` so the count cannot leak."""
+    SSE_STREAMS_OPEN.labels(endpoint).dec()
+    _open_streams[endpoint] = max(0, _open_streams.get(endpoint, 0) - 1)
+
+
+def open_stream_count() -> int:
+    """Total SSE streams open in this process, across endpoints."""
+    return sum(_open_streams.values())
+
+
 CHAT_QUEUE_WAIT = Histogram(
     "chat_queue_wait_seconds",
     "Enqueue -> task start",
@@ -129,6 +155,19 @@ INGESTION_CHUNKS = Histogram(
     "ingestion_chunks_per_document",
     "Chunks per document",
     buckets=(10, 25, 50, 100, 200, 500, 1000),
+)
+PICTURE_ENRICHER = Counter(
+    "picture_enricher_pictures_total",
+    "Pictures by lane and outcome",
+    # status: described | empty | skipped | failed. "empty" is the signature of a starved
+    # completion budget (reasoning spends it before any JSON is emitted) — graph it.
+    ["lane", "status"],
+)
+PICTURE_ENRICHER_DURATION = Histogram(
+    "picture_enricher_batch_seconds",
+    "Per-batch latency",
+    ["lane"],
+    buckets=(0.5, 1, 2.5, 5, 10, 30, 60),
 )
 INGESTION_DURATION = Histogram(
     "ingestion_stage_duration_seconds",

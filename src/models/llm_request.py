@@ -57,6 +57,13 @@ class LLMRequest(Base):
         nullable=False,
         server_default=text("'chat'"),
     )
+    # Caps acks_late redelivery loops: a SIGKILLed task is redelivered, and without a
+    # persistent counter the redelivery re-runs the agent loop and re-bills the provider.
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
 
     # LLM provider/model info
     provider: Mapped[str] = mapped_column(Text, nullable=False)

@@ -37,6 +37,12 @@ def _doc(status: str = "processing", processing_error: str | None = None):
     )
 
 
+class _FakeSession:
+    """Stands in for the request-scoped session, which is committed before streaming starts."""
+
+    async def commit(self) -> None: ...
+
+
 async def _collect(response, limit: int = 12) -> list[str]:
     chunks: list[str] = []
     async for chunk in response.body_iterator:
@@ -53,11 +59,19 @@ async def _call_stream(monkeypatch, doc, redis) -> object:
         async def get_by_id(self, _document_id):
             return doc
 
+    class _SessionCtx:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_exc):
+            return False
+
     monkeypatch.setattr(documents_router, "DocumentRepository", _Repo)
+    monkeypatch.setattr(documents_router, "get_session_factory", lambda: _SessionCtx)
     return await documents_router.ingestion_stream(
         document_id=doc.id,
         request=None,  # type: ignore[arg-type]
-        session=None,  # type: ignore[arg-type]
+        session=_FakeSession(),  # type: ignore[arg-type]
         redis=redis,  # type: ignore[arg-type]
         current_user=SimpleNamespace(id=doc.user_id),  # type: ignore[arg-type]
     )

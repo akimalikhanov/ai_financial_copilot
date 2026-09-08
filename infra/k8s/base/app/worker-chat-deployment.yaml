@@ -5,6 +5,14 @@ metadata:
   namespace: copilot
 spec:
   replicas: 1
+  # With a 420s grace period the default (maxUnavailable 25% -> 1 of 1) would leave the queue
+  # unserved for up to 7 minutes while the old pod drains. Surge instead: the new pod serves
+  # while the old one finishes its in-flight answers.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: chat_worker
@@ -22,6 +30,11 @@ spec:
         prometheus.io/port: "9100"
         prometheus.io/path: "/metrics"
     spec:
+      # Above CELERY_TASK_SOFT_TIME_LIMIT_SECONDS (360): SIGTERM is a Celery warm shutdown —
+      # stop accepting, finish in flight — and it needs room to finish the longest task Celery
+      # would itself allow. Below the soft limit, the default 30s SIGKILLs a running answer and
+      # acks_late redelivers it, re-billing the provider.
+      terminationGracePeriodSeconds: 420
       # Same depends_on port as api-deployment.yaml. fluent-bit is gone (Phase 14 tails node
       # logs instead of receiving pushes) and qdrant-hc is gone (Phase 5 retired the sidecar).
       initContainers:

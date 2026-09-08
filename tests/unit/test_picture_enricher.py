@@ -7,8 +7,10 @@ raising. The adapter-level image serialization is covered by test_openai_adapter
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -400,3 +402,285 @@ class TestCropEncoding:
         data = picture_enricher._crop_bytes(doc.pictures[0])
         assert data is not None
         assert Image.open(io.BytesIO(data)).format == "PNG"
+
+
+# --- Phase 6 -----------------------------------------------------------------------------
+
+
+class _SlowLLM(_StubLLM):
+    """Records concurrency: how many calls were in flight at once, and in what order."""
+
+    def __init__(self, *, delay: float = 0.05, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.delay = delay
+        self.in_flight = 0
+        self.peak_in_flight = 0
+
+    async def complete(self, messages, **params):  # noqa: ANN001, ANN003
+        self.in_flight += 1
+        self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(self.delay)
+            return await super().complete(messages, **params)
+        finally:
+            self.in_flight -= 1
+
+
+class TestConcurrency:
+    async def test_batches_within_a_lane_overlap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """17 sequential round-trips was ~100s per document. These are network waits."""
+        chart, caption = _SlowLLM(), _SlowLLM()
+        _install(monkeypatch, chart, caption)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_concurrency", lambda: 4)
+
+        doc = _doc(*[("bar_chart", 0.9)] * 4)
+        started = time.perf_counter()
+        assert await picture_enricher.enrich_pictures(doc) == 4
+        elapsed = time.perf_counter() - started
+
+        assert chart.peak_in_flight > 1, "batches ran sequentially"
+        # 4 x 50ms sequential would be 200ms; overlapped is ~50ms.
+        assert elapsed < 0.15
+
+    async def test_the_two_lanes_share_one_concurrency_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-lane semaphore would allow 2x the intended in-flight calls — the provider
+        rate limit is per-account, not per-lane."""
+        seen: list[int] = []
+        live = 0
+        lock_holder: dict[str, Any] = {}
+
+        class _Tracked(_StubLLM):
+            async def complete(self, messages, **params):  # noqa: ANN001, ANN003
+                nonlocal live
+                live += 1
+                seen.append(live)
+                try:
+                    await asyncio.sleep(0.05)
+                    return await _StubLLM.complete(self, messages, **params)
+                finally:
+                    live -= 1
+
+        chart, caption = _Tracked(), _Tracked()
+        lock_holder["chart"] = chart
+        _install(monkeypatch, chart, caption)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_concurrency", lambda: 2)
+
+        # 3 charts + 3 captions across both lanes, cap of 2 shared between them.
+        doc = _doc(*([("bar_chart", 0.9)] * 3 + [("photograph", 0.9)] * 3))
+        assert await picture_enricher.enrich_pictures(doc) == 6
+
+        assert max(seen) <= 2, f"exceeded the shared cap: peak {max(seen)} in flight"
+
+    async def test_one_failing_batch_does_not_cancel_its_siblings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """gather(return_exceptions=True) is what preserves "degrade, never fail"."""
+
+        class _OneBadBatch(_StubLLM):
+            """Fails for exactly one picture, identified by its own crop bytes."""
+
+            def __init__(self, doomed: bytes) -> None:
+                super().__init__()
+                self.doomed = doomed
+
+            async def complete(self, messages, **params):  # noqa: ANN001, ANN003
+                self.calls.append({"messages": messages, "params": params})
+                images = messages[-1].images or ()
+                if any(img.data == self.doomed for img in images):
+                    raise RuntimeError("provider exploded")
+                return _Resp(
+                    json.dumps(
+                        {
+                            "descriptions": [
+                                {"picture_id": i, "description": f"desc {i}"}
+                                for i in range(1, len(images) + 1)
+                            ]
+                        }
+                    )
+                )
+
+        doc = _doc(("bar_chart", 0.9), ("line_chart", 0.9), ("pie_chart", 0.9))
+        # _doc gives every picture the same red crop, so repaint one to make it identifiable.
+        doc.pictures[1].image = ImageRef.from_pil(_png("blue"), dpi=72)
+        doomed = picture_enricher._crop_bytes(doc.pictures[1])
+        assert doomed is not None
+
+        chart = _OneBadBatch(doomed)
+        _install(monkeypatch, chart, _StubLLM())
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+
+        written = await picture_enricher.enrich_pictures(doc)
+
+        # Two of three described; the failing batch degraded alone.
+        assert written == 2
+        assert sum(d is not None for d in _descriptions(doc)) == 2
+
+    async def test_an_exception_escaping_a_batch_does_not_kill_the_lane(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `return_exceptions=True` guard specifically.
+
+        _describe_batch swallows provider errors itself, so the test above never reaches the
+        gather's error path. This raises from _parse instead — past that catch — which is
+        where a bare gather() would cancel the sibling batches and lose the whole lane.
+        """
+        doc = _doc(("bar_chart", 0.9), ("line_chart", 0.9), ("pie_chart", 0.9))
+        doc.pictures[1].image = ImageRef.from_pil(_png("blue"), dpi=72)
+        doomed = picture_enricher._crop_bytes(doc.pictures[1])
+        assert doomed is not None
+
+        real_parse = picture_enricher._parse
+        seen: list[bytes] = []
+
+        def _exploding_parse(raw: str, size: int, lane: str = "unknown"):  # noqa: ANN202
+            if seen and seen[-1] == doomed:
+                raise RuntimeError("parser exploded")
+            return real_parse(raw, size, lane)
+
+        class _Tracking(_StubLLM):
+            async def complete(self, messages, **params):  # noqa: ANN001, ANN003
+                images = messages[-1].images or ()
+                seen.append(images[0].data if images else b"")
+                return await super().complete(messages, **params)
+
+        _install(monkeypatch, _Tracking(), _StubLLM())
+        monkeypatch.setattr(picture_enricher, "_parse", _exploding_parse)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+        # Serialize so the tracking above is unambiguous.
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_concurrency", lambda: 1)
+
+        written = await picture_enricher.enrich_pictures(doc)
+
+        assert written == 2, "a raising batch cancelled its siblings"
+
+    async def test_descriptions_are_matched_by_batch_not_by_position(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under gather, batches finish out of order. Results must be zipped back to their own
+        batch — relying on completion order silently mislabels pictures."""
+
+        class _OutOfOrder(_StubLLM):
+            """Later batches answer first, so completion order is reversed."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._n = 0
+
+            async def complete(self, messages, **params):  # noqa: ANN001, ANN003, ARG002
+                self._n += 1
+                await asyncio.sleep(0.05 / self._n)
+                text = messages[-1].content
+                # Echo back a description naming the label this batch actually received.
+                return _Resp(
+                    json.dumps({"descriptions": [{"picture_id": 1, "description": f"saw:{text}"}]})
+                )
+
+        chart = _OutOfOrder()
+        _install(monkeypatch, chart, _StubLLM())
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+
+        doc = _doc(("bar_chart", 0.9), ("line_chart", 0.9), ("pie_chart", 0.9))
+        await picture_enricher.enrich_pictures(doc)
+
+        # Each picture's description must name its own label, whatever order they returned in.
+        for pic, expected in zip(
+            doc.pictures, ["bar_chart", "line_chart", "pie_chart"], strict=True
+        ):
+            assert pic.meta is not None and pic.meta.description is not None
+            assert expected in pic.meta.description.text
+
+
+class TestStartupValidation:
+    def test_validate_config_raises_on_a_non_vision_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worker must fail at boot rather than degrade every document behind the call
+        site's bare `except Exception`."""
+        picture_enricher.reset()
+
+        class _Router:
+            def get(self, _model: str) -> Any:
+                return _StubLLM(vision=False)
+
+        monkeypatch.setattr(picture_enricher, "get_router", lambda: _Router())
+        with pytest.raises(ValueError, match="not marked vision-capable"):
+            picture_enricher.validate_config()
+        picture_enricher.reset()
+
+    def test_worker_init_validates_only_when_the_enricher_is_enabled(self) -> None:
+        """Guards the wiring: the check must sit behind the feature flag, and must run after
+        the cache_clear()s that would otherwise drop the state it just built."""
+        import inspect
+
+        from src.services.ingestion import tasks
+
+        source = inspect.getsource(tasks._on_worker_process_init)
+
+        assert "validate_picture_enricher_config()" in source
+        assert "get_picture_enricher_enabled()" in source
+        # Ordering: both caches are cleared before the validation resolves anything.
+        assert source.index("get_router.cache_clear()") < source.index(
+            "validate_picture_enricher_config()"
+        )
+        assert source.index("get_prompt_loader.cache_clear()") < source.index(
+            "validate_picture_enricher_config()"
+        )
+
+
+class TestStageTimeout:
+    async def test_enrichment_is_bounded_and_keeps_partial_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Enrichment runs after the parse, so only Celery's soft limit would otherwise bound
+        it — and that fails the whole document instead of degrading."""
+        chart = _SlowLLM(delay=10.0)
+        _install(monkeypatch, chart, _StubLLM())
+
+        doc = _doc(("bar_chart", 0.9))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(picture_enricher.enrich_pictures(doc), timeout=0.1)
+
+    def test_pipeline_wraps_enrichment_in_a_stage_timeout(self) -> None:
+        """Guards the call site: the timeout must be applied where the stage runs."""
+        import inspect
+
+        from src.services.ingestion import tasks
+
+        source = inspect.getsource(tasks)
+        stage = source.split('_log_stage("enrich_pictures")')[1].split("export_docling")[0]
+
+        assert "asyncio.wait_for" in stage
+        assert "get_picture_enricher_stage_timeout()" in stage
+        # A timeout must not be reported as a failed document.
+        assert "picture_enrichment_timeout" in stage
+
+
+class TestEnricherMetrics:
+    async def test_empty_body_is_counted_as_empty_not_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty body is the signature of a starved completion budget — the exact defect
+        6.1 fixed — so it needs its own counter rather than hiding inside "failed"."""
+        from src.observability.metrics import PICTURE_ENRICHER
+
+        before = PICTURE_ENRICHER.labels("chart", "empty")._value.get()
+
+        chart = _StubLLM(text="   ")
+        _install(monkeypatch, chart, _StubLLM())
+        await picture_enricher.enrich_pictures(_doc(("bar_chart", 0.9)))
+
+        assert PICTURE_ENRICHER.labels("chart", "empty")._value.get() > before
+
+    async def test_described_pictures_are_counted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from src.observability.metrics import PICTURE_ENRICHER
+
+        before = PICTURE_ENRICHER.labels("chart", "described")._value.get()
+
+        _install(monkeypatch, _StubLLM(), _StubLLM())
+        await picture_enricher.enrich_pictures(_doc(("bar_chart", 0.9), ("line_chart", 0.9)))
+
+        assert PICTURE_ENRICHER.labels("chart", "described")._value.get() == before + 2

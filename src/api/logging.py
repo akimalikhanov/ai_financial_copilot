@@ -246,7 +246,7 @@ def configure_worker_logging() -> None:
 _request_logger = logging.getLogger("api.request")
 
 
-_UNLOGGED_PATHS = frozenset({"/metrics", "/metrics/", "/healthz"})
+_UNLOGGED_PATHS = frozenset({"/metrics", "/metrics/", "/healthz", "/readyz"})
 
 
 async def request_logging_middleware(request: Request, call_next) -> Response:
@@ -256,9 +256,10 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
     2. Calls the route handler
     3. Emits a single JSON log with all accumulated metadata
 
-    Skips logging/metrics bookkeeping for /metrics and /healthz — Prometheus and
-    liveness probes hit these every few seconds and carry no business signal, so
-    logging them would just flood output with zero-value noise.
+    Skips logging/metrics bookkeeping for /metrics, /healthz and /readyz — Prometheus and
+    the probes hit these every few seconds and carry no business signal, so logging them
+    would just flood output with zero-value noise. /readyz matters most: at a 5s period it
+    is the most frequent request the API serves.
     """
     if request.url.path in _UNLOGGED_PATHS:
         return await call_next(request)

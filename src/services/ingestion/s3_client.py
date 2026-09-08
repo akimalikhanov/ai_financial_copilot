@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 import tempfile
@@ -54,8 +55,6 @@ async def upload_pdf(
     doc_id: UUID,
     filename: str,
     fileobj,
-    *,
-    content_length: int | None = None,
 ) -> str:
     """
     Upload PDF to S3/Garage. Returns storage_key.
@@ -71,14 +70,27 @@ async def upload_pdf(
         aws_secret_access_key=get_s3_secret_key(),
         config=_CLIENT_CONFIG,
     ) as client:
-        with contextlib.suppress(Exception):
-            fileobj.seek(0)
+        # `fileobj` is Starlette's SpooledTemporaryFile, which spills to disk above 1 MB —
+        # so for all but the smallest PDFs these are real blocking disk reads. Handing it
+        # to aioboto3 as Body= makes botocore read it from the event loop, freezing every
+        # open SSE stream for the length of the upload. Read it off-loop instead.
+        # upload_bytes() is not reused here: it takes bytes already in hand, and the read
+        # is exactly the part that must not happen on the loop.
+        def _read_all() -> bytes:
+            with contextlib.suppress(Exception):
+                fileobj.seek(0)
+            return fileobj.read()
+
+        body = await asyncio.to_thread(_read_all)
+
         await client.put_object(
             Bucket=get_s3_raw_bucket(),
             Key=storage_key,
-            Body=fileobj,
+            Body=body,
             ContentType="application/pdf",
-            **({"ContentLength": content_length} if content_length is not None else {}),
+            # Trust the bytes we actually read over the caller's advisory count: a
+            # mismatched ContentLength makes Garage reject or truncate the object.
+            ContentLength=len(body),
         )
     return storage_key
 

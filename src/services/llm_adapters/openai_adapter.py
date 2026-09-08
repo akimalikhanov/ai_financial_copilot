@@ -6,6 +6,11 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from src.services.llm_runtime.exception_mapper import map_openai_error
+from src.utils.config import (
+    get_llm_connect_timeout_seconds,
+    get_llm_max_retries,
+    get_llm_timeout_seconds,
+)
 from src.utils.llm_utils import (
     calc_cost_openai,
     compute_tps,
@@ -53,9 +58,19 @@ class OpenAIAdapter(LLMAdapter):
         if provider_name is not None:
             self.provider_name = provider_name
 
+        import httpx
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # Unset, these default to a 600s read timeout and 3 attempts — ten minutes inside a
+        # 900s task budget, and retries that multiply with the app-level parse retries.
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(
+                get_llm_timeout_seconds(), connect=get_llm_connect_timeout_seconds()
+            ),
+            max_retries=get_llm_max_retries(),
+        )
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

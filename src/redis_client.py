@@ -9,6 +9,8 @@ from uuid import uuid4
 from redis.asyncio import Redis
 
 from src.utils.config import (
+    get_chat_events_maxlen,
+    get_chat_events_ttl,
     get_chat_tail_max_messages,
     get_chat_tail_ttl,
     get_rate_limit_max_requests,
@@ -217,8 +219,20 @@ async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[s
     """Add an event to the request's events stream. Returns event id."""
     stream_key = events_stream_key(request_id)
     payload = json.dumps({"type": event_type, **data})
-    event_id = await redis.xadd(stream_key, {"payload": payload}, "*")
+    event_id = await redis.xadd(
+        stream_key,
+        {"payload": payload},
+        "*",
+        # ~maxlen: trims on radix node boundaries, O(1) amortised instead of O(n).
+        maxlen=get_chat_events_maxlen(),
+        approximate=True,
+    )
     return event_id
+
+
+async def expire_event_stream(redis: Redis, request_id: str) -> None:
+    """Give a finished request's stream a TTL. Idempotent; safe to call on every exit path."""
+    await redis.expire(events_stream_key(request_id), get_chat_events_ttl())
 
 
 async def get_activity_log(redis: Redis, request_id: str) -> list[dict]:

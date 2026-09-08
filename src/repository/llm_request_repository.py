@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.llm_request import LLMRequest
@@ -85,6 +85,21 @@ class LLMRequestRepository:
         llm_request.status = status
         await self.session.flush()
         return llm_request
+
+    async def increment_attempt_count(self, request_id: UUID) -> int:
+        """Atomically increment and return the new attempt count.
+
+        An UPDATE ... RETURNING rather than a read-modify-write: two workers racing on the
+        same redelivered task must not both observe attempt 1.
+        """
+        result = await self.session.execute(
+            update(LLMRequest)
+            .where(LLMRequest.id == request_id)
+            .values(attempt_count=LLMRequest.attempt_count + 1)
+            .returning(LLMRequest.attempt_count)
+        )
+        await self.session.flush()
+        return result.scalar_one()
 
     async def create_with_placeholder(
         self,

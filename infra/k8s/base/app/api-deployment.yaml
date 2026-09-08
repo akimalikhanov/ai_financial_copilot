@@ -5,6 +5,13 @@ metadata:
   namespace: copilot
 spec:
   replicas: 1
+  # With a 240s grace period, never take the only replica away before its replacement is
+  # ready — that would be a full outage for the length of the drain.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: api
@@ -85,6 +92,10 @@ spec:
               done
           resources:
             requests: { cpu: "10m", memory: "16Mi" }
+      # An SSE stream lives as long as the pipeline it is watching: measured chat_agent wall
+      # time is p95 102s / p99 187s / max 230s (Aug-Sep 2026), so the default 30s would cut
+      # most slow answers mid-stream on every deploy.
+      terminationGracePeriodSeconds: 240
       containers:
         - name: api
           image: copilot/api:dev
@@ -92,6 +103,13 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal and SIGTERM are concurrent, not ordered, so ingress-nginx
+                # and the frontend proxy can still route here for a moment after SIGTERM.
+                # Sleep first, let the removal propagate, then let uvicorn start refusing.
+                command: ["sh", "-c", "sleep 5"]
           # Order matters: later entries win, explicit env: below beats all of these.
           # Same precedence compose's env_file + environment: override gives.
           envFrom:
@@ -101,20 +119,27 @@ spec:
           env:
             - name: LOG_FILE
               value: ""
+          # Liveness must be strictly laxer than readiness. Failing readiness is safe and
+          # reversible (leave the endpoint list, come back); failing liveness is destructive
+          # (SIGKILL, every in-flight SSE stream dropped). Sharing one endpoint and one
+          # threshold — as these two did — means both fail at the same instant, so the safe
+          # behaviour never happens and a Redis blip restarts the pod. Steady-state a pod
+          # sheds after ~15s of failures and restarts after ~120s; the gap is the point.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz          # Redis reachable + below the stream cap
               port: 8000
-            initialDelaySeconds: 30    # compose start_period: 30s
-            periodSeconds: 15          # compose interval: 15s
-            failureThreshold: 5        # compose retries: 5
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3        # > the handler's own 2s Redis budget
+            failureThreshold: 3      # 3 x 5s = ~15s of failures to shed
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /healthz         # static 200 — only "is the event loop turning"
               port: 8000
-            initialDelaySeconds: 30
-            periodSeconds: 15
-            failureThreshold: 5
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6      # 6 x 20s = ~120s of failures to restart
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { cpu: "2000m", memory: "2Gi" }   # compose: cpus 2.00 / mem_limit 2g

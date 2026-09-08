@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json as _json
 import logging
+import os
 from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, NamedTuple
@@ -36,7 +37,7 @@ from src.observability.metrics import (
     RAG_CONTEXT_TOKENS,
     ROUTER_DECISIONS,
 )
-from src.redis_client import add_event, get_activity_log
+from src.redis_client import add_event, events_stream_key, expire_event_stream, get_activity_log
 from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
@@ -74,6 +75,11 @@ from src.utils.config import (
 logger = logging.getLogger(__name__)
 
 FINDINGS_BLOCK_MAX_CHARS = 20_000
+
+# Ceiling on acks_late redeliveries of one chat task, mirroring INGEST_MAX_ATTEMPTS. Past it
+# the request is failed rather than retried, so a task that reliably kills its worker cannot
+# loop forever re-billing the provider.
+CHAT_MAX_ATTEMPTS = int(os.getenv("CHAT_MAX_ATTEMPTS", "2"))
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
@@ -382,6 +388,49 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
                 return
 
+            # acks_late + reject_on_worker_lost means a SIGKILLed task is redelivered. Without
+            # this guard the redelivery re-runs the whole agent loop and synthesis, re-billing
+            # the provider and appending a second answer to the same SSE stream. Must stay the
+            # first thing after the load, ahead of any write or metric.
+            if llm_request.status == "completed":
+                logger.info("pipeline.already_completed", extra={"request_id": request_id})
+                return
+
+            attempt = await llm_request_repo.increment_attempt_count(UUID(request_id))
+            if attempt > CHAT_MAX_ATTEMPTS:
+                await llm_request_repo.update_status(UUID(request_id), "failed")
+                # Committed before returning: an uncommitted status leaves the next
+                # redelivery seeing the same state and looping forever.
+                await session.commit()
+                logger.warning(
+                    "pipeline.max_attempts_exceeded",
+                    extra={
+                        "request_id": request_id,
+                        "attempt": attempt,
+                        "max_attempts": CHAT_MAX_ATTEMPTS,
+                    },
+                )
+                await add_event(
+                    redis_app,
+                    request_id,
+                    "error",
+                    error_event(
+                        RuntimeError(f"Exceeded max processing attempts ({CHAT_MAX_ATTEMPTS})")
+                    ),
+                )
+                return
+
+            if attempt > 1:
+                # A redelivery must not append to the previous attempt's partial output —
+                # a client reconnecting with Last-Event-ID would read two answers spliced
+                # together. Start the stream clean.
+                logger.info(
+                    "pipeline.retry_attempt",
+                    extra={"request_id": request_id, "attempt": attempt},
+                )
+                with contextlib.suppress(Exception):
+                    await redis_app.delete(events_stream_key(request_id))
+
             CHAT_QUEUE_WAIT.observe((datetime.now(UTC) - llm_request.created_at).total_seconds())
 
             state.llm_request = llm_request
@@ -645,6 +694,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
                 return
 
+            # Release the pgbouncer slot before the agent loop / carryover branch, which can
+            # run for minutes — holding a transaction that long converts transaction pooling
+            # into session pooling. `expire_on_commit=False` keeps llm_request/assistant_msg
+            # usable after this.
+            await session.commit()
+
             agent_settings = get_agent_settings()
             # `user_id` is nullable on LLMRequest, and the agent loop cannot search
             # without one — route that case to the no-context path explicitly.
@@ -788,6 +843,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "hops": carried.hops,
                     },
                 )
+
+            # Release again before the synthesis stream.
+            await session.commit()
 
             top_score = (
                 state.rag_context.items[0].score
@@ -1228,6 +1286,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         if current_stage != "initializing" and current_stage_event_id is not None:
             _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
             await add_event(redis_app, request_id, "activity", end_data)
+        # After the last add_event above — an XADD on an expired/expiring key recreates it
+        # without a TTL, so this must be the final write to the stream.
+        with contextlib.suppress(Exception):
+            await expire_event_stream(redis_app, request_id)
         _stage_stack.close()
         _gen_stack.close()
         _lf_stack.close()

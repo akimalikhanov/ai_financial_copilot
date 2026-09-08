@@ -32,10 +32,14 @@ spec:
           # host, so the password has to be expanded by a shell at container runtime instead. The
           # `exec` matters: without it redis runs as PID 2 under sh and never receives SIGTERM on pod
           # deletion, so every shutdown burns the full terminationGracePeriodSeconds.
+          # maxmemory is a backstop only — the leak is fixed at the write site (CHAT_EVENTS_TTL).
+          # allkeys-lru is safe here because everything in redis-app is now TTL'd or regenerable;
+          # never apply it to redis-broker, where evicting a task loses a user's question.
           command:
             - sh
             - -c
             - exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+              --maxmemory 768mb --maxmemory-policy allkeys-lru
           volumeMounts:
             - name: data
               mountPath: /data
