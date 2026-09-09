@@ -14,7 +14,14 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
-from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
+from src.api.deps import (
+    CurrentUserDep,
+    LLMRouterDep,
+    RedisBrokerDep,
+    RedisDep,
+    chat_admission_control,
+    chat_rate_limit,
+)
 from src.api.exceptions import _sse_event
 from src.db import DbSessionDep, get_session_factory
 from src.models.llm_request import LLMRequest
@@ -105,6 +112,7 @@ async def chat_enqueue(
     req: schemas.ChatEnqueueRequest,
     session: DbSessionDep,
     redis: RedisDep,
+    redis_broker: RedisBrokerDep,
     llm_router: LLMRouterDep,
     current_user: CurrentUserDep,
 ) -> schemas.ChatEnqueueResponse:
@@ -137,6 +145,10 @@ async def chat_enqueue(
             assistant_seq=assistant_msg.seq if assistant_msg else 0,
             status=existing.status or "queued",
         )
+
+    # After the idempotency return, so a client retrying an already-queued request gets its IDs
+    # back instead of a 503.
+    await chat_admission_control(redis_broker)
 
     # Create or find user message (idempotent by client_msg_id)
     user_message = await message_repo.get_by_client_msg_id(req.conversation_id, req.client_msg_id)

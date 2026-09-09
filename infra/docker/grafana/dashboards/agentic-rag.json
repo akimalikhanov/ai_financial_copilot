@@ -249,10 +249,133 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 18,
+      "type": "row",
+      "title": "Latency Breakdown",
+      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "title": "Chat Stage Latency p95 (s)",
+      "type": "timeseries",
+      "description": "Which chat pipeline stage dominates end-to-end latency: route_query / agent_loop / render_prompt / stream_llm_response / persist_and_emit.",
+      "gridPos": { "x": 0, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chat_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p95 {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 20,
+      "title": "Chat Stage Latency p50 (s)",
+      "type": "timeseries",
+      "description": "Typical-case stage cost. Read against p95 to tell a stage with a high floor from one with a long tail.",
+      "gridPos": { "x": 8, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chat_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p50 {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 21,
+      "title": "Mean Time per Stage (s)",
+      "type": "timeseries",
+      "description": "Average seconds per stage occurrence. Stacks to the mean end-to-end pipeline cost, so it reads as a latency budget.",
+      "gridPos": { "x": 16, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(chat_pipeline_stage_duration_seconds_sum[5m])) by (stage) / sum(rate(chat_pipeline_stage_duration_seconds_count[5m])) by (stage)",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 22,
+      "title": "LLM Call Latency by Type (s)",
+      "type": "timeseries",
+      "description": "Per-call-site LLM latency — router / rewrite_query / agent_tool_call / chat. Replaces the old avg-from-Postgres panel: real percentiles, no query against the primary DB.",
+      "gridPos": { "x": 0, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, request_type))",
+          "legendFormat": "p95 {{request_type}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, request_type))",
+          "legendFormat": "p50 {{request_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 23,
+      "title": "LLM Call Latency p95 by Model (s)",
+      "type": "timeseries",
+      "description": "Same calls sliced by model — the input for swapping a model on a hot path.",
+      "gridPos": { "x": 8, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p95 {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 24,
+      "title": "Time to First Token (s)",
+      "type": "timeseries",
+      "description": "User-perceived wait on streaming calls. Diverges from total call latency once generations get long.",
+      "gridPos": { "x": 16, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_time_to_first_token_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(llm_time_to_first_token_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p50 {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 14,
       "type": "row",
       "title": "Quality Drill-Down (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 52, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -260,7 +383,7 @@
       "title": "Per-Request Stage Breakdown (slowest in range)",
       "type": "table",
       "description": "Outlier drill-down: the slowest requests in the dashboard time range. Not possible from aggregate histograms — find the specific requests where a stage blew up.",
-      "gridPos": { "x": 0, "y": 36, "w": 12, "h": 10 },
+      "gridPos": { "x": 0, "y": 53, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -283,7 +406,7 @@
       "title": "Response Quality — Thumbs Down Rate (hourly)",
       "type": "timeseries",
       "description": "Only user-perceived quality signal — catches fast-but-wrong regressions.",
-      "gridPos": { "x": 12, "y": 36, "w": 12, "h": 10 },
+      "gridPos": { "x": 12, "y": 53, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -296,25 +419,6 @@
         "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
       },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-    {
-      "id": 17,
-      "title": "Router LLM Overhead vs Chat Latency",
-      "type": "timeseries",
-      "description": "Cost of routing sub-call vs main response — validate the router is worth the latency.",
-      "gridPos": { "x": 0, "y": 46, "w": 12, "h": 8 },
-      "datasource": { "type": "postgres", "uid": "postgres" },
-      "targets": [
-        {
-          "format": "time_series",
-          "rawQuery": true,
-          "rawSql": "SELECT date_trunc('minute', created_at) AS time, request_type, avg(latency_ms) AS avg_latency_ms FROM llm_requests WHERE request_type IN ('router', 'chat') GROUP BY 1, 2 ORDER BY 1;"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "ms", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
-      },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     }
   ]
 }

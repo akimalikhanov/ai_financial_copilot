@@ -266,6 +266,21 @@ def get_max_open_streams() -> int:
     return int(os.getenv("MAX_OPEN_STREAMS", "200"))
 
 
+def get_chat_queue_max_depth() -> int:
+    """Queued chat tasks before the API sheds load (CHAT_QUEUE_MAX_DEPTH, default 36).
+
+    Global, unlike the per-user rate limit: 100 users each inside their own limit can still
+    admit far more than the worker pool can serve. Sized as
+    `slots x (longest promised wait / service time)` = 24 x (60s / 40.5s) ~= 36.
+
+    The depth is only meaningful against that 40.5s service time (measured 2026-09-07, see
+    docs/notes/capacity-model.md). If service time doubles, the same depth silently becomes a
+    two-minute buffer instead of a one-minute one — re-derive it whenever service time is
+    re-measured.
+    """
+    return int(os.getenv("CHAT_QUEUE_MAX_DEPTH", "36"))
+
+
 def get_readiness_redis_timeout_seconds() -> float:
     """Budget for the /readyz Redis ping (READINESS_REDIS_TIMEOUT_SECONDS, default 2.0).
 

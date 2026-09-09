@@ -354,6 +354,10 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   request_type       text NOT NULL DEFAULT 'chat',
   -- Discriminator: 'chat' (default, main assistant response) or 'router' (query routing sub-call).
 
+  query_shape        text,
+  -- Router's shape verdict ('extraction'/'comparison'/'analytical'), NULL on non-routed rows.
+  -- Separates "the workload got harder" from "a config change made every query cost more".
+
   attempt_count      integer NOT NULL DEFAULT 0,
   -- Number of times the chat pipeline has been attempted (caps acks_late redelivery loops).
 
@@ -787,6 +791,11 @@ ALTER TABLE llm_requests
   ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 0;
 COMMENT ON COLUMN llm_requests.attempt_count IS
   'Number of times the chat pipeline has been attempted (caps acks_late redelivery loops).';
+
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS query_shape text;
+COMMENT ON COLUMN llm_requests.query_shape IS
+  'Router query shape (extraction/comparison/analytical). Attributes cost drift to workload mix.';
 
 -- ============================================================================
 -- Add user_id FKs to users (conversations, messages, llm_requests)

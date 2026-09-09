@@ -139,6 +139,9 @@ services:
     image: postgres:16.11-alpine
     container_name: postgres
     restart: unless-stopped
+    # Matches infra/k8s/base/data/postgres-statefulset.yaml: pgbouncer can open up to 120
+    # server connections, above the image default of 100.
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       # superuser / default DB created by entrypoint
       POSTGRES_USER: ${POSTGRES_USER}

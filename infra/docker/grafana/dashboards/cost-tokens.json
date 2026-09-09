@@ -3,7 +3,7 @@
   "uid": "cost-tokens",
   "description": "Product owner / engineering lead: real-time LLM spend, token breakdown, cache effectiveness, per-model SLOs, and top users.",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 3,
   "refresh": "5m",
   "time": { "from": "now-24h", "to": "now" },
   "templating": {
@@ -201,6 +201,60 @@
         ]
       },
       "options": { "sortBy": [{ "displayName": "total_cost_usd", "desc": true }] }
+    },
+    {
+      "id": 11,
+      "title": "Capacity & Service-Time Drift (PostgreSQL)",
+      "type": "row",
+      "description": "Service time is the denominator of every capacity number (see docs/notes/capacity-model.md). It nearly doubled in one quarter on an unchanged model, so replica counts and the admission threshold derived from it have a shelf life. Both panels sum latency_ms across the request tree — LLM time only, so a lower bound: retrieval, reranking and embedding are never llm_requests rows.",
+      "gridPos": { "x": 0, "y": 36, "w": 24, "h": 1 }
+    },
+    {
+      "id": 12,
+      "title": "Service Time Drift by Month",
+      "type": "table",
+      "description": "Re-derive capacity when mean_service_s moves more than 25%, or quarterly. service_time ~= turns_per_query x time_per_turn, so watch both columns: they multiply. Filtered to chat_agent — blending in the retired non-agentic path understates the mean by ~3.4x.",
+      "gridPos": { "x": 0, "y": 37, "w": 12, "h": 8 },
+      "timeFrom": "180d",
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH tree AS (SELECT p.id, date_trunc('month', p.created_at) AS month, p.latency_ms + COALESCE(sum(c.latency_ms), 0) AS llm_ms, count(c.id) FILTER (WHERE c.request_type = 'agent_tool_call') AS turns FROM llm_requests p LEFT JOIN llm_requests c ON c.parent_request_id = p.id WHERE p.parent_request_id IS NULL AND p.request_type = 'chat_agent' AND p.status = 'completed' AND p.latency_ms IS NOT NULL AND $__timeFilter(p.created_at) GROUP BY p.id, month, p.latency_ms) SELECT month, count(*) AS requests, round((avg(llm_ms)/1000)::numeric, 1) AS mean_service_s, round((percentile_cont(0.95) WITHIN GROUP (ORDER BY llm_ms)/1000)::numeric, 1) AS p95_service_s, round(avg(turns)::numeric, 2) AS turns_per_query FROM tree GROUP BY month ORDER BY month;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "mean_service_s" }, "properties": [{ "id": "unit", "value": "s" }] },
+          { "matcher": { "id": "byName", "options": "p95_service_s" }, "properties": [{ "id": "unit", "value": "s" }] }
+        ]
+      }
+    },
+    {
+      "id": 13,
+      "title": "Service Time by Query Shape",
+      "type": "table",
+      "description": "What separates 'users asked harder questions' from 'a config change made every question cost more' — the two are indistinguishable in the monthly view. query_shape is recorded from Stage 17.5 Phase 7 onward, so older rows group under 'unrecorded'.",
+      "gridPos": { "x": 12, "y": 37, "w": 12, "h": 8 },
+      "timeFrom": "180d",
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH tree AS (SELECT p.id, p.query_shape, p.latency_ms + COALESCE(sum(c.latency_ms), 0) AS llm_ms, count(c.id) FILTER (WHERE c.request_type = 'agent_tool_call') AS turns, COALESCE(sum(c.reasoning_tokens), 0) + COALESCE(p.reasoning_tokens, 0) AS reasoning FROM llm_requests p LEFT JOIN llm_requests c ON c.parent_request_id = p.id WHERE p.parent_request_id IS NULL AND p.request_type = 'chat_agent' AND p.status = 'completed' AND p.latency_ms IS NOT NULL AND $__timeFilter(p.created_at) GROUP BY p.id, p.query_shape, p.latency_ms, p.reasoning_tokens) SELECT COALESCE(query_shape, 'unrecorded') AS query_shape, count(*) AS requests, round((avg(llm_ms)/1000)::numeric, 1) AS mean_service_s, round((percentile_cont(0.95) WITHIN GROUP (ORDER BY llm_ms)/1000)::numeric, 1) AS p95_service_s, round(avg(turns)::numeric, 2) AS turns_per_query, round(avg(reasoning)::numeric) AS avg_reasoning_tokens FROM tree GROUP BY 1 ORDER BY mean_service_s DESC NULLS LAST;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "mean_service_s" }, "properties": [{ "id": "unit", "value": "s" }] },
+          { "matcher": { "id": "byName", "options": "p95_service_s" }, "properties": [{ "id": "unit", "value": "s" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "mean_service_s", "desc": true }] }
     }
   ]
 }

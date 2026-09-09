@@ -26,6 +26,7 @@ from src.observability import langfuse as lf_client
 from src.observability.metrics import (
     AGENT_ITERATIONS,
     CHAT_QUEUE_WAIT,
+    CHAT_STAGE_DURATION,
     FOLLOWUP_DIRECT_ANSWER,
     FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
@@ -36,6 +37,7 @@ from src.observability.metrics import (
     RAG_CITATIONS,
     RAG_CONTEXT_TOKENS,
     ROUTER_DECISIONS,
+    observe_llm_latency,
 )
 from src.redis_client import add_event, events_stream_key, expire_event_stream, get_activity_log
 from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
@@ -328,7 +330,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     async def _log_stage(stage_name: str, **extra_fields: Any) -> None:
         nonlocal current_stage, current_stage_event_id, stage_start, _stage_stack
         if current_stage != "initializing":
-            stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+            elapsed = perf_counter() - stage_start
+            stage_times[current_stage] = round(elapsed, 3)
+            CHAT_STAGE_DURATION.labels(current_stage).observe(elapsed)
             _stage_stack.close()
             _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
             await add_event(redis_app, request_id, "activity", end_data)
@@ -594,6 +598,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 conversation_id=state.conversation_id,
             )
             ROUTER_DECISIONS.labels(state.router_output.route).inc()
+            # Flushed by the commits below; expire_on_commit=False keeps the object usable.
+            llm_request.query_shape = state.router_output.query_shape
             _scope_doc_ids = (
                 [str(d) for d in state.scope_result.doc_ids]
                 if state.scope_result and state.scope_result.doc_ids is not None
@@ -1026,7 +1032,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             citation_meta["agent_findings_sealed"] = state.agent_meta.sealed
 
                     # Finalize stage times (stream_llm_response ends here)
-                    stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+                    _elapsed = perf_counter() - stage_start
+                    stage_times[current_stage] = round(_elapsed, 3)
+                    CHAT_STAGE_DURATION.labels(current_stage).observe(_elapsed)
                     total_time = round(perf_counter() - pipeline_started_at, 3)
 
                     confidence = compute_confidence(top_score, num_chunks)
@@ -1118,6 +1126,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             LLM_CACHE_HIT_TOKENS.labels(_model).inc(chunk.stats.cached_input_tokens)
                         if chunk.stats.cost_usd:
                             LLM_COST.labels(_model).inc(chunk.stats.cost_usd)
+                        observe_llm_latency(_model, llm_request.request_type, chunk.stats)
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),

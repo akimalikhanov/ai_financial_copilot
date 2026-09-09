@@ -4,15 +4,17 @@ metadata:
   name: worker-chat
   namespace: copilot
 spec:
-  replicas: 1
-  # With a 420s grace period the default (maxUnavailable 25% -> 1 of 1) would leave the queue
-  # unserved for up to 7 minutes while the old pod drains. Surge instead: the new pod serves
-  # while the old one finishes its in-flight answers.
+  # 6 x CELERY_CHAT_WORKER_CONCURRENCY=4 = 24 slots -> ~35.6 answers/min at the measured 40.5s
+  # service time, ~70% utilisation at the 25 q/min design point. See docs/notes/capacity-model.md.
+  replicas: 6
+  # With a 420s grace period the default (maxUnavailable 25%) would leave the queue unserved
+  # while pods drain. Surge instead: new pods serve while old ones finish in-flight answers.
+  # maxSurge 2 rather than 1 — at 6 replicas, one-at-a-time is a ~42 minute rollout.
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
-      maxSurge: 1
+      maxSurge: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: chat_worker
@@ -152,8 +154,11 @@ spec:
             periodSeconds: 120
             timeoutSeconds: 60
             failureThreshold: 5
+          # requests.memory was 768Mi, below the measured idle container total of 1.257GiB.
+          # The scheduler places on requests, so under-requesting makes these pods first to be
+          # evicted once the node fills — which matters now that there are six of them.
           resources:
-            requests: { cpu: "250m", memory: "768Mi" }
+            requests: { cpu: "250m", memory: "1536Mi" }
             limits:   { cpu: "2000m", memory: "3Gi" }   # compose: cpus 2.00 / mem_limit 3g
       volumes:
         # emptyDir, not a PVC: pod-scoped lifetime is exactly right for multiprocess metric

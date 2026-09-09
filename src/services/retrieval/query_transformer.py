@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.metrics import observe_llm_latency
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_transform import ScopeDocSummary, TransformedQuery, TransformerInput
 from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
@@ -182,6 +183,7 @@ async def rewrite_query(
             return _fallback(raw_query), last_stats
 
         last_stats = resp.stats
+        observe_llm_latency(model_id, "rewrite_query", resp.stats)
 
         if should_log_subrequest:
             await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]

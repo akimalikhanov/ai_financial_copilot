@@ -36,6 +36,7 @@ from src.observability.metrics import (
     LLM_CACHE_HIT_TOKENS,
     LLM_COST,
     LLM_TOKENS,
+    observe_llm_latency,
 )
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
@@ -660,6 +661,7 @@ async def _run_turn_inner(
                 LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(turn.stats.cached_input_tokens)
             if turn.stats.cost_usd:
                 LLM_COST.labels(llm.model_id).inc(turn.stats.cost_usd)
+            observe_llm_latency(llm.model_id, "agent_tool_call", turn.stats)
 
             if chat_state.llm_request and chat_state.llm_request.conversation_id is not None:
                 with contextlib.suppress(Exception):

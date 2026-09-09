@@ -17,6 +17,9 @@ spec:
       containers:
         - name: postgres
           image: postgres:16.11-alpine
+          # Image default is 100, and pgbouncer can now open up to 120 server connections
+          # (app 60 + langfuse 30 + postgres 30). Below this, the pool hits a Postgres refusal.
+          args: ["postgres", "-c", "max_connections=200"]
           ports:
             - name: postgres
               containerPort: 5432

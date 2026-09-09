@@ -16,6 +16,7 @@ from src.utils.config import (
     get_rate_limit_max_requests,
     get_rate_limit_window_ms,
     get_redis_app_url,
+    get_redis_broker_url,
 )
 
 CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
@@ -38,6 +39,11 @@ def ingestion_stream_key(document_id: str) -> str:
 async def create_redis_app_client() -> Redis:
     """Create async Redis client for app (rate limit, cache, SSE stream)."""
     return Redis.from_url(get_redis_app_url(), decode_responses=True)
+
+
+async def create_redis_broker_client() -> Redis:
+    """Create async Redis client for the Celery broker (queue-depth reads for admission control)."""
+    return Redis.from_url(get_redis_broker_url(), decode_responses=True)
 
 
 async def close_redis_client(client: Redis) -> None:

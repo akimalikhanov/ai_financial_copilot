@@ -1198,8 +1198,13 @@ export default function App() {
       );
     } catch (err) {
       const error = err as ApiError;
+      // A 503 here is admission control shedding load, not a fault. Say so, or a system that is
+      // degrading on purpose reads to the user as one that is broken.
+      const content = error.statusCode === 503
+        ? `The assistant is at capacity right now. Please resend your question${error.retryAfterSeconds ? ` in about ${error.retryAfterSeconds} seconds` : ' shortly'}.`
+        : `Error: ${error.message}`;
       appendMessage(conversationId, { id: `temp-${clientMsgId}`, role: 'user', content: text, timestamp: Date.now() });
-      appendMessage(conversationId, { id: `error-${Date.now()}`, role: 'assistant', content: `Error: ${error.message}`, timestamp: Date.now() });
+      appendMessage(conversationId, { id: `error-${Date.now()}`, role: 'assistant', content, timestamp: Date.now() });
       setIsTyping(false);
       setIsAwaitingResponse(false);
     }

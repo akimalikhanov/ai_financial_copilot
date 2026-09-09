@@ -57,6 +57,9 @@ class LLMRequest(Base):
         nullable=False,
         server_default=text("'chat'"),
     )
+    # Router's shape verdict, persisted so cost drift can be attributed to workload mix rather
+    # than being indistinguishable from a prompt or effort-budget change.
+    query_shape: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Caps acks_late redelivery loops: a SIGKILLed task is redelivered, and without a
     # persistent counter the redelivery re-runs the agent loop and re-bills the provider.
     attempt_count: Mapped[int] = mapped_column(

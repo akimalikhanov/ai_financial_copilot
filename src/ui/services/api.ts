@@ -67,6 +67,8 @@ export interface ApiError {
   message: string;
   errorType?: string;
   statusCode?: number;
+  /** From the Retry-After header, when the server sent one (503 at capacity, 429 rate limit). */
+  retryAfterSeconds?: number;
   raw?: unknown;
 }
 
@@ -173,15 +175,25 @@ const toApiError = (payload: unknown, options: ApiErrorOptions = {}): ApiError =
   };
 };
 
+const parseRetryAfter = (response: Response): number | undefined => {
+  const raw = response.headers.get('Retry-After');
+  if (!raw) return undefined;
+  const seconds = Number.parseInt(raw, 10);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+};
+
 const toApiErrorFromResponse = async (response: Response): Promise<ApiError> => {
   const fallbackMessage = `Request failed with status ${response.status}`;
   const text = await response.text();
+  const retryAfterSeconds = parseRetryAfter(response);
+  let error: ApiError;
   try {
     const payload = JSON.parse(text) as unknown;
-    return toApiError(payload, { statusCode: response.status, fallbackMessage });
+    error = toApiError(payload, { statusCode: response.status, fallbackMessage });
   } catch {
-    return toApiError(text, { statusCode: response.status, fallbackMessage });
+    error = toApiError(text, { statusCode: response.status, fallbackMessage });
   }
+  return retryAfterSeconds === undefined ? error : { ...error, retryAfterSeconds };
 };
 
 const toApiErrorFromThrowable = (error: unknown): ApiError => {

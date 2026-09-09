@@ -16,7 +16,11 @@ from src.api.routers import get_routers
 from src.db import init_db, shutdown_db
 from src.observability import langfuse as lf_client
 from src.observability.metrics import open_stream_count
-from src.redis_client import close_redis_client, create_redis_app_client
+from src.redis_client import (
+    close_redis_client,
+    create_redis_app_client,
+    create_redis_broker_client,
+)
 from src.services.llm_router import get_router
 from src.services.llm_runtime.exceptions import LLMError
 from src.utils.config import (
@@ -35,6 +39,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_db()
     app.state.llm_router = get_router()
     app.state.redis = await create_redis_app_client()
+    # Separate instance from redis-app: the Celery queue lives on redis-broker, and admission
+    # control reads its depth.
+    app.state.redis_broker = await create_redis_broker_client()
     lf_client.initialize()
     logger.info("app.started")
 
@@ -45,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     lf_client.flush()
     await app.state.llm_router.close()
     await close_redis_client(app.state.redis)
+    await close_redis_client(app.state.redis_broker)
     await shutdown_db()
     logger.info("db.shutdown")
     logger.info("app.stopped")

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from src.services.llm_adapters.base_adapter import LLMResponseStats
+
 # --- HTTP ---
 HTTP_REQUESTS = Counter(
     "http_requests_total",
@@ -70,6 +72,10 @@ CHAT_QUEUE_WAIT = Histogram(
     "chat_queue_wait_seconds",
     "Enqueue -> task start",
     buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
+)
+CHAT_ADMISSION_REJECTED = Counter(
+    "chat_admission_rejected_total",
+    "Chat requests refused with 503 because the queue was at CHAT_QUEUE_MAX_DEPTH",
 )
 
 # --- Celery ---
@@ -144,10 +150,44 @@ FOLLOWUP_DIRECT_ANSWER = Counter(
 GUARDRAIL_BLOCKS = Counter("guardrail_blocks_total", "Guardrail blocks", ["type"])
 PIPELINE_ERRORS = Counter("chat_pipeline_errors_total", "Chat pipeline failures", ["stage"])
 
-# --- LLM cost/tokens ---
+CHAT_STAGE_DURATION = Histogram(
+    "chat_pipeline_stage_duration_seconds",
+    "Chat pipeline stage latency",
+    # stage: one of the _STAGE_LABELS keys in services/chat/tasks.py
+    ["stage"],
+    # agent_loop and stream_llm_response run tens of seconds; the rest are ms-scale.
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
+)
+
+# --- LLM cost/tokens/latency ---
 LLM_TOKENS = Counter("llm_tokens_total", "Tokens", ["direction", "model"])
 LLM_COST = Counter("llm_cost_usd_total", "Cost USD", ["model"])
 LLM_CACHE_HIT_TOKENS = Counter("llm_cache_hit_tokens_total", "Cached input tokens", ["model"])
+# request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
+# router | rewrite_query | conversation_naming.
+LLM_DURATION = Histogram(
+    "llm_request_duration_seconds",
+    "LLM call latency, first byte to last",
+    ["model", "request_type"],
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120),
+)
+LLM_TTFT = Histogram(
+    "llm_time_to_first_token_seconds",
+    "LLM time to first token (streaming calls only)",
+    ["model", "request_type"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 30),
+)
+
+
+def observe_llm_latency(model: str, request_type: str, stats: LLMResponseStats | None) -> None:
+    """Record one LLM call's latency histograms."""
+    if stats is None:
+        return
+    if stats.latency_ms is not None:
+        LLM_DURATION.labels(model, request_type).observe(stats.latency_ms / 1000.0)
+    if stats.ttft_ms is not None:
+        LLM_TTFT.labels(model, request_type).observe(stats.ttft_ms / 1000.0)
+
 
 # --- Ingestion ---
 INGESTION_DOCUMENTS = Counter("ingestion_documents_total", "Documents processed", ["status"])

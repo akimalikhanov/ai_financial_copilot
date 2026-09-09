@@ -6,6 +6,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.metrics import observe_llm_latency
 from src.repository.document_repository import DocumentRepository
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_router import (
@@ -203,6 +204,8 @@ async def route_query(
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})
             return _FALLBACK, None
+
+        observe_llm_latency(model_id, "router", resp.stats)
 
         if should_log_subrequest:
             await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]

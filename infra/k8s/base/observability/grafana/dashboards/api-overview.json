@@ -3,7 +3,7 @@
   "uid": "api-overview",
   "description": "On-call first stop: traffic, latency, errors, in-flight requests, and error log context.",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 3,
   "refresh": "30s",
   "time": { "from": "now-1h", "to": "now" },
   "templating": {
@@ -219,11 +219,61 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 12,
+      "title": "Chat Queue Depth vs Admission Threshold",
+      "type": "timeseries",
+      "description": "Backlog on the broker's chat list against CHAT_QUEUE_MAX_DEPTH, above which /v1/chat returns 503. max() not sum(): every worker replica samples the same shared queue, so summing multiplies depth by the replica count. The threshold line is derived from slots x (promised wait / service time) — update it here when CHAT_QUEUE_MAX_DEPTH changes.",
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(celery_queue_length{queue_name=\"chat\"}) by (queue_name)",
+          "legendFormat": "queued tasks"
+        },
+        {
+          "expr": "vector(36)",
+          "legendFormat": "CHAT_QUEUE_MAX_DEPTH"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "CHAT_QUEUE_MAX_DEPTH" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 13,
+      "title": "Chat Admission Rejections",
+      "type": "timeseries",
+      "description": "Requests refused with 503 + Retry-After because the queue was at capacity. Shedding load is a feature — a brief spike during a burst is the valve working. Sustained non-zero means demand exceeds provisioned slots: add replicas, or lower the threshold to match real capacity.",
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(chat_admission_rejected_total[5m])) * 60",
+          "legendFormat": "rejections/min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 10,
       "title": "Redis Memory vs Limit",
       "type": "timeseries",
       "description": "redis-app / redis-broker memory against the container limit — watch this during an 8h soak (Phase 2 acceptance: flat, not growing).",
-      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 43, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -245,7 +295,7 @@
       "title": "OpenSearch Container Memory",
       "type": "timeseries",
       "description": "Container working set vs the 2560Mi limit (Phase 0.1). Was measured at 99.7% of the old 1536Mi limit at idle.",
-      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
+      "gridPos": { "x": 12, "y": 43, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {

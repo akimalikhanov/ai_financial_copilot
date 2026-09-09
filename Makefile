@@ -33,6 +33,7 @@ lint:
 	.venv/bin/ruff format --check .
 	$(MAKE) k8s-check-initdb
 	$(MAKE) k8s-check-es-bootstrap
+	$(MAKE) k8s-check-dashboards
 
 .PHONY: typecheck
 typecheck:
@@ -239,6 +240,22 @@ k8s-check-es-bootstrap:
 	@diff -q infra/docker/elasticsearch/bootstrap.sh infra/k8s/base/search/es-bootstrap/bootstrap.sh
 	@diff -q infra/docker/elasticsearch/ilm-policy.json infra/k8s/base/search/es-bootstrap/ilm-policy.json
 	@diff -q infra/docker/elasticsearch/index-template.json infra/k8s/base/search/es-bootstrap/index-template.json
+
+# infra/k8s/base/observability/grafana/dashboards/* are copies of infra/docker/grafana/dashboards/*.
+# infra/docker/ is the source of truth. worker-health.json is excluded on purpose: the K8s copy
+# carries extra GPU panels (dcgm-exporter) that have no compose equivalent.
+.PHONY: k8s-sync-dashboards
+k8s-sync-dashboards:
+	@for d in api-overview agentic-rag cost-tokens logs-explorer eval-canary; do \
+	  cp infra/docker/grafana/dashboards/$$d.json infra/k8s/base/observability/grafana/dashboards/$$d.json; \
+	done
+
+# Fails if the K8s dashboard copies have drifted. Run `make k8s-sync-dashboards` to fix.
+.PHONY: k8s-check-dashboards
+k8s-check-dashboards:
+	@for d in api-overview agentic-rag cost-tokens logs-explorer eval-canary; do \
+	  diff -q infra/docker/grafana/dashboards/$$d.json infra/k8s/base/observability/grafana/dashboards/$$d.json || exit 1; \
+	done
 
 # Jobs are immutable (spec.template can't change in place); delete-then-apply is the explicit
 # re-run path recommended in Phase 8, mirroring how `docker compose run --rm garage-bootstrap`

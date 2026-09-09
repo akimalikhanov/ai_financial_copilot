@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.metrics import observe_llm_latency
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
 from src.services.llm_router import LLMRouter
@@ -61,6 +62,8 @@ async def generate_conversation_title(
     except Exception:
         logger.warning("conversation_naming_llm_error", exc_info=True)
         return None
+
+    observe_llm_latency(model, "conversation_naming", resp.stats)
 
     await LLMRequestRepository(session).create_subrequest(
         parent_request_id=parent_request_id,

@@ -31,7 +31,7 @@ cat > /etc/pgbouncer/pgbouncer.ini <<EOF
 [databases]
 # route specific DB names to Postgres
 ${POSTGRES_DB} = host=${PGB_POSTGRES_HOST} port=${PGB_POSTGRES_PORT} dbname=${POSTGRES_DB} password=${POSTGRES_PASSWORD}
-${APP_DB}      = host=${PGB_POSTGRES_HOST} port=${PGB_POSTGRES_PORT} dbname=${APP_DB} password=${APP_DB_PASSWORD}
+${APP_DB}      = host=${PGB_POSTGRES_HOST} port=${PGB_POSTGRES_PORT} dbname=${APP_DB} password=${APP_DB_PASSWORD} pool_size=60
 ${LANGFUSE_DB} = host=${PGB_POSTGRES_HOST} port=${PGB_POSTGRES_PORT} dbname=${LANGFUSE_DB} password=${LANGFUSE_DB_PASSWORD}
 
 [pgbouncer]
@@ -42,9 +42,11 @@ auth_type = md5
 auth_file = /etc/pgbouncer/userlist.txt
 
 pool_mode = transaction
+# 24 chat-worker slots x ~4 sessions ~= 96 clients. The app DB gets pool_size=60 inline above;
+# default stays 30 for langfuse/postgres, so worst case 60+30+30=120 < Postgres max_connections=200.
 default_pool_size = 30
 min_pool_size = 0
-max_client_conn = 200
+max_client_conn = 400
 
 # Without these, the admin console is unreachable and SHOW POOLS fails — the top suspected
 # bottleneck (pool saturation) has no telemetry at all. Must match the user connecting.
