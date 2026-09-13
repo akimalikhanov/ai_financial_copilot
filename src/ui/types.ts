@@ -59,6 +59,12 @@ export interface MessageMetadata {
   confidence?: 'low' | 'medium' | 'high' | 'none';
   ungrounded_claims?: boolean | null;
   route?: string | null;
+  /**
+   * Retrieval capabilities unavailable for at least one search ('dense' | 'keyword' |
+   * 'rerank'). Distinct from low confidence: that describes the answer's grounding,
+   * this describes a system fault that made the search weaker than it should be.
+   */
+  degraded_retrieval?: string[] | null;
 }
 
 export interface Message {

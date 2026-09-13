@@ -106,6 +106,8 @@ export interface MetadataEvent {
   confidence: 'low' | 'medium' | 'high' | 'none';
   ungrounded_claims: boolean | null;
   route: string | null;
+  /** Retrieval capabilities that were unavailable: 'dense' | 'keyword' | 'rerank'. */
+  degraded_retrieval?: string[] | null;
 }
 
 /** Unified event replacing the old StageEvent/ToolCallStarted/CompletedEvent/agent_turn_started/

@@ -32,3 +32,6 @@ configMapGenerator:
   - name: pgbouncer-entrypoint
     files:
       - pgbouncer-entrypoint.sh
+  - name: postgres-exporter-queries
+    files:
+      - postgres-exporter-queries.yaml

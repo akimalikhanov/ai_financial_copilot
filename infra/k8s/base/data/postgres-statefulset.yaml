@@ -13,6 +13,9 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: postgres
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
     spec:
       containers:
         - name: postgres
@@ -60,7 +63,48 @@ spec:
           resources:
             requests: { cpu: "250m", memory: "512Mi" }
             limits:   { cpu: "2",    memory: "2Gi" }   # compose: cpus 2.00 / mem_limit 2g
+        # Engine-level metrics for Prometheus. Grafana's `PostgreSQL` datasource queries
+        # pg_stat_activity over SQL at render time, which shows only the present moment —
+        # there was no history for it, so a load-test scenario could not be measured after
+        # the fact (T3 hit exactly this: docs/notes/loadtest-readiness-audit.md §4.1).
+        #
+        # --collector.stat_activity is NOT on by default and is the whole reason this sidecar
+        # exists: it emits pg_stat_activity_count{datname,state}, including the
+        # state="idle in transaction" series T3's pass bar is written against. Six series per
+        # database, labels stable.
+        # database_wraparound (datfrozenxid age) is a built-in; the xmin horizon T6 needs is
+        # not, hence the query file. --extend.query-path is deprecated but the only mechanism
+        # that loads custom queries in v0.20.x.
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+          args:
+            - --collector.stat_activity
+            - --collector.database_wraparound
+            - --extend.query-path=/etc/postgres-exporter/postgres-exporter-queries.yaml
+          ports:
+            - name: metrics
+              containerPort: 9187
+          env:
+            # Superuser: pg_stat_activity otherwise hides other users' backends, which are
+            # precisely the app/pgbouncer sessions worth counting. Same secret the pgbouncer
+            # exporter uses; $(VAR) is expanded by kubelet, not a shell.
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD } }
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:5432/postgres?sslmode=disable"
+          volumeMounts:
+            - name: exporter-queries
+              mountPath: /etc/postgres-exporter
+              readOnly: true
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
       volumes:
+        - name: exporter-queries
+          configMap:
+            name: postgres-exporter-queries
         - name: initdb
           configMap:
             name: postgres-initdb

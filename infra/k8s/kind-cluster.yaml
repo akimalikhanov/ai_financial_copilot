@@ -27,3 +27,10 @@ nodes:
       # "Failed to initialize NVML: ERROR_LIBRARY_NOT_FOUND".
       - hostPath: /dev/null
         containerPath: /var/run/nvidia-container-devices/all
+      # Backs the loadtest overlay's hostPath PV (infra/k8s/loadtest/results-pv.yaml) — without
+      # this the node's hostPath is just a directory inside the kind node's own container
+      # filesystem, invisible from the actual host. Relative hostPaths resolve against this
+      # file's directory (infra/k8s/), so this lands at infra/k8s/loadtest/results/ on the
+      # host — gitignored, created on demand by Docker's bind mount if it doesn't exist yet.
+      - hostPath: ./loadtest/results
+        containerPath: /mnt/loadtest-results

@@ -133,3 +133,66 @@ class TestEmbedTei:
 
     def test_empty_input_short_circuits(self) -> None:
         assert embedder.embed_chunks([]) == []
+
+
+class TestEmbedQueryRetry:
+    """The chat-path entry point: bounded, and deliberately selective about what it retries.
+
+    A query embed runs inside the agent's search fan-out, which sits outside the per-turn
+    timeout — so a patient retry here occupies a chat worker slot rather than just a
+    socket. Retrying saturation would make that worse, which is why read timeouts are
+    excluded while connection failures (what a rolling TEI pod looks like) are not.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fast_retries(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("EMBEDDER_QUERY_RETRY_BACKOFF_SECONDS", "0")
+
+    @respx.mock
+    def test_retries_connect_error_then_succeeds(self) -> None:
+        _info_route()
+        route = respx.post(f"{TEI_URL}/embed").mock(
+            side_effect=[httpx.ConnectError("refused"), httpx.Response(200, json=[[1.0]])]
+        )
+
+        assert embedder.embed_query("7") == [1.0]
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_retries_503(self) -> None:
+        _info_route()
+        route = respx.post(f"{TEI_URL}/embed").mock(
+            side_effect=[httpx.Response(503), httpx.Response(200, json=[[2.0]])]
+        )
+
+        assert embedder.embed_query("7") == [2.0]
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_read_timeout_is_not_retried(self) -> None:
+        """Saturation: a second attempt adds load to the queue that is already the problem."""
+        _info_route()
+        route = respx.post(f"{TEI_URL}/embed").mock(side_effect=httpx.ReadTimeout("slow"))
+
+        with pytest.raises(httpx.ReadTimeout):
+            embedder.embed_query("7")
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_400_is_not_retried(self) -> None:
+        _info_route()
+        route = respx.post(f"{TEI_URL}/embed").mock(return_value=httpx.Response(400))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            embedder.embed_query("7")
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_attempts_are_bounded_then_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EMBEDDER_QUERY_MAX_ATTEMPTS", "3")
+        _info_route()
+        route = respx.post(f"{TEI_URL}/embed").mock(side_effect=httpx.ConnectError("refused"))
+
+        with pytest.raises(httpx.ConnectError):
+            embedder.embed_query("7")
+        assert route.call_count == 3

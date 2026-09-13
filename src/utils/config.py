@@ -95,13 +95,24 @@ def load_models_config(config_path: str | Path | None = None) -> dict[str, Any]:
     Load models.yaml config file with environment variable expansion.
 
     Args:
-        config_path: Path to models.yaml. If None, uses infra/config/models.yaml relative to project root.
+        config_path: Path to models.yaml. If None, checks the MODELS_CONFIG_PATH env var, then
+            falls back to infra/config/models.yaml relative to project root. The env var is the
+            hook a load-test deployment uses to swap in infra/config/models.loadtest.yaml
+            without touching any call site — see docs/notes/loadtest-concepts.md §6.
+
+            A relative value is resolved against the project root, so one setting
+            ("infra/config/models.loadtest.yaml") works both on the host and inside a
+            container, where the repo lives at /app. Prefer that over an absolute
+            container path, which breaks host-side tooling like pytest.
 
     Returns:
         Parsed YAML dict with env vars expanded.
     """
+    config_path = config_path or os.environ.get("MODELS_CONFIG_PATH")
     if config_path is None:
         return load_yaml_config("infra/config/models.yaml", expand_env_vars=True)
+    if not Path(config_path).is_absolute():
+        return load_yaml_config(str(config_path), expand_env_vars=True)
     return load_yaml_config("", config_path=config_path, expand_env_vars=True)
 
 
@@ -603,6 +614,35 @@ def get_embedder_timeout_seconds() -> float:
         return float(os.getenv("EMBEDDER_TIMEOUT_SECONDS", "30.0"))
     except ValueError:
         return 30.0
+
+
+def get_embedder_query_timeout_seconds() -> float:
+    """EMBEDDER_QUERY_TIMEOUT_SECONDS (default: 5.0).
+
+    Per-attempt budget for the chat path only. Deliberately far below
+    EMBEDDER_TIMEOUT_SECONDS: an ingestion batch can afford to wait, but a query embed
+    sits inside the agent's search fan-out, which runs outside the per-turn timeout.
+    """
+    try:
+        return float(os.getenv("EMBEDDER_QUERY_TIMEOUT_SECONDS", "5.0"))
+    except ValueError:
+        return 5.0
+
+
+def get_embedder_query_max_attempts() -> int:
+    """EMBEDDER_QUERY_MAX_ATTEMPTS (default: 2). Total attempts, not extra retries."""
+    try:
+        return max(1, int(os.getenv("EMBEDDER_QUERY_MAX_ATTEMPTS", "2")))
+    except ValueError:
+        return 2
+
+
+def get_embedder_query_retry_backoff_seconds() -> float:
+    """EMBEDDER_QUERY_RETRY_BACKOFF_SECONDS (default: 0.15), jittered per attempt."""
+    try:
+        return float(os.getenv("EMBEDDER_QUERY_RETRY_BACKOFF_SECONDS", "0.15"))
+    except ValueError:
+        return 0.15
 
 
 def get_embedder_batch_size() -> int:

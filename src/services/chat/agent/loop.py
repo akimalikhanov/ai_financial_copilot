@@ -98,6 +98,14 @@ class _SearchResult:
     # arguments" — only the former justifies Stop("search_unavailable") or a
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
     backend_failed: bool = False
+    # Capabilities this search ran without ("dense", "keyword", "rerank"). Partial
+    # degradation, as opposed to backend_failed's total outage: the search still returned
+    # usable chunks, just from fewer sources than it should have.
+    degraded: frozenset[str] = frozenset()
+    # False when this search's chunk scores are fusion scores rather than cross-encoder
+    # ones — true whenever reranking fell open *or* is switched off. The two scales are an
+    # order of magnitude apart, so confidence thresholds must not be applied to them.
+    scores_are_rerank: bool = True
     # The `tool_call_started` activity event's id, so completion correlates by id
     # rather than by entity name — None when no started event was ever emitted
     # (invalid tool-call arguments, resolved before entity/id assignment).
@@ -331,6 +339,20 @@ async def _execute_search(
                 activity_id=activity_id,
             )
 
+    degraded = frozenset(
+        name
+        for name, ok in (
+            ("dense", retrieval_trace.embed_ok and retrieval_trace.vector_ok),
+            ("keyword", retrieval_trace.keyword_ok),
+            ("rerank", retrieval_trace.rerank_ok),
+        )
+        if not ok
+    )
+    if degraded:
+        logger.warning(
+            "agent_search_degraded", extra={"entity": entity, "degraded": sorted(degraded)}
+        )
+
     chunks = [dc_replace(c, turn_index=iteration) for c in raw_chunks]
     payloads = await get_chunk_prompt_payloads(session, [c.chunk_id for c in chunks])
     AGENT_TOOL_CALLS.labels("search_documents", "ok").inc()
@@ -340,6 +362,8 @@ async def _execute_search(
         chunks=chunks,
         payloads=payloads,
         rewrite_stats=rewrite_stats,
+        degraded=degraded,
+        scores_are_rerank=retrieval_trace.scores_are_rerank,
         activity_id=activity_id,
     )
 
@@ -679,6 +703,14 @@ async def _run_turn_inner(
                         status="completed",
                         **stats_to_request_kwargs(turn.stats),
                     )
+                    # Release the pgbouncer server connection between turns. create_subrequest
+                    # only flushes, so without this the transaction it opens stays open across
+                    # the next turn's LLM call — converting transaction pooling into session
+                    # pooling for the whole loop (readiness audit §4.1; T4 measured 17 such
+                    # holds at 50 users). Committed here and not inside create_subrequest
+                    # because naming.py's caller depends on NOT committing: its sub-request and
+                    # the title update have to land together (tasks.py:1222).
+                    await session.commit()
 
         if not turn.tool_calls:
             # With no terminal tool this is a normal exit, not a rare one: the model
@@ -749,6 +781,9 @@ async def _run_turn_inner(
             new_chunks += entity_new
             if result.entity:
                 state.searched_entities.add(result.entity)
+            state.degraded_capabilities |= result.degraded
+            if result.chunks and not result.scores_are_rerank:
+                state.scores_are_rerank = False
 
             # D5: per-aspect search provenance, written at the one instant everything is
             # in hand. A failed or empty search admits no chunks, so this cannot be

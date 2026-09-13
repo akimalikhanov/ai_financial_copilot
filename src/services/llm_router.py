@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,6 +16,7 @@ from src.services.llm_adapters.base_adapter import (
     LLMResponse,
     LLMStreamChunk,
 )
+from src.services.llm_adapters.fake_adapter import FakeAdapter
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
 from src.services.llm_runtime.exceptions import LLMError, LLMNotFoundError, LLMServerError
@@ -76,7 +78,22 @@ def _normalize_base_url(host: str, port: Any, base_path: str = "") -> str:
     return f"{host}:{port}{base_path}"
 
 
+def _fake_llm_only() -> bool:
+    return os.environ.get("FAKE_LLM_ONLY", "").strip().lower() in {"1", "true", "yes"}
+
+
 def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
+    # Fail closed during load tests: a pod that races the config rollout, or a models.yaml
+    # that was never swapped, would otherwise bill a real provider. Refusing to construct
+    # the adapter at all is the only check that cannot be lost to a stale lru_cache'd router.
+    if provider != "fake" and _fake_llm_only():
+        raise LLMServerError(
+            f"FAKE_LLM_ONLY is set but model resolved to provider {provider!r}; "
+            "refusing to call a real LLM provider",
+            provider=provider,
+            status_code=500,
+        )
+
     if provider == "openai":
         model_name = model_cfg.get("model_name")
         if not model_name:
@@ -128,6 +145,9 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             include_usage=include_usage,
             provider_name="vllm",
         )
+
+    if provider == "fake":
+        return FakeAdapter(default_model=model_cfg.get("model_name") or "fake")
 
     raise LLMServerError(f"Unsupported provider: {provider!r}", provider=provider, status_code=500)
 

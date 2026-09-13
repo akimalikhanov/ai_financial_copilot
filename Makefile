@@ -34,6 +34,7 @@ lint:
 	$(MAKE) k8s-check-initdb
 	$(MAKE) k8s-check-es-bootstrap
 	$(MAKE) k8s-check-dashboards
+	$(MAKE) k8s-check-loadtest
 
 .PHONY: typecheck
 typecheck:
@@ -53,6 +54,28 @@ test: test-unit test-integration
 .PHONY: test-cov
 test-cov:
 	.venv/bin/python -m pytest tests/unit/ --cov=src --cov-report=term --cov-report=html
+
+# Load test against the docker-compose stack (mode A/B, see CLAUDE.md), headless with a
+# text summary on stdout. USERS/SPAWN_RATE/DURATION are overridable: `make loadtest-local
+# USERS=40 DURATION=30m`. Not a CI gate — see docs/notes/loadtest-concepts.md.
+#
+# Point the api/worker-chat env at infra/config/models.loadtest.yaml first (MODELS_CONFIG_PATH)
+# unless you mean to spend real LLM money — see docs/notes/loadtest-concepts.md §6.
+LOADTEST_HOST := http://localhost:$(or $(API_PORT),8000)
+USERS ?= 5
+SPAWN_RATE ?= 1
+DURATION ?= 5m
+
+.PHONY: loadtest-local
+loadtest-local:
+	.venv/bin/locust -f infra/loadtest/locustfile.py --host $(LOADTEST_HOST) \
+	  --headless -u $(USERS) -r $(SPAWN_RATE) -t $(DURATION)
+
+# Same target with the interactive web UI instead of a headless run — open the URL Locust
+# prints (default http://localhost:8089) to start/stop the run and watch charts live.
+.PHONY: loadtest-local-ui
+loadtest-local-ui:
+	.venv/bin/locust -f infra/loadtest/locustfile.py --host $(LOADTEST_HOST)
 
 # Rebuild + restart the containerized stack, then drop the dangling images
 # left behind by the previous build (same tag, now untagged).
@@ -281,6 +304,129 @@ k8s-preload-models: k8s-set-images
 	kubectl delete job model-preload -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
 	kubectl wait --namespace copilot --for=condition=complete job/model-preload --timeout=3600s
+
+# infra/k8s/loadtest/{locustfile.py,models.yaml} are copies of infra/loadtest/locustfile.py
+# and infra/config/models.loadtest.yaml. Kustomize refuses to read files outside its own
+# directory, so the copies exist for configMapGenerator; the originals stay the source of truth.
+.PHONY: k8s-sync-loadtest
+k8s-sync-loadtest:
+	cp infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
+	cp infra/config/models.loadtest.yaml infra/k8s/loadtest/models.yaml
+
+# Fails if the K8s loadtest copies have drifted. Run `make k8s-sync-loadtest` to fix.
+.PHONY: k8s-check-loadtest
+k8s-check-loadtest:
+	@diff -q infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
+	@diff -q infra/config/models.loadtest.yaml infra/k8s/loadtest/models.yaml
+
+# Runs the Locust load test from inside the cluster (docs/notes/loadtest-concepts.md §7).
+# Applying this overlay puts api + both workers into fake-LLM mode; `k8s-loadtest-clean`
+# reverts. An initContainer refuses to generate load if that patch has not taken effect,
+# so an accidental run cannot spend real money.
+#
+# Depends on k8s-deploy, not just k8s-set-images: MODELS_CONFIG_PATH is only honoured by
+# config.py::load_models_config, so a cluster running an image built before that landed
+# ignores the env var and silently serves the REAL models config. The gate catches it, but
+# the fix is to ship current code — hence a full build+push here.
+#
+# Override per T-series scenario, e.g.:
+#   make k8s-loadtest LOADTEST_USERS=100 LOADTEST_SPAWN_RATE=10 LOADTEST_DURATION=30m
+# T2 (ramp, see infra/loadtest/locustfile.py::RampShape) is a shape, not a flat -u/-r/-t:
+#   make k8s-loadtest LOADTEST_SHAPE=ramp LOADTEST_DURATION=30m
+# LOADTEST_USERS/LOADTEST_SPAWN_RATE are ignored by locust once a shape is active — the ramp's
+# own step knobs (LOADTEST_RAMP_*, see RampShape) take over instead.
+# T3 (SSE hold) swaps the user class rather than the shape — pass LOADTEST_SHAPE= empty, since
+# a shape would override the flat -u this scenario needs:
+#   make k8s-loadtest LOADTEST_MODE=sse_hold LOADTEST_SHAPE= LOADTEST_USERS=40 \
+#     LOADTEST_SPAWN_RATE=5 LOADTEST_DURATION=15m
+K8S_LOADTEST := infra/k8s/loadtest
+LOADTEST_USERS ?= 20
+LOADTEST_SPAWN_RATE ?= 1
+LOADTEST_DURATION ?= 10m
+LOADTEST_TARGET_HOST ?= http://api:8000
+LOADTEST_SHAPE ?=
+# T3: "ask" (default) or "sse_hold" — picks the locustfile's user class, not a shape.
+LOADTEST_MODE ?= ask
+LOADTEST_HOLD_FOR_S ?= 86400
+# Think-time between one user's questions. This — not user count — is what actually drives
+# utilisation: a user spends most of its cycle waiting, so halving these doubles arrival rate
+# at the same user count (docs/notes/capacity-planning-concepts.md §1).
+LOADTEST_MIN_WAIT ?= 180
+LOADTEST_MAX_WAIT ?= 300
+LOADTEST_RAMP_INITIAL_USERS ?= 1
+LOADTEST_RAMP_STEP_USERS ?= 2
+LOADTEST_RAMP_STEP_SECONDS ?= 30
+LOADTEST_RAMP_MAX_USERS ?= 60
+LOADTEST_RAMP_SPAWN_RATE ?= 10
+# T4 (SpikeShape): spawn LOADTEST_SPIKE_USERS over _SPAWN_SECONDS, then hold for _HOLD.
+# LOADTEST_DURATION/USERS/SPAWN_RATE are ignored while a shape is active.
+LOADTEST_SPIKE_USERS ?= 50
+LOADTEST_SPIKE_SPAWN_SECONDS ?= 10
+LOADTEST_SPIKE_HOLD ?= 2m
+
+.PHONY: k8s-loadtest
+k8s-loadtest: k8s-sync-loadtest k8s-deploy
+	@sed -i 's|^\( *newTag: \).*|\1$(GIT_SHA)|' $(K8S_LOADTEST)/kustomization.yaml
+	@sed -i \
+	  -e 's|^LOADTEST_TARGET_HOST=.*|LOADTEST_TARGET_HOST=$(LOADTEST_TARGET_HOST)|' \
+	  -e 's|^LOADTEST_USERS=.*|LOADTEST_USERS=$(LOADTEST_USERS)|' \
+	  -e 's|^LOADTEST_SPAWN_RATE=.*|LOADTEST_SPAWN_RATE=$(LOADTEST_SPAWN_RATE)|' \
+	  -e 's|^LOADTEST_DURATION=.*|LOADTEST_DURATION=$(LOADTEST_DURATION)|' \
+	  -e 's|^LOADTEST_SHAPE=.*|LOADTEST_SHAPE=$(LOADTEST_SHAPE)|' \
+	  -e 's|^LOADTEST_MODE=.*|LOADTEST_MODE=$(LOADTEST_MODE)|' \
+	  -e 's|^LOADTEST_HOLD_FOR_S=.*|LOADTEST_HOLD_FOR_S=$(LOADTEST_HOLD_FOR_S)|' \
+	  -e 's|^LOADTEST_MIN_WAIT=.*|LOADTEST_MIN_WAIT=$(LOADTEST_MIN_WAIT)|' \
+	  -e 's|^LOADTEST_MAX_WAIT=.*|LOADTEST_MAX_WAIT=$(LOADTEST_MAX_WAIT)|' \
+	  -e 's|^LOADTEST_RAMP_INITIAL_USERS=.*|LOADTEST_RAMP_INITIAL_USERS=$(LOADTEST_RAMP_INITIAL_USERS)|' \
+	  -e 's|^LOADTEST_RAMP_STEP_USERS=.*|LOADTEST_RAMP_STEP_USERS=$(LOADTEST_RAMP_STEP_USERS)|' \
+	  -e 's|^LOADTEST_RAMP_STEP_SECONDS=.*|LOADTEST_RAMP_STEP_SECONDS=$(LOADTEST_RAMP_STEP_SECONDS)|' \
+	  -e 's|^LOADTEST_RAMP_MAX_USERS=.*|LOADTEST_RAMP_MAX_USERS=$(LOADTEST_RAMP_MAX_USERS)|' \
+	  -e 's|^LOADTEST_RAMP_SPAWN_RATE=.*|LOADTEST_RAMP_SPAWN_RATE=$(LOADTEST_RAMP_SPAWN_RATE)|' \
+	  -e 's|^LOADTEST_SPIKE_USERS=.*|LOADTEST_SPIKE_USERS=$(LOADTEST_SPIKE_USERS)|' \
+	  -e 's|^LOADTEST_SPIKE_SPAWN_SECONDS=.*|LOADTEST_SPIKE_SPAWN_SECONDS=$(LOADTEST_SPIKE_SPAWN_SECONDS)|' \
+	  -e 's|^LOADTEST_SPIKE_HOLD=.*|LOADTEST_SPIKE_HOLD=$(LOADTEST_SPIKE_HOLD)|' \
+	  $(K8S_LOADTEST)/loadtest-params.env
+	kubectl delete job loadtest -n copilot --ignore-not-found
+	# Two-phase apply, and the ordering is a money-safety property, not a nicety.
+	#
+	# Applying the Job in the SAME kubectl apply as the fake-LLM patches is a race that has
+	# already cost real money once: the Job's pod starts immediately, its gate only checks
+	# `api`, and api's new pod comes up long before worker-chat's six replicas finish rolling.
+	# Locust then drives load into old workers still holding the REAL models config in their
+	# cached router. Measured on 2026-09-10: $0.19 of live OpenAI spend over ~6 minutes,
+	# with the gate reporting "fake LLM adapter confirmed active" the whole time.
+	#
+	# So: apply everything EXCEPT the Job, wait for all three deployments to finish rolling,
+	# and only then create the Job. The rollout waits below are what actually enforce this —
+	# they must stay BEFORE the Job is created, or the guarantee silently disappears again.
+	kubectl kustomize $(K8S_LOADTEST) \
+	  | python3 -c 'import sys,yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d and not (d.get("kind")=="Job" and d["metadata"]["name"]=="loadtest")]; yaml.safe_dump_all(docs,sys.stdout)' \
+	  | kubectl apply -f -
+	kubectl rollout status deployment/api -n copilot --timeout=300s
+	kubectl rollout status deployment/worker-chat -n copilot --timeout=600s
+	kubectl rollout status deployment/worker-ingestion -n copilot --timeout=600s
+	# Every LLM-calling workload is now serving the fake config; safe to generate load.
+	kubectl kustomize $(K8S_LOADTEST) \
+	  | python3 -c 'import sys,yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind")=="Job" and d["metadata"]["name"]=="loadtest"]; yaml.safe_dump_all(docs,sys.stdout)' \
+	  | kubectl apply -f -
+	@echo "streaming loadtest logs (Ctrl-C is safe, the Job keeps running)..."
+	kubectl wait --for=create pod -l job-name=loadtest -n copilot --timeout=180s
+	kubectl logs -f job/loadtest -n copilot
+
+# Reverts the cluster out of fake-LLM mode and removes the Job. Run this when done, or the
+# cluster keeps answering every question with the fake adapter.
+.PHONY: k8s-loadtest-clean
+k8s-loadtest-clean: k8s-deploy
+	# k8s-deploy, not k8s-set-images: GIT_SHA includes a working-tree hash, so any edit since
+	# the last build makes set-images point at a tag that was never pushed -> ImagePullBackOff
+	# and a half-reverted cluster. Building is the only way to guarantee the tag resolves.
+	#
+	# loadtest is deleted here rather than by k8s-deploy because k8s-deploy doesn't know about
+	# it; model-preload is already handled there.
+	kubectl delete job loadtest -n copilot --ignore-not-found
+	kubectl rollout status deployment/api -n copilot --timeout=300s
+	kubectl rollout status deployment/worker-chat -n copilot --timeout=600s
+	kubectl rollout status deployment/worker-ingestion -n copilot --timeout=600s
 
 K8S_SECRETS := infra/k8s/overlays/kind/secrets
 

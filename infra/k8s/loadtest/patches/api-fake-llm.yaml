@@ -1,0 +1,25 @@
+# Routes the api's LLM calls to the FakeAdapter. See docs/notes/loadtest-concepts.md §8.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: MODELS_CONFIG_PATH
+              value: infra/config/loadtest/models.yaml
+            # Fail closed: refuses to build a real adapter even if this pod somehow loads
+            # the production models.yaml. See _build_adapter in src/services/llm_router.py.
+            - name: FAKE_LLM_ONLY
+              value: "true"
+          volumeMounts:
+            - name: loadtest-models-config
+              mountPath: /app/infra/config/loadtest
+              readOnly: true
+      volumes:
+        - name: loadtest-models-config
+          configMap:
+            name: loadtest-models-config

@@ -57,6 +57,22 @@ const modelParamsFromDefaults = (defaults: ModelDefaultParams | undefined): Mode
 });
 
 const generateId = () => Math.random().toString(36).slice(2, 11);
+
+const DEGRADED_RETRIEVAL_LABELS: Record<string, string> = {
+  dense: 'semantic search',
+  keyword: 'keyword search',
+  rerank: 'result ranking',
+};
+
+/** Names what was unavailable rather than just saying "degraded" — the user can judge
+ *  whether it matters for their question, and it is actionable when reported. */
+const describeDegradedRetrieval = (degraded: string[]): string => {
+  const names = degraded.map(d => DEGRADED_RETRIEVAL_LABELS[d] ?? d);
+  const joined = names.length > 1
+    ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+    : names[0];
+  return `Search ran degraded — ${joined} unavailable`;
+};
 const mapDocStatus = (s: string): Document['status'] =>
   s === 'ready' ? 'Ready' : s === 'failed' ? 'Error' : 'Processing';
 
@@ -122,6 +138,14 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       bboxHints: (r.bbox_hints as ReferenceItem['bboxHints'] | undefined) ?? undefined,
     })),
     feedback: msg.feedback ? { rating: msg.feedback.rating, comment: msg.feedback.comment ?? null } : null,
+    // Carried through so quality badges survive a reload — they are streamed on the
+    // `metadata` SSE event, which only ever reaches the client that was connected.
+    metadata: {
+      confidence: meta.confidence as MessageMetadata['confidence'],
+      ungrounded_claims: meta.ungrounded_claims as boolean | null | undefined,
+      route: meta.route as string | null | undefined,
+      degraded_retrieval: meta.degraded_retrieval as string[] | null | undefined,
+    },
   };
 };
 
@@ -1181,7 +1205,7 @@ export default function App() {
         (meta) => {
           updateMessage(conversationId, placeholderId, m => ({
             ...m,
-            metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route },
+            metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route, degraded_retrieval: meta.degraded_retrieval },
           }));
         },
         (ev) => {
@@ -1552,10 +1576,19 @@ export default function App() {
                       {msg.role === 'assistant' && stageSnapshots[msg.id] && (
                         <AgentTimeline snapshot={stageSnapshots[msg.id]} />
                       )}
-                      {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieve' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
+                      {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieval' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
                         <div className="pl-4 mb-1">
                           <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
                             Limited source coverage — answer may be incomplete
+                          </span>
+                        </div>
+                      )}
+                      {/* Separate from the coverage badge above: that one is about how well the
+                          corpus answered, this one about search running in a degraded state. */}
+                      {msg.role === 'assistant' && ((msg.metadata as MessageMetadata)?.degraded_retrieval?.length ?? 0) > 0 && (
+                        <div className="pl-4 mb-1">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20">
+                            {describeDegradedRetrieval((msg.metadata as MessageMetadata).degraded_retrieval!)}
                           </span>
                         </div>
                       )}

@@ -23,6 +23,18 @@ class TestComputeConfidence:
         assert compute_confidence(0.25, 1) == "medium"
         assert compute_confidence(0.24, 1) == "low"
 
+    def test_fusion_scale_scores_are_unknown_not_low(self) -> None:
+        """A reranker outage must not be reported as weak grounding.
+
+        RRF scores sit ~0.05 (k=20), under every band below, so applying the
+        cross-encoder thresholds to them turns a ranking outage into a corpus verdict.
+        """
+        assert compute_confidence(0.05, 3, scores_are_rerank=False) == "medium"
+        assert compute_confidence(0.05, 3) == "low"
+
+    def test_no_chunks_still_none_regardless_of_scale(self) -> None:
+        assert compute_confidence(0.05, 0, scores_are_rerank=False) == "none"
+
 
 class TestHasUngroundedClaims:
     def test_cited_numeric_sentence_is_grounded(self) -> None:

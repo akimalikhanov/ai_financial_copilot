@@ -1,0 +1,45 @@
+# Static hostPath PV/PVC pair so Locust's --csv output survives on the actual host, not just
+# inside the kind node's own container filesystem (see docs/notes/loadtest-concepts.md §7
+# "Getting results out" for why emptyDir + kubectl cp/exec doesn't work once the pod is
+# Completed). Requires the matching extraMounts entry in ../kind-cluster.yaml — this only
+# resolves to a real host directory because that mount exists; without it hostPath still just
+# names a path inside the node container, same problem as emptyDir, just longer-lived.
+#
+# A static PV (not the `standard`/local-path-provisioner StorageClass) is used deliberately:
+# local-path-provisioner allocates under /var/local-path-provisioner *on the node*, which is
+# exactly the "invisible from the host" case this exists to avoid.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: loadtest-results
+  # No namespace — PVs are cluster-scoped; namespace: copilot from the overlay's kustomization
+  # would be rejected here, so this resource is excluded from that transform (see
+  # kustomization.yaml's patches list, which targets it by kind+name for the same reason).
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  # Deleting the PVC must not delete the CSVs sitting on the host — Retain leaves the
+  # directory's contents alone; only unbinding, not data loss.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: loadtest-results
+  hostPath:
+    path: /mnt/loadtest-results
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loadtest-results
+  namespace: copilot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: loadtest-results
+  resources:
+    requests:
+      storage: 1Gi
+  # Binds directly to the PV above by name, bypassing the provisioner search that
+  # storageClassName + capacity matching would otherwise do across every PV in the cluster.
+  volumeName: loadtest-results

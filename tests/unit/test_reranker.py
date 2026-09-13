@@ -32,8 +32,11 @@ class TestNoOpReranker:
     @pytest.mark.asyncio
     async def test_identity_passthrough(self) -> None:
         chunks = [_chunk(), _chunk()]
-        result = await NoOpReranker().rerank("query", chunks, {})
-        assert result == chunks
+        outcome = await NoOpReranker().rerank("query", chunks, {})
+        assert outcome.chunks == chunks
+        # Reranking switched off is a configuration, not a fault: unscored but not degraded.
+        assert outcome.scored is False
+        assert outcome.degraded is False
 
 
 class TestGetReranker:
@@ -55,8 +58,9 @@ class TestLocalCrossEncoderRerankerEdgeCases:
         r = LocalCrossEncoderReranker(base_url=BASE_URL)
         with respx.mock(assert_all_called=False) as mock:
             route = mock.post(f"{BASE_URL}/rerank")
-            result = await r.rerank("q", [], {})
-        assert result == []
+            outcome = await r.rerank("q", [], {})
+        assert outcome.chunks == []
+        assert outcome.degraded is False
         assert route.call_count == 0
 
     @pytest.mark.asyncio
@@ -65,8 +69,11 @@ class TestLocalCrossEncoderRerankerEdgeCases:
         chunks = [_chunk(), _chunk()]
         with respx.mock(assert_all_called=False) as mock:
             route = mock.post(f"{BASE_URL}/rerank")
-            result = await r.rerank("q", chunks, {})
-        assert result == chunks
+            outcome = await r.rerank("q", chunks, {})
+        assert outcome.chunks == chunks
+        # No payload text to score against is a hydration gap, not a reranker fault.
+        assert outcome.scored is False
+        assert outcome.degraded is False
         assert route.call_count == 0
 
     @pytest.mark.asyncio
@@ -102,9 +109,11 @@ class TestLocalCrossEncoderRerankerErrorHandling:
         with respx.mock:
             respx.post(f"{BASE_URL}/rerank").mock(return_value=httpx.Response(500))
             with caplog.at_level("WARNING"):
-                result = await r.rerank("q", chunks, texts)
+                outcome = await r.rerank("q", chunks, texts)
 
-        assert result == chunks[:2]
+        assert outcome.chunks == chunks[:2]
+        assert outcome.scored is False
+        assert outcome.degraded is True
         assert "reranker_failed" in caplog.text
 
     @pytest.mark.asyncio
@@ -116,9 +125,11 @@ class TestLocalCrossEncoderRerankerErrorHandling:
         with respx.mock:
             respx.post(f"{BASE_URL}/rerank").mock(side_effect=httpx.TimeoutException("timeout"))
             with caplog.at_level("WARNING"):
-                result = await r.rerank("q", chunks, texts)
+                outcome = await r.rerank("q", chunks, texts)
 
-        assert result == chunks[:2]
+        assert outcome.chunks == chunks[:2]
+        assert outcome.scored is False
+        assert outcome.degraded is True
         assert "reranker_failed" in caplog.text
 
     @pytest.mark.asyncio
@@ -134,9 +145,11 @@ class TestLocalCrossEncoderRerankerErrorHandling:
                 return_value=httpx.Response(200, json={"bad": "shape"})
             )
             with caplog.at_level("WARNING"):
-                result = await r.rerank("q", chunks, texts)
+                outcome = await r.rerank("q", chunks, texts)
 
-        assert result == chunks[:2]
+        assert outcome.chunks == chunks[:2]
+        assert outcome.scored is False
+        assert outcome.degraded is True
         assert "reranker_invalid_response" in caplog.text
 
     @pytest.mark.asyncio
@@ -151,9 +164,11 @@ class TestLocalCrossEncoderRerankerErrorHandling:
                 return_value=httpx.Response(200, json=[{"index": 0, "score": 0.5}])
             )
             with caplog.at_level("WARNING"):
-                result = await r.rerank("q", chunks, texts)
+                outcome = await r.rerank("q", chunks, texts)
 
-        assert result == chunks[:2]
+        assert outcome.chunks == chunks[:2]
+        assert outcome.scored is False
+        assert outcome.degraded is True
         assert "reranker_incomplete_scores" in caplog.text
 
 
@@ -175,8 +190,11 @@ class TestLocalCrossEncoderRerankerHappyPath:
                     ],
                 )
             )
-            result = await r.rerank("q", chunks, texts)
+            outcome = await r.rerank("q", chunks, texts)
 
+        result = outcome.chunks
+        assert outcome.scored is True
+        assert outcome.degraded is False
         assert len(result) == 2
         assert result[0].chunk_id == chunks[1].chunk_id
         assert result[0].score == 0.9

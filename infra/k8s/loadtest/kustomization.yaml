@@ -1,0 +1,55 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: copilot
+
+# Layered on kind-deploy so the api/frontend images come from the registry. Deliberately NOT
+# referenced from base: `make k8s-deploy` must never put a cluster into load-test mode.
+# `make k8s-loadtest-clean` reverts. See docs/notes/loadtest-concepts.md §7.
+resources:
+  - ../overlays/kind-deploy
+  - loadtest-job.yaml
+  - loadtest-rbac.yaml
+  - results-pv.yaml
+
+configMapGenerator:
+  # locustfile.py and models.yaml are copies kept in sync by `make k8s-sync-loadtest`
+  # (kustomize refuses to read files outside its own directory); `make k8s-check-loadtest`
+  # fails on drift. Shipping them as ConfigMaps means a scenario edit is an apply, not a
+  # docker build + push.
+  - name: loadtest-locustfile
+    files: [locustfile.py]
+  - name: loadtest-models-config
+    files: [models.yaml]
+  # `make k8s-loadtest` rewrites the LOADTEST_* values here before applying.
+  - name: loadtest-params
+    envs: [loadtest-params.env]
+
+generatorOptions:
+  # Keep hashing ON: editing the locustfile or the fake models config must roll the pods that
+  # mount it, or a run would silently use the previous version.
+  disableNameSuffixHash: false
+
+# The Job is added above kind-deploy, so that overlay's image rewrite never sees it — without
+# this it keeps base's placeholder `copilot/worker:dev` and ErrImagePulls. `make k8s-loadtest`
+# rewrites newTag from GIT_SHA before applying.
+images:
+  - name: copilot/worker
+    newName: localhost:5001/copilot/worker
+    newTag: c5b71a8-e938d83e
+
+# These three must land together with the Job — that coupling is what makes accidental
+# real-LLM spend impossible. worker-ingestion is included because the table summarizer and
+# picture enricher make LLM calls too, not just the chat path.
+patches:
+  - path: patches/api-fake-llm.yaml
+    target:
+      kind: Deployment
+      name: api
+  - path: patches/worker-chat-fake-llm.yaml
+    target:
+      kind: Deployment
+      name: worker-chat
+  - path: patches/worker-ingestion-fake-llm.yaml
+    target:
+      kind: Deployment
+      name: worker-ingestion

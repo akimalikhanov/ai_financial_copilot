@@ -161,6 +161,12 @@ class AgentRunState:
     sealed_by_coverage: bool = False
     expected_entities: set[str] = field(default_factory=set)
     searched_entities: set[str] = field(default_factory=set)
+    # Retrieval capabilities that were unavailable for at least one search this run
+    # ("dense", "keyword", "rerank"). A run can be partly degraded without any single
+    # search failing outright, so this accumulates rather than describing the last search.
+    degraded_capabilities: set[str] = field(default_factory=set)
+    # Cleared once any contributing search returned fusion scores instead of rerank ones.
+    scores_are_rerank: bool = True
     spend: dict[str, TokenSpend] = field(default_factory=dict)
 
     # --- decomposition plan: loop-minted aspect ids, same shape/role as expected_entities ---
@@ -262,6 +268,13 @@ class AgentLoopMeta:
     # Entities the loop actually called search_documents for — the synthesis boundary uses
     # this (not reported coverage) to label stubs for entities the agent never searched.
     searched_entities: frozenset[str] = field(default_factory=frozenset)
+    # Retrieval capabilities unavailable for at least one search ("dense", "keyword",
+    # "rerank"). Drives the user-facing degradation badge and the trace; distinct from a
+    # total outage, which surfaces as a search error and gap text instead.
+    degraded_capabilities: frozenset[str] = field(default_factory=frozenset)
+    # False when the served chunks' scores are fusion-scale, so confidence thresholds
+    # calibrated on cross-encoder scores cannot be applied to them.
+    scores_are_rerank: bool = True
     # Step 9: decomposition width/coverage and whether reporting was incremental. The
     # kill criterion is report_calls_total ≈ 1 *and* plan_covered/plan_seeded no better
     # than v3 — that means the mechanism is inert while costing an extra tool call.
@@ -403,6 +416,8 @@ def build_meta(state: AgentRunState, iterations: int) -> AgentLoopMeta:
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
         cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),
         searched_entities=frozenset(state.searched_entities),
+        degraded_capabilities=frozenset(state.degraded_capabilities),
+        scores_are_rerank=state.scores_are_rerank,
         plan_seeded=len(state.plan),
         plan_covered=(
             state.plan_covered_at_stop

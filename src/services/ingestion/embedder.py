@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
@@ -13,6 +15,9 @@ from src.utils.config import (
     get_embedder_base_url,
     get_embedder_batch_size,
     get_embedder_concurrency,
+    get_embedder_query_max_attempts,
+    get_embedder_query_retry_backoff_seconds,
+    get_embedder_query_timeout_seconds,
     get_embedder_timeout_seconds,
     get_embedding_device,
     get_embedding_dim,
@@ -102,9 +107,9 @@ def _post_batch(client: httpx.Client, base_url: str, batch: list[str]) -> list[l
     return response.json()
 
 
-def _embed_tei(chunks: list[str]) -> list[list[float]]:
+def _embed_tei(chunks: list[str], timeout: float | None = None) -> list[list[float]]:
     base_url = get_embedder_base_url().rstrip("/")
-    timeout = get_embedder_timeout_seconds()
+    timeout = timeout if timeout is not None else get_embedder_timeout_seconds()
     batch_size = _resolve_tei_batch_size(base_url, timeout)
     batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
     # TEI queues each input separately and batches across requests, so one in-flight request
@@ -137,7 +142,7 @@ def _embed_openai(chunks: list[str], model_name: str) -> list[list[float]]:
     return [list(item.embedding) for item in response.data]
 
 
-def embed_chunks(chunks: list[str]) -> list[list[float]]:
+def embed_chunks(chunks: list[str], timeout: float | None = None) -> list[list[float]]:
     """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer."""
     if not chunks:
         return []
@@ -146,7 +151,7 @@ def embed_chunks(chunks: list[str]) -> list[list[float]]:
     model_name = get_embedding_model()
 
     if provider == "tei":
-        vectors = _embed_tei(chunks)
+        vectors = _embed_tei(chunks, timeout)
     elif provider == "openai":
         vectors = _embed_openai(chunks, model_name)
     else:
@@ -160,3 +165,50 @@ def embed_chunks(chunks: list[str]) -> list[list[float]]:
         )
 
     return vectors
+
+
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry fast, transient failures only.
+
+    A read/pool timeout means TEI is saturated, so retrying adds load to the queue that
+    is already the problem (the retry-amplification shape in the load-test audit §4.6).
+    A refused connection or a 503, by contrast, is what a rolling TEI pod looks like:
+    it fails in milliseconds and the next attempt may well land on the new pod.
+    """
+    if isinstance(exc, httpx.ReadTimeout | httpx.PoolTimeout | httpx.WriteTimeout):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return isinstance(exc, httpx.ConnectTimeout | httpx.NetworkError | httpx.RemoteProtocolError)
+
+
+def embed_query(text: str) -> list[float]:
+    """Embed one query for the chat critical path, with a bounded retry.
+
+    Separate entry point from `embed_chunks` because the two callers have opposite
+    latency budgets: ingestion batches may wait EMBEDDER_TIMEOUT_SECONDS, while this
+    runs inside the agent's search fan-out, which sits outside the per-turn timeout —
+    so total wall clock, not attempt count, is what has to be bounded here.
+
+    Raises the last exception if every attempt fails; callers fail open (see
+    `run_chat_rag_pipeline`, which degrades to keyword-only).
+    """
+    attempts = get_embedder_query_max_attempts()
+    backoff = get_embedder_query_retry_backoff_seconds()
+    timeout = get_embedder_query_timeout_seconds()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return embed_chunks([text], timeout=timeout)[0]
+        except Exception as exc:
+            if attempt >= attempts or not _is_retryable(exc):
+                raise
+            _LOG.warning(
+                "embedder.query_retry",
+                extra={"attempt": attempt, "attempts": attempts, "error": str(exc)},
+            )
+            time.sleep(backoff * attempt * (0.5 + random.random()))
+    raise AssertionError("unreachable")  # pragma: no cover — loop either returns or raises

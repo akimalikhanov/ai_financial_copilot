@@ -307,6 +307,46 @@
         "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
       },
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 14,
+      "title": "Postgres Idle in Transaction",
+      "type": "timeseries",
+      "description": "Backends holding an open transaction while doing nothing. T3 acceptance: stays < 5 while SSE streams are held — a stream that parks a transaction shows up here.",
+      "gridPos": { "x": 0, "y": 51, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(pg_stat_activity_count{state=~\"idle in transaction.*\"}) by (datname, state)",
+          "legendFormat": "{{datname}} {{state}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 15,
+      "title": "Postgres xmin Horizon Age",
+      "type": "timeseries",
+      "description": "Age in transactions of the oldest snapshot held by a live backend. T6 acceptance: flat — sustained growth means a long-lived transaction is blocking vacuum. Not the same as datfrozenxid age.",
+      "gridPos": { "x": 12, "y": 51, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "pg_xmin_horizon_oldest_backend_xmin_age",
+          "legendFormat": "oldest backend xmin age"
+        },
+        {
+          "expr": "pg_xmin_horizon_backends_holding_xmin",
+          "legendFormat": "backends holding a snapshot"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     }
   ]
 }

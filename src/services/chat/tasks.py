@@ -589,6 +589,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 ],
                 prior_findings_block=prior_findings.block,
             )
+            # Release before the router's LLM call. update_status above only flushes, and the
+            # message reads reopen a transaction anyway, so without this the connection is
+            # held across route_query — the same pattern as the agent loop
+            # (agent/loop.py:689), one stage earlier. Measured as the residual
+            # `idle in transaction` after that fix: readiness audit §4.1.
+            await session.commit()
             state.router_output, state.scope_result = await route_query(
                 router_input,
                 user_id=llm_request.user_id,
@@ -717,9 +723,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         f"AGENT_TOOL_MODEL={_tool_model_id!r} does not have tool_calling: true in models.yaml"
                     )
 
-                # Step 25: mark this request as agentic for DB queries/dashboards
+                # Step 25: mark this request as agentic for DB queries/dashboards.
+                # Left pending deliberately: flushing here would reopen the transaction the
+                # commit above just closed, right before an LLM call. The dirty attribute
+                # holds no connection, and the loop's first create_subrequest flushes it
+                # along with its own INSERT (agent/loop.py:689).
                 llm_request.request_type = "chat_agent"
-                await session.flush()
 
                 await _log_stage(
                     "agent_loop", model=_tool_llm.model_id, provider=_tool_llm.provider
@@ -1037,7 +1046,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     CHAT_STAGE_DURATION.labels(current_stage).observe(_elapsed)
                     total_time = round(perf_counter() - pipeline_started_at, 3)
 
-                    confidence = compute_confidence(top_score, num_chunks)
+                    scores_are_rerank = (
+                        state.agent_meta.scores_are_rerank if state.agent_meta else True
+                    )
+                    degraded = sorted(
+                        state.agent_meta.degraded_capabilities if state.agent_meta else ()
+                    )
+                    confidence = compute_confidence(
+                        top_score, num_chunks, scores_are_rerank=scores_are_rerank
+                    )
                     ungrounded = has_ungrounded_claims(state.clean_content, parser.all_spans)
 
                     # Build pipeline trace
@@ -1085,7 +1102,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     trace_payload["guardrails"] = {
                         "confidence": confidence,
                         "top_reranker_score": top_score,
+                        "scores_are_rerank": scores_are_rerank,
                         "num_chunks": num_chunks,
+                        "degraded_retrieval": degraded,
                         "ungrounded_claims": ungrounded,
                         **(
                             {
@@ -1100,6 +1119,17 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             else {}
                         ),
                     }
+
+                    # Persist the answer-quality signals onto the message itself, not just
+                    # the trace: the SSE `metadata` event only reaches the client that was
+                    # streaming, so without this every badge vanishes on reload.
+                    citation_meta["confidence"] = confidence
+                    citation_meta["ungrounded_claims"] = ungrounded
+                    citation_meta["route"] = (
+                        state.router_output.route if state.router_output else None
+                    )
+                    if degraded:
+                        citation_meta["degraded_retrieval"] = degraded
 
                     lf_trace_id = UUID(request_id).hex if lf else None
                     await message_repo.update_on_final(
@@ -1169,6 +1199,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "confidence": confidence,
                             "ungrounded_claims": ungrounded,
                             "route": state.router_output.route if state.router_output else None,
+                            "degraded_retrieval": degraded,
                         },
                     )
                     logger.info(
@@ -1177,7 +1208,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "request_id": request_id,
                             "confidence": confidence,
                             "top_score": top_score,
+                            "scores_are_rerank": scores_are_rerank,
                             "num_chunks": num_chunks,
+                            "degraded_retrieval": degraded,
                             "ungrounded_claims": ungrounded,
                         },
                     )

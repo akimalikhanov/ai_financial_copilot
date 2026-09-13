@@ -1,0 +1,150 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadtest
+  namespace: copilot
+spec:
+  # A load test that fails is a result, not a flake — never silently re-run it.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loadtest
+    spec:
+      restartPolicy: Never
+      serviceAccountName: loadtest
+      initContainers:
+        # The /v1/models probe below can only see the api. worker-chat is where the agent loop
+        # and answer stream run — it is what actually bills a provider — and worker-ingestion
+        # calls the table summarizer and picture enricher. Both are invisible over HTTP, so
+        # gate on the rollouts converging: until every old-ReplicaSet pod is gone, a pod still
+        # holding the real config can pick a task off the queue and spend real money. A prior
+        # run leaked ~6 minutes of real OpenAI calls through exactly this gap.
+        - name: await-fake-llm-rollout
+          # registry.k8s.io/kubectl, not bitnami/kubectl: Bitnami retired most of their
+          # Docker Hub catalog, so bitnami/kubectl:<ver> now 404s on pull. Tag tracks the
+          # cluster version (kind-cluster.yaml's node image).
+          #
+          # This image is distroless — no shell, `kubectl` IS the entrypoint — so this must be
+          # `args` to that binary, not a `sh -c` script. One invocation listing all three
+          # deployments is equivalent to a loop: rollout status waits for every resource named.
+          image: registry.k8s.io/kubectl:v1.36.1
+          args:
+            - rollout
+            - status
+            - deploy/api
+            - deploy/worker-chat
+            - deploy/worker-ingestion
+            - -n
+            - copilot
+            - --timeout=10m
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+        # The results volume is a hostPath PV, which arrives root-owned 0755 while
+        # Dockerfile.worker runs as uid 1001 — locust's --csv then dies with EACCES before
+        # sending a single request. securityContext.fsGroup does NOT fix this: the kubelet
+        # only applies fsGroup ownership to volume types that support ownership management,
+        # and hostPath is deliberately excluded (chowning arbitrary host paths would be
+        # unsafe). A root initContainer doing the chown itself is the standard workaround.
+        - name: chown-results
+          image: busybox:1.37
+          command: ["sh", "-c", "chown 1001:1001 /results && chmod 0775 /results"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: results
+              mountPath: /results
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        # Fails the Job before a single request is sent if the API is not serving the fake
+        # adapter — including the case the overlay alone cannot catch: an api pod that was
+        # never restarted after the patch and is still holding the real config in its
+        # lru_cache'd router. See docs/notes/loadtest-concepts.md §8.
+        - name: assert-fake-llm
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              # Polls rather than checking once: this Job is created in the same apply that
+              # patches the api Deployment, so for the first stretch the Service still routes
+              # to un-patched pods that answer with the real config. Waiting for the fake
+              # labels to appear is what makes the check independent of apply ordering.
+              # Only a timeout is a failure — that means the patch never took effect.
+              deadline=$(( $(date +%s) + 300 ))
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                models=$(curl -fsS http://api:8000/v1/models 2>/dev/null) || {
+                  echo "api not answering yet, retrying"; sleep 5; continue
+                }
+                if echo "$models" | grep -q 'Fake (was'; then
+                  echo "fake LLM adapter confirmed active"
+                  exit 0
+                fi
+                echo "api still serving the real models config, waiting for the roll"
+                sleep 5
+              done
+              echo "REFUSING TO RUN: api is not using the fake LLM adapter." >&2
+              echo "MODELS_CONFIG_PATH must point at models.loadtest.yaml, and the api" >&2
+              echo "image must be new enough for config.py to honour it." >&2
+              echo "/v1/models returned: $models" >&2
+              exit 1
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: locust
+          # Reuses the worker image: locust is a main dependency in pyproject.toml, so it is
+          # already installed there (Dockerfile.worker runs `uv sync --no-dev`).
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          # `python -m locust`, not the `locust` console script: that script's shebang bakes in
+          # the builder stage's venv path (/build/.venv/bin/python), which doesn't exist in the
+          # runtime image (venv is copied to /app/.venv) — exec fails with "no such file or
+          # directory". Same trap as docling-tools in model-preload-job.yaml.
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              python -m locust \
+                -f /mnt/loadtest/locustfile.py \
+                --host "$LOADTEST_TARGET_HOST" \
+                --headless \
+                -u "$LOADTEST_USERS" \
+                -r "$LOADTEST_SPAWN_RATE" \
+                -t "$LOADTEST_DURATION" \
+                --csv /results/run \
+                --only-summary
+              status=$?
+              for f in /results/run_stats.csv /results/run_stats_history.csv /results/run_failures.csv /results/run_exceptions.csv; do
+                if [ -f "$f" ]; then
+                  echo "===== BEGIN CSV: $f ====="
+                  cat "$f"
+                  echo "===== END CSV: $f ====="
+                fi
+              done
+              exit "$status"
+          envFrom:
+            - configMapRef: { name: loadtest-params }
+          volumeMounts:
+            - name: locustfile
+              mountPath: /mnt/loadtest
+              readOnly: true
+            - name: results
+              mountPath: /results
+          # Generous on purpose: a throttled load generator produces exactly the false knee
+          # this whole exercise exists to avoid.
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "2Gi" }
+      volumes:
+        - name: locustfile
+          configMap:
+            name: loadtest-locustfile
+        # hostPath-backed PVC (results-pv.yaml), not emptyDir: the CSVs also get cat'd to
+        # stdout as a redundant, always-reachable copy (kubectl logs works on a Completed
+        # pod; kubectl cp/exec don't), but a real file on the host is worth having when you
+        # want to diff runs or load the history CSV into a spreadsheet.
+        - name: results
+          persistentVolumeClaim:
+            claimName: loadtest-results

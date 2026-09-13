@@ -60,3 +60,7 @@ infra/docker/export_volumes.sh
 infra/docker/import_volumes.sh
 .agents
 skills-lock.json
+
+# k8s loadtest results (hostPath PV target, see infra/k8s/kind-cluster.yaml)
+infra/k8s/loadtest/results/*
+!infra/k8s/loadtest/results/.gitkeep

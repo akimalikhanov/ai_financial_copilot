@@ -9,10 +9,20 @@ from src.schemas.retrieval import AnswerCitationSpan
 _FACT_PATTERN = re.compile(r"\$[\d,.]+|\d+\.?\d*%|\b(19|20)\d{2}\b|\d[\d,]{2,}")
 
 
-def compute_confidence(top_score: float | None, num_chunks: int) -> str:
+def compute_confidence(
+    top_score: float | None, num_chunks: int, *, scores_are_rerank: bool = True
+) -> str:
+    """Retrieval confidence from the top chunk's cross-encoder score.
+
+    The thresholds below are calibrated on cross-encoder scores (~0–1). When reranking
+    fell open or is switched off the chunks instead carry RRF fusion scores (~0.05 at
+    k=20), which would land under every threshold and report a *ranking* outage as weak
+    grounding — a system fault disguised as a corpus one. Unknown, not low, is the honest
+    answer there; the degradation itself is surfaced separately.
+    """
     if num_chunks == 0:
         return "none"
-    if top_score is None:
+    if top_score is None or not scores_are_rerank:
         return "medium"
     if top_score >= 0.7:
         return "high"

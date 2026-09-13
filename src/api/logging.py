@@ -312,10 +312,24 @@ def _route_template(request: Request) -> str:
     """
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        if route.matches(request.scope)[0] == Match.FULL:
-            return getattr(route, "path", "unmatched")
-    return "unmatched"
+    # FastAPI >=0.139 keeps `include_router` results nested as `_IncludedRouter` objects
+    # (BaseRoute subclasses with no `.path`) rather than flattening them into app.routes,
+    # so a match has to recurse to reach the APIRoute that owns the template.
+    def _resolve(routes: list) -> str | None:
+        for route in routes:
+            if route.matches(request.scope)[0] != Match.FULL:
+                continue
+            path = getattr(route, "path", None)
+            if path is not None:
+                return path
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                resolved = _resolve(inner.routes)
+                if resolved is not None:
+                    return resolved
+        return None
+
+    return _resolve(request.app.routes) or "unmatched"
 
 
 def _record_http_metrics(ctx: RequestContext, endpoint: str) -> None:

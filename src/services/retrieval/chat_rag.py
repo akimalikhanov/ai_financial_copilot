@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Literal
 from uuid import UUID
@@ -14,7 +15,7 @@ from src.observability.langfuse import span as lf_span
 from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
 from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
-from src.services.ingestion.embedder import embed_chunks
+from src.services.ingestion.embedder import embed_query
 from src.services.retrieval.context_assembler import assemble_rag_context
 from src.services.retrieval.hybrid_retriever import fuse_rrf
 from src.services.retrieval.opensearch_retriever import retrieve as opensearch_retrieve
@@ -58,8 +59,18 @@ async def _retrieve_with_timeout(coro, timeout: float | None = None) -> tuple[li
         return [], False
 
 
+@dataclass(frozen=True)
+class _PassResult:
+    vector: list[RetrievedChunk]
+    keyword: list[RetrievedChunk]
+    fused: list[RetrievedChunk]
+    vector_ok: bool
+    keyword_ok: bool
+    all_backends_failed: bool
+
+
 async def _run_single_pass(
-    semantic_vector: list[float],
+    semantic_vector: list[float] | None,
     keyword_query: str,
     user_id: UUID,
     doc_ids: list[UUID] | None,
@@ -67,26 +78,37 @@ async def _run_single_pass(
     vector_top_k: int,
     keyword_top_k: int,
     search_mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
-) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk], bool]:
+) -> _PassResult:
     """Run retrieval backends in parallel (skipping one when search_mode is single-backend).
 
-    Returns (vector_results, keyword_results, fused, all_backends_failed).
     For single-backend modes, fused == the single backend's results (no RRF), and
     all_backends_failed reflects that one backend alone.
+
+    `semantic_vector` is None when the query could not be embedded; the vector leg is
+    then skipped as unavailable rather than treated as empty.
     """
+    if semantic_vector is None and search_mode != "keyword":
+        if search_mode == "vector":
+            return _PassResult([], [], [], False, True, True)
+        search_mode = "keyword"
+
     if search_mode == "vector":
+        assert semantic_vector is not None
         vector_results, vec_ok = await _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
             timeout,
         )
-        return vector_results, [], vector_results, not vec_ok
+        return _PassResult(vector_results, [], vector_results, vec_ok, True, not vec_ok)
     if search_mode == "keyword":
         keyword_results, kw_ok = await _retrieve_with_timeout(
             opensearch_retrieve(keyword_query, user_id, doc_ids=doc_ids, top_k=keyword_top_k),
             timeout,
         )
-        return [], keyword_results, keyword_results, not kw_ok
+        # vector_ok stays True only when the dense leg was never meant to run; a failed
+        # embed downgrades it at the call site, which is the one place that knows.
+        return _PassResult([], keyword_results, keyword_results, True, kw_ok, not kw_ok)
 
+    assert semantic_vector is not None
     (vector_results, vec_ok), (keyword_results, kw_ok) = await asyncio.gather(
         _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
@@ -98,9 +120,10 @@ async def _run_single_pass(
         ),
     )
     fused = fuse_rrf(vector_results, keyword_results)
-    # Only a total outage is reported: with one backend alive the request still has real
-    # retrieval, and degrading it to "search unavailable" would be a false alarm.
-    return vector_results, keyword_results, fused, not (vec_ok or kw_ok)
+    # Only a total outage sets all_backends_failed: with one backend alive the request
+    # still has real retrieval, and calling that "search unavailable" would be a false
+    # alarm. The per-leg flags carry the partial case, which callers surface separately.
+    return _PassResult(vector_results, keyword_results, fused, vec_ok, kw_ok, not (vec_ok or kw_ok))
 
 
 async def run_chat_rag_pipeline(
@@ -129,18 +152,27 @@ async def run_chat_rag_pipeline(
     if reranker is None:
         reranker = get_reranker()
 
+    # Fails open like every other retrieval backend. Embedding sits *in front of* both
+    # of them — it produces an argument to the fan-out rather than running inside it — so
+    # letting it raise would take keyword search down with it while OpenSearch is healthy,
+    # which is the one thing the per-backend fail-open below exists to prevent.
+    semantic_vector: list[float] | None = None
     with lf_span("embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
         _t = perf_counter()
-        vectors_list = await asyncio.to_thread(embed_chunks, [transformed.semantic_query])
+        try:
+            semantic_vector = await asyncio.to_thread(embed_query, transformed.semantic_query)
+        except Exception as e:
+            logger.warning("embed_query_failed", extra={"error": str(e)})
         RAG_RETRIEVAL.labels("embed").observe(perf_counter() - _t)
         if obs:
             obs.update(
                 output={
-                    "vector_count": len(vectors_list),
-                    "dims": len(vectors_list[0]) if vectors_list else 0,
+                    "vector_count": 1 if semantic_vector else 0,
+                    "dims": len(semantic_vector) if semantic_vector else 0,
+                    "ok": semantic_vector is not None,
                 }
             )
-    semantic_vector = vectors_list[0]
+    embed_ok = semantic_vector is not None
 
     with lf_span(
         "hybrid_retrieve",
@@ -153,7 +185,7 @@ async def run_chat_rag_pipeline(
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        vec_r, kw_r, fused, all_backends_failed = await _run_single_pass(
+        _pass = await _run_single_pass(
             semantic_vector,
             transformed.keyword_query,
             user_id,
@@ -163,6 +195,10 @@ async def run_chat_rag_pipeline(
             keyword_top_k,
             search_mode=search_mode,
         )
+        vec_r, kw_r, fused = _pass.vector, _pass.keyword, _pass.fused
+        all_backends_failed = _pass.all_backends_failed
+        vector_ok = _pass.vector_ok and embed_ok
+        keyword_ok = _pass.keyword_ok
         RAG_RETRIEVAL.labels("hybrid_retrieve").observe(perf_counter() - _t)
         RAG_CHUNKS.labels("vector").observe(len(vec_r))
         RAG_CHUNKS.labels("keyword").observe(len(kw_r))
@@ -182,6 +218,9 @@ async def run_chat_rag_pipeline(
             qdrant=[_to_hit(c) for c in vec_r],
             opensearch=[_to_hit(c) for c in kw_r],
             all_backends_failed=all_backends_failed,
+            embed_ok=embed_ok,
+            vector_ok=vector_ok,
+            keyword_ok=keyword_ok,
         )
         return RAGContext(formatted_context="", items=(), chunk_count=0), trace, []
 
@@ -199,13 +238,15 @@ async def run_chat_rag_pipeline(
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        reranked = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        outcome = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        reranked = outcome.chunks
         RAG_RETRIEVAL.labels("rerank").observe(perf_counter() - _t)
         RAG_CHUNKS.labels("reranked").observe(len(reranked))
         if obs:
             obs.update(
                 output={
                     "output_count": len(reranked),
+                    "scored": outcome.scored,
                     "chunks": [
                         {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked
                     ],
@@ -218,6 +259,11 @@ async def run_chat_rag_pipeline(
         fused=[_to_hit(c) for c in fused],
         reranked=[_to_hit(c) for c in reranked],
         all_backends_failed=all_backends_failed,
+        embed_ok=embed_ok,
+        vector_ok=vector_ok,
+        keyword_ok=keyword_ok,
+        rerank_ok=not outcome.degraded,
+        scores_are_rerank=outcome.scored,
     )
     with lf_span(
         "assemble_context",

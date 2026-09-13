@@ -178,3 +178,15 @@ class RetrievalTrace(BaseModel):
     # Every enabled backend errored or timed out, so zero results means "unreachable",
     # not "not in the corpus" (P1-F).
     all_backends_failed: bool = False
+    # Per-capability health. `all_backends_failed` only fires on a *total* outage, so
+    # without these a half-broken retrieval is indistinguishable from a healthy one:
+    # a dead Qdrant still returns keyword hits, and the answer looks fully grounded.
+    # Default True so traces persisted before these existed deserialize unchanged.
+    embed_ok: bool = True
+    vector_ok: bool = True
+    keyword_ok: bool = True
+    rerank_ok: bool = True
+    # Whether `reranked` carries cross-encoder scores (~0–1) or fusion scores (RRF, ~0.05).
+    # Distinct from rerank_ok: reranking switched off yields unscored-but-healthy, while a
+    # fall-open yields unscored-and-degraded. Confidence thresholds only apply when True.
+    scores_are_rerank: bool = True
