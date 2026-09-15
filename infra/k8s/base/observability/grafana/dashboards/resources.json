@@ -1,0 +1,1080 @@
+{
+  "title": "Resources",
+  "uid": "resources",
+  "description": "Container, node and GPU saturation. Container series come from the kubernetes-cadvisor job (kubelet cgroup stats); restart/termination-reason and node-condition series come from kube-state-metrics. Panels here were consolidated out of Worker Health (GPU row) and API Overview (Redis/OpenSearch memory) so every saturation signal reads from one place.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "workload",
+        "label": "Workload",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(container_memory_working_set_bytes{namespace=\"copilot\", container!=\"\"}, container)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Pressure & Failures",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "Firing Alerts",
+      "type": "table",
+      "description": "There is no Alertmanager in this stack — rules in alert-rules.yml are evaluated by Prometheus and surface here as ALERTS series. An OOM overnight stays visible for the 30d retention instead of vanishing with the pod's status.",
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sort_desc(ALERTS{alertstate=\"firing\"})",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "alertstate": true
+            },
+            "renameByName": {
+              "alertname": "Alert",
+              "severity": "Severity",
+              "pod": "Pod",
+              "container": "Container",
+              "node": "Node"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Severity"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 3,
+      "title": "Restarts by Container (24h)",
+      "type": "barchart",
+      "description": "Integer restart counts, highest first. Computed as max_over_time - min_over_time of the restart counter rather than increase(), which extrapolates over the window and reports fractional restarts (9.49 instead of 9) for what is a count of discrete events. Containers that never restarted are filtered out, so an empty panel is the healthy state. A bar here says the container died; the panel to the left says whether it was an OOM.",
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 7,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (container) (max_over_time(kube_pod_container_status_restarts_total{namespace=\"copilot\", container=~\"$workload\"}[24h]) - min_over_time(kube_pod_container_status_restarts_total{namespace=\"copilot\", container=~\"$workload\"}[24h])) > 0)",
+          "legendFormat": "{{container}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 4
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xTickLabelRotation": 0,
+        "showValue": "always",
+        "legend": {
+          "showLegend": false
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "OOMKills (24h)",
+      "type": "stat",
+      "description": "Counts ContainerOOMKilled alert firings, not pod status. kube_pod_container_status_last_terminated_reason only exists while the OOMKilled pod is still around — once a Deployment replaces it the series disappears, so reading pod status would show zero for an OOM that definitely happened. ALERTS_FOR_STATE is written to the TSDB when the rule fires and stays for the 30d retention, which is what makes an overnight kill still visible the next morning. Zero here means no OOM in 24h.",
+      "gridPos": {
+        "x": 19,
+        "y": 1,
+        "w": 5,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "count(count by (pod, container) (max_over_time(ALERTS_FOR_STATE{alertname=\"ContainerOOMKilled\"}[24h]))) or vector(0)",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "None",
+                  "color": "green",
+                  "index": 0
+                }
+              }
+            }
+          ]
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Container Memory",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "title": "Memory — % of Limit",
+      "type": "timeseries",
+      "description": "The headroom view. Anything riding above 90% is one allocation away from an exit-137. Thresholds mirror the ContainerMemoryNearLimit rule.",
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "container_memory_working_set_bytes{namespace=\"copilot\", container=~\"$workload\"} / container_spec_memory_limit_bytes{namespace=\"copilot\", container=~\"$workload\"}",
+          "legendFormat": "{{pod}}/{{container}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Memory — Working Set vs Limit (bytes)",
+      "type": "timeseries",
+      "description": "Absolute footprint against the ceiling. Working set excludes reclaimable page cache, so it is what the kernel actually weighs at OOM time — RSS alone overstates.",
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "container_memory_working_set_bytes{namespace=\"copilot\", container=~\"$workload\"}",
+          "legendFormat": "{{pod}}/{{container}}"
+        },
+        {
+          "expr": "max by (container) (container_spec_memory_limit_bytes{namespace=\"copilot\", container=~\"$workload\"})",
+          "legendFormat": "{{container}} limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Peak Memory vs Request & Limit (24h)",
+      "type": "table",
+      "description": "Sizing view, not a live one. Peak far above request means the scheduler is placing this pod too optimistically and it will be evicted early under node pressure; peak near limit means the next spike is an OOM.",
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max by (container) (max_over_time(container_memory_working_set_bytes{namespace=\"copilot\", container=~\"$workload\"}[24h]))",
+          "format": "table",
+          "instant": true,
+          "refId": "PEAK"
+        },
+        {
+          "expr": "max by (container) (kube_pod_container_resource_requests{namespace=\"copilot\", resource=\"memory\", container=~\"$workload\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "REQ"
+        },
+        {
+          "expr": "max by (container) (container_spec_memory_limit_bytes{namespace=\"copilot\", container=~\"$workload\"})",
+          "format": "table",
+          "instant": true,
+          "refId": "LIM"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "container",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true
+            },
+            "renameByName": {
+              "container": "Container",
+              "Value #PEAK": "Peak 24h",
+              "Value #REQ": "Request",
+              "Value #LIM": "Limit"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Container"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "string"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Container CPU",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 9,
+      "title": "CPU Usage (cores) vs Limit",
+      "type": "timeseries",
+      "description": "Cores, not percent — directly comparable to the cpu limits in the deployment manifests.",
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod, container) (rate(container_cpu_usage_seconds_total{namespace=\"copilot\", container=~\"$workload\"}[5m]))",
+          "legendFormat": "{{pod}}/{{container}}"
+        },
+        {
+          "expr": "max by (container) (kube_pod_container_resource_limits{namespace=\"copilot\", resource=\"cpu\", container=~\"$workload\"})",
+          "legendFormat": "{{container}} limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "CPU Throttling (% of periods)",
+      "type": "timeseries",
+      "description": "The quiet failure: the cgroup stalls the container at its quota with no restart and no error — only task p95 drifting upward. Sustained throttling above the 25% line is the ContainerCPUThrottling rule.",
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "rate(container_cpu_cfs_throttled_periods_total{namespace=\"copilot\", container=~\"$workload\"}[5m]) / clamp_min(rate(container_cpu_cfs_periods_total{namespace=\"copilot\", container=~\"$workload\"}[5m]), 1)",
+          "legendFormat": "{{pod}}/{{container}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.25
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "max",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Node",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 12,
+      "title": "Node Memory — Used vs Allocatable",
+      "type": "timeseries",
+      "description": "Namespace limits sum past node capacity by design. That is only safe while actual usage stays clear of allocatable — once the node fills, the kubelet evicts by QoS class and Burstable pods go first.",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (container_memory_working_set_bytes{namespace=\"copilot\", container!=\"\"})",
+          "legendFormat": "{{node}} used"
+        },
+        {
+          "expr": "sum by (node) (kube_node_status_allocatable{resource=\"memory\"})",
+          "legendFormat": "{{node}} allocatable"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*allocatable$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Node CPU — Used vs Allocatable",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 8,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(container_cpu_usage_seconds_total{namespace=\"copilot\", container!=\"\"}[5m]))",
+          "legendFormat": "{{node}} used"
+        },
+        {
+          "expr": "sum by (node) (kube_node_status_allocatable{resource=\"cpu\"})",
+          "legendFormat": "{{node}} allocatable"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*allocatable$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Node Conditions",
+      "type": "timeseries",
+      "description": "MemoryPressure / DiskPressure / PIDPressure. Any of these going to 1 means the kubelet has started or will start evicting.",
+      "gridPos": {
+        "x": 16,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "kube_node_status_condition{condition=~\"MemoryPressure|DiskPressure|PIDPressure\", status=\"true\"}",
+          "legendFormat": "{{node}} {{condition}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "drawStyle": "bars"
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Datastore Memory",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 16,
+      "title": "Redis Memory vs Limit",
+      "type": "timeseries",
+      "description": "Migrated from API Overview. Redis enforces its own maxmemory before the cgroup limit is reached, so this is the ceiling that actually bites first.",
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "redis_memory_used_bytes",
+          "legendFormat": "{{job}} used"
+        },
+        {
+          "expr": "redis_memory_max_bytes",
+          "legendFormat": "{{job}} max"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*max$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "OpenSearch / Qdrant Container Memory",
+      "type": "timeseries",
+      "description": "Migrated from API Overview, widened to cover Qdrant too — both are JVM/heap-shaped workloads whose working set sits near their limit by design.",
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(container_memory_working_set_bytes{namespace=\"copilot\", pod=~\"opensearch-.*|qdrant-.*\", container!=\"\"}) by (pod)",
+          "legendFormat": "{{pod}}"
+        },
+        {
+          "expr": "sum(container_spec_memory_limit_bytes{namespace=\"copilot\", pod=~\"opensearch-.*|qdrant-.*\", container!=\"\"}) by (pod)",
+          "legendFormat": "{{pod}} limit"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 8
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*limit$"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "GPU (kind only — dcgm-exporter DaemonSet)",
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "title": "GPU Utilization",
+      "type": "timeseries",
+      "description": "Migrated from Worker Health. Time-sliced across worker-ingestion, tei, and tei-embedder — no per-pod attribution, only per-GPU.",
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_UTIL",
+          "legendFormat": "gpu{{gpu}} {{modelName}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "GPU Memory Used vs Free",
+      "type": "timeseries",
+      "description": "Migrated from Worker Health. Framebuffer usage — watch for OOM headroom across the three time-sliced consumers.",
+      "gridPos": {
+        "x": 8,
+        "y": 54,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_FB_USED * 1024 * 1024",
+          "legendFormat": "gpu{{gpu}} used"
+        },
+        {
+          "expr": "DCGM_FI_DEV_FB_FREE * 1024 * 1024",
+          "legendFormat": "gpu{{gpu}} free"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "GPU Temperature",
+      "type": "timeseries",
+      "description": "Migrated from Worker Health.",
+      "gridPos": {
+        "x": 16,
+        "y": 54,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "DCGM_FI_DEV_GPU_TEMP",
+          "legendFormat": "gpu{{gpu}} {{modelName}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
+    }
+  ]
+}

@@ -308,6 +308,117 @@ k8s-preload-models: k8s-set-images
 # infra/k8s/loadtest/{locustfile.py,models.yaml} are copies of infra/loadtest/locustfile.py
 # and infra/config/models.loadtest.yaml. Kustomize refuses to read files outside its own
 # directory, so the copies exist for configMapGenerator; the originals stay the source of truth.
+# Builds the three ingestion fixture classes into the hostPath the fixtures PVC is backed by
+# (docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3). SOURCE must be a real filing:
+# T11 measures service time, and a synthetic PDF parses in seconds where a real one takes
+# minutes. The generated PDFs are gitignored and reproducible from this command.
+#   make loadtest-fixtures SOURCE="data/corpus/pdfs/Microsoft Corporation.pdf"
+# 0 = the whole filing, for both. Neither capacity fixture may be truncated: the corpus runs
+# 11-1043 pages (median 128), so the 10-page versions these used to build were shorter than the
+# smallest real document in it, and sampled only the prose front matter. Set either to a page
+# count for a quick smoke run.
+LOADTEST_FIXTURE_PAGES ?= 0
+LOADTEST_SCAN_PAGES ?= 0
+.PHONY: loadtest-fixtures
+loadtest-fixtures:
+	@test -n "$(SOURCE)" || { echo "SOURCE=<path to a real PDF> is required"; exit 1; }
+	.venv/bin/python -m infra.loadtest.make_fixtures \
+	  --source "$(SOURCE)" --pages $(LOADTEST_FIXTURE_PAGES) \
+	  --scan-pages $(LOADTEST_SCAN_PAGES) --out $(K8S_LOADTEST)/fixtures
+	@$(MAKE) --no-print-directory k8s-loadtest-fixtures-push
+
+# Item 2.2's backlog: 20 real filings stratified across the measured service-time distribution,
+# listed in infra/loadtest/backlog_sample.txt. Copies from the corpus into fixtures/backlog/, so
+# a run selects it with LOADTEST_FIXTURE_DIR=/fixtures/backlog rather than naming 20 files.
+.PHONY: loadtest-backlog
+loadtest-backlog:
+	.venv/bin/python -m infra.loadtest.make_backlog
+	@$(MAKE) --no-print-directory k8s-loadtest-fixtures-push
+
+# The fixtures PV's hostPath only names a real host directory if kind-cluster.yaml's extraMounts
+# entry existed when the cluster was CREATED — extraMounts is a create-time property. On an
+# older cluster the path is a directory inside the node container, so the PDFs have to be copied
+# in, exactly as the results CSVs have to be copied out. Skipped when the bind mount is live:
+# there source and destination are the same files, and `docker cp` would truncate each one while
+# reading it.
+K8S_NODE ?= copilot-control-plane
+.PHONY: k8s-loadtest-fixtures-push
+k8s-loadtest-fixtures-push:
+	@find $(K8S_LOADTEST)/fixtures -name '*.pdf' | grep -q . || { \
+	  echo "no fixtures to push; run: make loadtest-fixtures SOURCE=<a real filing>"; exit 1; }
+	@docker inspect $(K8S_NODE) >/dev/null 2>&1 || { \
+	  echo "node $(K8S_NODE) is not running; skipping push"; exit 0; }
+	@if docker inspect $(K8S_NODE) --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' \
+	   | grep -qx /mnt/loadtest-fixtures; then \
+	  echo "$(K8S_NODE):/mnt/loadtest-fixtures is bind-mounted from the host — nothing to copy"; \
+	else \
+	  docker exec $(K8S_NODE) mkdir -p /mnt/loadtest-fixtures; \
+	  : "trailing /. copies directory CONTENTS recursively, so backlog/ comes along"; \
+	  docker cp $(K8S_LOADTEST)/fixtures/. $(K8S_NODE):/mnt/loadtest-fixtures/ || exit 1; \
+	  echo "pushed to $(K8S_NODE):/mnt/loadtest-fixtures:"; \
+	  docker exec $(K8S_NODE) find /mnt/loadtest-fixtures -name '*.pdf' | sed 's|^|  |'; \
+	fi
+
+# Deletes every loadtest-*@example.com user and everything that cascades from them, plus the
+# Qdrant/OpenSearch/S3 entries for their documents (which do not cascade). Runs inside the api
+# pod because it needs the cluster's own Qdrant/OpenSearch/S3 endpoints, and because the API's
+# DELETE /v1/documents/{id} authenticates as the owning user — these are throwaway accounts
+# with random passwords. Defaults to a dry run; pass YES=1 to actually delete.
+.PHONY: k8s-loadtest-cleanup
+k8s-loadtest-cleanup:
+	$(eval POD := $(shell kubectl get pod -n copilot -l app.kubernetes.io/name=api \
+	  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null))
+	@test -n "$(POD)" || { echo "no api pod found"; exit 1; }
+	# /tmp, not /app: the image ships infra/config/ only, and /app is root-owned while the
+	# container runs as appuser. PYTHONPATH keeps `src` importable from the app root.
+	kubectl cp infra/loadtest/cleanup.py copilot/$(POD):/tmp/loadtest_cleanup.py
+	kubectl exec -n copilot $(POD) -- sh -c \
+	  'cd /app && PYTHONPATH=/app:/tmp python -m loadtest_cleanup $(if $(YES),--yes,--dry-run)'
+
+# Counterpart to the push: on such a cluster the CSVs land in the node container too, and a
+# Completed pod cannot be `kubectl cp`-ed out of.
+LOADTEST_RESULTS_DIR ?= $(K8S_LOADTEST)/results
+.PHONY: k8s-loadtest-results
+k8s-loadtest-results:
+	@mkdir -p $(LOADTEST_RESULTS_DIR)
+	docker cp $(K8S_NODE):/mnt/loadtest-results/. $(LOADTEST_RESULTS_DIR)/
+	@ls -la $(LOADTEST_RESULTS_DIR)
+
+# T13 (§8 item 1.4): the parse-timeout leak is a property of the wrap *firing*, not of when,
+# so the run lowers the server's timeout instead of building a pathological PDF that takes ten
+# minutes to parse. Turns a ~50 min run into a ~5 min one. `-restore` puts it back.
+T13_PARSE_TIMEOUT ?= 60
+.PHONY: k8s-loadtest-t13-timeout k8s-loadtest-t13-timeout-restore
+k8s-loadtest-t13-timeout:
+	kubectl set env deploy/worker-ingestion -n copilot \
+	  DOCLING_PARSE_TIMEOUT_SECONDS=$(T13_PARSE_TIMEOUT)
+	kubectl rollout status deploy/worker-ingestion -n copilot --timeout=5m
+k8s-loadtest-t13-timeout-restore:
+	kubectl set env deploy/worker-ingestion -n copilot DOCLING_PARSE_TIMEOUT_SECONDS-
+	kubectl rollout status deploy/worker-ingestion -n copilot --timeout=5m
+
+# §4.7's unresolved inconsistency, scoped to a run. Ingestion inherits the GLOBAL Celery limits
+# (hard 450 / soft 360), which sit BELOW DOCLING_PARSE_TIMEOUT_SECONDS=600 — so the Celery hard
+# limit kills a slow parse first, the least informative of the three failure paths: no
+# parse_status, no partial result, and acks_late + INGEST_MAX_ATTEMPTS=2 then burns the slot a
+# second time. Under the pre-optimization pipeline 3 of 50 real filings exceeded 450s.
+#
+# worker-ingestion is its own Deployment, so raising these here leaves worker-chat's hierarchy
+# (960 > 450 > 360 > 180 > 60) untouched. Restores the ordering the audit asks for:
+# visibility 960 > hard 900 > soft 850 > parse 600.
+INGEST_HARD_LIMIT ?= 900
+INGEST_SOFT_LIMIT ?= 850
+.PHONY: k8s-loadtest-ingest-limits k8s-loadtest-ingest-limits-restore
+k8s-loadtest-ingest-limits:
+	kubectl set env deploy/worker-ingestion -n copilot \
+	  CELERY_TASK_TIME_LIMIT_SECONDS=$(INGEST_HARD_LIMIT) \
+	  CELERY_TASK_SOFT_TIME_LIMIT_SECONDS=$(INGEST_SOFT_LIMIT)
+	kubectl rollout status deploy/worker-ingestion -n copilot --timeout=5m
+k8s-loadtest-ingest-limits-restore:
+	kubectl set env deploy/worker-ingestion -n copilot \
+	  CELERY_TASK_TIME_LIMIT_SECONDS- CELERY_TASK_SOFT_TIME_LIMIT_SECONDS-
+	kubectl rollout status deploy/worker-ingestion -n copilot --timeout=5m
+
 .PHONY: k8s-sync-loadtest
 k8s-sync-loadtest:
 	cp infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
@@ -345,9 +456,21 @@ LOADTEST_SPAWN_RATE ?= 1
 LOADTEST_DURATION ?= 10m
 LOADTEST_TARGET_HOST ?= http://api:8000
 LOADTEST_SHAPE ?=
-# T3: "ask" (default) or "sse_hold" — picks the locustfile's user class, not a shape.
+# "ask" (default), "sse_hold" (T3) or "upload" (T11-T13) — picks the locustfile's user class,
+# not a shape. "upload" needs fixtures on the host first: `make loadtest-fixtures SOURCE=...`.
 LOADTEST_MODE ?= ask
 LOADTEST_HOLD_FOR_S ?= 86400
+# Ingestion track (docs/notes/loadtest-readiness-audit.md §8). One upload per user makes
+# LOADTEST_USERS the backlog depth: -u 20 is item 2.2's 20-document queue.
+LOADTEST_UPLOADS_PER_USER ?= 1
+LOADTEST_INGEST_TIMEOUT_S ?= 1500
+# Which fixture class(es) a run uploads. Empty draws from all of them, which is only right for
+# a smoke test — see the note in loadtest-params.env.
+#   make k8s-loadtest LOADTEST_MODE=upload LOADTEST_FIXTURES=normal.pdf ...
+LOADTEST_FIXTURES ?=
+# Which directory a run uploads from. /fixtures holds the three single-document classes;
+# /fixtures/backlog holds item 2.2's 20-filing stratified sample (`make loadtest-backlog`).
+LOADTEST_FIXTURE_DIR ?= /fixtures
 # Think-time between one user's questions. This — not user count — is what actually drives
 # utilisation: a user spends most of its cycle waiting, so halving these doubles arrival rate
 # at the same user count (docs/notes/capacity-planning-concepts.md §1).
@@ -375,6 +498,10 @@ k8s-loadtest: k8s-sync-loadtest k8s-deploy
 	  -e 's|^LOADTEST_SHAPE=.*|LOADTEST_SHAPE=$(LOADTEST_SHAPE)|' \
 	  -e 's|^LOADTEST_MODE=.*|LOADTEST_MODE=$(LOADTEST_MODE)|' \
 	  -e 's|^LOADTEST_HOLD_FOR_S=.*|LOADTEST_HOLD_FOR_S=$(LOADTEST_HOLD_FOR_S)|' \
+	  -e 's|^LOADTEST_UPLOADS_PER_USER=.*|LOADTEST_UPLOADS_PER_USER=$(LOADTEST_UPLOADS_PER_USER)|' \
+	  -e 's|^LOADTEST_INGEST_TIMEOUT_S=.*|LOADTEST_INGEST_TIMEOUT_S=$(LOADTEST_INGEST_TIMEOUT_S)|' \
+	  -e 's|^LOADTEST_FIXTURES=.*|LOADTEST_FIXTURES=$(LOADTEST_FIXTURES)|' \
+	  -e 's|^LOADTEST_FIXTURE_DIR=.*|LOADTEST_FIXTURE_DIR=$(LOADTEST_FIXTURE_DIR)|' \
 	  -e 's|^LOADTEST_MIN_WAIT=.*|LOADTEST_MIN_WAIT=$(LOADTEST_MIN_WAIT)|' \
 	  -e 's|^LOADTEST_MAX_WAIT=.*|LOADTEST_MAX_WAIT=$(LOADTEST_MAX_WAIT)|' \
 	  -e 's|^LOADTEST_RAMP_INITIAL_USERS=.*|LOADTEST_RAMP_INITIAL_USERS=$(LOADTEST_RAMP_INITIAL_USERS)|' \

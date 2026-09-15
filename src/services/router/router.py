@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from uuid import UUID
@@ -194,12 +195,17 @@ async def route_query(
     output: RouterOutput | None = None
     for attempt in range(2):
         try:
-            resp = await llm.complete(
-                messages=messages,
-                _lf_name="query_router",
-                temperature=cfg["temperature"],
-                max_tokens=int(cfg["max_tokens"]),
-                response_format=response_format,
+            # Without this the only bound is the SDK read timeout (120s), which the SDK
+            # retry then doubles, and the parse retry doubles again — 480s to route.
+            resp = await asyncio.wait_for(
+                llm.complete(
+                    messages=messages,
+                    _lf_name="query_router",
+                    temperature=cfg["temperature"],
+                    max_tokens=int(cfg["max_tokens"]),
+                    response_format=response_format,
+                ),
+                timeout=float(cfg["timeout"]),
             )
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})

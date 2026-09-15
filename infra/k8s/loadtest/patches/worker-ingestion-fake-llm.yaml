@@ -17,6 +17,8 @@ spec:
             # the production models.yaml. See _build_adapter in src/services/llm_router.py.
             - name: FAKE_LLM_ONLY
               value: "true"
+            - name: PICTURE_ENRICHER_ENABLED
+              value: "false"
           volumeMounts:
             - name: loadtest-models-config
               mountPath: /app/infra/config/loadtest

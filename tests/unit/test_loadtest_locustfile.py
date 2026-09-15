@@ -67,10 +67,18 @@ def _locust_stub() -> types.ModuleType:
     def _between(_min: float, _max: float) -> Any:
         return lambda _self: 0.0
 
+    class _StopUser(Exception):
+        """locust.exception.StopUser — locust catches it to retire one user's greenlet."""
+
+    exception_mod = types.ModuleType("locust.exception")
+    exception_mod.StopUser = _StopUser  # type: ignore[attr-defined]
+    sys.modules["locust.exception"] = exception_mod
+
     module.HttpUser = _Base  # type: ignore[attr-defined]
     module.LoadTestShape = _Base  # type: ignore[attr-defined]
     module.task = _task  # type: ignore[attr-defined]
     module.between = _between  # type: ignore[attr-defined]
+    module.exception = exception_mod  # type: ignore[attr-defined]
     return module
 
 
@@ -84,16 +92,17 @@ def _load_locustfile() -> Any:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
 
-    real_locust = sys.modules.get("locust")
-    sys.modules["locust"] = _locust_stub()
+    saved = {name: sys.modules.get(name) for name in ("locust", "locust.exception")}
+    sys.modules["locust"] = _locust_stub()  # also installs the locust.exception stub
     sys.modules["loadtest_locustfile"] = module
     try:
         spec.loader.exec_module(module)
     finally:
-        if real_locust is not None:
-            sys.modules["locust"] = real_locust
-        else:
-            del sys.modules["locust"]
+        for name, real in saved.items():
+            if real is not None:
+                sys.modules[name] = real
+            else:
+                sys.modules.pop(name, None)
     return module
 
 
@@ -294,3 +303,73 @@ class TestShapeGating:
         # Ends at spawn + hold, so the plateau really is 2 min long.
         shape.get_run_time = lambda: 130.0
         assert shape.tick() is None
+
+
+class TestFixtureSelection:
+    """The fixture classes differ ~4x in service time, so which ones a run draws from decides
+    what its numbers mean. §8 item 2.1 measures S for one class and 2.2's queue curve assumes
+    a constant S; a mis-selected pool reports a plausible number for the wrong thing."""
+
+    @pytest.fixture
+    def fixture_dir(self, tmp_path: Path) -> Path:
+        for name in ("normal.pdf", "scanned.pdf", "brokenfont.pdf", "notes.txt"):
+            (tmp_path / name).write_bytes(b"x")
+        return tmp_path
+
+    def test_unfiltered_takes_every_pdf_and_only_pdfs(self, fixture_dir: Path) -> None:
+        loaded = lf._load_fixtures(str(fixture_dir), [])
+        assert [Path(p).name for p in loaded] == ["brokenfont.pdf", "normal.pdf", "scanned.pdf"]
+
+    def test_names_restrict_the_pool(self, fixture_dir: Path) -> None:
+        loaded = lf._load_fixtures(str(fixture_dir), ["normal.pdf"])
+        assert [Path(p).name for p in loaded] == ["normal.pdf"]
+
+    def test_unknown_name_raises_rather_than_silently_falling_back(self, fixture_dir: Path) -> None:
+        """The failure that matters: dropping the name would leave the run uploading the other
+        classes and reporting their service time under item 2.1's heading."""
+        with pytest.raises(RuntimeError, match="nope.pdf"):
+            lf._load_fixtures(str(fixture_dir), ["nope.pdf"])
+
+    def test_missing_directory_is_empty_not_an_error(self, tmp_path: Path) -> None:
+        """Chat-mode runs import the locustfile with no fixtures mounted; UploadUser.on_start
+        is where an empty pool is fatal, and only for MODE=upload."""
+        assert lf._load_fixtures(str(tmp_path / "absent"), []) == []
+
+
+class TestFixtureRotation:
+    def test_every_fixture_is_used_once_per_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Item 2.2 uploads a stratified sample of 20 filings with 20 users, one each. Under
+        the independent `random.choice` this replaced, that covers only ~12.8 of the 20 on
+        average and duplicates the rest — and misses the slowest document, which dominates
+        E[S^2], about a third of the time. The queue curve would look entirely plausible."""
+        monkeypatch.setenv("LOADTEST_MODE", "upload")
+        module = _load_locustfile()
+        module.FIXTURES = [f"/fixtures/{i:02d}.pdf" for i in range(20)]
+        import itertools
+
+        module._FIXTURE_CYCLE = itertools.cycle(module.FIXTURES)
+
+        drawn = [next(module._FIXTURE_CYCLE) for _ in range(20)]
+        assert sorted(drawn) == sorted(module.FIXTURES)
+        # And it keeps cycling rather than stopping at the end of the pool.
+        assert next(module._FIXTURE_CYCLE) == module.FIXTURES[0]
+
+
+class TestUploadUserRetires:
+    def test_finished_uploader_stops_instead_of_spinning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """UploadUser's wait_time is 0, so a finished user that merely `return`s puts locust
+        into a tight loop of no-op task calls for the rest of -t. Observed at -u 1: a full
+        core, 97C package temperature, and nothing being measured. At -u 20 those greenlets
+        would also compete with the ones still reading streams for in-flight documents."""
+        monkeypatch.setenv("LOADTEST_MODE", "upload")
+        module = _load_locustfile()
+
+        user = module.UploadUser.__new__(module.UploadUser)
+        user._uploads_done = module.UPLOADS_PER_USER
+
+        # module.StopUser is whatever the locustfile imported — the stub class here, the real
+        # locust.exception.StopUser in a run.
+        with pytest.raises(module.StopUser):
+            module.UploadUser.upload_document(user)

@@ -90,6 +90,10 @@ async def register(
     sess = await session_repo.create(user.id, expires_at)
     access_token = create_access_token(user.id)
     refresh_token = create_refresh_token(user.id, sess.id)
+    # Commit before returning: get_db_session's teardown commit runs after the response body
+    # is already sent, so a client that immediately uses this access_token (e.g. Locust's
+    # on_start) can race a subsequent request's user lookup against an uncommitted INSERT.
+    await session.commit()
     _set_refresh_cookie(response, refresh_token)
     return TokenResponse(
         access_token=access_token,

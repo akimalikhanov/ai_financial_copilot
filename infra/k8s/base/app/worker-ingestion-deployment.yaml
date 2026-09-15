@@ -159,8 +159,14 @@ spec:
             periodSeconds: 120
             timeoutSeconds: 60
             failureThreshold: 5
+          # requests.memory was 1536Mi while this pod was measured peaking at 5.0GiB parsing a
+          # large PDF (and it has been OOMKilled once at exit 137). The scheduler places on
+          # requests and the kubelet evicts by how far a pod exceeds them, so a request set at a
+          # third of the real peak makes this the first pod reclaimed whenever the node fills —
+          # mid-ingestion, with acks_late redelivering the document to the replacement pod.
+          # 4Gi is the observed steady-state ceiling; the 12Gi limit still absorbs the spike.
           resources:
-            requests: { cpu: "500m", memory: "1536Mi" }
+            requests: { cpu: "500m", memory: "4Gi" }
             limits:   { cpu: "4000m", memory: "12Gi" }   # compose: cpus 4.00 / mem_limit 12g
           # GPU is deliberately NOT requested here. Compose reserves an nvidia device for
           # this service, but a base manifest that hard-requires nvidia.com/gpu is
@@ -169,6 +175,8 @@ spec:
           # The kind overlay adds the GPU request (and the nodeSelector) as a patch:
           # overlays/kind/patches/worker-ingestion-gpu.yaml. See docs/notes/gpu-in-kubernetes.md.
       volumes:
+        # Pod-scoped, so it survives an OOMKill container restart; the app purges stale
+        # shards at startup (src/observability/multiproc.py). See worker-chat-deployment.yaml.
         - name: prom-multiproc
           emptyDir: {}
         - name: hf-model-cache

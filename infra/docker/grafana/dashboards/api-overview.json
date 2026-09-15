@@ -1,18 +1,24 @@
 {
   "title": "API Overview",
   "uid": "api-overview",
-  "description": "On-call first stop: traffic, latency, errors, in-flight requests, and error log context.",
+  "description": "API request rate, latency, errors and admission control. Container/datastore memory saturation lives on the Resources dashboard (uid: resources).",
   "schemaVersion": 39,
   "version": 3,
   "refresh": "30s",
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "templating": {
     "list": [
       {
         "name": "endpoint",
         "label": "Endpoint",
         "type": "query",
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
         "query": "label_values(http_requests_total, endpoint)",
         "includeAll": true,
         "allValue": ".*",
@@ -27,8 +33,16 @@
       "title": "Request Rate (RPS)",
       "type": "timeseries",
       "description": "Baseline traffic — spot sudden drops or spikes per endpoint.",
-      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{endpoint=~\"$endpoint\"}[1m])) by (endpoint)",
@@ -38,18 +52,34 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 2,
       "title": "p50 / p95 / p99 Latency (s)",
       "type": "timeseries",
       "description": "SLO tracking — distinguish median vs tail latency per endpoint.",
-      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{endpoint=~\"$endpoint\"}[1m])) by (le, endpoint))",
@@ -67,24 +97,54 @@
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byRegexp", "options": "p99.*" },
-            "properties": [{ "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } }]
+            "matcher": {
+              "id": "byRegexp",
+              "options": "p99.*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    8,
+                    4
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
           }
         ]
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 3,
       "title": "4xx / 5xx Error Rate",
       "type": "timeseries",
       "description": "Primary incident signal — client and server errors by endpoint.",
-      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{status=~\"4..\",endpoint=~\"$endpoint\"}[1m])) by (endpoint, status)",
@@ -98,28 +158,66 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byRegexp", "options": "5xx.*" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byRegexp",
+              "options": "5xx.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byRegexp", "options": "4xx.*" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byRegexp",
+              "options": "4xx.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 4,
       "title": "In-Flight Requests",
       "type": "timeseries",
       "description": "Detect request pile-up or slow drain — gauge of currently active requests.",
-      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(http_requests_in_progress{endpoint=~\"$endpoint\"}) by (method, endpoint)",
@@ -130,22 +228,46 @@
         "defaults": {
           "unit": "short",
           "min": 0,
-          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
         }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 5,
       "title": "Recent Error Log Lines",
       "type": "logs",
       "description": "Jump from a metric anomaly to log context. Filter by endpoint using the variable above.",
-      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 10 },
-      "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 10
+      },
+      "datasource": {
+        "type": "elasticsearch",
+        "uid": "elasticsearch"
+      },
       "targets": [
         {
           "query": "level:ERROR",
-          "metrics": [{ "id": "1", "type": "logs", "settings": { "limit": "500" } }],
+          "metrics": [
+            {
+              "id": "1",
+              "type": "logs",
+              "settings": {
+                "limit": "500"
+              }
+            }
+          ],
           "bucketAggs": [],
           "timeField": "timestamp"
         }
@@ -165,30 +287,66 @@
       "title": "Saturation",
       "type": "row",
       "description": "How full the system is — the signal that predicts failure before latency does.",
-      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 }
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 1
+      }
     },
     {
       "id": 7,
       "title": "SSE Streams Open",
       "type": "timeseries",
       "description": "Currently open chat/ingestion streams. Was structurally impossible to see before Phase 0 (naive middleware records duration at call_next return, before the body streams).",
-      "gridPos": { "x": 0, "y": 27, "w": 8, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
-        { "expr": "sse_streams_open", "legendFormat": "{{endpoint}}" }
+        {
+          "expr": "sse_streams_open",
+          "legendFormat": "{{endpoint}}"
+        }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 8,
       "title": "Chat Queue Wait p95",
       "type": "timeseries",
       "description": "Enqueue -> task start. Rising wait with flat latency elsewhere means the worker pool is the bottleneck, not the LLM.",
-      "gridPos": { "x": 8, "y": 27, "w": 8, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 8,
+        "y": 27,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum(rate(chat_queue_wait_seconds_bucket[5m])) by (le))",
@@ -196,17 +354,37 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 9,
       "title": "PgBouncer Clients Waiting",
       "type": "timeseries",
       "description": "cl_waiting from SHOW POOLS. Any non-zero value means clients are queuing for a server connection — must stay at 0 (Phase 1 acceptance).",
-      "gridPos": { "x": 16, "y": 27, "w": 8, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 16,
+        "y": 27,
+        "w": 8,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(pgbouncer_pools_client_waiting_connections) by (database)",
@@ -214,17 +392,37 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 12,
       "title": "Chat Queue Depth vs Admission Threshold",
       "type": "timeseries",
       "description": "Backlog on the broker's chat list against CHAT_QUEUE_MAX_DEPTH, above which /v1/chat returns 503. max() not sum(): every worker replica samples the same shared queue, so summing multiplies depth by the replica count. The threshold line is derived from slots x (promised wait / service time) — update it here when CHAT_QUEUE_MAX_DEPTH changes.",
-      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "max(celery_queue_length{queue_name=\"chat\"}) by (queue_name)",
@@ -236,27 +434,68 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "CHAT_QUEUE_MAX_DEPTH" },
+            "matcher": {
+              "id": "byName",
+              "options": "CHAT_QUEUE_MAX_DEPTH"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
-              { "id": "custom.fillOpacity", "value": 0 },
-              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
             ]
           }
         ]
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 13,
       "title": "Chat Admission Rejections",
       "type": "timeseries",
       "description": "Requests refused with 503 + Retry-After because the queue was at capacity. Shedding load is a feature — a brief spike during a burst is the valve working. Sustained non-zero means demand exceeds provisioned slots: add replicas, or lower the threshold to match real capacity.",
-      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(rate(chat_admission_rejected_total[5m])) * 60",
@@ -264,57 +503,37 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
-      },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
-    },
-    {
-      "id": 10,
-      "title": "Redis Memory vs Limit",
-      "type": "timeseries",
-      "description": "redis-app / redis-broker memory against the container limit — watch this during an 8h soak (Phase 2 acceptance: flat, not growing).",
-      "gridPos": { "x": 0, "y": 43, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "expr": "redis_memory_used_bytes",
-          "legendFormat": "{{instance}} used"
-        },
-        {
-          "expr": "redis_memory_max_bytes",
-          "legendFormat": "{{instance}} maxmemory"
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
         }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
-    },
-    {
-      "id": 11,
-      "title": "OpenSearch Container Memory",
-      "type": "timeseries",
-      "description": "Container working set vs the 2560Mi limit (Phase 0.1). Was measured at 99.7% of the old 1536Mi limit at idle.",
-      "gridPos": { "x": 12, "y": 43, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        {
-          "expr": "sum(container_memory_working_set_bytes{namespace=\"copilot\", pod=~\"opensearch-.*\", container=\"opensearch\"}) by (pod)",
-          "legendFormat": "{{pod}}"
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
         }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "bytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
-      },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      }
     },
     {
       "id": 14,
       "title": "Postgres Idle in Transaction",
       "type": "timeseries",
       "description": "Backends holding an open transaction while doing nothing. T3 acceptance: stays < 5 while SSE streams are held — a stream that parks a transaction shows up here.",
-      "gridPos": { "x": 0, "y": 51, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(pg_stat_activity_count{state=~\"idle in transaction.*\"}) by (datname, state)",
@@ -322,17 +541,37 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     },
     {
       "id": 15,
       "title": "Postgres xmin Horizon Age",
       "type": "timeseries",
       "description": "Age in transactions of the oldest snapshot held by a live backend. T6 acceptance: flat — sustained growth means a long-lived transaction is blocking vacuum. Not the same as datfrozenxid age.",
-      "gridPos": { "x": 12, "y": 51, "w": 12, "h": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "pg_xmin_horizon_oldest_backend_xmin_age",
@@ -344,9 +583,21 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        }
       },
-      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      }
     }
   ]
 }

@@ -161,9 +161,9 @@ spec:
             requests: { cpu: "250m", memory: "1536Mi" }
             limits:   { cpu: "2000m", memory: "3Gi" }   # compose: cpus 2.00 / mem_limit 3g
       volumes:
-        # emptyDir, not a PVC: pod-scoped lifetime is exactly right for multiprocess metric
-        # shards. Stale shards surviving a restart would double-count. Counters resetting on
-        # restart is expected and harmless — the dashboards use rate().
+        # emptyDir, not a PVC: nothing here is worth persisting. Note it is *pod*-scoped, so
+        # it survives an OOMKill container restart — the app purges it at startup instead
+        # (src/observability/multiproc.py), which is what keeps the in-flight gauges honest.
         - name: prom-multiproc
           emptyDir: {}
 ---

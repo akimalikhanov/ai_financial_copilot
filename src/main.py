@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from prometheus_client import make_asgi_app
+from prometheus_client import REGISTRY, CollectorRegistry, make_asgi_app, multiprocess
 
 from src.api.exceptions import llm_error_handler
 from src.api.logging import configure_logging, request_logging_middleware
@@ -30,6 +31,20 @@ from src.utils.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _metrics_registry() -> CollectorRegistry:
+    """Registry for ``/metrics``: multiprocess-aware when the shard dir is configured.
+
+    Falls back to the default process-local registry otherwise (dev `make api`, tests),
+    which is also the only mode that carries the python_gc_*/process_* collectors.
+    """
+    mpdir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+    if not mpdir:
+        return REGISTRY
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    return registry
 
 
 @asynccontextmanager
@@ -77,8 +92,12 @@ def create_app() -> FastAPI:
 
     app.middleware("http")(request_logging_middleware)
 
-    # Expose Prometheus metrics (scraped by Prometheus locally / Operator in K8s)
-    app.mount("/metrics", make_asgi_app())
+    # Expose Prometheus metrics (scraped by Prometheus locally / Operator in K8s).
+    # Dockerfile.api sets PROMETHEUS_MULTIPROC_DIR, which makes every metric write to a
+    # per-PID mmap file. The default registry reports only the serving process's own
+    # values, so it is correct at --workers 1 but silently under-reports the moment the
+    # API is scaled; the multiprocess collector aggregates every worker's shard.
+    app.mount("/metrics", make_asgi_app(_metrics_registry()))
 
     # Register global exception handler for LLM errors
     app.add_exception_handler(LLMError, llm_error_handler)

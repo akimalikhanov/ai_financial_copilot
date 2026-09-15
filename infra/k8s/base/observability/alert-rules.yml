@@ -1,0 +1,127 @@
+# Evaluated by Prometheus itself — there is no Alertmanager in this stack. A firing rule
+# becomes an ALERTS{alertname=...,alertstate="firing"} series, visible in Grafana's alert
+# view and in the "Firing Alerts" panel on the Resources dashboard, and it persists for the
+# 30d TSDB retention. That is the point: an OOMKill at 03:00 leaves a durable trace instead
+# of living only in pod status that the next restart overwrites.
+groups:
+  - name: container-resources
+    interval: 30s
+    rules:
+      # The alert that would have caught the miss: worker-ingestion hit its ceiling and was
+      # killed (exit 137) with nothing recording it. Restart-with-reason is what separates an
+      # OOM from a crash or an eviction; cAdvisor's container_oom_events_total does not.
+      - alert: ContainerOOMKilled
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="copilot"}[10m]) > 0
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{namespace="copilot", reason="OOMKilled"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} was OOMKilled"
+          description: >-
+            Killed by the kernel at its memory limit. Celery runs acks_late, so the in-flight
+            task is redelivered rather than lost — a repeating OOM shows up as duplicate work
+            and re-billed LLM calls, not as a task failure.
+
+      # Fires before the kill. Catches slow growth only: a single large allocation (a big PDF
+      # through Docling) outruns a 10m window, and ContainerOOMKilled is the net for that.
+      #
+      # The JVM/heap services are excluded because they reserve their heap at startup and then
+      # sit against the limit permanently — elasticsearch measured a 24h *minimum* of 0.93 and a
+      # steady 0.98. Alerting on them would fire forever and teach you to ignore the rule, which
+      # costs more than the coverage is worth; their real failure signal is a heap-pressure or
+      # GC metric, not working-set-vs-limit.
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{namespace="copilot", container!~"|elasticsearch|opensearch|clickhouse"}
+            / container_spec_memory_limit_bytes{namespace="copilot", container!~"|elasticsearch|opensearch|clickhouse"} > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} at {{ $value | humanizePercentage }} of its memory limit"
+
+      # The CPU counterpart of an OOM, and quieter: no restart, no error, just latency. The
+      # cgroup throttles the container and task p95 drifts up with nothing else to show for it.
+      - alert: ContainerCPUThrottling
+        expr: |
+          rate(container_cpu_cfs_throttled_periods_total{namespace="copilot", container!=""}[5m])
+            / clamp_min(rate(container_cpu_cfs_periods_total{namespace="copilot", container!=""}[5m]), 1) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} CPU-throttled {{ $value | humanizePercentage }} of periods"
+
+      # Restarts that are not OOM — failed migration, bad config, a dependency that never came
+      # up. Threshold is above the readiness-probe flapping seen during a rolling update, and
+      # the owner join keeps one-shot bootstrap Jobs (which legitimately retry) out of it.
+      - alert: ContainerRestarting
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="copilot"}[1h]) > 3
+          and on (namespace, pod)
+          kube_pod_owner{namespace="copilot", owner_kind=~"ReplicaSet|StatefulSet|DaemonSet"}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} restarted {{ $value | printf \"%.0f\" }}x in the last hour"
+
+      # A pod stuck Pending is invisible in the app metrics: the workload just runs with fewer
+      # replicas and a deeper queue. 15m is past any normal image pull or init-container wait.
+      #
+      # Restricted to pods owned by a controller that is supposed to keep them running. Without
+      # the join this fires on every completed bootstrap Job in the namespace (garage-bootstrap,
+      # es-bootstrap, model-preload) and on superseded ReplicaSet pods left behind by a rollout —
+      # all of which sit in a terminal phase forever by design.
+      - alert: PodNotReady
+        expr: |
+          max by (namespace, pod, phase) (
+            kube_pod_status_phase{namespace="copilot", phase=~"Pending|Unknown"} == 1
+          )
+          and on (namespace, pod)
+          kube_pod_owner{namespace="copilot", owner_kind=~"ReplicaSet|StatefulSet|DaemonSet"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }} stuck in {{ $labels.phase }} for 15m"
+
+  - name: node-resources
+    interval: 30s
+    rules:
+      # Node memory pressure evicts by QoS class, so a pod whose requests sit below its real
+      # working set goes first. Limits across this namespace sum well past node capacity, which
+      # is fine until several pods peak together.
+      - alert: NodeMemoryPressure
+        expr: |
+          sum by (node) (container_memory_working_set_bytes{namespace="copilot", container!=""})
+            / sum by (node) (kube_node_status_allocatable{resource="memory"}) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} at {{ $value | humanizePercentage }} of allocatable memory"
+
+      - alert: NodeConditionUnhealthy
+        expr: |
+          kube_node_status_condition{condition=~"MemoryPressure|DiskPressure|PIDPressure", status="true"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.node }} reports {{ $labels.condition }} — pods will be evicted"
+
+  - name: scrape-health
+    interval: 30s
+    rules:
+      # Without this, monitoring that has itself fallen over is indistinguishable from nothing
+      # being wrong: every rule above silently stops evaluating when its exporter stops answering.
+      - alert: TargetDown
+        expr: up == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus target {{ $labels.job }} ({{ $labels.instance }}) has been down for 10m"

@@ -37,6 +37,7 @@ from src.utils.config import (
     get_docling_ocr_use_gpu,
     get_docling_picture_vlm_model,
     get_docling_picture_vlm_prompt,
+    get_docling_scan_ocr_enabled,
     get_docling_text_quality_threshold,
 )
 
@@ -176,8 +177,65 @@ def parse(pdf_path: Path) -> ParseResult:
     result = _check_status(converter.convert(pdf_path), pdf_path)
     parse_status = result.status.name.lower()  # e.g. success, partial_success
 
+    # A scan has no text layer to garble, so it slips past the quality gate below: `assess`
+    # returns not-garbled for any sample under _MIN_SAMPLE_CHARS, and a scan's sample is
+    # essentially empty. With DOCLING_DO_OCR=false that document goes on to produce zero
+    # chunks and is marked ready — indexed and unsearchable, with nothing in the status to
+    # say so.
+    #
+    # The classification reads the PDF rather than `result.document`, because a scanned page
+    # parses to texts=0, pictures=0, tables=0 — indistinguishable from a blank page. Gated on
+    # a near-empty parse so the probe (~2ms a page) never runs on a normal document.
+    verdict, page_stats = "text", text_quality.PageContentStats(0, 0, 0, 0, 0)
+    if text_quality.looks_textless(result.document, len(result.pages)):
+        verdict, page_stats = text_quality.classify_page_content(pdf_path)
+
+    if verdict == "scanned":
+        _LOG.warning(
+            "docling.scanned_pdf_detected",
+            extra={
+                "pdf_path": str(pdf_path),
+                "scanned_pages": page_stats.scanned_pages,
+                "text_pages": page_stats.text_pages,
+                "blank_pages": page_stats.blank_pages,
+                "total_pages": page_stats.total_pages,
+            },
+        )
+        if get_docling_scan_ocr_enabled():
+            result = _check_status(
+                _get_ocr_converter().convert(pdf_path), pdf_path, stage="scan_ocr"
+            )
+            retry_status = result.status.name.lower()
+            # Judged on the OCR'd document, not by re-probing the PDF: the file is unchanged,
+            # so the probe would report "scanned" however well the OCR went. What matters now
+            # is whether text came out, which is a property of the new parse.
+            still_textless = text_quality.looks_textless(result.document, len(result.pages))
+            if still_textless:
+                # OCR ran and the pages still carry no text: an unreadable scan, not a
+                # recoverable one. Never "success" — the UI badge keys on that
+                # (src/ui/App.tsx:160) and this document has no retrievable content.
+                parse_status = "scanned_no_text"
+            elif retry_status != "success":
+                parse_status = f"{retry_status}_scan_ocr"
+            else:
+                parse_status = "success_scan_ocr"
+            _LOG.warning(
+                "docling.scan_ocr_complete",
+                extra={"pdf_path": str(pdf_path), "parse_status": parse_status},
+            )
+        else:
+            parse_status = "scanned_no_text"
+    elif verdict == "blank":
+        # No text and no page images anywhere. OCR would only spend ~4.3s a page proving the
+        # document is still empty, so it is reported rather than retried.
+        parse_status = "empty"
+        _LOG.warning(
+            "docling.empty_document",
+            extra={"pdf_path": str(pdf_path), "total_pages": page_stats.total_pages},
+        )
+
     # A broken font encoding still parses as SUCCESS, so the status alone will not catch it.
-    if get_docling_ocr_fallback_enabled():
+    if parse_status in ("success", "partial_success") and get_docling_ocr_fallback_enabled():
         threshold = get_docling_text_quality_threshold()
         sample = text_quality.sample_document_text(result.document)
         garbled, ratio = text_quality.assess(sample, threshold=threshold)

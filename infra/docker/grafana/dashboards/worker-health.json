@@ -79,7 +79,7 @@
       "id": 4,
       "title": "Queue Depth",
       "type": "timeseries",
-      "description": "Backlog growth = workers can't keep up. Approximate (LLEN omits in-flight tasks).",
+      "description": "Backlog growth = workers can't keep up. Waiting tasks only — LLEN omits in-flight work; see Outstanding Work below.",
       "gridPos": { "x": 16, "y": 1, "w": 8, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
@@ -181,10 +181,54 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 18,
+      "title": "Ingestion Queue Wait p50 / p95 (s)",
+      "type": "timeseries",
+      "description": "Upload accepted -> task start. At one ingestion slot this is most of the user-visible wait. Measured from documents.created_at, stamped before the S3 PUT, so a large upload inflates it.",
+      "gridPos": { "x": 0, "y": 26, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ingestion_queue_wait_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ingestion_queue_wait_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 19,
+      "title": "Outstanding Work — Queued vs In Flight",
+      "type": "timeseries",
+      "description": "celery_queue_length is an LLEN: waiting tasks only. A reserved task leaves the list, so at one ingestion slot an idle worker and a worker mid-parse both read 0. Total outstanding work is the two series summed.",
+      "gridPos": { "x": 12, "y": 26, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(celery_queue_length{queue_name=\"ingestion\"})",
+          "legendFormat": "queued"
+        },
+        {
+          "expr": "sum(celery_tasks_in_flight{task_name=\"ingest_document\"})",
+          "legendFormat": "in flight"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 10,
       "type": "row",
       "title": "Silent Failure Modes (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 34, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -192,7 +236,7 @@
       "title": "Retry Storm — Documents by Attempt Count",
       "type": "barchart",
       "description": "Documents hitting 3+ attempts — silent failure mode not visible in Prometheus.",
-      "gridPos": { "x": 0, "y": 27, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -209,7 +253,7 @@
       "title": "Partial-Parse Rate",
       "type": "piechart",
       "description": "partial_success rate; Docling degradation.",
-      "gridPos": { "x": 12, "y": 27, "w": 12, "h": 8 },
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -230,7 +274,7 @@
       "title": "Worker Error Logs",
       "type": "logs",
       "description": "Stack traces for failed tasks — Celery and ingestion/chat worker loggers at ERROR level.",
-      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 10 },
+      "gridPos": { "x": 0, "y": 43, "w": 24, "h": 10 },
       "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
       "targets": [
         {

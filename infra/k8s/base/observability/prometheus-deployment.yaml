@@ -5,6 +5,13 @@ metadata:
   namespace: copilot
 spec:
   replicas: 1
+  # Recreate, not the default RollingUpdate: prometheus-data is ReadWriteOnce and the TSDB
+  # takes an exclusive lock on it. Under RollingUpdate the new pod starts before the old one
+  # releases the volume and dies on "lock DB directory: resource temporarily unavailable",
+  # crashlooping until the rollout times out — so any config change would be undeployable.
+  # A single-replica metrics store has nothing to gain from a surge anyway.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: prometheus

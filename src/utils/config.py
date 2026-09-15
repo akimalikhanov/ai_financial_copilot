@@ -261,8 +261,9 @@ def get_llm_connect_timeout_seconds() -> float:
 def get_llm_max_retries() -> int:
     """SDK-level retries (LLM_MAX_RETRIES, default 1).
 
-    Attempts multiply across layers: the openai default of 2 retries (3 attempts) times the
-    app-level parse retry in query_transformer/router is 6 HTTP calls for one rewrite.
+    Attempts multiply across layers: 2 attempts times the app-level parse retry in
+    query_transformer/router is 4 HTTP calls for one rewrite (the openai default of 2
+    retries would make it 6). Each layer is separately bounded by its own timeout.
     """
     return int(os.getenv("LLM_MAX_RETRIES", "1"))
 
@@ -523,6 +524,19 @@ def get_docling_text_quality_threshold() -> float:
         return float(os.getenv("DOCLING_TEXT_QUALITY_THRESHOLD", "0.02"))
     except ValueError:
         return 0.02
+
+
+def get_docling_scan_ocr_enabled() -> bool:
+    """DOCLING_SCAN_OCR_ENABLED (default: true).
+
+    Re-parse with forced full-page OCR when a PDF has no text layer at all (a scan). Separate
+    from DOCLING_OCR_FALLBACK_ENABLED, which covers a *present but garbled* text layer: this
+    path costs ~4.3s a page on documents that would otherwise finish in seconds, so it is the
+    one to turn off first when the single ingestion slot is the binding constraint. Left on by
+    default because the alternative is a document that completes with zero chunks and is
+    marked ready — silently unsearchable.
+    """
+    return _parse_bool(os.getenv("DOCLING_SCAN_OCR_ENABLED"), True)
 
 
 def get_docling_device() -> str:
@@ -955,12 +969,13 @@ def get_router_config() -> dict[str, float | int]:
     """Query router configuration from environment variables.
 
     Returns:
-        Dict with keys: temperature, max_tokens, entity_similarity_threshold,
+        Dict with keys: temperature, max_tokens, timeout, entity_similarity_threshold,
         entity_max_candidates, filtered_md_thresh.
     """
     return {
         "temperature": float(os.getenv("ROUTER_TEMPERATURE", "0.0")),
         "max_tokens": int(os.getenv("ROUTER_MAX_TOKENS", "800")),
+        "timeout": float(os.getenv("ROUTER_TIMEOUT", "10.0")),
         "entity_similarity_threshold": float(os.getenv("ENTITY_SIMILARITY_THRESHOLD", "0.3")),
         "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
         "filtered_md_thresh": int(os.getenv("FILTERED_MD_THRESH", "5")),

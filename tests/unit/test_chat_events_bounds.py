@@ -1,7 +1,12 @@
-"""Chat SSE event streams must be bounded: capped length, and a TTL once the request ends.
+"""Chat SSE event streams must be bounded: capped length, and a TTL that always applies.
 
 Regression cover for the leak in §4.3 of the loadtest audit — streams were written with no
-maxlen, no TTL, and nothing deleting them, so every request left a key behind forever.
+maxlen, no TTL, and nothing deleting them, so every request left a key behind forever. The
+first fix only set a TTL at normal completion (expire_event_stream), which left a second,
+narrower version of the same leak: a pipeline that crashes, times out, or is killed before
+reaching that call leaves its stream with no TTL forever. add_event now refreshes the TTL on
+every write, so a stream self-heals off the last event it ever received instead of relying on
+a specific exit path being reached.
 """
 
 from __future__ import annotations
@@ -30,10 +35,24 @@ async def redis() -> AsyncGenerator[FakeAsyncRedis, None]:
 
 
 @pytest.mark.asyncio
-async def test_add_event_leaves_no_ttl_while_streaming(redis: FakeAsyncRedis) -> None:
-    """An in-flight stream must NOT expire — the client is still reading it."""
+async def test_add_event_sets_a_bounded_ttl(redis: FakeAsyncRedis) -> None:
+    """Every write gets a TTL, not just the completion path — an abandoned stream must
+    still self-heal even if nothing ever calls expire_event_stream()."""
     await add_event(redis, _REQUEST_ID, "delta", {"text": "hello"})
-    assert await redis.ttl(_KEY) == -1
+    ttl = await redis.ttl(_KEY)
+    assert 0 < ttl <= get_chat_events_ttl()
+
+
+@pytest.mark.asyncio
+async def test_add_event_refreshes_ttl_on_every_write(redis: FakeAsyncRedis) -> None:
+    """An in-flight stream must not actually expire while the client is still reading it:
+    each new event pushes the TTL back out to the full window, so a live pipeline (well
+    under CHAT_EVENTS_TTL=3600s) never races its own deadline. Force the TTL down first so a
+    subsequent write's reset is unambiguous rather than lost in normal-case noise."""
+    await add_event(redis, _REQUEST_ID, "delta", {"text": "hello"})
+    await redis.expire(_KEY, 5)
+    await add_event(redis, _REQUEST_ID, "delta", {"text": "world"})
+    assert await redis.ttl(_KEY) > 5
 
 
 @pytest.mark.asyncio

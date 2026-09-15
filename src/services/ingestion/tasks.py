@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -26,6 +27,7 @@ from src.observability.metrics import (
     INGESTION_CHUNKS,
     INGESTION_DOCUMENTS,
     INGESTION_DURATION,
+    INGESTION_QUEUE_WAIT,
 )
 from src.redis_client import ingestion_stream_key
 from src.services.ingestion.chunker import reset_tokenizer
@@ -285,6 +287,11 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 )
                 return
 
+            if attempt == 1:
+                # First attempt only: on a redelivery created_at is the original upload,
+                # so the difference would report the failed attempt's runtime as queue wait.
+                INGESTION_QUEUE_WAIT.observe((datetime.now(UTC) - doc.created_at).total_seconds())
+
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
             upload_metadata = dict(doc.document_metadata or {})
@@ -412,9 +419,17 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         INGESTION_CHUNKS.observe(len(chunks))
 
         if not chunks:
-            logger.info(
+            # Zero chunks means nothing was indexed: the document is "ready" but no query can
+            # ever retrieve it. Logged at warning and counted under its own status rather than
+            # "success" — a scanned PDF with OCR disabled lands here, and as a plain success it
+            # was indistinguishable from a document that ingested correctly.
+            logger.warning(
                 "pipeline.no_chunks",
-                extra={"document_id": document_id, "stage": "chunk_document"},
+                extra={
+                    "document_id": document_id,
+                    "stage": "chunk_document",
+                    "parse_status": parse_result.parse_status,
+                },
             )
             await _log_stage("finalize_ready")
             stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
@@ -427,7 +442,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.update_status(doc_uuid, "ready")
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
-            INGESTION_DOCUMENTS.labels("success").inc()
+            INGESTION_DOCUMENTS.labels("no_content").inc()
             await _emit("done", {"chunks": 0})
             logger.info(
                 "pipeline.complete",

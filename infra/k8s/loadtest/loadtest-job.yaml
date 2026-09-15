@@ -57,6 +57,51 @@ spec:
               mountPath: /results
           resources:
             requests: { cpu: "10m", memory: "16Mi" }
+        # LOADTEST_MODE=upload with an empty fixture directory would spawn users that raise
+        # on start, which Locust reports as errors rather than as a setup failure — a run that
+        # looks like it measured something. Fail before the Job starts instead. Skipped
+        # entirely for the chat modes, which need no fixtures.
+        - name: assert-fixtures
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              if [ "$LOADTEST_MODE" != "upload" ]; then
+                echo "mode=$LOADTEST_MODE needs no fixtures, skipping"; exit 0
+              fi
+              # Checks the directory the run will actually read, not /fixtures: item 2.2's
+              # backlog lives in a subdirectory, and validating the parent would pass while the
+              # selected directory was empty.
+              dir="${LOADTEST_FIXTURE_DIR:-/fixtures}"
+              count=$(find "$dir" -maxdepth 1 -name '*.pdf' 2>/dev/null | wc -l)
+              if [ "$count" -eq 0 ]; then
+                echo "REFUSING TO RUN: no PDFs in $dir." >&2
+                echo "Run: make loadtest-fixtures SOURCE=<a real filing>" >&2
+                echo "If that was already run, the host directory is not reaching the node:" >&2
+                echo "kind extraMounts apply only at cluster creation, so a cluster older" >&2
+                echo "than that entry needs: make k8s-loadtest-fixtures-push" >&2
+                echo "See docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3." >&2
+                exit 1
+              fi
+              echo "found $count fixture PDF(s) in $dir"
+              find "$dir" -maxdepth 1 -name '*.pdf' -exec ls -la {} \;
+              # A named-fixture typo would otherwise surface as a spawn-time RuntimeError from
+              # every user, in among the request stats. Catch it here.
+              for want in $(echo "$LOADTEST_FIXTURES" | tr ',' ' '); do
+                if [ ! -f "$dir/$want" ]; then
+                  echo "REFUSING TO RUN: LOADTEST_FIXTURES names '$want', not in $dir." >&2
+                  exit 1
+                fi
+              done
+          envFrom:
+            - configMapRef: { name: loadtest-params }
+          volumeMounts:
+            - name: fixtures
+              mountPath: /fixtures
+              readOnly: true
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
         # Fails the Job before a single request is sent if the API is not serving the fake
         # adapter — including the case the overlay alone cannot catch: an api pod that was
         # never restarted after the patch and is still holding the real config in its
@@ -132,6 +177,12 @@ spec:
               readOnly: true
             - name: results
               mountPath: /results
+            # LOADTEST_FIXTURE_DIR defaults to /fixtures in the locustfile. Mounted for every
+            # mode, not just upload: an unused read-only mount costs nothing, and gating it
+            # would mean two Job variants.
+            - name: fixtures
+              mountPath: /fixtures
+              readOnly: true
           # Generous on purpose: a throttled load generator produces exactly the false knee
           # this whole exercise exists to avoid.
           resources:
@@ -148,3 +199,8 @@ spec:
         - name: results
           persistentVolumeClaim:
             claimName: loadtest-results
+        # Inbound counterpart to results: the ingestion fixture PDFs, too large for a
+        # ConfigMap (see fixtures-pv.yaml).
+        - name: fixtures
+          persistentVolumeClaim:
+            claimName: loadtest-fixtures

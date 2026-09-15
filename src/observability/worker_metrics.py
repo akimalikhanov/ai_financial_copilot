@@ -16,10 +16,16 @@ import threading
 import time
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-from celery.signals import task_postrun, task_prerun, task_retry
+from celery.signals import task_postrun, task_prerun, task_retry, worker_process_shutdown
 from prometheus_client import CollectorRegistry, make_wsgi_app, multiprocess
 
-from src.observability.metrics import CELERY_DURATION, CELERY_QUEUE, CELERY_TASKS
+from src.observability.metrics import (
+    CELERY_DURATION,
+    CELERY_QUEUE,
+    CELERY_TASKS,
+    CELERY_TASKS_IN_FLIGHT,
+)
+from src.observability.multiproc import purge_multiproc_dir
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +51,10 @@ _started = False
 
 
 @task_prerun.connect
-def _on_task_prerun(task_id: str | None = None, **_kwargs: object) -> None:
+def _on_task_prerun(task_id: str | None = None, task=None, **_kwargs: object) -> None:
     if task_id is not None:
         _task_starts[task_id] = time.perf_counter()
+    CELERY_TASKS_IN_FLIGHT.labels(getattr(task, "name", "unknown")).inc()
 
 
 @task_postrun.connect
@@ -55,6 +62,7 @@ def _on_task_postrun(
     task_id: str | None = None, task=None, state: str | None = None, **_kwargs: object
 ) -> None:
     name = getattr(task, "name", "unknown")
+    CELERY_TASKS_IN_FLIGHT.labels(name).dec()
     CELERY_TASKS.labels(name, (state or "UNKNOWN").lower()).inc()
     start = _task_starts.pop(task_id, None) if task_id is not None else None
     if start is not None:
@@ -66,12 +74,35 @@ def _on_task_retry(sender=None, **_kwargs: object) -> None:
     CELERY_TASKS.labels(getattr(sender, "name", "unknown"), "retry").inc()
 
 
+@worker_process_shutdown.connect
+def _on_worker_process_shutdown_metrics(**_kwargs: object) -> None:
+    """Retire this child's multiprocess metric files.
+
+    ``livesum`` sums every live PID's file and drops dead ones — but only once
+    they are marked dead; it does not detect exits by itself. Without this, a
+    child that exits mid-task leaves its ``celery_tasks_in_flight`` increment in
+    place forever, and the gauge ratchets upward across pool recycles. Only
+    covers a graceful exit; a SIGKILLed child still leaks until the pod restarts.
+    """
+    mpdir = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+    if not mpdir:
+        return
+    try:
+        multiprocess.mark_process_dead(os.getpid(), mpdir)
+    except Exception:  # noqa: BLE001 — never let metrics cleanup block shutdown
+        logger.debug("worker_metrics.mark_process_dead_failed", exc_info=True)
+
+
 def _sample_queue_depth(queues: tuple[str, ...]) -> None:
     """Periodically sample broker list length per queue into CELERY_QUEUE.
 
-    LLEN is approximate (omits in-flight/unacked tasks) — good enough for trend
-    and alerting. Uses a sync Redis client on a daemon thread to stay off the
-    worker's event loop.
+    LLEN counts *waiting* tasks only. A task that a worker has reserved is gone
+    from the list, so in-flight and unacked work is invisible here: with one
+    ingestion slot, an idle worker and a worker mid-parse both read 0. Pair this
+    with ``celery_tasks_in_flight`` — total outstanding work is the sum of the
+    two, and "is anything running" is the second one alone.
+
+    Uses a sync Redis client on a daemon thread to stay off the worker's event loop.
     """
     from redis import Redis
 
@@ -95,11 +126,18 @@ def start_worker_metrics(port: int, queues: tuple[str, ...]) -> None:
     (set in the worker bootstrap); the parent's server aggregates them with a
     multiprocess collector. Without that env var (e.g. solo pool) it serves the
     default single-process registry.
+
+    Purges stale shards first: this runs in the parent before any child is forked,
+    which is the only safe moment to delete them. Normally already done by the
+    ``src.observability`` package body; the call is idempotent and kept here because
+    the aggregation below is only correct on a clean directory.
     """
     global _started
     if _started:
         return
     _started = True
+
+    purge_multiproc_dir()
 
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         registry = CollectorRegistry()

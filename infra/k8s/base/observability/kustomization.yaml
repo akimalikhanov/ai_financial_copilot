@@ -5,14 +5,16 @@ resources:
   - prometheus-rbac.yaml
   - prometheus-deployment.yaml
   - prometheus-service.yaml
+  - kube-state-metrics.yaml
   - fluent-bit-rbac.yaml
   - fluent-bit-daemonset.yaml
   - grafana-deployment.yaml
   - grafana-service.yaml
 
 configMapGenerator:
+  # Both land in /etc/prometheus; prometheus.yml's rule_files points at alert-rules.yml there.
   - name: prometheus-config
-    files: [prometheus.yml]
+    files: [prometheus.yml, alert-rules.yml]
   - name: fluent-bit-config
     files: [fluent-bit.conf, parsers.conf]
   - name: grafana-datasources
@@ -23,6 +25,7 @@ configMapGenerator:
     files:
       - grafana/dashboards/api-overview.json
       - grafana/dashboards/worker-health.json
+      - grafana/dashboards/resources.json
       - grafana/dashboards/agentic-rag.json
       - grafana/dashboards/cost-tokens.json
       - grafana/dashboards/logs-explorer.json

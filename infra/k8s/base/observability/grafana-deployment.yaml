@@ -5,6 +5,11 @@ metadata:
   namespace: copilot
 spec:
   replicas: 1
+  # Recreate for the same reason as prometheus-deployment.yaml: grafana-data is ReadWriteOnce
+  # and holds a SQLite database. A RollingUpdate overlaps two pods writing the same file, which
+  # risks corrupting it rather than failing loudly the way the Prometheus TSDB lock does.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: grafana

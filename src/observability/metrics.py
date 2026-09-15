@@ -28,13 +28,23 @@ HTTP_IN_PROGRESS = Gauge(
     "http_requests_in_progress",
     "In-flight requests",
     ["method", "endpoint"],
+    # livesum, not the default "all": under multiprocess the default keeps a per-PID
+    # series (unbounded cardinality across restarts, and every query needs its own
+    # sum()), and mark_process_dead only deletes live* shards — so a SIGKILLed
+    # process's leaked +1 would have no cleanup path at all.
+    multiprocess_mode="livesum",
 )
 
 # --- SSE streams ---
 # Naive middleware records duration/in-progress at call_next return, which for a
 # StreamingResponse is when headers are ready, not when the body finishes — so these are
 # instrumented directly in the generator instead of via HTTP_DURATION/HTTP_IN_PROGRESS.
-SSE_STREAMS_OPEN = Gauge("sse_streams_open", "Currently open SSE streams", ["endpoint"])
+SSE_STREAMS_OPEN = Gauge(
+    "sse_streams_open",
+    "Currently open SSE streams",
+    ["endpoint"],
+    multiprocess_mode="livesum",  # same reasoning as HTTP_IN_PROGRESS
+)
 SSE_STREAM_DURATION = Histogram(
     "sse_stream_duration_seconds",
     "SSE stream lifetime",
@@ -88,7 +98,27 @@ CELERY_DURATION = Histogram(
     # every ingestion into +Inf, breaking histogram_quantile (NaN).
     buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
 )
-CELERY_QUEUE = Gauge("celery_queue_length", "Queue depth", ["queue_name"])
+CELERY_QUEUE = Gauge(
+    "celery_queue_length",
+    "Broker queue depth (waiting tasks only — excludes in-flight/unacked work)",
+    ["queue_name"],
+    # Absolute .set() of an external truth (Redis LLEN), not a delta, so it cannot leak
+    # the way the in-flight gauges do. livemostrecent still beats the default "all":
+    # it drops the pid label and, if a sampler is ever replaced, reports the newest
+    # sample instead of exposing two competing series.
+    multiprocess_mode="livemostrecent",
+)
+CELERY_TASKS_IN_FLIGHT = Gauge(
+    "celery_tasks_in_flight",
+    "Tasks currently executing (prerun -> postrun)",
+    ["task_name"],
+    # Incremented in prefork children, so the default per-PID series would need
+    # summing by the query. livesum does it here and drops dead children's values —
+    # but only children that reached worker_process_shutdown. A SIGKILLed child's +1
+    # survives on disk, so correctness also depends on purge_multiproc_dir() running
+    # at startup; see src/observability/multiproc.py.
+    multiprocess_mode="livesum",
+)
 
 # --- Agentic RAG ---
 RAG_RETRIEVAL = Histogram(
@@ -215,5 +245,16 @@ INGESTION_DURATION = Histogram(
     ["stage"],  # parse | chunk | embed | upsert_qdrant | upsert_opensearch
     # Stages span ms-scale upserts to minute-scale Docling parses; default
     # buckets top out at 10s and dump every parse into +Inf (breaks quantiles).
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
+    # Ceiling is 900 to clear DOCLING_PARSE_TIMEOUT_SECONDS=600 and the 1200s
+    # Celery hard limit — a slow parse must land in a bucket, not in +Inf.
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900),
+)
+INGESTION_QUEUE_WAIT = Histogram(
+    "ingestion_queue_wait_seconds",
+    "Upload -> task start",
+    # Mirrors CHAT_QUEUE_WAIT. At one ingestion slot this is most of the
+    # user-visible latency, so the buckets run out to the 1200s hard limit.
+    # Measured from documents.created_at, which is stamped before the S3 PUT:
+    # a large upload inflates this by the PUT's duration.
+    buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200),
 )

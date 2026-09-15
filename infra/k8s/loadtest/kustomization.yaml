@@ -10,6 +10,7 @@ resources:
   - loadtest-job.yaml
   - loadtest-rbac.yaml
   - results-pv.yaml
+  - fixtures-pv.yaml
 
 configMapGenerator:
   # locustfile.py and models.yaml are copies kept in sync by `make k8s-sync-loadtest`
@@ -35,7 +36,7 @@ generatorOptions:
 images:
   - name: copilot/worker
     newName: localhost:5001/copilot/worker
-    newTag: c5b71a8-e938d83e
+    newTag: 9cd69b1-ba3e885c
 
 # These three must land together with the Job — that coupling is what makes accidental
 # real-LLM spend impossible. worker-ingestion is included because the table summarizer and

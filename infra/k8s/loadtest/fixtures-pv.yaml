@@ -1,0 +1,44 @@
+# Static hostPath PV/PVC pair delivering the ingestion fixture PDFs to the Locust pod
+# (docs/notes/loadtest-readiness-audit.md §8, items 1.2-1.3). Same mechanism as
+# results-pv.yaml, opposite direction: results flow out, fixtures flow in.
+#
+# Not a ConfigMap, which is how locustfile.py and models.yaml ship: those are a few KB and the
+# limit is ~1MB, while a 10-page rasterized filing is ~4MB. Not baked into the worker image
+# either — that would put real filings in a pushed layer and turn "swap the fixture" into a
+# rebuild, losing the same property the ConfigMaps exist to preserve.
+#
+# Populate the host directory with `make loadtest-fixtures SOURCE=...` before applying; the
+# Job's init container fails the run if it is empty, rather than reporting a clean run in
+# which no document was ever uploaded.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: loadtest-fixtures
+  # No namespace — PVs are cluster-scoped, same as loadtest-results.
+spec:
+  capacity:
+    storage: 2Gi
+  accessModes:
+    # ReadOnlyMany would be the honest access mode, but the PVC below mounts it readOnly at
+    # the pod and a single Job pod is the only consumer, so RWO matches results-pv.yaml and
+    # avoids a second binding mode to reason about.
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: loadtest-fixtures
+  hostPath:
+    path: /mnt/loadtest-fixtures
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loadtest-fixtures
+  namespace: copilot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: loadtest-fixtures
+  resources:
+    requests:
+      storage: 2Gi
+  volumeName: loadtest-fixtures

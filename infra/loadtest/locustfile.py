@@ -1,4 +1,4 @@
-"""Locust load test for the chat path (Stage 17.5 Phase 8 / Stage 17 Phase 18).
+"""Locust load test for the chat and ingestion paths (Stage 17.5 Phase 8 / Stage 17 Phase 18).
 
 Run locally against docker-compose (`make loadtest-local` / `make loadtest-local-ui`), or from
 inside a kind/EKS cluster (`make k8s-loadtest`, see docs/notes/loadtest-concepts.md §8). This is
@@ -13,6 +13,11 @@ POST's own latency. Locust's built-in client can't read `text/event-stream` incr
 SSE leg uses a plain `httpx.Client` and reports its own timings into Locust's stats via
 `environment.events.request.fire()`.
 
+`LOADTEST_MODE=upload` drives ingestion instead (docs/notes/loadtest-readiness-audit.md §8):
+the same two-leg shape, POST /v1/documents/upload then the document's own SSE progress stream.
+Note the FakeAdapter caveat applies differently there — it deletes the picture enricher's LLM
+calls, so a fake ingestion run measures parse-bound time only (§8 item 1.5).
+
 Point this at a stack whose LLM calls are routed to the FakeAdapter (MODELS_CONFIG_PATH ->
 infra/config/models.loadtest.yaml) unless you mean to spend real money — see
 docs/notes/loadtest-concepts.md §6.
@@ -20,6 +25,7 @@ docs/notes/loadtest-concepts.md §6.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
@@ -29,6 +35,7 @@ from dataclasses import dataclass
 
 import httpx
 from locust import HttpUser, LoadTestShape, between, task
+from locust.exception import StopUser
 
 # Must be a model id present in whichever models.yaml the target API is running with —
 # infra/config/models.loadtest.yaml (fake) or infra/config/models.yaml (real, do not use
@@ -47,14 +54,50 @@ MAX_WAIT_S = float(os.environ.get("LOADTEST_MAX_WAIT", "300"))
 
 # Which user class generates load. "ask" (default) is the question-asking profile every
 # throughput scenario uses (T1/T1b/T2/T2b/T4/T5/T6); "sse_hold" is T3, which opens a stream
-# per user and holds it with no further questions. Exactly one is active per run — Locust
-# spawns every non-abstract HttpUser it finds, so mixing the two would conflate T3's
+# per user and holds it with no further questions; "upload" is the ingestion track (T11-T13),
+# which uploads a PDF and follows it to a terminal status. Exactly one is active per run —
+# Locust spawns every non-abstract HttpUser it finds, so mixing them would conflate T3's
 # connection-holding measurement with chat throughput, which is the whole thing T3 isolates.
 LOADTEST_MODE = os.environ.get("LOADTEST_MODE", "ask")
 
 # T3 hold length. Defaults past any plausible -t so the run duration is the real bound and
 # the hold does not end early on its own; set it below -t only to test reconnect churn.
 HOLD_FOR_S = float(os.environ.get("LOADTEST_HOLD_FOR_S", "86400"))
+
+# --- Ingestion (LOADTEST_MODE=upload), docs/notes/loadtest-readiness-audit.md §8 -------------
+
+# Directory of PDFs to upload from, taken round-robin. Phase 1's three single-document classes
+# live at /fixtures; item 2.2's 20-filing stratified sample lives at /fixtures/backlog. Which
+# scenario a run exercises is therefore a matter of which directory it reads, not a code change.
+FIXTURE_DIR = os.environ.get("LOADTEST_FIXTURE_DIR", "/fixtures")
+
+# Restrict the pool to named files, e.g. "normal.pdf". Empty = everything in FIXTURE_DIR.
+#
+# The fixture classes differ by roughly 20x in service time (93-page text ~28.5s measured
+# 2026-09-14, the same filing rasterized ~4 min at the OCR path's ~2.7s/page), so a run drawing
+# from all three reports a variance that is mostly fixture mix and a mean describing no document
+# that exists. Item 2.1 pins this to one class; T12 pins it to scanned.pdf to hold the GPU on the
+# path it is measuring. Item 2.2 instead selects a whole directory via LOADTEST_FIXTURE_DIR.
+FIXTURE_NAMES = [n.strip() for n in os.environ.get("LOADTEST_FIXTURES", "").split(",") if n.strip()]
+
+# Deliberately far above the chat budget: ingestion is minutes, not seconds. It must sit above
+# every server-side bound, or the client reports a timeout for a document the worker is still
+# legitimately working on. Those bounds are DOCLING_PARSE_TIMEOUT_SECONDS=600 and the Celery
+# limits — globally 450/360, which is BELOW the parse wrapper (audit §4.7, still open); the
+# ingestion runs raise them per-Deployment via `make k8s-loadtest-ingest-limits`.
+# T13 lowers the *server's* parse timeout instead (§8 item 1.4) rather than this.
+INGEST_TIMEOUT_S = float(os.environ.get("LOADTEST_INGEST_TIMEOUT_S", "1500"))
+
+# Think-time between uploads for one uploader. Defaults to zero — the backlog run (§8 item
+# 2.2) wants N documents queued as fast as they can be posted, and at one ingestion slot the
+# queue, not the client, is what paces the run.
+UPLOAD_MIN_WAIT_S = float(os.environ.get("LOADTEST_UPLOAD_MIN_WAIT", "0"))
+UPLOAD_MAX_WAIT_S = float(os.environ.get("LOADTEST_UPLOAD_MAX_WAIT", "0"))
+
+# Uploads per user before it stops posting (it stays spawned, holding no work). §8 item 2.2
+# is "a 20-document backlog", a fixed population — an open-ended upload loop would instead
+# measure how fast the client can outrun one slot, which is not a number anyone needs.
+UPLOADS_PER_USER = int(os.environ.get("LOADTEST_UPLOADS_PER_USER", "1"))
 
 SAMPLE_QUESTIONS = [
     "What was total revenue last quarter?",
@@ -238,6 +281,167 @@ def _hold_chat_stream(
     # failure, unconditionally: a healthy hold exits via the ReadTimeout above, so reaching
     # here at all means the stream did not survive its budget.
     return ("closed_early", _elapsed(), "server closed the stream")
+
+
+@dataclass
+class _IngestResult:
+    status: str  # "done" | "error" | "timeout" | "http_error"
+    first_stage_s: float | None  # enqueue -> first stage event ~= queue wait at the client
+    done_s: float | None
+    last_stage: str = ""
+    stage_count: int = 0
+    detail: str = ""
+
+
+def _read_ingestion_stream(
+    base_url: str, document_id: str, token: str, started_at: float
+) -> _IngestResult:
+    """Follow one document's ingestion SSE stream to a terminal event.
+
+    Same wire format as the chat stream, with three differences that matter here
+    (src/api/routers/documents.py::ingestion_stream):
+      * no `id:` lines — this stream has no resume, so there is nothing to track;
+      * terminal events are `done` / `error` and carry no `persisted` flag, so the event
+        type alone ends the read;
+      * a document already terminal when the stream opens gets a synthetic `done`/`error`
+        immediately (documents.py:257-276). That is a real outcome, not a short read: at
+        one ingestion slot a fast document can finish before the client connects.
+
+    `first_stage_s` is the client-side view of what §8 item 0.2 adds server-side as
+    INGESTION_QUEUE_WAIT — the gap from upload to the worker's first `stage` event is
+    queue wait plus startup. Reported separately from total because at one slot those are
+    the two halves that move independently: service time is a property of the document,
+    queue wait a property of the backlog ahead of it.
+    """
+    first_stage_s: float | None = None
+    event_type: str | None = None
+    data_line: str | None = None
+    last_stage = ""
+    stage_count = 0
+
+    try:
+        with (
+            httpx.Client(timeout=INGEST_TIMEOUT_S) as client,
+            client.stream(
+                "GET",
+                f"{base_url}/v1/documents/{document_id}/stream",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response,
+        ):
+            if response.status_code != 200:
+                return _IngestResult(
+                    "http_error", None, None, detail=f"status={response.status_code}"
+                )
+            for line in response.iter_lines():
+                if line == "":
+                    event_type, data_line = None, None
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    event_type = line[len("event:") :].strip()
+                    continue
+                if line.startswith("data:"):
+                    data_line = line[len("data:") :].strip()
+                if event_type is None or data_line is None:
+                    continue
+
+                try:
+                    data = json.loads(data_line)
+                except json.JSONDecodeError:
+                    data = {}
+
+                if event_type == "stage":
+                    if first_stage_s is None:
+                        first_stage_s = time.perf_counter() - started_at
+                    stage_count += 1
+                    last_stage = str(data.get("stage", ""))
+
+                if event_type == "done":
+                    return _IngestResult(
+                        "done",
+                        first_stage_s,
+                        time.perf_counter() - started_at,
+                        last_stage=last_stage,
+                        stage_count=stage_count,
+                    )
+
+                if event_type == "error":
+                    return _IngestResult(
+                        "error",
+                        first_stage_s,
+                        None,
+                        last_stage=last_stage,
+                        stage_count=stage_count,
+                        detail=str(data.get("message", ""))[:200],
+                    )
+    except httpx.TimeoutException:
+        return _IngestResult(
+            "timeout", first_stage_s, None, last_stage=last_stage, stage_count=stage_count
+        )
+    except httpx.HTTPError as exc:
+        return _IngestResult(
+            "http_error",
+            first_stage_s,
+            None,
+            last_stage=last_stage,
+            stage_count=stage_count,
+            detail=str(exc),
+        )
+
+    # The stream ended without `done` or `error`. Not a pass: documents.py only closes the
+    # generator on a terminal event or on a Redis read failure it deliberately does not
+    # report as `error` (documents.py:340-348), so reaching here means the outcome is
+    # genuinely unknown and must not be counted as a success.
+    return _IngestResult(
+        "error",
+        first_stage_s,
+        None,
+        last_stage=last_stage,
+        stage_count=stage_count,
+        detail="stream closed with no terminal event",
+    )
+
+
+def _load_fixtures(directory: str, names: list[str]) -> list[str]:
+    """Absolute paths of the PDFs available to upload.
+
+    Read once at import rather than per task: the set is static for a run, and re-statting
+    the directory on every upload would put client-side I/O inside the timed section.
+    """
+    if not os.path.isdir(directory):
+        return []
+    found = sorted(
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if name.lower().endswith(".pdf")
+    )
+    if not names:
+        return found
+
+    by_name = {os.path.basename(p): p for p in found}
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        # Loud, at import. A silently-dropped name would leave the run drawing from whatever
+        # else the directory holds and report a service time for the wrong document class.
+        raise RuntimeError(
+            f"LOADTEST_FIXTURES names {missing} not in {directory!r} "
+            f"(has: {sorted(by_name) or 'nothing'})"
+        )
+    return [by_name[n] for n in names]
+
+
+FIXTURES = _load_fixtures(FIXTURE_DIR, FIXTURE_NAMES)
+
+# Round-robin, NOT random.choice. Item 2.2's backlog is a stratified sample of 20 filings
+# uploaded by 20 users — with independent random picks that covers only ~12.8 of the 20 on
+# average and duplicates the rest, so the run would measure a random multiset rather than the
+# distribution the sample was built to represent, and would miss the slowest document (the one
+# that dominates E[S^2]) about a third of the time. Cycling makes "N users over an N-document
+# set" mean exactly that, and is identical to random.choice when the pool holds one fixture.
+#
+# next() on a cycle has no yield point, so it is atomic across gevent greenlets.
+_FIXTURE_CYCLE = itertools.cycle(FIXTURES) if FIXTURES else None
 
 
 class RampShape(LoadTestShape):
@@ -487,4 +691,96 @@ class SseHoldUser(_AuthenticatedUser):
             response_time=held_s * 1000,
             response_length=0,
             exception=None if status == "held" else RuntimeError(f"{status}: {detail}"),
+        )
+
+
+class UploadUser(_AuthenticatedUser):
+    """T11-T13 (docs/notes/loadtest-readiness-audit.md §8): upload a PDF and follow it to a
+    terminal ingestion status.
+
+    Same two-leg shape as ChatUser and for the same reason (concepts §2-3): POST
+    /v1/documents/upload stores to S3 and enqueues, returning in well under a second, while
+    the work itself runs in the ingestion worker and reports over SSE. The POST's latency is
+    S3 upload time and says nothing about ingestion, so the numbers that matter —
+    first_stage and done — are fired from the stream leg.
+
+    Each user uploads UPLOADS_PER_USER documents and then idles. With one ingestion slot,
+    concurrency here is a property of the *queue*, not of the client: -u 20 with the default
+    one-upload-each is §8 item 2.2's 20-document backlog, posted near-simultaneously and
+    drained serially by the worker.
+    """
+
+    abstract = LOADTEST_MODE != "upload"
+
+    wait_time = between(UPLOAD_MIN_WAIT_S, UPLOAD_MAX_WAIT_S)
+
+    def on_start(self) -> None:
+        super().on_start()
+        self._uploads_done = 0
+        if not FIXTURES:
+            # Nothing to upload — fail loudly at spawn rather than reporting a clean run in
+            # which no document was ever ingested.
+            raise RuntimeError(
+                f"no PDFs in LOADTEST_FIXTURE_DIR={FIXTURE_DIR!r}; "
+                "see docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3"
+            )
+
+    @task
+    def upload_document(self) -> None:
+        if self._uploads_done >= UPLOADS_PER_USER:
+            # StopUser, not `return`: the upload wait_time is 0 (the backlog run wants its
+            # documents posted as fast as they can be), so returning would put locust into a
+            # tight loop of no-op task calls for the rest of -t. Measured at -u 1: a full core
+            # at 97C, and at -u 20 those spinning greenlets would compete with the ones still
+            # reading streams — inflating ingest_done for documents that are merely waiting.
+            raise StopUser
+        self._uploads_done += 1
+
+        assert _FIXTURE_CYCLE is not None  # on_start raises if FIXTURES is empty
+        path = next(_FIXTURE_CYCLE)
+        with open(path, "rb") as fh:
+            payload = fh.read()
+
+        started_at = time.perf_counter()
+        with self.client.post(
+            "/v1/documents/upload",
+            files={"file": (os.path.basename(path), payload, "application/pdf")},
+            headers=self._auth_headers(),
+            name="/v1/documents/upload (enqueue)",
+            catch_response=True,
+        ) as resp:
+            if resp.status_code != 200:
+                resp.failure(f"upload failed: {resp.status_code} {resp.text[:200]}")
+                return
+            # UploadDocumentResponse names the field `id`, not `document_id`
+            # (src/api/routers/documents.py:170-177).
+            document_id = str(resp.json()["id"])
+
+        assert self.host is not None, "run with --host, e.g. http://localhost:8000"
+        result = _read_ingestion_stream(self.host, document_id, self.token, started_at)
+
+        # self.environment.events — see the note in ChatUser.ask_question.
+        events = self.environment.events
+
+        if result.first_stage_s is not None:
+            events.request.fire(
+                request_type="INGEST",
+                name="ingest_first_stage",
+                response_time=result.first_stage_s * 1000,
+                response_length=0,
+                exception=None,
+            )
+
+        total_s = time.perf_counter() - started_at
+        events.request.fire(
+            request_type="INGEST",
+            name="ingest_done",
+            response_time=(result.done_s or total_s) * 1000,
+            response_length=0,
+            exception=None
+            if result.status == "done"
+            else RuntimeError(
+                f"{result.status} after {result.stage_count} stages "
+                f"(last={result.last_stage or 'none'}): {result.detail}"
+            ),
         )

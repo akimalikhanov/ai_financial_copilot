@@ -34,3 +34,8 @@ nodes:
       # host — gitignored, created on demand by Docker's bind mount if it doesn't exist yet.
       - hostPath: ./loadtest/results
         containerPath: /mnt/loadtest-results
+      # Same mechanism for the ingestion fixture PDFs, inbound (loadtest/fixtures-pv.yaml).
+      # Populated on the host by `make loadtest-fixtures`; gitignored, since it holds real
+      # filings and multi-MB generated PDFs.
+      - hostPath: ./loadtest/fixtures
+        containerPath: /mnt/loadtest-fixtures

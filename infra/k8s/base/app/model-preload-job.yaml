@@ -36,6 +36,10 @@ spec:
             - layout
             - tableformer
             - picture_classifier
+            # DOCLING_SCAN_OCR_ENABLED=true means a scanned PDF re-parses with full-page
+            # EasyOCR. With artifacts_path set, easyocr runs with downloads disabled, so the
+            # weights must be here or the ingest fails at parse_pdf_docling.
+            - easyocr
           envFrom:
             - configMapRef: { name: app-config }
             - secretRef:    { name: app-secret }   # HF_TOKEN

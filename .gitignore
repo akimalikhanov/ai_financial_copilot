@@ -64,3 +64,8 @@ skills-lock.json
 # k8s loadtest results (hostPath PV target, see infra/k8s/kind-cluster.yaml)
 infra/k8s/loadtest/results/*
 !infra/k8s/loadtest/results/.gitkeep
+# Ingestion fixtures: real filings must not be committed, and the generated classes are
+# reproducible from infra/loadtest/make_fixtures.py.
+infra/k8s/loadtest/fixtures/*
+!infra/k8s/loadtest/fixtures/.gitkeep
+infra/loadtest/backlog_sample.txt

@@ -2,6 +2,11 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Evaluated in-process — there is no Alertmanager, so firing rules surface as ALERTS series
+# in Grafana rather than as notifications. Mounted from the same ConfigMap as this file.
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
 scrape_configs:
   - job_name: kubernetes-pods
     kubernetes_sd_configs:
@@ -12,6 +17,13 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
         action: keep
         regex: "true"
+      # kube-state-metrics has its own job below. It must not be scraped here: the `pod`
+      # relabel at the end of this job would stamp every series it exports — one per pod in
+      # the namespace, each already carrying the `pod` it describes — with the exporter's own
+      # pod name, which silently breaks every alert that joins on (namespace, pod, container).
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        action: drop
+        regex: kube-state-metrics
       - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
         action: replace
         target_label: __metrics_path__
@@ -29,6 +41,18 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_name]
         action: replace
         target_label: pod
+
+  # Pod/node object state from the API server: restart counts, terminated reasons (the
+  # OOMKilled signal the alert rules join on), pod phase, node conditions and allocatable.
+  # cAdvisor below reports usage but cannot say why a container died.
+  #
+  # honor_labels is the point of the separate job. Every series here already carries the
+  # `pod`/`namespace`/`container` it describes; without honor_labels Prometheus would rename
+  # those to exported_pod and attach the exporter's own target labels instead.
+  - job_name: kube-state-metrics
+    honor_labels: true
+    static_configs:
+      - targets: ["kube-state-metrics:8080"]
 
   # Container resource metrics (container_memory_working_set_bytes, etc.) for the Grafana
   # dashboards' "Container Memory" panels. No pod exposes these itself — they're cgroup

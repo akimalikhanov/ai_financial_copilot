@@ -222,17 +222,29 @@ async def invalidate_chat_tail(redis: Redis, conv_id: str) -> None:
 
 
 async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[str, Any]) -> str:
-    """Add an event to the request's events stream. Returns event id."""
+    """Add an event to the request's events stream. Returns event id.
+
+    Refreshes the stream's TTL on every write, not just at completion
+    (expire_event_stream). A stream stays alive as long as something is actively writing to
+    it; a pipeline that crashes, times out, or is killed mid-run stops writing, so its last
+    event's TTL is what reclaims the key instead of leaving it to live forever. Without this,
+    only requests that reach a normal exit path (which calls expire_event_stream) ever get
+    cleaned up — every abandoned request leaked indefinitely, maxlen bounding size but never
+    reclaiming the key itself.
+    """
     stream_key = events_stream_key(request_id)
     payload = json.dumps({"type": event_type, **data})
-    event_id = await redis.xadd(
-        stream_key,
-        {"payload": payload},
-        "*",
-        # ~maxlen: trims on radix node boundaries, O(1) amortised instead of O(n).
-        maxlen=get_chat_events_maxlen(),
-        approximate=True,
-    )
+    async with redis.pipeline(transaction=False) as pipe:
+        pipe.xadd(
+            stream_key,
+            {"payload": payload},
+            "*",
+            # ~maxlen: trims on radix node boundaries, O(1) amortised instead of O(n).
+            maxlen=get_chat_events_maxlen(),
+            approximate=True,
+        )
+        pipe.expire(stream_key, get_chat_events_ttl())
+        event_id, _ = await pipe.execute()
     return event_id
 
 
