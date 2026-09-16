@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import httpx
+import numpy as np
 
 from src.utils.config import (
     get_embedder_base_url,
@@ -101,13 +102,14 @@ def _resolve_tei_batch_size(base_url: str, timeout: float) -> int:
         return resolved
 
 
-def _post_batch(client: httpx.Client, base_url: str, batch: list[str]) -> list[list[float]]:
+def _post_batch(client: httpx.Client, base_url: str, batch: list[str]) -> np.ndarray:
     response = client.post(f"{base_url}/embed", json={"inputs": batch, "normalize": True})
     response.raise_for_status()
-    return response.json()
+    # float32 per batch: as Python float lists a 1024-dim vector costs ~32 KB, not 4 KB.
+    return np.asarray(response.json(), dtype=np.float32)
 
 
-def _embed_tei(chunks: list[str], timeout: float | None = None) -> list[list[float]]:
+def _embed_tei(chunks: list[str], timeout: float | None = None) -> np.ndarray:
     base_url = get_embedder_base_url().rstrip("/")
     timeout = timeout if timeout is not None else get_embedder_timeout_seconds()
     batch_size = _resolve_tei_batch_size(base_url, timeout)
@@ -126,26 +128,29 @@ def _embed_tei(chunks: list[str], timeout: float | None = None) -> list[list[flo
                 # .map preserves input order, so vectors stay aligned with chunks, and
                 # re-raises the first batch failure when the results are consumed.
                 batch_vectors = list(pool.map(lambda b: _post_batch(client, base_url, b), batches))
-    return [vector for batch in batch_vectors for vector in batch]
+    return np.concatenate(batch_vectors)
 
 
-def _embed_local(chunks: list[str], model_name: str) -> list[list[float]]:
+def _embed_local(chunks: list[str], model_name: str) -> np.ndarray:
     with _st_lock:
         model = _get_sentence_transformer(model_name, get_embedding_device())
     vectors = model.encode(chunks, batch_size=32, convert_to_numpy=True, show_progress_bar=False)
-    return vectors.tolist()
+    return np.asarray(vectors, dtype=np.float32)
 
 
-def _embed_openai(chunks: list[str], model_name: str) -> list[list[float]]:
+def _embed_openai(chunks: list[str], model_name: str) -> np.ndarray:
     client = _get_openai_client()
     response = client.embeddings.create(model=model_name, input=chunks)
-    return [list(item.embedding) for item in response.data]
+    return np.asarray([item.embedding for item in response.data], dtype=np.float32)
 
 
-def embed_chunks(chunks: list[str], timeout: float | None = None) -> list[list[float]]:
-    """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer."""
+def embed_chunks(chunks: list[str], timeout: float | None = None) -> np.ndarray:
+    """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer.
+
+    Returns a float32 array of shape (len(chunks), dim).
+    """
     if not chunks:
-        return []
+        return np.empty((0, 0), dtype=np.float32)
 
     provider = get_embedding_provider()
     model_name = get_embedding_model()
@@ -158,8 +163,8 @@ def embed_chunks(chunks: list[str], timeout: float | None = None) -> list[list[f
         vectors = _embed_local(chunks, model_name)
 
     expected_dim = get_embedding_dim()
-    if expected_dim is not None and any(len(v) != expected_dim for v in vectors):
-        actual = len(vectors[0]) if vectors else 0
+    if expected_dim is not None and vectors.shape[1] != expected_dim:
+        actual = vectors.shape[1]
         raise RuntimeError(
             f"Embedding dimension mismatch: expected {expected_dim}, got {actual} from provider '{provider}'"
         )
@@ -202,7 +207,7 @@ def embed_query(text: str) -> list[float]:
 
     for attempt in range(1, attempts + 1):
         try:
-            return embed_chunks([text], timeout=timeout)[0]
+            return embed_chunks([text], timeout=timeout)[0].tolist()
         except Exception as exc:
             if attempt >= attempts or not _is_retryable(exc):
                 raise

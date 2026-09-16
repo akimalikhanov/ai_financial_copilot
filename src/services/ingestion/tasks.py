@@ -12,7 +12,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from celery.exceptions import Retry, SoftTimeLimitExceeded
@@ -40,6 +40,8 @@ from src.services.ingestion.picture_enricher import (
     validate_config as validate_picture_enricher_config,
 )
 from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
+from src.services.ingestion.s3_client import close_client as close_s3_client
+from src.services.ingestion.s3_client import reset_client as reset_s3_client
 from src.services.ingestion.table_summarizer import reset as reset_table_summarizer
 from src.services.ingestion.table_summarizer import (
     summarize_table_chunks as _summarize_table_chunks,
@@ -51,14 +53,17 @@ from src.utils.config import (
     get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
+    get_ingest_max_pages,
     get_picture_enricher_enabled,
-    get_picture_enricher_stage_timeout,
     get_redis_app_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_rendered_bucket,
     get_table_summarizer_enabled,
 )
+
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DoclingDocument
 
 logger = logging.getLogger(__name__)
 _worker_loop: asyncio.AbstractEventLoop | None = None
@@ -74,7 +79,16 @@ def _get_int_env(name: str) -> int | None:
     return int(raw)
 
 
-_task_soft_time_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
+# Ingestion gets its own limits rather than the app-wide CELERY_TASK_*_SECONDS pair, which is
+# sized for chat (360/450). A 1000-page parse alone outlives that, so the global limits made
+# every inner stage timeout unreachable: Celery reaped the child first and every large-document
+# failure surfaced as a generic SoftTimeLimitExceeded instead of the stage that actually blew.
+# Must stay strictly above the sum of the stage budgets — see docs/stages/
+# ingestion-pipeline-findings.md P1-2 for the ladder.
+_task_soft_time_limit = _get_int_env("INGEST_TASK_SOFT_TIME_LIMIT_SECONDS") or 2400
+# Held back from the enrichment budget for everything after it (~60s on a 1043-page filing).
+_POST_ENRICH_RESERVE_SECONDS = 300
+_task_time_limit = _get_int_env("INGEST_TASK_TIME_LIMIT_SECONDS") or 2700
 INGEST_MAX_ATTEMPTS = int(os.getenv("INGEST_MAX_ATTEMPTS", "3"))
 
 
@@ -96,6 +110,7 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     get_prompt_loader.cache_clear()
     reset_qdrant_client()
     reset_opensearch_client()
+    reset_s3_client()
     if get_picture_enricher_enabled():
         validate_picture_enricher_config()
     if _worker_loop is None or _worker_loop.is_closed():
@@ -119,6 +134,7 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
         _worker_loop.run_until_complete(_redis_ingestion.aclose())
     if _engine is not None:
         _worker_loop.run_until_complete(_engine.dispose())
+    _worker_loop.run_until_complete(close_s3_client())
     _redis_ingestion = None
     _engine = None
     _session_factory = None
@@ -126,61 +142,185 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
     _worker_loop = None
 
 
-def _export_artifacts(document) -> tuple[bytes, bytes]:
-    """Serialize DoclingDocument to JSON and Markdown bytes without embedded images."""
+def _enforce_page_limit(pdf_path: Path) -> None:
+    """Fail a document that is too large to parse, before any model runs.
+
+    Cheap precheck, because the expensive failure is not a slow parse: a document past the
+    memory ceiling OOM-kills the container, and task_acks_late redelivers it until every
+    INGEST_MAX_ATTEMPTS is spent on container restarts, with no record of why. A PDF whose page
+    count cannot be read is let through — the parse is the better judge of a broken file.
+    """
+    from src.services.ingestion import docling_parser
+
+    max_pages = get_ingest_max_pages()
+    if max_pages <= 0:
+        return
+    pages = docling_parser.probe_page_count(pdf_path)
+    if pages is not None and pages > max_pages:
+        raise RuntimeError(
+            f"Document has {pages} pages, above the {max_pages}-page ingestion limit "
+            f"(INGEST_MAX_PAGES)"
+        )
+
+
+def _export_artifacts(document, out_dir: Path) -> tuple[Path, Path]:
+    """Write the DoclingDocument to `out_dir` as JSON and Markdown, returning both paths.
+
+    Clears every `pic.image` first, so it must run after `_upload_picture_crops`.
+    ImageRefMode.PLACEHOLDER only strips images from Markdown: `save_as_json` still serializes
+    each crop as a base64 data URI (~1.33x its bytes, a second copy of the pictures bucket).
+    Nothing downstream reads the crops — enrichment has run and the chunker serializes
+    pictures as placeholders — so dropping them also frees their memory before chunking.
+    `indent=None` because save_as_json builds the whole JSON string before writing it.
+    """
     from docling_core.types.doc.base import ImageRefMode
 
-    td = Path(tempfile.mkdtemp(prefix="docling_"))
-    try:
-        json_p = td / "doc.json"
-        md_p = td / "doc.md"
-        document.save_as_json(json_p, image_mode=ImageRefMode.PLACEHOLDER)
-        document.save_as_markdown(md_p, image_mode=ImageRefMode.PLACEHOLDER)
-        return json_p.read_bytes(), md_p.read_bytes()
-    finally:
-        shutil.rmtree(td, ignore_errors=True)
+    for pic in document.pictures:
+        pic.image = None
+    json_p = out_dir / "docling.json"
+    md_p = out_dir / "document.md"
+    document.save_as_json(json_p, image_mode=ImageRefMode.PLACEHOLDER, indent=None)  # pyright: ignore[reportArgumentType]
+    document.save_as_markdown(md_p, image_mode=ImageRefMode.PLACEHOLDER)
+    return json_p, md_p
 
 
-def _extract_picture_crops(document) -> list[dict[str, Any]]:
-    """Encode each picture's in-memory crop to PNG bytes, with its top classification
-    label if Docling produced one (do_picture_classification, see docling_parser.py).
+def _encode_picture_crop(pic) -> dict[str, Any] | None:
+    """Encode one picture's in-memory crop to PNG bytes, with its top classification label if
+    Docling produced one (do_picture_classification, see docling_parser.py). None when the
+    picture has no crop or it fails to encode.
 
     Crops only exist here because generate_picture_images=True keeps them on the
-    DoclingDocument through parse; export_docling_artifacts strips them via
-    ImageRefMode.PLACEHOLDER, so this has to run before the document is discarded.
+    DoclingDocument through parse, until `_export_artifacts` clears them.
     """
-    crops: list[dict[str, Any]] = []
-    for pic in document.pictures:
-        if pic.image is None:
-            continue
-        try:
-            pil_image = pic.image.pil_image
-            if pil_image is None:
-                raise ValueError("pil_image decode returned None")
-            buf = io.BytesIO()
-            pil_image.save(buf, format="PNG")
-            label: str | None = None
-            confidence: float | None = None
-            if pic.meta is not None and pic.meta.classification is not None:
-                main = pic.meta.classification.get_main_prediction()
-                label, confidence = main.class_name, main.confidence
-            crops.append(
-                {
-                    "self_ref": pic.self_ref,
-                    "data": buf.getvalue(),
-                    "label": label,
-                    "confidence": confidence,
-                }
-            )
-        except Exception:
+    if pic.image is None:
+        return None
+    try:
+        pil_image = pic.image.pil_image
+        if pil_image is None:
+            raise ValueError("pil_image decode returned None")
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        label: str | None = None
+        confidence: float | None = None
+        if pic.meta is not None and pic.meta.classification is not None:
+            main = pic.meta.classification.get_main_prediction()
+            label, confidence = main.class_name, main.confidence
+        return {
+            "self_ref": pic.self_ref,
+            "data": buf.getvalue(),
+            "label": label,
+            "confidence": confidence,
+        }
+    except Exception:
+        # A crop is a re-runnable convenience artifact (Phase 5), not required for
+        # this document to become searchable — never fail the pipeline over one.
+        logger.warning(
+            "pipeline.picture_crop_encode_failed",
+            extra={"self_ref": pic.self_ref},
+            exc_info=True,
+        )
+        return None
+
+
+# Crops encoded and in flight at once. Bounds both the PNG bytes held and the concurrent
+# requests against Garage; unbounded, a 300-picture document opened 300 uploads together.
+_CROP_UPLOAD_CONCURRENCY = 8
+
+
+async def _load_persisted_document(key: str, document_id: str) -> DoclingDocument | None:
+    """The docling.json an earlier attempt uploaded, or None when it is missing or unreadable
+    (the caller then re-parses)."""
+    from docling_core.types.doc.document import DoclingDocument as _DoclingDocument
+
+    from src.services.ingestion import s3_client
+
+    try:
+        path = await s3_client.download_file(key, bucket=get_s3_docling_bucket())
+    except Exception:
+        logger.info("pipeline.resume_unavailable", extra={"document_id": document_id})
+        return None
+    try:
+        document = await asyncio.to_thread(_DoclingDocument.load_from_json, path)
+    except Exception:
+        logger.warning(
+            "pipeline.resume_load_failed", extra={"document_id": document_id}, exc_info=True
+        )
+        return None
+    finally:
+        path.unlink(missing_ok=True)
+    logger.info(
+        "pipeline.resumed_from_artifact",
+        extra={"document_id": document_id, "pictures": len(document.pictures)},
+    )
+    return document
+
+
+async def _upload_picture_crops(document, document_id: str) -> int:
+    """Encode, upload and release each picture crop, returning how many landed in S3.
+
+    Each crop is encoded under the semaphore and dropped as soon as its upload returns, so at
+    most `_CROP_UPLOAD_CONCURRENCY` encoded crops are live — never a list of all of them.
+    """
+    from src.services.ingestion import s3_client
+
+    sem = asyncio.Semaphore(_CROP_UPLOAD_CONCURRENCY)
+
+    async def _one(pic) -> bool:
+        async with sem:
+            crop = await asyncio.to_thread(_encode_picture_crop, pic)
+            if crop is None:
+                return False
             # A crop is a re-runnable convenience artifact (Phase 5), not required for
             # this document to become searchable — never fail the pipeline over one.
-            logger.warning(
-                "pipeline.picture_crop_encode_failed",
-                extra={"self_ref": pic.self_ref},
-                exc_info=True,
+            try:
+                await s3_client.upload_picture_crop(
+                    document_id,
+                    crop["self_ref"],
+                    crop["data"],
+                    label=crop["label"],
+                    confidence=crop["confidence"],
+                )
+            except Exception:
+                logger.warning(
+                    "pipeline.picture_crop_upload_failed",
+                    extra={"document_id": document_id, "self_ref": crop["self_ref"]},
+                    exc_info=True,
+                )
+                return False
+            return True
+
+    results = await asyncio.gather(*(_one(pic) for pic in document.pictures))
+    return sum(results)
+
+
+def _write_chunks_jsonl(path: Path, chunks: list[dict[str, Any]], db_chunks: list[Any]) -> None:
+    """Stream the chunk backup to disk one row at a time, rather than joining it into one
+    string and encoding a second copy."""
+    with path.open("w", encoding="utf-8") as f:
+        for i, (c, db) in enumerate(zip(chunks, db_chunks, strict=True)):
+            if i:
+                f.write("\n")
+            f.write(
+                json.dumps(
+                    {
+                        "chunk_id": str(db.id),
+                        "chunk_index": c["chunk_index"],
+                        "raw_text": c["raw_text"],
+                        "enriched_text": c["enriched_text"],
+                        "heading_trail": c.get("heading_trail"),
+                        "chunk_type": c.get("chunk_type"),
+                        "page_start": c.get("page_start"),
+                        "page_end": c.get("page_end"),
+                        "token_count": c.get("token_count"),
+                        "table_nl_summary": c.get("table_nl_summary"),
+                        "table_nl_summary_model": c.get("table_nl_summary_model"),
+                        "provenance": c.get("provenance"),
+                        "metadata": c.get("metadata", {}),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
             )
-    return crops
 
 
 async def _run_pipeline(document_id: str) -> None:  # noqa: C901
@@ -200,11 +340,12 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     sf = _session_factory
     doc_uuid = UUID(document_id)
     pdf_path: Path | None = None
+    work_dir: Path | None = None
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     stage_order: list[str] = []
-    stage_total = 12 + get_table_summarizer_enabled() + get_picture_enricher_enabled()
+    stage_total = 13 + get_table_summarizer_enabled() + get_picture_enricher_enabled()
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
@@ -294,127 +435,142 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
+            prior_parse_status = doc.parse_status
             upload_metadata = dict(doc.document_metadata or {})
             await repo.update_status(doc_uuid, "processing", clear_processing_error=True)
             await session.commit()
 
-        # -- download raw PDF -----------------------------------------------
-        await _log_stage("download_pdf")
-        pdf_path = await s3_client.download_file(storage_key)
-
-        # -- parse with Docling (CPU/GPU-bound) -----------------------------
-        await _log_stage("parse_pdf_docling")
-        # Docling's own document_timeout bounds its page loop only; assembly, reading order and
-        # enrichment run outside it. This is the wall-clock ceiling on the whole parse. A thread
-        # cannot be killed, so the abandoned parse runs on until it finishes or Celery's hard
-        # time limit reaps the child; the document fails now rather than hanging.
-        parse_timeout = get_docling_parse_timeout()
-        try:
-            parse_result = await _timed(
-                "parse",
-                asyncio.wait_for(
-                    asyncio.to_thread(docling_parser.parse, pdf_path), timeout=parse_timeout
-                ),
-            )
-        except TimeoutError as exc:
-            raise RuntimeError(
-                f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
-                f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
-            ) from exc
-
-        # -- describe pictures with a vision model (network-bound) ---------
-        # Must run before export and before chunking: it writes pic.meta.description, which
-        # the exported JSON carries and the chunker substitutes for `<!-- image -->`.
-        if get_picture_enricher_enabled():
-            await _log_stage("enrich_pictures")
-            try:
-                described = await asyncio.wait_for(
-                    _enrich_pictures(parse_result.document),
-                    timeout=get_picture_enricher_stage_timeout(),
-                )
-                logger.info(
-                    "pipeline.pictures_enriched",
-                    extra={"document_id": document_id, "described": described},
-                )
-            except TimeoutError:
-                logger.warning(
-                    "pipeline.picture_enrichment_timeout",
-                    extra={"document_id": document_id},
-                )
-            except Exception:
-                # Enrichment degrades to Phase 4 quality; it never fails a document.
-                logger.warning(
-                    "pipeline.picture_enrichment_failed",
-                    extra={"document_id": document_id},
-                    exc_info=True,
-                )
-
-        # -- export artifacts (CPU-bound serialization) --------------------
-        await _log_stage("export_docling_artifacts")
-        (json_bytes, md_bytes), picture_crops = await asyncio.gather(
-            asyncio.to_thread(_export_artifacts, parse_result.document),
-            asyncio.to_thread(_extract_picture_crops, parse_result.document),
-        )
-
-        # -- update metadata + upload artifacts (parallel I/O) --------------
-        await _log_stage("save_metadata_and_upload_artifacts")
+        work_dir = Path(tempfile.mkdtemp(prefix="ingest_"))
         base_key = f"processed/{user_id}/{document_id}"
 
-        async def _save_metadata():
-            async with sf() as session:
-                repo = DocumentRepository(session)
-                merged_metadata = {
-                    **upload_metadata,
-                    **parse_result.metadata,
-                }
-                await repo.update_metadata(
-                    doc_uuid,
-                    page_count=parse_result.page_count,
-                    extracted_title=parse_result.extracted_title,
-                    parse_status=parse_result.parse_status,
-                    metadata=merged_metadata,
-                )
-                await session.commit()
+        # -- resume: a retry reuses the parse an earlier attempt persisted ----
+        # parse_status is written in the same step that uploads docling.json, which already
+        # carries the picture descriptions, and the crops are uploaded before it. So a retry
+        # that finds both skips download, parse, enrichment and export entirely.
+        document = None
+        if attempt > 1 and prior_parse_status is not None:
+            await _log_stage("load_persisted_parse")
+            document = await _load_persisted_document(f"{base_key}/docling.json", document_id)
+        if document is not None:
+            parse_status = prior_parse_status
+            # load_persisted_parse stands in for the parse path's own stages.
+            stage_total -= 4 + get_picture_enricher_enabled()
+        else:
+            # -- download raw PDF -----------------------------------------------
+            await _log_stage("download_pdf")
+            pdf_path = await s3_client.download_file(storage_key)
 
-        async def _upload_crop(crop: dict[str, Any]) -> None:
-            # A crop is a re-runnable convenience artifact (Phase 5), not required for
-            # this document to become searchable — never fail the pipeline over one.
+            # -- page-count guardrail (milliseconds, no models) ------------------
+            await asyncio.to_thread(_enforce_page_limit, pdf_path)
+
+            # -- parse with Docling (CPU/GPU-bound) -----------------------------
+            await _log_stage("parse_pdf_docling")
+            # Docling's own document_timeout bounds its page loop only; assembly, reading order and
+            # enrichment run outside it. This is the wall-clock ceiling on the whole parse. A thread
+            # cannot be killed, so the abandoned parse runs on until it finishes or Celery's hard
+            # time limit reaps the child; the document fails now rather than hanging.
+            parse_timeout = get_docling_parse_timeout()
             try:
-                await s3_client.upload_picture_crop(
-                    document_id,
-                    crop["self_ref"],
-                    crop["data"],
-                    label=crop["label"],
-                    confidence=crop["confidence"],
+                parse_result = await _timed(
+                    "parse",
+                    asyncio.wait_for(
+                        asyncio.to_thread(docling_parser.parse, pdf_path), timeout=parse_timeout
+                    ),
                 )
-            except Exception:
-                logger.warning(
-                    "pipeline.picture_crop_upload_failed",
-                    extra={"document_id": document_id, "self_ref": crop["self_ref"]},
-                    exc_info=True,
-                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
+                    f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
+                ) from exc
 
-        await asyncio.gather(
-            _save_metadata(),
-            s3_client.upload_bytes(
-                f"{base_key}/docling.json",
-                json_bytes,
-                "application/json",
-                bucket=get_s3_docling_bucket(),
-            ),
-            s3_client.upload_bytes(
-                f"{base_key}/document.md",
-                md_bytes,
-                "text/markdown",
-                bucket=get_s3_rendered_bucket(),
-            ),
-            *(_upload_crop(crop) for crop in picture_crops),
-        )
+            # -- describe pictures with a vision model (network-bound) ---------
+            # Must run before export and before chunking: it writes pic.meta.description, which
+            # the exported JSON carries and the chunker substitutes for `<!-- image -->`.
+            if get_picture_enricher_enabled():
+                await _log_stage("enrich_pictures")
+                try:
+                    # The enricher sizes its own budget from the picture count and keeps completed
+                    # batches on timeout; this cap keeps it inside the task's soft limit.
+                    remaining = (
+                        _task_soft_time_limit
+                        - (perf_counter() - pipeline_started_at)
+                        - _POST_ENRICH_RESERVE_SECONDS
+                    )
+                    described = await _enrich_pictures(parse_result.document, max_timeout=remaining)
+                    logger.info(
+                        "pipeline.pictures_enriched",
+                        extra={"document_id": document_id, "described": described},
+                    )
+                except Exception:
+                    # Enrichment degrades to Phase 4 quality; it never fails a document.
+                    logger.warning(
+                        "pipeline.picture_enrichment_failed",
+                        extra={"document_id": document_id},
+                        exc_info=True,
+                    )
+
+            # -- upload picture crops (bounded, one encoded crop per slot) -------
+            # Must run before export: export clears pic.image so docling.json carries no base64.
+            await _log_stage("upload_picture_crops")
+            crops_uploaded = await _upload_picture_crops(parse_result.document, document_id)
+            logger.info(
+                "pipeline.picture_crops_uploaded",
+                extra={
+                    "document_id": document_id,
+                    "uploaded": crops_uploaded,
+                    "pictures": len(parse_result.document.pictures),
+                },
+            )
+
+            # -- export artifacts to disk (CPU-bound serialization) -------------
+            await _log_stage("export_docling_artifacts")
+            json_path, md_path = await asyncio.to_thread(
+                _export_artifacts, parse_result.document, work_dir
+            )
+
+            # -- update metadata + upload artifacts (parallel I/O) --------------
+            await _log_stage("save_metadata_and_upload_artifacts")
+
+            async def _save_metadata():
+                async with sf() as session:
+                    repo = DocumentRepository(session)
+                    merged_metadata = {
+                        **upload_metadata,
+                        **parse_result.metadata,
+                    }
+                    await repo.update_metadata(
+                        doc_uuid,
+                        page_count=parse_result.page_count,
+                        extracted_title=parse_result.extracted_title,
+                        parse_status=parse_result.parse_status,
+                        metadata=merged_metadata,
+                    )
+                    await session.commit()
+
+            await asyncio.gather(
+                _save_metadata(),
+                s3_client.upload_file(
+                    json_path,
+                    f"{base_key}/docling.json",
+                    "application/json",
+                    bucket=get_s3_docling_bucket(),
+                ),
+                s3_client.upload_file(
+                    md_path,
+                    f"{base_key}/document.md",
+                    "text/markdown",
+                    bucket=get_s3_rendered_bucket(),
+                ),
+            )
+            json_path.unlink(missing_ok=True)
+            md_path.unlink(missing_ok=True)
+            document = parse_result.document
+            parse_status = parse_result.parse_status
 
         # -- chunk document (CPU-bound) -------------------------------------
         await _log_stage("chunk_document")
         chunks = await _timed(
-            "chunk", asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
+            "chunk", asyncio.to_thread(chunker.chunk_document, document, document_id)
         )
         INGESTION_CHUNKS.observe(len(chunks))
 
@@ -428,7 +584,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 extra={
                     "document_id": document_id,
                     "stage": "chunk_document",
-                    "parse_status": parse_result.parse_status,
+                    "parse_status": parse_status,
                 },
             )
             await _log_stage("finalize_ready")
@@ -510,7 +666,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- ensure collections/indices exist (parallel) --------------------
         await _log_stage("ensure_vector_and_search_indexes")
-        dim = len(vectors[0]) if vectors else (get_embedding_dim() or 384)
+        dim = len(vectors[0]) if len(vectors) else (get_embedding_dim() or 384)
         await asyncio.gather(
             asyncio.to_thread(qdrant_ingest.ensure_collection, "documents", dim),
             asyncio.to_thread(opensearch_ingest.ensure_index, "chunks"),
@@ -520,36 +676,27 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         # By document_id and *before* indexing, so re-ingestion is idempotent wherever a
         # prior attempt died. The old chunk-id list came from Postgres and ran after
         # indexing, so a rollback erased the only record of what needed cleaning.
+        # Skipped on the first attempt: ingest_attempt_count is never reset, so nothing can
+        # have been indexed under this document_id yet.
         await _log_stage("purge_stale_chunks")
-        await asyncio.gather(
-            asyncio.to_thread(qdrant_ingest.delete_by_document, "documents", document_id),
-            asyncio.to_thread(opensearch_ingest.delete_by_document, "chunks", document_id),
-        )
+        if attempt > 1:
+            await asyncio.gather(
+                asyncio.to_thread(qdrant_ingest.delete_by_document, "documents", document_id),
+                asyncio.to_thread(opensearch_ingest.delete_by_document, "chunks", document_id),
+            )
 
         # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
         await _log_stage("index_and_backup_chunks")
-        chunks_jsonl = "\n".join(
-            json.dumps(
-                {
-                    "chunk_id": str(db.id),
-                    "chunk_index": c["chunk_index"],
-                    "raw_text": c["raw_text"],
-                    "enriched_text": c["enriched_text"],
-                    "heading_trail": c.get("heading_trail"),
-                    "chunk_type": c.get("chunk_type"),
-                    "page_start": c.get("page_start"),
-                    "page_end": c.get("page_end"),
-                    "token_count": c.get("token_count"),
-                    "table_nl_summary": c.get("table_nl_summary"),
-                    "table_nl_summary_model": c.get("table_nl_summary_model"),
-                    "provenance": c.get("provenance"),
-                    "metadata": c.get("metadata", {}),
-                },
-                ensure_ascii=False,
-                default=str,
+        chunks_jsonl_path = work_dir / "chunks.jsonl"
+
+        async def _backup_chunks() -> None:
+            await asyncio.to_thread(_write_chunks_jsonl, chunks_jsonl_path, chunks, db_chunks)
+            await s3_client.upload_file(
+                chunks_jsonl_path,
+                f"{base_key}/chunks.jsonl",
+                "application/jsonl",
+                bucket=get_s3_chunks_bucket(),
             )
-            for c, db in zip(chunks, db_chunks, strict=True)
-        ).encode()
 
         await asyncio.gather(
             _timed(
@@ -572,12 +719,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                     user_id=user_id,
                 ),
             ),
-            s3_client.upload_bytes(
-                f"{base_key}/chunks.jsonl",
-                chunks_jsonl,
-                "application/jsonl",
-                bucket=get_s3_chunks_bucket(),
-            ),
+            _backup_chunks(),
         )
 
         # -- finalize -> ready ----------------------------------------------
@@ -667,9 +809,16 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     finally:
         if pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
+        if work_dir is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@celery_app.task(bind=True, name="ingest_document")
+@celery_app.task(
+    bind=True,
+    name="ingest_document",
+    soft_time_limit=_task_soft_time_limit,
+    time_limit=_task_time_limit,
+)
 def ingest_document(self, document_id: str) -> None:
     """Full ingestion pipeline: parse -> chunk -> embed -> index -> finalize."""
     logger.info("ingest_document.start", extra={"document_id": document_id})

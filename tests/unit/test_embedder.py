@@ -6,6 +6,7 @@ import json
 import threading
 
 import httpx
+import numpy as np
 import pytest
 import respx
 
@@ -82,7 +83,9 @@ class TestEmbedTei:
         respx.post(f"{TEI_URL}/embed").mock(side_effect=_embed_echo)
 
         chunks = [str(i) for i in range(9)]
-        assert embedder.embed_chunks(chunks) == [[float(i)] for i in range(9)]
+        vectors = embedder.embed_chunks(chunks)
+        assert vectors.dtype == np.float32
+        assert vectors.tolist() == [[float(i)] for i in range(9)]
 
     @respx.mock
     def test_splits_into_batches_of_resolved_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -132,7 +135,7 @@ class TestEmbedTei:
             embedder.embed_chunks(["a", "b"])
 
     def test_empty_input_short_circuits(self) -> None:
-        assert embedder.embed_chunks([]) == []
+        assert len(embedder.embed_chunks([])) == 0
 
 
 class TestEmbedQueryRetry:

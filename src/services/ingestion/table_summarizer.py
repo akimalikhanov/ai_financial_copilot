@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -12,6 +13,7 @@ from src.services.llm_router import RoutedLLM, get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_table_summarizer_batch_size,
+    get_table_summarizer_concurrency,
     get_table_summarizer_enable_thinking,
     get_table_summarizer_model,
 )
@@ -106,8 +108,10 @@ async def summarize_table_chunks(chunks: list[dict[str, Any]]) -> list[dict[str,
         "table_summaries", TableSummaryResponse.model_json_schema()
     )
 
-    succeeded = 0
-    for batch_start in range(0, len(table_indices), batch_size):
+    llm, system_prompt = _llm, _system_prompt
+
+    async def _one(batch_start: int) -> int:
+        """Summarize one batch and write it onto its chunks; returns how many succeeded."""
         batch_indices = table_indices[batch_start : batch_start + batch_size]
 
         # Build numbered batch: use 1-based IDs within each batch
@@ -118,19 +122,20 @@ async def summarize_table_chunks(chunks: list[dict[str, Any]]) -> list[dict[str,
         batch_ids = [tid for tid, _ in batch]
         user_msg = _build_batch_user_message(batch)
         messages = [
-            ChatMessage(role=Role.system, content=_system_prompt),
+            ChatMessage(role=Role.system, content=system_prompt),
             ChatMessage(role=Role.user, content=user_msg),
         ]
 
         try:
-            resp = await _llm.complete(
-                messages,
-                _lf_name="table_summarizer",
-                temperature=0.0,
-                max_tokens=300 * len(batch_indices),
-                response_format=response_format,
-                **extra_params,
-            )
+            async with sem:
+                resp = await llm.complete(
+                    messages,
+                    _lf_name="table_summarizer",
+                    temperature=0.0,
+                    max_tokens=300 * len(batch_indices),
+                    response_format=response_format,
+                    **extra_params,
+                )
             summaries = _parse_batch_response(resp.text, batch_ids)
         except Exception:
             logger.warning(
@@ -145,12 +150,28 @@ async def summarize_table_chunks(chunks: list[dict[str, Any]]) -> list[dict[str,
             summaries = dict.fromkeys(batch_ids)
 
         # Map summaries back to chunks
+        ok = 0
         for local_id, idx in enumerate(batch_indices, start=1):
             summary = summaries.get(local_id)
             chunks[idx]["table_nl_summary"] = summary
             chunks[idx]["table_nl_summary_model"] = _model_id if summary else None
             if summary:
-                succeeded += 1
+                ok += 1
+        return ok
+
+    # Batches are network waits: overlap them under a cap instead of awaiting each in turn.
+    # Each batch writes only its own chunk indices, so completion order does not matter.
+    sem = asyncio.Semaphore(get_table_summarizer_concurrency())
+    results = await asyncio.gather(
+        *(_one(start) for start in range(0, len(table_indices), batch_size)),
+        return_exceptions=True,
+    )
+    succeeded = 0
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.warning("table_summarizer.batch_raised", exc_info=result)
+            continue
+        succeeded += result
 
     logger.info(
         "table_summarizer.done",

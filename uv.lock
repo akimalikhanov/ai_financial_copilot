@@ -83,7 +83,7 @@ requires-dist = [
     { name = "aioboto3", specifier = ">=15.5.0" },
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "celery", extras = ["redis"], specifier = ">=5.3.1" },
-    { name = "docling", specifier = ">=2.74.0" },
+    { name = "docling", specifier = "==2.111.0" },
     { name = "easyocr", specifier = ">=1.7.2" },
     { name = "fastapi", specifier = ">=0.128.0" },
     { name = "google-api-core", specifier = ">=2.29.0" },

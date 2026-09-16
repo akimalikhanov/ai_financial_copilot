@@ -462,28 +462,37 @@ def get_docling_picture_vlm_prompt() -> str:
 
 
 def get_docling_document_timeout() -> float:
-    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0).
+    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 1200.0).
 
     Bounds Docling's page loop only. Assembly, reading order and enrichment run outside it —
     see get_docling_parse_timeout() for the wall-clock ceiling on the whole parse.
+
+    Exceeding it truncates the document silently: Docling stops the page loop, returns
+    PARTIAL_SUCCESS, and the pages never parsed are simply absent. docling_parser._check_status
+    fails the document rather than indexing the remainder. Sized from a measured ~0.45s/page
+    (1043 pages in ~470s) with 2.5x headroom for a slower box or a denser document.
     """
-    val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "300")
+    val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "1200")
     try:
         return float(val)
     except ValueError:
-        return 300.0
+        return 1200.0
 
 
 def get_docling_parse_timeout() -> float:
-    """DOCLING_PARSE_TIMEOUT_SECONDS in seconds (default: 600.0).
+    """DOCLING_PARSE_TIMEOUT_SECONDS in seconds (default: 1800.0).
 
-    Wall-clock ceiling on the entire parse, unlike DOCLING_DOCUMENT_TIMEOUT.
+    Wall-clock ceiling on the entire parse, unlike DOCLING_DOCUMENT_TIMEOUT. Must stay above it
+    with room for assembly and reading order, which run after the page loop, and for the
+    OCR fallback, which re-converts the whole document inside this same budget under its own
+    DOCLING_OCR_DOCUMENT_TIMEOUT. Both page loops cannot run to their own ceilings inside this
+    one — a document that needs the full OCR fallback is bounded here, not there.
     """
-    val = os.getenv("DOCLING_PARSE_TIMEOUT_SECONDS", "600")
+    val = os.getenv("DOCLING_PARSE_TIMEOUT_SECONDS", "1800")
     try:
         return float(val)
     except ValueError:
-        return 600.0
+        return 1800.0
 
 
 def get_docling_ocr_fallback_enabled() -> bool:
@@ -512,6 +521,30 @@ def get_docling_ocr_document_timeout() -> float:
         return float(val)
     except ValueError:
         return 1800.0
+
+
+def get_docling_ocr_max_pages() -> int:
+    """DOCLING_OCR_MAX_PAGES (default: 300; 0 disables the cap).
+
+    Above this the OCR retries are skipped: a re-convert doubles peak memory and costs ~4.3s a
+    page, inside the parse budget the first pass already spent from.
+    """
+    try:
+        return int(os.getenv("DOCLING_OCR_MAX_PAGES", "300"))
+    except ValueError:
+        return 300
+
+
+def get_ingest_max_pages() -> int:
+    """INGEST_MAX_PAGES (default: 2000; 0 disables the guardrail).
+
+    Hard page ceiling, checked before the parse. Sized from a measured ~4.9 MB/page plus ~1.5 GB
+    fixed against a 12 GB worker; raise it only alongside the memory limit.
+    """
+    try:
+        return int(os.getenv("INGEST_MAX_PAGES", "2000"))
+    except ValueError:
+        return 2000
 
 
 def get_docling_text_quality_threshold() -> float:
@@ -762,6 +795,14 @@ def get_table_summarizer_enable_thinking() -> bool:
     }
 
 
+def get_table_summarizer_concurrency() -> int:
+    """In-flight table summarizer batches (TABLE_SUMMARIZER_CONCURRENCY, default: 4)."""
+    try:
+        return max(1, int(os.getenv("TABLE_SUMMARIZER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
 def get_table_summarizer_batch_size() -> int:
     """Number of tables to summarize per LLM call (TABLE_SUMMARIZER_BATCH_SIZE, default: 3)."""
     return int(os.getenv("TABLE_SUMMARIZER_BATCH_SIZE", "3"))
@@ -832,8 +873,8 @@ def get_picture_enricher_concurrency() -> int:
 
 
 def get_picture_enricher_stage_timeout() -> float:
-    """Wall-clock budget for the whole enrichment stage (PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS,
-    default: 300).
+    """Floor of the enrichment stage budget (PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS, default: 300);
+    the budget grows with picture count, see get_picture_enricher_seconds_per_picture.
 
     Enrichment runs after the parse, so DOCLING_PARSE_TIMEOUT_SECONDS does not cover it; without
     this only Celery's soft limit would, which fails the whole document. Timing out here leaves
@@ -843,6 +884,16 @@ def get_picture_enricher_stage_timeout() -> float:
         return float(os.getenv("PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS", "300"))
     except ValueError:
         return 300.0
+
+
+def get_picture_enricher_seconds_per_picture() -> float:
+    """Per-picture share of the enrichment stage budget (PICTURE_ENRICHER_SECONDS_PER_PICTURE,
+    default: 1.0). The budget is max(stage timeout, pictures x this); measured ~0.7 s/picture
+    at concurrency 4 on a 1043-page filing."""
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_SECONDS_PER_PICTURE", "1.0"))
+    except ValueError:
+        return 1.0
 
 
 def get_picture_enricher_max_image_px() -> int:

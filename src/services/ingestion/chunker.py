@@ -112,46 +112,60 @@ class CustomHybridChunker(HybridChunker):
         for chunk in chunks:
             self._pieces_by_key[self._chunk_key(chunk)] = [self._piece(chunk)]
 
+        # Each count runs the full custom contextualize, so counts are cached, and a merge
+        # candidate is costed as the sum of its members plus delimiters rather than built and
+        # tokenized. contextualize(merge(a, b)) renders as contextualize(a) + delim +
+        # contextualize(b), so the sum is exact up to tokenizer effects at the join. Only an
+        # accepted merge is built and tokenized.
+        counts: dict[tuple[str, ...], int] = {}
+        delim_tokens = self.tokenizer.count_tokens(self.delim)
+
+        def tokens(c: DocChunk) -> int:
+            key = self._chunk_key(c)
+            n = counts.get(key)
+            if n is None:
+                n = counts[key] = self._count_chunk_tokens(c)
+            return n
+
+        def fits(a: DocChunk, b: DocChunk) -> bool:
+            return tokens(a) + delim_tokens + tokens(b) <= self.merge_limit
+
         out: list[DocChunk] = []
         i = 0
 
         while i < len(chunks):
             cur = chunks[i]
 
-            if self._count_chunk_tokens(cur) >= self.min_tokens:
+            if tokens(cur) >= self.min_tokens:
                 out.append(cur)
                 i += 1
                 continue
 
             group = [cur]
+            group_tokens = tokens(cur)
             i += 1
 
             while i < len(chunks):
                 nxt = chunks[i]
-                if self._count_chunk_tokens(nxt) >= self.min_tokens:
+                if tokens(nxt) >= self.min_tokens:
                     break
-
-                candidate = self._merge([*group, nxt])
-                if self._count_chunk_tokens(candidate) > self.merge_limit:
+                if group_tokens + delim_tokens + tokens(nxt) > self.merge_limit:
                     break
 
                 group.append(nxt)
+                group_tokens += delim_tokens + tokens(nxt)
                 i += 1
 
             merged = group[0] if len(group) == 1 else self._merge(group)
 
-            if self._count_chunk_tokens(merged) < self.min_tokens:
-                if i < len(chunks):
-                    candidate = self._merge([merged, chunks[i]])
-                    if self._count_chunk_tokens(candidate) <= self.merge_limit:
-                        chunks[i] = candidate
-                        continue
+            if tokens(merged) < self.min_tokens:
+                if i < len(chunks) and fits(merged, chunks[i]):
+                    chunks[i] = self._merge([merged, chunks[i]])
+                    continue
 
-                if out:
-                    candidate = self._merge([out[-1], merged])
-                    if self._count_chunk_tokens(candidate) <= self.merge_limit:
-                        out[-1] = candidate
-                        continue
+                if out and fits(out[-1], merged):
+                    out[-1] = self._merge([out[-1], merged])
+                    continue
 
             out.append(merged)
 
@@ -206,9 +220,11 @@ class CustomHybridChunker(HybridChunker):
 
     @staticmethod
     def _chunk_key(chunk: DocChunk) -> tuple[str, ...]:
-        return tuple(
-            ref for ref in (getattr(item, "self_ref", None) for item in chunk.meta.doc_items) if ref
-        )
+        # The text is part of the key: docling splits an oversized item (a long table) into
+        # several chunks with identical doc_items, and keyed by refs alone they all rendered
+        # the last segment's text.
+        refs = (getattr(item, "self_ref", None) for item in chunk.meta.doc_items)
+        return (*(ref for ref in refs if ref), chunk.text)
 
 
 def _dump_model(value: Any) -> Any:

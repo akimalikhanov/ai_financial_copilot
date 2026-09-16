@@ -20,6 +20,7 @@ def ensure_collection(name: str, dim: int) -> None:
         client.create_collection(
             collection_name=name,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            shard_number=1,  # upsert_chunks relies on per-shard ordering
         )
     for field in ("user_id", "document_id"):
         with suppress(Exception):
@@ -46,30 +47,35 @@ def upsert_chunks(
     from qdrant_client.http.models import PointStruct
 
     doc_id_str = str(doc_id)
-    points: list[PointStruct] = []
 
-    for item in chunks_with_vectors:
-        vector = item["vector"]
-        chunk_id = item["chunk_id"]
-        chunk_index = item["chunk_index"]
-
+    def _point(item: dict[str, Any]) -> PointStruct:
         payload: dict[str, Any] = {
-            "chunk_id": str(chunk_id),
+            "chunk_id": str(item["chunk_id"]),
             "document_id": doc_id_str,
             "user_id": str(user_id),
-            "chunk_index": chunk_index,
+            "chunk_index": item["chunk_index"],
         }
         for key in ("chunk_type", "page_start", "page_end", "heading_trail"):
             if key in item and item[key] is not None:
                 payload[key] = item[key]
-
-        points.append(PointStruct(id=str(chunk_id), vector=vector, payload=payload))
+        vector = item["vector"]
+        # float32 array rows (embedder) become lists only for the batch being sent.
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+        return PointStruct(id=str(item["chunk_id"]), vector=vector, payload=payload)
 
     # Qdrant's default max_request_size_mb is 32 MB. A 768-dim vector is ~12 KB
     # in JSON, so 500 points ≈ 6 MB per batch — well within the limit.
+    # Only the last batch waits: Qdrant applies operations in order per shard, so it fences
+    # the earlier ones. That holds because the collection is created single-shard.
     client = get_client()
-    for i in range(0, len(points), 500):
-        client.upsert(collection_name=collection, points=points[i : i + 500], wait=True)
+    starts = range(0, len(chunks_with_vectors), 500)
+    for i in starts:
+        client.upsert(
+            collection_name=collection,
+            points=[_point(item) for item in chunks_with_vectors[i : i + 500]],
+            wait=i == starts[-1],
+        )
 
 
 def delete_by_document(collection: str, doc_id: UUID | str) -> None:

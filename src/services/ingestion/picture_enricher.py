@@ -33,6 +33,8 @@ from src.utils.config import (
     get_picture_enricher_min_confidence,
     get_picture_enricher_model,
     get_picture_enricher_reasoning_effort,
+    get_picture_enricher_seconds_per_picture,
+    get_picture_enricher_stage_timeout,
 )
 from src.utils.json_schema import build_response_format
 
@@ -53,7 +55,7 @@ CHART_LABELS = frozenset({"bar_chart", "line_chart", "pie_chart", "flow_chart", 
 # decorative icon is noise that gets embedded and BM25-indexed as document text.
 SKIP_LABELS = frozenset({"logo", "icon", "signature", "stamp", "qr_code", "bar_code"})
 
-_MIME = "image/png"  # what export writes; see tasks._extract_picture_crops
+_MIME = "image/png"  # what _crop_bytes writes; same format as tasks._encode_picture_crop
 # One retry: the chart lane occasionally returns HTTP 200 with an empty body.
 _MAX_ATTEMPTS = 2
 # Completion budget per picture, floored by PICTURE_ENRICHER_MIN_COMPLETION_TOKENS so that a
@@ -63,10 +65,21 @@ _TOKENS_PER_PICTURE = 1200
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
-    """One picture to describe, paired with the crop bytes and the lane it routed to."""
+    """One picture to describe and the lane it routed to.
+
+    Holds no crop bytes: those are encoded per batch inside `_run_lane`, under the semaphore,
+    so at most `concurrency x batch_size` PNGs are live rather than one per picture.
+    """
 
     picture: PictureItem
     label: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Encoded:
+    """A candidate whose crop has been encoded for the call in flight."""
+
+    candidate: _Candidate
     image: bytes
 
 
@@ -141,8 +154,8 @@ def _label_of(pic: PictureItem, min_confidence: float) -> str:
 def _crop_bytes(pic: PictureItem) -> bytes | None:
     """PNG bytes for the picture's in-memory crop, or None when it has none.
 
-    Same source as tasks._extract_picture_crops: the crops exist on the document only because
-    generate_picture_images=True, and only until export strips them.
+    Same source as tasks._encode_picture_crop: the crops exist on the document only because
+    generate_picture_images=True, and only until tasks._upload_picture_crops clears them.
     """
     if pic.image is None:
         return None
@@ -158,37 +171,44 @@ def _plan(
     document: DoclingDocument, min_confidence: float
 ) -> tuple[list[_Candidate], list[_Candidate]]:
     """Split the document's pictures into the chart lane and the caption lane, dropping the
-    skip labels and anything with no crop to send."""
+    skip labels and anything with no crop to send. Encoding is deferred to `_encode_batch`."""
     charts: list[_Candidate] = []
     captions: list[_Candidate] = []
     for pic in document.pictures:
         label = _label_of(pic, min_confidence)
-        if label in SKIP_LABELS:
+        if label in SKIP_LABELS or pic.image is None:
             continue
+        candidate = _Candidate(picture=pic, label=label)
+        (charts if label in CHART_LABELS else captions).append(candidate)
+    return charts, captions
+
+
+def _encode_batch(batch: list[_Candidate]) -> list[_Encoded]:
+    """Encode a batch's crops, dropping any that fail to decode or come back empty."""
+    encoded: list[_Encoded] = []
+    for candidate in batch:
         try:
-            image = _crop_bytes(pic)
+            image = _crop_bytes(candidate.picture)
         except Exception:
             logger.warning(
                 "picture_enricher.crop_failed",
-                extra={"self_ref": pic.self_ref},
+                extra={"self_ref": candidate.picture.self_ref},
                 exc_info=True,
             )
             continue
-        if not image:
-            continue
-        candidate = _Candidate(picture=pic, label=label, image=image)
-        (charts if label in CHART_LABELS else captions).append(candidate)
-    return charts, captions
+        if image:
+            encoded.append(_Encoded(candidate=candidate, image=image))
+    return encoded
 
 
 # -- LLM calls ----------------------------------------------------------------
 
 
-def _build_message(batch: list[_Candidate], detail: str) -> ChatMessage:
+def _build_message(batch: list[_Encoded], detail: str) -> ChatMessage:
     """One user message holding the whole batch: a text part naming each picture, then the
     crops in the same order. The model sees only pixels and this text, so the label has to be
     written in explicitly (see docs/notes/llm-image-inputs.md)."""
-    lines = [f"[PICTURE {i}] {c.label}" for i, c in enumerate(batch, start=1)]
+    lines = [f"[PICTURE {i}] {c.candidate.label}" for i, c in enumerate(batch, start=1)]
     return ChatMessage(
         role=Role.user,
         content="\n".join(lines),
@@ -234,7 +254,7 @@ def _parse(raw: str, size: int, lane: str = "unknown") -> dict[int, str] | None:
 
 
 async def _describe_batch(
-    batch: list[_Candidate],
+    batch: list[_Encoded],
     *,
     llm: RoutedLLM,
     model: str,
@@ -319,14 +339,49 @@ async def _run_lane(
 
     batches = [candidates[i : i + batch_size] for i in range(0, len(candidates), batch_size)]
 
-    async def _one(
-        start: int, batch: list[_Candidate]
-    ) -> tuple[int, list[_Candidate], dict[int, str] | None]:
-        """Return the batch alongside its result: descriptions are matched to pictures by
-        identity, never by position in the gather output."""
+    def _write(start: int, batch: list[_Candidate], descriptions: dict[int, str] | None) -> int:
+        if descriptions is None:
+            # Per-batch isolation: the contract is that enrichment degrades, never fails.
+            PICTURE_ENRICHER.labels(lane, "failed").inc(len(batch))
+            logger.warning(
+                "picture_enricher.batch_failed",
+                extra={
+                    "lane": lane,
+                    "batch_start": start,
+                    "batch_size": len(batch),
+                    "model": model,
+                },
+            )
+            return 0
+        described = 0
+        for local_id, candidate in enumerate(batch, start=1):
+            text = descriptions.get(local_id)
+            if not text:
+                continue
+            pic = candidate.picture
+            if pic.meta is None:
+                pic.meta = PictureMeta()
+            pic.meta.description = DescriptionMetaField(text=text, created_by=model)
+            described += 1
+        PICTURE_ENRICHER.labels(lane, "described").inc(described)
+        # Parsed fine but the model declined to describe these — its escape hatch for an
+        # unreadable image, which is a different outcome from a failed call.
+        PICTURE_ENRICHER.labels(lane, "skipped").inc(len(batch) - described)
+        return described
+
+    async def _one(start: int, batch: list[_Candidate]) -> int:
+        """Describe one batch and write its descriptions before returning.
+
+        Writing here rather than after the gather is what keeps completed batches when the
+        stage budget cancels the rest. The crops are encoded under the semaphore and released
+        on return; the 1-based ids in `descriptions` line up with the encoded subset.
+        """
         async with sem:
+            encoded = _encode_batch(batch)
+            if not encoded:
+                return 0
             descriptions = await _describe_batch(
-                batch,
+                encoded,
                 llm=llm,
                 model=model,
                 system_prompt=system_prompt,
@@ -334,7 +389,7 @@ async def _run_lane(
                 lane=lane,
                 response_format=response_format,
             )
-        return start, batch, descriptions
+        return _write(start, [e.candidate for e in encoded], descriptions)
 
     # return_exceptions=True is what preserves "degrade, never fail" under gather: without it
     # one raising batch cancels its siblings and takes down the whole lane.
@@ -354,45 +409,19 @@ async def _run_lane(
                 exc_info=result,
             )
             continue
-
-        start, batch, descriptions = result
-        if descriptions is None:
-            # Per-batch isolation: the contract is that enrichment degrades, never fails.
-            PICTURE_ENRICHER.labels(lane, "failed").inc(len(batch))
-            logger.warning(
-                "picture_enricher.batch_failed",
-                extra={
-                    "lane": lane,
-                    "batch_start": start,
-                    "batch_size": len(batch),
-                    "model": model,
-                },
-            )
-            continue
-
-        described = 0
-        for local_id, candidate in enumerate(batch, start=1):
-            text = descriptions.get(local_id)
-            if not text:
-                continue
-            pic = candidate.picture
-            if pic.meta is None:
-                pic.meta = PictureMeta()
-            pic.meta.description = DescriptionMetaField(text=text, created_by=model)
-            described += 1
-        written += described
-        PICTURE_ENRICHER.labels(lane, "described").inc(described)
-        # Parsed fine but the model declined to describe these — its escape hatch for an
-        # unreadable image, which is a different outcome from a failed call.
-        PICTURE_ENRICHER.labels(lane, "skipped").inc(len(batch) - described)
+        written += result
     return written
 
 
-async def enrich_pictures(document: DoclingDocument) -> int:
+async def enrich_pictures(document: DoclingDocument, *, max_timeout: float | None = None) -> int:
     """Route document.pictures by classification, write pic.meta.description, return how many.
 
     Mutates the document in place. Never raises for an LLM or image failure: a picture that
     could not be described keeps meta.description unset, which the chunker drops.
+
+    The stage budget scales with the number of pictures sent, floored by
+    PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS and capped by `max_timeout` (what the task has left).
+    On timeout, batches that already finished keep their descriptions.
     """
     _ensure_initialized()
     assert _chart_llm is not None and _caption_llm is not None
@@ -422,7 +451,14 @@ async def enrich_pictures(document: DoclingDocument) -> int:
     # One semaphore across both lanes: the rate limit that matters is the provider account's,
     # not each lane's. Creating it per-lane would let 2x the intended calls in flight.
     sem = asyncio.Semaphore(get_picture_enricher_concurrency())
-    chart_written, caption_written = await asyncio.gather(
+    attempted = len(charts) + len(captions)
+    budget = max(
+        get_picture_enricher_stage_timeout(),
+        attempted * get_picture_enricher_seconds_per_picture(),
+    )
+    if max_timeout is not None:
+        budget = max(0.0, min(budget, max_timeout))
+    lanes = asyncio.gather(
         _run_lane(
             charts,
             llm=_chart_llm,
@@ -444,10 +480,29 @@ async def enrich_pictures(document: DoclingDocument) -> int:
             sem=sem,
         ),
     )
-    written = chart_written + caption_written
+    try:
+        chart_written, caption_written = await asyncio.wait_for(lanes, timeout=budget)
+        written = chart_written + caption_written
+    except TimeoutError:
+        models = {_chart_model, _caption_model}
+        written = sum(
+            1
+            for c in (*charts, *captions)
+            if c.picture.meta is not None
+            and c.picture.meta.description is not None
+            and c.picture.meta.description.created_by in models
+        )
+        logger.warning(
+            "picture_enricher.stage_timeout",
+            extra={
+                "budget_seconds": round(budget, 1),
+                "described": written,
+                "attempted": attempted,
+            },
+        )
 
     logger.info(
         "picture_enricher.done",
-        extra={"described": written, "attempted": len(charts) + len(captions), "pictures": total},
+        extra={"described": written, "attempted": attempted, "pictures": total},
     )
     return written

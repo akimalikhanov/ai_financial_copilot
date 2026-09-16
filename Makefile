@@ -155,14 +155,20 @@ k8s-set-images:
 
 # Full build+push+deploy loop; use individual docker-build-*/k8s-push-* targets to iterate on one service.
 #
-# model-preload is deleted first because a Job's spec.template is immutable and its image tag
-# changes on every rebuild — applying over a completed Job is a hard error that would fail the
-# whole deploy. Recreating it is cheap: once the PVC holds the weights the Job is a no-op that
-# exits in seconds, which also re-warms the cache if the PVC was ever wiped.
+# Every Job the overlay applies is deleted first, because a Job's spec.template is immutable:
+# applying over an existing Job is a hard error that fails the whole deploy. Each of the three
+# has a template that changes on its own schedule — model-preload's image tag on every rebuild,
+# and the two bootstraps' configMapGenerator hash suffix whenever their scripts change — so any
+# of them can wedge a deploy. Recreating all three is cheap: each is a no-op that exits in
+# seconds once its PVC/bucket/index already exists.
+#
+# Leaving one out is not merely a failed deploy. A Job created against a since-renamed
+# ConfigMap can never be repaired by apply, and its pod sits in ContainerCreating on
+# FailedMount indefinitely — observed on es-bootstrap and garage-bootstrap for 22h.
 .PHONY: k8s-deploy
 k8s-deploy: docker-build-api docker-build-frontend docker-build-worker
 	$(MAKE) k8s-push-api k8s-push-frontend k8s-push-worker k8s-set-images
-	kubectl delete job model-preload -n copilot --ignore-not-found
+	kubectl delete job model-preload es-bootstrap garage-bootstrap -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
 
 # Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run

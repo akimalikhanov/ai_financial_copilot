@@ -13,6 +13,10 @@ class FakeIndices:
     def __init__(self, exists: bool) -> None:
         self._exists = exists
         self.create_calls: list[dict] = []
+        self.refresh_calls: list[dict] = []
+
+    def refresh(self, **kwargs) -> None:
+        self.refresh_calls.append(kwargs)
 
     def exists(self, index: str) -> bool:  # noqa: ARG002
         return self._exists
@@ -54,7 +58,8 @@ class TestBulkIndex:
     def test_bulk_called_with_index_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = []
         monkeypatch.setattr("opensearchpy.helpers.bulk", lambda *a, **k: calls.append((a, k)))
-        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: FakeClient())
+        client = FakeClient()
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
 
         chunk_id = uuid4()
         chunks = [
@@ -70,6 +75,9 @@ class TestBulkIndex:
         actions = calls[0][0][1]
         assert actions[0]["_op_type"] == "index"
         assert actions[0]["_id"] == str(chunk_id)
+        # P1-3: no forced refresh per 500-action request; one explicit refresh at the end.
+        assert calls[0][1]["refresh"] is False
+        assert client.indices.refresh_calls == [{"index": "chunks"}]
 
 
 class TestBulkDelete:

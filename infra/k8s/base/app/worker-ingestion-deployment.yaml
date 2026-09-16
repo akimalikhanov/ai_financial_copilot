@@ -39,10 +39,11 @@ spec:
         prometheus.io/port: "9101"
         prometheus.io/path: "/metrics"
     spec:
-      # Above CELERY_TASK_SOFT_TIME_LIMIT_SECONDS (360), same reasoning as worker-chat: a warm
+      # Above INGEST_TASK_SOFT_TIME_LIMIT_SECONDS (2400) — not the app-wide 360, which
+      # ingest_document overrides on its own decorator. Same reasoning as worker-chat: a warm
       # shutdown must be able to finish the longest task Celery allows. Ingestion is already
       # attempt-capped (INGEST_MAX_ATTEMPTS), but a redelivered parse still costs a GPU slot.
-      terminationGracePeriodSeconds: 420
+      terminationGracePeriodSeconds: 2500
       initContainers:
         - name: wait-for-pgbouncer
           image: postgres:16.11-alpine
@@ -149,12 +150,13 @@ spec:
           # waits on a broadcast reply — it cannot finish in 10s while both children are busy
           # parsing, so compose's 10s/30s values flap the pod to 0/1 during every real ingest
           # (and burn CPU on imports that get SIGKILLed). Long timeout, long period.
+          # env -u: importing src.observability purges the multiproc dir, wiping the live worker's shards.
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
-                - python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1
+                - env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1
             initialDelaySeconds: 60
             periodSeconds: 120
             timeoutSeconds: 60

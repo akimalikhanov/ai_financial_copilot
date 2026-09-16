@@ -321,6 +321,8 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   fetch_document_record: 'Starting',
   download_pdf: 'Downloading',
   parse_pdf_docling: 'Parsing',
+  upload_picture_crops: 'Uploading',
+  load_persisted_parse: 'Resuming',
   export_docling_artifacts: 'Exporting',
   save_metadata_and_upload_artifacts: 'Saving',
   chunk_document: 'Chunking',

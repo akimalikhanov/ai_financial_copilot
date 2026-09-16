@@ -632,20 +632,53 @@ class TestStartupValidation:
 
 
 class TestStageTimeout:
-    async def test_enrichment_is_bounded_and_keeps_partial_work(
+    async def test_timeout_keeps_batches_that_already_finished(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Enrichment runs after the parse, so only Celery's soft limit would otherwise bound
-        it — and that fails the whole document instead of degrading."""
-        chart = _SlowLLM(delay=10.0)
-        _install(monkeypatch, chart, _StubLLM())
+        """P1-1: descriptions are written as each batch returns, so a stage timeout discards
+        only the batches still in flight — not the ones that already succeeded."""
 
-        doc = _doc(("bar_chart", 0.9))
-        with pytest.raises(TimeoutError):
-            await asyncio.wait_for(picture_enricher.enrich_pictures(doc), timeout=0.1)
+        class _OneSlow(_StubLLM):
+            async def complete(self, messages, **params):  # noqa: ANN001, ANN003
+                if "line_chart" in messages[-1].content:
+                    await asyncio.sleep(10.0)
+                return await super().complete(messages, **params)
 
-    def test_pipeline_wraps_enrichment_in_a_stage_timeout(self) -> None:
-        """Guards the call site: the timeout must be applied where the stage runs."""
+        _install(monkeypatch, _OneSlow(), _StubLLM())
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_batch_size", lambda: 1)
+
+        doc = _doc(("bar_chart", 0.9), ("line_chart", 0.9), ("pie_chart", 0.9))
+        started = time.perf_counter()
+        written = await picture_enricher.enrich_pictures(doc, max_timeout=0.2)
+
+        assert time.perf_counter() - started < 2.0
+        assert written == 2
+        assert [d is not None for d in _descriptions(doc)] == [True, False, True]
+
+    async def test_budget_scales_with_picture_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        budgets: list[float] = []
+        real_wait_for = asyncio.wait_for
+
+        async def _spy(aw, timeout):  # noqa: ANN001, ANN202
+            budgets.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        _install(monkeypatch, _StubLLM(), _StubLLM())
+        monkeypatch.setattr(picture_enricher.asyncio, "wait_for", _spy)
+        monkeypatch.setattr(picture_enricher, "get_picture_enricher_stage_timeout", lambda: 5.0)
+        monkeypatch.setattr(
+            picture_enricher, "get_picture_enricher_seconds_per_picture", lambda: 2.0
+        )
+
+        await picture_enricher.enrich_pictures(_doc(("bar_chart", 0.9)))
+        await picture_enricher.enrich_pictures(_doc(*[("bar_chart", 0.9)] * 4))
+        await picture_enricher.enrich_pictures(_doc(*[("bar_chart", 0.9)] * 4), max_timeout=3.0)
+
+        # Floor, then pictures x per-picture, then capped by what the task has left.
+        assert budgets == [5.0, 8.0, 3.0]
+
+    def test_pipeline_caps_enrichment_by_the_task_budget(self) -> None:
+        """Guards the call site: the cap must come from the task's remaining soft limit."""
         import inspect
 
         from src.services.ingestion import tasks
@@ -653,10 +686,8 @@ class TestStageTimeout:
         source = inspect.getsource(tasks)
         stage = source.split('_log_stage("enrich_pictures")')[1].split("export_docling")[0]
 
-        assert "asyncio.wait_for" in stage
-        assert "get_picture_enricher_stage_timeout()" in stage
-        # A timeout must not be reported as a failed document.
-        assert "picture_enrichment_timeout" in stage
+        assert "max_timeout=remaining" in stage
+        assert "_task_soft_time_limit" in stage
 
 
 class TestEnricherMetrics:

@@ -83,7 +83,10 @@ def bulk_index(
         for item in chunks
     ]
 
-    bulk(get_client(), actions, refresh=True)
+    # One refresh at the end rather than one per 500-action request the helper sends.
+    client = get_client()
+    bulk(client, actions, refresh=False)
+    client.indices.refresh(index=index)
 
 
 def delete_by_document(index: str, doc_id: UUID | str) -> None:
