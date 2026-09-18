@@ -225,10 +225,446 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 20,
+      "type": "row",
+      "title": "Ingestion Worker Memory",
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 34, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "title": "Memory Kept After Each Document",
+      "type": "timeseries",
+      "description": "How much memory the worker process still holds when a document finishes. The next document starts from this level.\n\nAbove the red line, the worker process is replaced right after that document, and the next one starts from about 0.7 GB again.\n\nThis is the line to judge a memory fix by.",
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max(ingestion_worker_rss_bytes{point=\"task_end\"})",
+          "legendFormat": "kept after document",
+          "refId": "A"
+        },
+        {
+          "expr": "max(ingestion_worker_recycle_threshold_bytes) > 0",
+          "legendFormat": "recycle threshold",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "lineInterpolation": "stepAfter",
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "recycle threshold"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "linear"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "What Fills the Container",
+      "type": "timeseries",
+      "description": "Memory in the ingestion container, stacked.\n\n- main process: Celery's parent process.\n- worker process: the process that parses documents.\n- compile workers: helper processes that torch.compile starts.\n- other: page cache and kernel memory, most of which the kernel can reclaim.\n\nProcesses are measured by PSS, so memory they share is split between them and the layers add up. The container is OOM-killed when the total reaches the limit (Kubernetes only).",
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max(worker_process_pss_bytes{job=\"ingestion_worker\", role=\"parent\"})",
+          "legendFormat": "main process",
+          "refId": "A"
+        },
+        {
+          "expr": "max(worker_process_pss_bytes{job=\"ingestion_worker\", role=\"children\"})",
+          "legendFormat": "worker process",
+          "refId": "B"
+        },
+        {
+          "expr": "max(worker_process_pss_bytes{job=\"ingestion_worker\", role=\"descendants\"})",
+          "legendFormat": "compile workers",
+          "refId": "C"
+        },
+        {
+          "expr": "clamp_min(max(worker_cgroup_memory_bytes{job=\"ingestion_worker\", kind=\"current\"}) - scalar(sum(max by (role) (worker_process_pss_bytes{job=\"ingestion_worker\"}))), 0)",
+          "legendFormat": "other",
+          "refId": "D"
+        },
+        {
+          "expr": "max(container_spec_memory_limit_bytes{container=\"worker-ingestion\"}) > 0",
+          "legendFormat": "limit",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limit"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.showPoints",
+                "value": "never"
+              },
+              {
+                "id": "custom.lineInterpolation",
+                "value": "linear"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "Memory Each Stage Added (Last Document)",
+      "type": "bargauge",
+      "description": "How far memory rose above where each pipeline stage started, for the last document that ran it. Memory kept from earlier stages is not counted, so this is what the stage itself needed. Parsing is normally by far the largest.",
+      "gridPos": { "x": 0, "y": 43, "w": 12, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sort_desc(max by (stage) (ingestion_worker_stage_growth_bytes))",
+          "legendFormat": "{{stage}}",
+          "refId": "A",
+          "instant": true,
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "namePlacement": "left",
+        "sizing": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 24,
+      "title": "Peak of Last Document",
+      "type": "stat",
+      "description": "The most memory the worker process used at any point during the last document.",
+      "gridPos": { "x": 12, "y": 43, "w": 4, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max(ingestion_worker_peak_rss_bytes{stage=\"task\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 25,
+      "title": "Worker Process Replaced (24h)",
+      "type": "stat",
+      "description": "How many times the worker process was replaced because a document left more memory behind than the recycle threshold. The next document after each replacement reloads the Docling models.",
+      "gridPos": { "x": 16, "y": 43, "w": 4, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "round(sum(increase(ingestion_worker_recycles_total[24h]))) or vector(0)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 26,
+      "title": "Documents on Current Worker Process",
+      "type": "stat",
+      "description": "Documents the current worker process has handled since it started. Goes back to 0 when the process is replaced.",
+      "gridPos": { "x": 20, "y": 43, "w": 4, "h": 8 },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "max(ingestion_worker_child_tasks)",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "center"
+      }
+    },
+    {
+      "id": 27,
+      "title": "Allocator Free Pool (Sizing, Not Residency)",
+      "type": "timeseries",
+      "description": "Free space on glibc's heap free lists after each document.\n\nThis sizes how much of the floor above *might* be reclaimable — it is not a progress metric. malloc_trim unmaps the pages under this space but leaves the space listed, so a trim that hands GBs back to the system barely moves this line.\n\nTo judge a memory fix, read \"Memory Kept After Each Document\" instead.\n\nHigh and rising alongside a rising floor means the allocator is holding the memory (glibc arenas), rather than the pipeline still referencing it.",
+      "gridPos": { "x": 0, "y": 51, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(ingestion_worker_malloc_free_bytes)",
+          "legendFormat": "free on glibc's heap",
+          "refId": "A"
+        },
+        {
+          "expr": "max(ingestion_worker_rss_bytes{point=\"task_end\"})",
+          "legendFormat": "memory kept (for scale)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "lineInterpolation": "stepAfter",
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "memory kept (for scale)" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 8] } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "text" } }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 10,
       "type": "row",
       "title": "Silent Failure Modes (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 34, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 59, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -236,7 +672,7 @@
       "title": "Retry Storm — Documents by Attempt Count",
       "type": "barchart",
       "description": "Documents hitting 3+ attempts — silent failure mode not visible in Prometheus.",
-      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 60, "w": 12, "h": 8 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -253,7 +689,7 @@
       "title": "Partial-Parse Rate",
       "type": "piechart",
       "description": "partial_success rate; Docling degradation.",
-      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 },
+      "gridPos": { "x": 12, "y": 60, "w": 12, "h": 8 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -274,7 +710,7 @@
       "title": "Worker Error Logs",
       "type": "logs",
       "description": "Stack traces for failed tasks — Celery and ingestion/chat worker loggers at ERROR level.",
-      "gridPos": { "x": 0, "y": 43, "w": 24, "h": 10 },
+      "gridPos": { "x": 0, "y": 68, "w": 24, "h": 10 },
       "datasource": { "type": "elasticsearch", "uid": "elasticsearch" },
       "targets": [
         {

@@ -238,6 +238,17 @@ def configure_worker_logging() -> None:
         root.addHandler(h)
     root.setLevel(level)
 
+    # Celery sets up billiard's logger only when nothing handles setup_logging, and the workers
+    # do. Without this, pool warnings (the memory recycle, child errors) are dropped silently.
+    # It does not propagate, so it gets its own unfiltered handler.
+    from billiard.util import get_logger as get_billiard_logger
+
+    pool_handler = FlushingStreamHandler(sys.stdout)
+    pool_handler.setFormatter(formatter)
+    pool_logger = get_billiard_logger()
+    pool_logger.handlers = [pool_handler]
+    pool_logger.setLevel(logging.WARNING)
+
 
 # ---------------------------------------------------------------------------
 # Unified Request Logging Middleware

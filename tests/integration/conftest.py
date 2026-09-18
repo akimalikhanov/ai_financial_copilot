@@ -180,8 +180,8 @@ def _patch_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
 def _patch_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub out embedding calls (no TEI/OpenAI service available in these tests)."""
     monkeypatch.setattr(
-        "src.services.retrieval.chat_rag.embed_chunks",
-        lambda chunks: [[0.0] * 8 for _ in chunks],
+        "src.services.retrieval.chat_rag.embed_query",
+        lambda _query: [0.0] * 8,
     )
 
 

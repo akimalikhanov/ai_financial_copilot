@@ -17,7 +17,9 @@ import time
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from celery.signals import task_postrun, task_prerun, task_retry, worker_process_shutdown
-from prometheus_client import CollectorRegistry, make_wsgi_app, multiprocess
+from prometheus_client import REGISTRY, CollectorRegistry, make_wsgi_app, multiprocess
+from prometheus_client.core import GaugeMetricFamily
+from prometheus_client.registry import Collector
 
 from src.observability.metrics import (
     CELERY_DURATION,
@@ -26,6 +28,12 @@ from src.observability.metrics import (
     CELERY_TASKS_IN_FLIGHT,
 )
 from src.observability.multiproc import purge_multiproc_dir
+from src.observability.process_memory import (
+    cgroup_memory,
+    child_pids,
+    descendant_pids,
+    pid_pss_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +101,45 @@ def _on_worker_process_shutdown_metrics(**_kwargs: object) -> None:
         logger.debug("worker_metrics.mark_process_dead_failed", exc_info=True)
 
 
+class ProcessTreeMemoryCollector(Collector):
+    """Scrape-time memory of the worker's process tree and its container.
+
+    Runs in the parent, which serves /metrics, so the pool children need no sampler thread.
+    Uses PSS, so the roles add up and the cgroup's ``current`` minus their sum is memory no
+    process owns: page cache and kernel memory.
+
+    role="descendants" is what the pool children start themselves, such as torch.compile's
+    compile-worker pool: the cgroup pays for it, and nothing else reports it.
+    """
+
+    def collect(self):
+        pss = GaugeMetricFamily(
+            "worker_process_pss_bytes",
+            "PSS of the worker parent, its pool children, and their descendants",
+            labels=["role"],
+        )
+        pss.add_metric(["parent"], float(pid_pss_bytes(os.getpid()) or 0))
+        # A zombie (a reaped-late child) has no memory map, which also keeps it out of the count.
+        children = {pid: m for pid in child_pids() if (m := pid_pss_bytes(pid)) is not None}
+        pss.add_metric(["children"], float(sum(children.values())))
+        descendants = (pid_pss_bytes(d) for pid in children for d in descendant_pids(pid))
+        pss.add_metric(["descendants"], float(sum(m for m in descendants if m is not None)))
+        yield pss
+        yield GaugeMetricFamily(
+            "worker_pool_children", "Live pool children", value=float(len(children))
+        )
+        cgroup = cgroup_memory()
+        if cgroup:
+            family = GaugeMetricFamily(
+                "worker_cgroup_memory_bytes",
+                "Container cgroup v2 memory: current, and memory.stat anon/file/inactive_file/shmem",
+                labels=["kind"],
+            )
+            for kind, value in cgroup.items():
+                family.add_metric([kind], float(value))
+            yield family
+
+
 def _sample_queue_depth(queues: tuple[str, ...]) -> None:
     """Periodically sample broker list length per queue into CELERY_QUEUE.
 
@@ -142,9 +189,10 @@ def start_worker_metrics(port: int, queues: tuple[str, ...]) -> None:
     if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
         registry = CollectorRegistry()
         multiprocess.MultiProcessCollector(registry)
-        app = make_wsgi_app(registry)
     else:
-        app = make_wsgi_app()
+        registry = REGISTRY
+    registry.register(ProcessTreeMemoryCollector())
+    app = make_wsgi_app(registry)
 
     httpd = make_server("", port, app, handler_class=_QuietWSGIRequestHandler)
     threading.Thread(target=httpd.serve_forever, name="metrics-server", daemon=True).start()

@@ -36,7 +36,7 @@ generatorOptions:
 images:
   - name: copilot/worker
     newName: localhost:5001/copilot/worker
-    newTag: 9cd69b1-ba3e885c
+    newTag: 9aa8c34-df190257
 
 # These three must land together with the Job — that coupling is what makes accidental
 # real-LLM spend impossible. worker-ingestion is included because the table summarizer and

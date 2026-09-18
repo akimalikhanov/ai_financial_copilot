@@ -386,7 +386,13 @@
             "lastNotNull"
           ]
         }
-      }
+      },
+      "links": [
+        {
+          "title": "Ingestion worker memory breakdown (Worker Health)",
+          "url": "/d/worker-health"
+        }
+      ]
     },
     {
       "id": 7,

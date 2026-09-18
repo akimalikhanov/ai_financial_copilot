@@ -113,6 +113,44 @@ groups:
         annotations:
           summary: "Node {{ $labels.node }} reports {{ $labels.condition }} — pods will be evicted"
 
+  # The ingestion worker process is replaced when the memory it kept after a document passes
+  # the recycle threshold (--max-memory-per-child). Both rules watch that mechanism.
+  # Both key on rss_bytes deliberately. Do not rewrite them against
+  # ingestion_worker_malloc_free_bytes: that gauge tracks glibc's free lists rather than
+  # residency, so it stays high after a malloc_trim that returned the memory.
+  - name: ingestion-worker-memory
+    interval: 30s
+    rules:
+      # The last document started on more memory than the threshold allows, so the recycle that
+      # should have replaced the process did not happen. The next large document can OOM.
+      - alert: IngestionWorkerStartedAboveThreshold
+        expr: |
+          max(ingestion_worker_rss_bytes{point="task_start"})
+            > max(ingestion_worker_recycle_threshold_bytes > 0)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion worker started a document on {{ $value | humanize1024 }}, above the recycle threshold"
+          description: >-
+            The memory recycle is not working. Check that the worker runs with
+            --max-memory-per-child and that its pipeline.memory log lines show
+            recycle_expected=true for large documents.
+
+      # Recycling keeps a leak off the memory panels, so a growing leak shows up here instead.
+      # A 1000-page document takes ~10 min at one slot, so more than 10 recycles an hour means
+      # small documents are also leaving more than the threshold behind.
+      - alert: IngestionWorkerRecyclingOften
+        expr: sum(increase(ingestion_worker_recycles_total[1h])) > 10
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion worker process replaced {{ $value | printf \"%.0f\" }} times in the last hour"
+          description: >-
+            Each replacement reloads the Docling models. Compare rss_end_mb and stage_growth_mb
+            across recent pipeline.memory log lines to see what is keeping memory.
+
   - name: scrape-health
     interval: 30s
     rules:

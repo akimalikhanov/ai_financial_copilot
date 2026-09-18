@@ -146,6 +146,37 @@ def reset_converter() -> None:
         _ocr_converter = None
 
 
+def release_ocr_converter() -> bool:
+    """Drop the forced-OCR converter and its models. True when one was held.
+
+    The OCR converter is a second full pipeline, built only for the rare broken-font or scanned
+    PDF. Left in place it stays resident for the child's whole life, and no allocator trim can
+    return it: the models are live objects, not free heap. The next such PDF pays the load again.
+    """
+    global _ocr_converter
+    with _converter_lock:
+        if _ocr_converter is None:
+            return False
+        _ocr_converter = None
+
+    # The converter holds reference cycles, so dropping the name is not enough to free the
+    # models before the cyclic GC next runs on its own.
+    gc.collect()
+    _empty_cuda_cache()
+    return True
+
+
+def _empty_cuda_cache() -> None:
+    """Return the OCR models' VRAM to the driver. No-op without torch or a GPU."""
+    try:
+        import torch
+    except ImportError:
+        return
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def probe_page_count(pdf_path: Path) -> int | None:
     """Page count straight from the PDF, or None if it cannot be read.
 
@@ -355,6 +386,11 @@ def parse(pdf_path: Path) -> ParseResult:
                     "parse_status": parse_status,
                 },
             )
+
+    # Both retry paths above build the OCR converter; release it here so one rare PDF does not
+    # leave a second pipeline resident for the rest of the child's life.
+    if release_ocr_converter():
+        _LOG.info("docling.ocr_converter_released", extra={"pdf_path": str(pdf_path)})
 
     document = result.document
     page_count = len(result.pages)

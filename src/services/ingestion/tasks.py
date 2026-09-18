@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -28,7 +29,14 @@ from src.observability.metrics import (
     INGESTION_DOCUMENTS,
     INGESTION_DURATION,
     INGESTION_QUEUE_WAIT,
+    INGESTION_WORKER_CHILD_TASKS,
+    INGESTION_WORKER_MALLOC_FREE,
+    INGESTION_WORKER_PEAK_RSS,
+    INGESTION_WORKER_RECYCLES,
+    INGESTION_WORKER_RSS,
+    INGESTION_WORKER_STAGE_GROWTH,
 )
+from src.observability.process_memory import TaskMemory, malloc_trim
 from src.redis_client import ingestion_stream_key
 from src.services.ingestion.chunker import reset_tokenizer
 from src.services.ingestion.docling_parser import reset_converter
@@ -53,7 +61,9 @@ from src.utils.config import (
     get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
+    get_ingest_malloc_trim_enabled,
     get_ingest_max_pages,
+    get_ingest_worker_max_memory_per_child_kb,
     get_picture_enricher_enabled,
     get_redis_app_url,
     get_s3_chunks_bucket,
@@ -70,6 +80,8 @@ _worker_loop: asyncio.AbstractEventLoop | None = None
 _redis_ingestion: Redis | None = None
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+# Tasks started by this process. Only prefork children run tasks, so it counts since fork.
+_child_tasks = 0
 
 
 def _get_int_env(name: str) -> int | None:
@@ -323,7 +335,7 @@ def _write_chunks_jsonl(path: Path, chunks: list[dict[str, Any]], db_chunks: lis
             )
 
 
-async def _run_pipeline(document_id: str) -> None:  # noqa: C901
+async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None:  # noqa: C901
     from src.repository.chunk_repository import ChunkRepository
     from src.repository.document_repository import DocumentRepository
     from src.services.ingestion import (
@@ -367,6 +379,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         stage_index += 1
         current_stage = stage_name
         stage_order.append(stage_name)
+        if mem is not None:
+            mem.stage(stage_name)
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
@@ -436,6 +450,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
             prior_parse_status = doc.parse_status
+            if mem is not None:
+                mem.page_count = doc.page_count
             upload_metadata = dict(doc.document_metadata or {})
             await repo.update_status(doc_uuid, "processing", clear_processing_error=True)
             await session.commit()
@@ -482,6 +498,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                     f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
                     f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
                 ) from exc
+            if mem is not None:
+                mem.page_count = parse_result.page_count
 
             # -- describe pictures with a vision model (network-bound) ---------
             # Must run before export and before chunking: it writes pic.meta.description, which
@@ -821,11 +839,75 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 )
 def ingest_document(self, document_id: str) -> None:
     """Full ingestion pipeline: parse -> chunk -> embed -> index -> finalize."""
+    global _child_tasks
     logger.info("ingest_document.start", extra={"document_id": document_id})
+    _child_tasks += 1
+    mem = _record_task_start(_child_tasks)
+    try:
+        _ingest_document(self, document_id, mem)
+    finally:
+        # After _run_pipeline returned, so its locals (the parsed document) are gone and
+        # task_end reads the floor the next task inherits.
+        _record_task_end(mem, document_id)
+
+
+def _record_task_start(child_tasks: int) -> TaskMemory:
+    mem = TaskMemory.start(child_tasks)
+    INGESTION_WORKER_CHILD_TASKS.set(child_tasks)
+    if mem.rss_start is not None:
+        INGESTION_WORKER_RSS.labels("task_start").set(mem.rss_start)
+    return mem
+
+
+def _record_task_end(mem: TaskMemory, document_id: str) -> None:
+    """Publish the task's floor, peaks and growth, and log them as one pipeline.memory line.
+
+    finish() resets the peak, so the --max-memory-per-child check that billiard runs next
+    compares the threshold with the memory the task kept.
+    """
+    try:
+        # Before finish(): it reads the floor and resets the peak that billiard's recycle
+        # check compares, so trimming after it would recycle on memory already returned.
+        trimmed = False
+        if get_ingest_malloc_trim_enabled():
+            gc.collect()
+            trimmed = malloc_trim()
+        report = mem.finish()
+        if report.rss_end is not None:
+            INGESTION_WORKER_RSS.labels("task_end").set(report.rss_end)
+        if report.malloc_end is not None:
+            INGESTION_WORKER_MALLOC_FREE.set(report.malloc_end.fordblks)
+        for stage, peak in mem.stage_peaks.items():
+            INGESTION_WORKER_PEAK_RSS.labels(stage).set(peak)
+        for stage, growth in mem.stage_growth.items():
+            INGESTION_WORKER_STAGE_GROWTH.labels(stage).set(growth)
+        if mem.task_peak is not None:
+            INGESTION_WORKER_PEAK_RSS.labels("task").set(mem.task_peak)
+        threshold_kib = get_ingest_worker_max_memory_per_child_kb()
+        recycle = bool(
+            threshold_kib and report.rss_end is not None and report.rss_end > threshold_kib * 1024
+        )
+        if recycle:
+            INGESTION_WORKER_RECYCLES.inc()
+        logger.info(
+            "pipeline.memory",
+            extra={
+                "document_id": document_id,
+                **report.log_fields(),
+                "recycle_threshold_mb": round(threshold_kib * 1024 / 1e6, 1),
+                "recycle_expected": recycle,
+                "malloc_trimmed": trimmed,
+            },
+        )
+    except Exception:  # noqa: BLE001 — instrumentation never fails a task
+        logger.warning("pipeline.memory_failed", extra={"document_id": document_id}, exc_info=True)
+
+
+def _ingest_document(self, document_id: str, mem: TaskMemory) -> None:
     try:
         if _worker_loop is None or _worker_loop.is_closed():
             raise RuntimeError("Ingestion worker loop is not initialized")
-        _worker_loop.run_until_complete(_run_pipeline(document_id))
+        _worker_loop.run_until_complete(_run_pipeline(document_id, mem))
         logger.info("ingest_document.done", extra={"document_id": document_id})
     except LookupError:
         logger.warning(

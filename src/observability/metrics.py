@@ -258,3 +258,49 @@ INGESTION_QUEUE_WAIT = Histogram(
     # a large upload inflates this by the PUT's duration.
     buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200),
 )
+
+# --- Ingestion worker memory ---
+# Set in the prefork pool child ("worker process") that runs the documents. mostrecent keeps
+# the last value after that child is recycled, so the document that caused a recycle stays on
+# the dashboard until the next document replaces it.
+INGESTION_WORKER_RSS = Gauge(
+    "ingestion_worker_rss_bytes",
+    "Worker process RSS when the last document started and when it finished",
+    ["point"],  # task_start | task_end
+    multiprocess_mode="mostrecent",
+)
+# Sizing, not residency, and not a progress metric: malloc_trim unmaps the pages under this
+# free space but leaves the space on glibc's free lists, so a trim that returns GBs of RSS
+# moves this barely at all. Use it to see how much of the floor might be reclaimable; judge
+# whether it was by ingestion_worker_rss_bytes{point="task_end"}.
+INGESTION_WORKER_MALLOC_FREE = Gauge(
+    "ingestion_worker_malloc_free_bytes",
+    "Free space on glibc's heap free lists after the last document (may or may not be resident)",
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_PEAK_RSS = Gauge(
+    "ingestion_worker_peak_rss_bytes",
+    "Worker process peak RSS per pipeline stage, last document that ran it (stage=task: whole)",
+    ["stage"],
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_STAGE_GROWTH = Gauge(
+    "ingestion_worker_stage_growth_bytes",
+    "How far RSS rose above its level at the start of the stage, last document that ran it",
+    ["stage"],
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_CHILD_TASKS = Gauge(
+    "ingestion_worker_child_tasks",
+    "Documents the current worker process has started",
+    multiprocess_mode="livemostrecent",
+)
+INGESTION_WORKER_RECYCLE_THRESHOLD = Gauge(
+    "ingestion_worker_recycle_threshold_bytes",
+    "--max-memory-per-child in bytes (0 = off)",
+    multiprocess_mode="livemax",  # set once, in the parent
+)
+INGESTION_WORKER_RECYCLES = Counter(
+    "ingestion_worker_recycles_total",
+    "Documents after which the worker process kept more than the threshold and was replaced",
+)

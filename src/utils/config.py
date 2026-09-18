@@ -536,15 +536,39 @@ def get_docling_ocr_max_pages() -> int:
 
 
 def get_ingest_max_pages() -> int:
-    """INGEST_MAX_PAGES (default: 2000; 0 disables the guardrail).
+    """INGEST_MAX_PAGES (default: 1200; 0 disables the guardrail).
 
-    Hard page ceiling, checked before the parse. Sized from a measured ~4.9 MB/page plus ~1.5 GB
-    fixed against a 12 GB worker; raise it only alongside the memory limit.
+    Hard page ceiling, checked before the parse. A fresh child needs ~2.44 GB + 4.9 MB/page, and
+    that has to fit on top of the floor the memory recycle allows (see
+    get_ingest_worker_max_memory_per_child_kb). Move it only together with that and the limit.
     """
     try:
-        return int(os.getenv("INGEST_MAX_PAGES", "2000"))
+        return int(os.getenv("INGEST_MAX_PAGES", "1200"))
     except ValueError:
-        return 2000
+        return 1200
+
+
+def get_ingest_worker_max_memory_per_child_kb() -> int:
+    """INGEST_WORKER_MAX_MEMORY_PER_CHILD_KB (default: 4882812 = 5.0 GB; 0 disables).
+
+    Passed to the ingestion worker as --max-memory-per-child. billiard compares it with the
+    child's ru_maxrss after each task. ingest_document resets that peak at task end, so the
+    check sees the memory the task kept, and no child starts a document on a floor above T.
+    Sized as limit - margin - parent - demand(INGEST_MAX_PAGES).
+    """
+    try:
+        return int(os.getenv("INGEST_WORKER_MAX_MEMORY_PER_CHILD_KB", "4882812"))
+    except ValueError:
+        return 4882812
+
+
+def get_ingest_malloc_trim_enabled() -> bool:
+    """Whether to malloc_trim() after each document (INGEST_MALLOC_TRIM, default: false).
+
+    Returns memory glibc has freed but kept on its heaps, which otherwise accumulates over a
+    worker's lifetime.
+    """
+    return os.getenv("INGEST_MALLOC_TRIM", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_docling_text_quality_threshold() -> float:
