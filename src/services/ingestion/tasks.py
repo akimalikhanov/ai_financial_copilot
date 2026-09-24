@@ -10,11 +10,12 @@ import logging
 import os
 import shutil
 import tempfile
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from celery.exceptions import Retry, SoftTimeLimitExceeded
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -37,9 +38,9 @@ from src.observability.metrics import (
     INGESTION_WORKER_STAGE_GROWTH,
 )
 from src.observability.process_memory import TaskMemory, malloc_trim
-from src.redis_client import ingestion_stream_key
+from src.redis_client import add_ingestion_event, ingestion_lease_key, ingestion_reap_key
 from src.services.ingestion.chunker import reset_tokenizer
-from src.services.ingestion.docling_parser import reset_converter
+from src.services.ingestion.docling_parser import empty_cuda_cache, reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
 from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
 from src.services.ingestion.picture_enricher import enrich_pictures as _enrich_pictures
@@ -61,6 +62,9 @@ from src.utils.config import (
     get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
+    get_ingest_cuda_empty_cache_enabled,
+    get_ingest_heartbeat_interval_seconds,
+    get_ingest_lease_ttl_seconds,
     get_ingest_malloc_trim_enabled,
     get_ingest_max_pages,
     get_ingest_worker_max_memory_per_child_kb,
@@ -152,6 +156,129 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
     _session_factory = None
     _worker_loop.close()
     _worker_loop = None
+
+
+class _DocumentLease:
+    """One task's claim on one document: mutual exclusion and liveness in a single Redis key.
+
+    Claimed with SET NX before the attempt count is spent, refreshed while the task runs, and
+    deleted on the way out. A worker killed without warning runs none of its handlers, so the
+    key just expires — which is what lets a reader tell a document that is still being worked
+    on from one whose worker is gone, without waiting for the broker's visibility timeout.
+
+    Refresh and release are both compare-and-set on the token this task generated. After a
+    Redis restart, or an expiry under a stalled event loop, the key can already belong to a
+    second worker; the rule is that the loser stands down rather than racing it through
+    delete_by_document.
+    """
+
+    _REFRESH_LUA = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('expire', KEYS[1], ARGV[2])
+    end
+    return 0
+    """
+
+    _RELEASE_LUA = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('del', KEYS[1])
+    end
+    return 0
+    """
+
+    def __init__(self, redis: Redis | None, document_id: str) -> None:
+        self._redis = redis
+        self._document_id = document_id
+        self._key = ingestion_lease_key(document_id)
+        self._token = uuid4().hex
+        self._ttl = get_ingest_lease_ttl_seconds()
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._owner: asyncio.Task[Any] | None = None
+        # EVALSHA with an EVAL fallback, so the refresh does not resend the script body on
+        # every tick. Registering is local — it only hashes the source.
+        self._refresh = redis.register_script(self._REFRESH_LUA) if redis is not None else None
+        self._release = redis.register_script(self._RELEASE_LUA) if redis is not None else None
+        self.held = False
+        self.lost = False
+
+    async def acquire(self) -> bool:
+        """True when this task may proceed, False when another worker already owns the document.
+
+        Redis being unreachable returns True without a lease: refusing to ingest is the worse
+        failure, and the reader-side recovery that depends on the lease cannot run while Redis
+        is down either.
+        """
+        if self._redis is None:
+            return True
+        try:
+            claimed = await self._redis.set(self._key, self._token, nx=True, ex=self._ttl)
+        except Exception:
+            logger.warning(
+                "pipeline.lease_unavailable",
+                extra={"document_id": self._document_id},
+                exc_info=True,
+            )
+            return True
+        if not claimed:
+            return False
+        self.held = True
+        return True
+
+    def start_heartbeat(self) -> None:
+        """Begin refreshing the lease. Records the calling task, which a lost lease cancels."""
+        if not self.held:
+            return
+        self._owner = asyncio.current_task()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self) -> None:
+        interval = get_ingest_heartbeat_interval_seconds()
+        while True:
+            await asyncio.sleep(interval)
+            if self._refresh is None:
+                return
+            try:
+                refreshed = await self._refresh(keys=[self._key], args=[self._token, self._ttl])
+            except Exception:
+                # A transient Redis error is not evidence the lease is gone. The TTL is sized
+                # to outlive a couple of missed refreshes; a real loss shows up on a later tick.
+                logger.warning(
+                    "pipeline.lease_refresh_failed",
+                    extra={"document_id": self._document_id},
+                    exc_info=True,
+                )
+                continue
+            if int(refreshed) == 1:
+                continue
+            self.lost = True
+            self.held = False
+            logger.error(
+                "pipeline.lease_lost",
+                extra={"document_id": self._document_id, "lease_ttl_seconds": self._ttl},
+            )
+            if self._owner is not None:
+                self._owner.cancel()
+            return
+
+    async def release(self) -> None:
+        """Stop the heartbeat and drop the key, but only while it is still this task's."""
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        if not self.held or self._release is None:
+            return
+        self.held = False
+        try:
+            await self._release(keys=[self._key], args=[self._token])
+        except Exception:
+            # The TTL reclaims it; the cost is one lease interval of an unclaimable document.
+            logger.warning(
+                "pipeline.lease_release_failed",
+                extra={"document_id": self._document_id},
+                exc_info=True,
+            )
 
 
 def _enforce_page_limit(pdf_path: Path) -> None:
@@ -361,16 +488,14 @@ async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
-    stream_key = ingestion_stream_key(document_id)
+    lease = _DocumentLease(_redis_ingestion, document_id)
 
     async def _emit(event_type: str, data: dict) -> None:
         if _redis_ingestion is None:
             return
-        try:
-            payload = json.dumps({"type": event_type, **data})
-            await _redis_ingestion.xadd(stream_key, {"payload": payload}, "*", maxlen=100)
-        except Exception:
-            pass
+        # Progress reporting is never worth failing a document over.
+        with suppress(Exception):
+            await add_ingestion_event(_redis_ingestion, document_id, event_type, data)
 
     async def _log_stage(stage_name: str) -> None:
         nonlocal stage_index, current_stage, stage_start
@@ -423,6 +548,35 @@ async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None
             doc = await repo.get_by_id(doc_uuid)
             if doc is None:
                 raise LookupError(f"Document {document_id} not found")
+
+            # acks_late + reject_on_worker_lost means a SIGKILLed task is redelivered, and the
+            # broker's visibility timeout can hold that redelivery for an hour. By then the
+            # document may have been re-ingested and be serving queries: without this guard the
+            # redelivery spends an attempt, trips the max-attempts branch below and calls
+            # set_failed on a healthy row. Must stay the first thing after the load.
+            if doc.status == "ready":
+                logger.info("pipeline.already_ready", extra={"document_id": document_id})
+                return
+
+            # Claim the document before spending an attempt on it: a delivery that is refused
+            # here did no work, so it must not count as one. The claim also precedes the flip
+            # to `processing`, which keeps the invariant the readers rely on pointing the right
+            # way — a `processing` row with no lease means its owner is dead, never that its
+            # owner has not claimed it yet. A queued document is still `pending` and holds no
+            # lease, which is why they key on the status and not on the lease alone.
+            if not await lease.acquire():
+                logger.warning("pipeline.already_claimed", extra={"document_id": document_id})
+                return
+            lease.start_heartbeat()
+            # A worker has the document, so any outstanding re-enqueue marker has done its
+            # job. Clearing it here rather than letting it expire is what keeps the marker
+            # meaning "an enqueue is in flight" instead of "we re-enqueued recently" — the
+            # readers cannot tell a queued document from an abandoned one on their own, and
+            # a queue deeper than the marker's TTL would otherwise collect one duplicate
+            # task per TTL for as long as the document waits.
+            if _redis_ingestion is not None:
+                with suppress(Exception):
+                    await _redis_ingestion.delete(ingestion_reap_key(document_id))
 
             attempt = await repo.increment_attempt_count(doc_uuid)
             if attempt > INGEST_MAX_ATTEMPTS:
@@ -764,6 +918,18 @@ async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None
             },
         )
 
+    except asyncio.CancelledError:
+        if not lease.lost:
+            raise
+        # The heartbeat found the lease in someone else's hands and cancelled us. Another
+        # worker owns this document now, so returning normally acks the delivery and leaves
+        # the row to the owner: writing anything from here would fight it. Deliberately not
+        # re-raised, and not counted as a failure — the document is not failing, it moved.
+        logger.warning(
+            "pipeline.abandoned_lost_lease",
+            extra={"document_id": document_id, "stage": current_stage},
+        )
+        return
     except LookupError:
         raise
     except SoftTimeLimitExceeded:
@@ -825,6 +991,7 @@ async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
     finally:
+        await lease.release()
         if pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
         if work_dir is not None:
@@ -869,8 +1036,16 @@ def _record_task_end(mem: TaskMemory, document_id: str) -> None:
         # Before finish(): it reads the floor and resets the peak that billiard's recycle
         # check compares, so trimming after it would recycle on memory already returned.
         trimmed = False
-        if get_ingest_malloc_trim_enabled():
+        cuda_emptied = False
+        trim_enabled = get_ingest_malloc_trim_enabled()
+        cuda_enabled = get_ingest_cuda_empty_cache_enabled()
+        if trim_enabled or cuda_enabled:
             gc.collect()
+        if cuda_enabled:
+            # Ahead of the trim: releasing CUDA blocks drops the host-side bookkeeping that
+            # pins them, which malloc_trim can then return to the OS.
+            cuda_emptied = empty_cuda_cache()
+        if trim_enabled:
             trimmed = malloc_trim()
         report = mem.finish()
         if report.rss_end is not None:
@@ -897,6 +1072,7 @@ def _record_task_end(mem: TaskMemory, document_id: str) -> None:
                 "recycle_threshold_mb": round(threshold_kib * 1024 / 1e6, 1),
                 "recycle_expected": recycle,
                 "malloc_trimmed": trimmed,
+                "cuda_cache_emptied": cuda_emptied,
             },
         )
     except Exception:  # noqa: BLE001 — instrumentation never fails a task

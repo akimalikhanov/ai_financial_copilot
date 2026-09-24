@@ -277,6 +277,33 @@ async def test_fixed_latency_env_var_overrides_sampling(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_blank_latency_env_var_falls_back_to_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blank is the no-fault value, not a malformed one.
+
+    infra/k8s/loadtest/patches/worker-chat-faults.yaml carries FAKE_LLM_LATENCY_MS on every
+    run and `make k8s-loadtest` writes the scenario's value into it, so every scenario except
+    T7 sets it to "". Reading that as a number would raise on the first LLM call of every
+    other load test.
+    """
+    recorded: list[float] = []
+
+    async def _recording_sleep(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", _recording_sleep)
+    monkeypatch.setenv("FAKE_LLM_LATENCY_MS", "")
+
+    adapter = FakeAdapter(default_model="fake")
+    req = ChatRequest(messages=(_user_message("hello"),), model="fake")
+    await adapter._complete(req)
+
+    assert len(recorded) == 1
+    assert 2.0 <= recorded[0] <= 20.0  # the sampled profile's bounds, not a fixed value
+
+
+@pytest.mark.asyncio
 async def test_run_loop_terminates_cleanly_with_real_fake_adapter() -> None:
     """End-to-end: wire a real FakeAdapter (not AsyncMock) into run_loop and confirm the
     agent loop's state machine — turn partitioning, tool-result bookkeeping, termination —

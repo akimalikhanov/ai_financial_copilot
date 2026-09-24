@@ -104,3 +104,73 @@ async def test_repository_increment_uses_returning_clause() -> None:
     assert "update(" in source
     assert "returning(" in source
     assert "select(" not in source
+
+
+def test_max_request_age_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators must be able to tighten the staleness bound without a code change.
+
+    Exercised through the config getter rather than by reloading the tasks module: a reload
+    swaps out objects other test modules already hold references to, which makes any failure
+    depend on collection order.
+    """
+    from src.utils.config import get_chat_max_request_age_seconds
+
+    monkeypatch.setenv("CHAT_MAX_REQUEST_AGE_SECONDS", "120")
+    assert get_chat_max_request_age_seconds() == 120.0
+
+    monkeypatch.setenv("CHAT_MAX_REQUEST_AGE_SECONDS", "not-a-number")
+    assert get_chat_max_request_age_seconds() == 900.0
+
+
+def test_module_constant_comes_from_the_config_getter() -> None:
+    """The worker reads the knob once at import; it must be the same knob operators set."""
+    from src.services.chat.tasks import CHAT_MAX_REQUEST_AGE_SECONDS
+    from src.utils.config import get_chat_max_request_age_seconds
+
+    assert get_chat_max_request_age_seconds() == CHAT_MAX_REQUEST_AGE_SECONDS
+
+
+def test_max_request_age_sits_between_a_full_task_and_the_visibility_timeout() -> None:
+    """The bound only works in a window, and both ends matter.
+
+    Too low and it fails work that was merely queued behind a backlog — worst case is a full
+    queue at CHAT_QUEUE_MAX_DEPTH ahead of a full task, a few hundred seconds. Too high and it
+    never fires before the broker's visibility timeout redelivers, which is the hour this
+    guard exists to bound.
+    """
+    from src.services.chat.tasks import CHAT_MAX_REQUEST_AGE_SECONDS
+
+    assert CHAT_MAX_REQUEST_AGE_SECONDS > 600
+    assert CHAT_MAX_REQUEST_AGE_SECONDS < 3600
+
+
+def _pipeline_source() -> str:
+    """The guard lives in the async pipeline nested inside the Celery task, so the task object
+    itself is not what carries it — read the module."""
+    import inspect
+
+    from src.services.chat import tasks
+
+    return inspect.getsource(tasks)
+
+
+def test_staleness_guard_runs_before_the_attempt_counter() -> None:
+    """Order is the whole point: a task killed on its FIRST delivery comes back at attempt 1.
+
+    The attempt counter cannot see that case — it looks like a new request — so the age check
+    has to sit ahead of it, next to the `completed` early return rather than after it.
+    """
+    source = _pipeline_source()
+
+    assert source.index("pipeline.request_too_stale") < source.index("increment_attempt_count(")
+
+
+def test_stale_request_is_failed_and_committed_not_just_returned() -> None:
+    """An uncommitted status leaves the next redelivery reading the same state and taking the
+    same branch, which is the loop the max-attempts guard already learned to avoid."""
+    source = _pipeline_source()
+    start = source.index("age_s = ")
+    guard = source[start : source.index("pipeline.request_too_stale")]
+
+    assert 'update_status(UUID(request_id), "failed")' in guard
+    assert "session.commit()" in guard

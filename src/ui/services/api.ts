@@ -519,6 +519,9 @@ export const subscribeIngestionStream = (
   onDone: () => void,
   onError: (message: string) => void,
   onTransportError?: (message: string) => void,
+  // The worker died and the server put the document back on the queue. Not terminal: the
+  // replacement attempt writes to this same stream, so the stage events resume here.
+  onRetrying?: (attempt: number) => void,
 ): (() => void) => {
   const url = joinUrl(API_BASE_URL, `/v1/documents/${documentId}/stream`);
 
@@ -558,6 +561,7 @@ export const subscribeIngestionStream = (
           try {
             const payload = JSON.parse(line.slice(5).trim());
             if (eventType === 'stage') onStage(payload as IngestionStageEvent);
+            else if (eventType === 'retrying') onRetrying?.(Number(payload.attempt) || 0);
             else if (eventType === 'done') { onDone(); return true; }
             else if (eventType === 'error') { onError(payload.message ?? 'Ingestion failed'); return true; }
           } catch { /* ignore malformed */ }

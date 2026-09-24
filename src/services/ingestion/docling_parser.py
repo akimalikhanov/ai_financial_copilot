@@ -162,19 +162,28 @@ def release_ocr_converter() -> bool:
     # The converter holds reference cycles, so dropping the name is not enough to free the
     # models before the cyclic GC next runs on its own.
     gc.collect()
-    _empty_cuda_cache()
+    empty_cuda_cache()
     return True
 
 
-def _empty_cuda_cache() -> None:
-    """Return the OCR models' VRAM to the driver. No-op without torch or a GPU."""
+def empty_cuda_cache() -> bool:
+    """Hand torch's cached CUDA blocks back to the driver. True when the call was made.
+
+    Torch's allocator keeps every block it has grabbed, so parse-time intermediates stay
+    reserved after the tensors using them are gone. Only this crosses back to the driver:
+    gc.collect() returns blocks to torch's own pool, not to CUDA. False without torch or a GPU.
+    """
     try:
         import torch
     except ImportError:
-        return
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.empty_cache()
+    except Exception:
+        return False
+    return True
 
 
 def probe_page_count(pdf_path: Path) -> int | None:

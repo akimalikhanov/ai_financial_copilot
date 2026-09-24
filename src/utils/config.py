@@ -239,6 +239,38 @@ def get_chat_events_ttl() -> int:
     return int(os.getenv("CHAT_EVENTS_TTL", "3600"))
 
 
+def get_chat_stream_abandoned_after_seconds() -> float:
+    """CHAT_STREAM_ABANDONED_AFTER_SECONDS (default: 510.0).
+
+    How long an SSE subscriber waits with no progress before reporting the worker gone.
+    A worker killed without warning (OOMKill, eviction, node loss) never runs its exception
+    handlers, so the request's status stays non-terminal and the stream's only other
+    give-up path never fires. The default is CELERY_TASK_TIME_LIMIT_SECONDS=450 plus a 60 s
+    margin: a task that is genuinely running is bounded by that hard limit, so anything past
+    it is a worker that is gone rather than one that is slow.
+    """
+    try:
+        return float(os.getenv("CHAT_STREAM_ABANDONED_AFTER_SECONDS", "510"))
+    except ValueError:
+        return 510.0
+
+
+def get_chat_max_request_age_seconds() -> float:
+    """CHAT_MAX_REQUEST_AGE_SECONDS (default: 900.0).
+
+    Ceiling on how stale a chat request may be and still be worth processing. acks_late
+    redelivery is gated on the broker's visibility timeout, which is sized for ingestion's
+    2700 s parses and so runs an hour on the chat queue too. Past this age the subscriber has
+    already been told the worker is gone, so re-running the agent loop only re-bills work
+    nobody asked for any more. Sits above the worst legitimate queue wait plus a full task
+    (~590 s) and far below the visibility timeout.
+    """
+    try:
+        return float(os.getenv("CHAT_MAX_REQUEST_AGE_SECONDS", "900"))
+    except ValueError:
+        return 900.0
+
+
 def get_llm_timeout_seconds() -> float:
     """Per-request LLM timeout (LLM_TIMEOUT_SECONDS, default 120.0).
 
@@ -535,6 +567,79 @@ def get_docling_ocr_max_pages() -> int:
         return 300
 
 
+def get_ingest_lease_ttl_seconds() -> int:
+    """INGEST_LEASE_TTL_SECONDS (default: 45).
+
+    Lifetime of the Redis key an ingestion task holds while it owns a document. A worker
+    killed without warning (OOMKill, eviction, node loss) never releases it, so this is how
+    long a dead worker's document stays unclaimable. Must stay comfortably above
+    INGEST_HEARTBEAT_INTERVAL_SECONDS: a live worker whose refresh is merely late must not
+    lose a document it is still parsing.
+    """
+    try:
+        return int(os.getenv("INGEST_LEASE_TTL_SECONDS", "45"))
+    except ValueError:
+        return 45
+
+
+def get_ingest_heartbeat_interval_seconds() -> int:
+    """INGEST_HEARTBEAT_INTERVAL_SECONDS (default: 15).
+
+    How often the running task refreshes its lease. Docling parses in a worker thread, so the
+    event loop is free through the slowest stage and the refresh keeps ticking there. Three
+    intervals fit inside the default TTL, so two consecutive misses are survivable.
+    """
+    try:
+        return int(os.getenv("INGEST_HEARTBEAT_INTERVAL_SECONDS", "15"))
+    except ValueError:
+        return 15
+
+
+def get_ingest_events_ttl() -> int:
+    """TTL applied to a document's ingestion SSE stream (INGEST_EVENTS_TTL, default 3600).
+
+    Refreshed on every event, so a stream lives as long as something is writing to it. Only
+    a document that reaches a terminal stage stops writing at a predictable point; one whose
+    worker is killed stops writing wherever it happened to be, and without an expiry that
+    key is never reclaimed by anything.
+    """
+    try:
+        return int(os.getenv("INGEST_EVENTS_TTL", "3600"))
+    except ValueError:
+        return 3600
+
+
+def get_ingest_stream_abandoned_after_seconds() -> float:
+    """INGEST_STREAM_ABANDONED_AFTER_SECONDS (default: 2760.0).
+
+    Backstop only: how long an uploader's SSE stream waits with no progress before reporting
+    the worker gone. The lease normally detects a dead worker in seconds and the document is
+    re-enqueued while the stream stays open, so this fires only when the lease is unreadable
+    too. The default is INGEST_TASK_TIME_LIMIT_SECONDS=2700 plus a margin: a task that is
+    genuinely running is bounded by that hard limit.
+    """
+    try:
+        return float(os.getenv("INGEST_STREAM_ABANDONED_AFTER_SECONDS", "2760"))
+    except ValueError:
+        return 2760.0
+
+
+def get_ingest_reap_debounce_seconds() -> int:
+    """INGEST_REAP_DEBOUNCE_SECONDS (default: 3600).
+
+    Lifetime of the marker that says a re-enqueue for this document is already in flight. A
+    document waiting in the queue looks exactly like an abandoned one — `processing`, no
+    lease — so without the marker every read of that row would queue another copy of it.
+    The task deletes the marker as soon as it claims the document, so this is only the
+    ceiling for an enqueue that never arrives at a worker at all; that is the same failure
+    the broker's visibility timeout covers, so they are sized alike.
+    """
+    try:
+        return int(os.getenv("INGEST_REAP_DEBOUNCE_SECONDS", "3600"))
+    except ValueError:
+        return 3600
+
+
 def get_ingest_max_pages() -> int:
     """INGEST_MAX_PAGES (default: 1200; 0 disables the guardrail).
 
@@ -569,6 +674,22 @@ def get_ingest_malloc_trim_enabled() -> bool:
     worker's lifetime.
     """
     return os.getenv("INGEST_MALLOC_TRIM", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_ingest_cuda_empty_cache_enabled() -> bool:
+    """Whether to empty torch's CUDA cache after each document (INGEST_CUDA_EMPTY_CACHE,
+    default: true).
+
+    The VRAM counterpart to INGEST_MALLOC_TRIM. Torch keeps the blocks it grabbed for parse-time
+    intermediates, so without this a worker's VRAM floor steps up on its first document and
+    never comes back down.
+    """
+    return os.getenv("INGEST_CUDA_EMPTY_CACHE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def get_docling_text_quality_threshold() -> float:

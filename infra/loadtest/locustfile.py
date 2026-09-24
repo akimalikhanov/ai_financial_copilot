@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import random
 import time
@@ -34,13 +35,19 @@ import uuid
 from dataclasses import dataclass
 
 import httpx
-from locust import HttpUser, LoadTestShape, between, task
+from locust import HttpUser, LoadTestShape, between, events, task
 from locust.exception import StopUser
 
 # Must be a model id present in whichever models.yaml the target API is running with —
 # infra/config/models.loadtest.yaml (fake) or infra/config/models.yaml (real, do not use
 # without reading docs/notes/loadtest-concepts.md §6 first).
 CHAT_MODEL = os.environ.get("LOADTEST_CHAT_MODEL", "gpt-4o-mini")
+
+# Log in as this account instead of registering a throwaway one. Set it when the run needs the
+# questions to actually retrieve — an account with no documents matches nothing, so the
+# reranker never runs. Unset (default) keeps the throwaway-per-user behaviour.
+EXISTING_EMAIL = os.environ.get("LOADTEST_CHAT_EMAIL", "").strip()
+EXISTING_PASSWORD = os.environ.get("LOADTEST_CHAT_PASSWORD", "")
 
 # Overall budget for one SSE read, matching the plan's soak/ramp scenarios where a slow
 # answer is expected, not a bug. Measured p95 service time is ~101s (capacity-planning-
@@ -291,6 +298,39 @@ class _IngestResult:
     last_stage: str = ""
     stage_count: int = 0
     detail: str = ""
+    # `retrying` events seen: the server found the worker gone and re-queued the document.
+    retry_count: int = 0
+
+
+# Uploads whose POST returned but whose stream has not reached a terminal event yet, by
+# document id -> upload start. A run that ends with entries here uploaded documents nothing
+# ever accounted for, which is precisely how a killed worker reads as a clean run: the
+# stranded document fires no event at all, so there is not even a failure to count. The
+# listener below turns each one into a failure at shutdown.
+_INFLIGHT_UPLOADS: dict[str, float] = {}
+_UPLOADS_ENQUEUED = 0
+
+
+@events.test_stop.add_listener
+def _account_for_inflight_uploads(environment, **_kwargs) -> None:
+    """Enqueues against completions — the only check that catches a stranded upload."""
+    stranded = list(_INFLIGHT_UPLOADS.items())
+    _INFLIGHT_UPLOADS.clear()
+    logging.info(
+        "uploads enqueued=%d completed=%d still_processing=%d",
+        _UPLOADS_ENQUEUED,
+        _UPLOADS_ENQUEUED - len(stranded),
+        len(stranded),
+    )
+    now = time.perf_counter()
+    for document_id, started_at in stranded:
+        environment.events.request.fire(
+            request_type="INGEST",
+            name="ingest_done",
+            response_time=(now - started_at) * 1000,
+            response_length=0,
+            exception=RuntimeError(f"never reached a terminal event: {document_id}"),
+        )
 
 
 def _read_ingestion_stream(
@@ -318,6 +358,7 @@ def _read_ingestion_stream(
     data_line: str | None = None
     last_stage = ""
     stage_count = 0
+    retry_count = 0
 
     try:
         with (
@@ -357,6 +398,14 @@ def _read_ingestion_stream(
                     stage_count += 1
                     last_stage = str(data.get("stage", ""))
 
+                # Not terminal: the server detected that this document's worker died and put
+                # it back on the queue, and the replacement attempt's stage events arrive on
+                # this same stream. Counted because the document still completes — without
+                # it a run in which a worker was killed reports nothing at all.
+                if event_type == "retrying":
+                    retry_count += 1
+                    last_stage = f"retrying (attempt {data.get('attempt', '?')})"
+
                 if event_type == "done":
                     return _IngestResult(
                         "done",
@@ -364,6 +413,7 @@ def _read_ingestion_stream(
                         time.perf_counter() - started_at,
                         last_stage=last_stage,
                         stage_count=stage_count,
+                        retry_count=retry_count,
                     )
 
                 if event_type == "error":
@@ -374,10 +424,16 @@ def _read_ingestion_stream(
                         last_stage=last_stage,
                         stage_count=stage_count,
                         detail=str(data.get("message", ""))[:200],
+                        retry_count=retry_count,
                     )
     except httpx.TimeoutException:
         return _IngestResult(
-            "timeout", first_stage_s, None, last_stage=last_stage, stage_count=stage_count
+            "timeout",
+            first_stage_s,
+            None,
+            last_stage=last_stage,
+            stage_count=stage_count,
+            retry_count=retry_count,
         )
     except httpx.HTTPError as exc:
         return _IngestResult(
@@ -387,6 +443,7 @@ def _read_ingestion_stream(
             last_stage=last_stage,
             stage_count=stage_count,
             detail=str(exc),
+            retry_count=retry_count,
         )
 
     # The stream ended without `done` or `error`. Not a pass: documents.py only closes the
@@ -400,6 +457,7 @@ def _read_ingestion_stream(
         last_stage=last_stage,
         stage_count=stage_count,
         detail="stream closed with no terminal event",
+        retry_count=retry_count,
     )
 
 
@@ -518,13 +576,23 @@ class _AuthenticatedUser(HttpUser):
     abstract = True
 
     def on_start(self) -> None:
-        email = f"loadtest-{uuid.uuid4()}@example.com"
-        password = "loadtest-password-not-real"  # noqa: S105 — synthetic account, throwaway
-        resp = self.client.post(
-            "/v1/auth/register",
-            json={"email": email, "password": password},
-            name="/v1/auth/register",
-        )
+        if EXISTING_EMAIL:
+            # Retrieval is scoped to one user_id in both backends, so a fresh account can never
+            # match a chunk — the reranker then returns on its empty-input path and never reaches
+            # the GPU. T12 needs that leg live, so it logs in as an account that owns documents.
+            resp = self.client.post(
+                "/v1/auth/login",
+                json={"email": EXISTING_EMAIL, "password": EXISTING_PASSWORD},
+                name="/v1/auth/login",
+            )
+        else:
+            email = f"loadtest-{uuid.uuid4()}@example.com"
+            password = "loadtest-password-not-real"  # noqa: S105 — synthetic, throwaway
+            resp = self.client.post(
+                "/v1/auth/register",
+                json={"email": email, "password": password},
+                name="/v1/auth/register",
+            )
         resp.raise_for_status()
         self.token = resp.json()["access_token"]
 
@@ -757,10 +825,30 @@ class UploadUser(_AuthenticatedUser):
             document_id = str(resp.json()["id"])
 
         assert self.host is not None, "run with --host, e.g. http://localhost:8000"
-        result = _read_ingestion_stream(self.host, document_id, self.token, started_at)
+        global _UPLOADS_ENQUEUED
+        _UPLOADS_ENQUEUED += 1
+        _INFLIGHT_UPLOADS[document_id] = started_at
+        try:
+            result = _read_ingestion_stream(self.host, document_id, self.token, started_at)
+        finally:
+            # Off the in-flight list either way: from here the document has an outcome, and
+            # only the ones that never got that far may be reported as unaccounted for.
+            _INFLIGHT_UPLOADS.pop(document_id, None)
 
         # self.environment.events — see the note in ChatUser.ask_question.
         events = self.environment.events
+
+        for _ in range(result.retry_count):
+            # The document itself recovers and fires a passing ingest_done, so a kill would
+            # otherwise leave the run with zero failures. This is the row that says a worker
+            # died: one per kill the server had to recover from.
+            events.request.fire(
+                request_type="INGEST",
+                name="ingest_retry",
+                response_time=0,
+                response_length=0,
+                exception=RuntimeError(f"worker died mid-document, re-queued: {document_id}"),
+            )
 
         if result.first_stage_s is not None:
             events.request.fire(

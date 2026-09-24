@@ -67,6 +67,7 @@ from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
+    get_chat_max_request_age_seconds,
     get_conversation_naming_config,
     get_db_url,
     get_followup_max_inherit_hops,
@@ -82,6 +83,10 @@ FINDINGS_BLOCK_MAX_CHARS = 20_000
 # the request is failed rather than retried, so a task that reliably kills its worker cannot
 # loop forever re-billing the provider.
 CHAT_MAX_ATTEMPTS = int(os.getenv("CHAT_MAX_ATTEMPTS", "2"))
+
+# Ceiling on how stale a redelivered chat task may be and still be worth running. Bounds the
+# hour that the broker's visibility timeout otherwise allows; see the guard in `process_chat`.
+CHAT_MAX_REQUEST_AGE_SECONDS = get_chat_max_request_age_seconds()
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
@@ -398,6 +403,36 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             # first thing after the load, ahead of any write or metric.
             if llm_request.status == "completed":
                 logger.info("pipeline.already_completed", extra={"request_id": request_id})
+                return
+
+            # The companion to the guard above, for the case it cannot see. acks_late
+            # redelivery is gated on the broker's visibility timeout, which is sized for
+            # ingestion's 2700s parses and so runs an hour on the chat queue too (both queues
+            # share one transport, and kombu restores from a single global unacked index). By
+            # the time a redelivery of that age lands, the subscriber has already reported the
+            # worker gone, so re-running the agent loop bills the provider for an answer
+            # nobody is waiting for. Attempt count alone cannot catch this: a task killed on
+            # its FIRST delivery arrives here at attempt 1, looking new.
+            age_s = (datetime.now(UTC) - llm_request.created_at).total_seconds()
+            if age_s > CHAT_MAX_REQUEST_AGE_SECONDS:
+                await llm_request_repo.update_status(UUID(request_id), "failed")
+                # Same reason as the max-attempts path below: commit before returning, or the
+                # next redelivery reads the old state and takes this branch again.
+                await session.commit()
+                logger.warning(
+                    "pipeline.request_too_stale",
+                    extra={
+                        "request_id": request_id,
+                        "age_seconds": round(age_s, 1),
+                        "max_age_seconds": CHAT_MAX_REQUEST_AGE_SECONDS,
+                    },
+                )
+                await add_event(
+                    redis_app,
+                    request_id,
+                    "error",
+                    error_event(RuntimeError("Request expired before it could be processed")),
+                )
                 return
 
             attempt = await llm_request_repo.increment_attempt_count(UUID(request_id))

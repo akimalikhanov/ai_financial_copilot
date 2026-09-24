@@ -221,6 +221,11 @@ def observe_llm_latency(model: str, request_type: str, stats: LLMResponseStats |
 
 # --- Ingestion ---
 INGESTION_DOCUMENTS = Counter("ingestion_documents_total", "Documents processed", ["status"])
+INGESTION_REAPED = Counter(
+    "ingestion_documents_reaped_total",
+    "Documents re-enqueued after their worker died without reporting it",
+    ["source"],
+)
 INGESTION_CHUNKS = Histogram(
     "ingestion_chunks_per_document",
     "Chunks per document",

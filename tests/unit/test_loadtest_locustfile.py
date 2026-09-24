@@ -70,6 +70,20 @@ def _locust_stub() -> types.ModuleType:
     class _StopUser(Exception):
         """locust.exception.StopUser — locust catches it to retire one user's greenlet."""
 
+    class _EventHook:
+        """locust.events.EventHook: add_listener returns the handler, fire calls them all."""
+
+        def __init__(self) -> None:
+            self.handlers: list[Any] = []
+
+        def add_listener(self, handler: Any) -> Any:
+            self.handlers.append(handler)
+            return handler
+
+        def fire(self, **kwargs: Any) -> None:
+            for handler in self.handlers:
+                handler(**kwargs)
+
     exception_mod = types.ModuleType("locust.exception")
     exception_mod.StopUser = _StopUser  # type: ignore[attr-defined]
     sys.modules["locust.exception"] = exception_mod
@@ -78,6 +92,7 @@ def _locust_stub() -> types.ModuleType:
     module.LoadTestShape = _Base  # type: ignore[attr-defined]
     module.task = _task  # type: ignore[attr-defined]
     module.between = _between  # type: ignore[attr-defined]
+    module.events = types.SimpleNamespace(test_stop=_EventHook(), request=_EventHook())  # type: ignore[attr-defined]
     module.exception = exception_mod  # type: ignore[attr-defined]
     return module
 
@@ -123,8 +138,14 @@ class _SseHandler(BaseHTTPRequestHandler):
         # The mode rides in on `request_id`, not a query of its own: _hold_chat_stream builds
         # the URL as f"{base_url}/v1/chat/stream" and passes request_id through httpx params,
         # so a query appended to base_url would land mid-URL and never reach the handler.
-        query = parse_qs(urlparse(self.path).query)
-        mode = query.get("request_id", ["keepalive"])[0]
+        path = urlparse(self.path).path
+        if path.startswith("/v1/documents/"):
+            # The ingestion stream takes no query at all, so its mode rides in as the
+            # document id: /v1/documents/{mode}/stream.
+            mode = path.split("/")[3]
+        else:
+            query = parse_qs(urlparse(self.path).query)
+            mode = query.get("request_id", ["keepalive"])[0]
 
         if mode == "reject":
             self.send_response(404)
@@ -151,6 +172,20 @@ class _SseHandler(BaseHTTPRequestHandler):
                 time.sleep(10)
             elif mode == "error":
                 self.wfile.write(b'id: 9-1\nevent: error\ndata: {"message": "boom"}\n\n')
+                self.wfile.flush()
+                time.sleep(10)
+            elif mode == "ingest_retry":
+                # One document, one killed worker: a stage, the server's re-queue notice,
+                # then the replacement attempt's stages on the same stream.
+                self.wfile.write(b'event: stage\ndata: {"stage": "parse_pdf_docling"}\n\n')
+                self.wfile.write(b'event: retrying\ndata: {"attempt": 2}\n\n')
+                self.wfile.write(b'event: stage\ndata: {"stage": "download_pdf"}\n\n')
+                self.wfile.write(b'event: done\ndata: {"chunks": 12}\n\n')
+                self.wfile.flush()
+                time.sleep(10)
+            elif mode == "ingest_done":
+                self.wfile.write(b'event: stage\ndata: {"stage": "download_pdf"}\n\n')
+                self.wfile.write(b'event: done\ndata: {"chunks": 12}\n\n')
                 self.wfile.flush()
                 time.sleep(10)
             elif mode == "close":
@@ -373,3 +408,59 @@ class TestUploadUserRetires:
         # locust.exception.StopUser in a run.
         with pytest.raises(module.StopUser):
             module.UploadUser.upload_document(user)
+
+
+class TestIngestionAccounting:
+    """T10b leg B reported 0 failures while stranding a document: a killed worker's upload
+    fires no event at all, so there is not even a failure to count. Both halves of the fix
+    are pinned here — the run must account for every upload it enqueued, and a kill the
+    server recovered from must still show up as a failure row."""
+
+    def test_retrying_is_counted_without_ending_the_read(self, sse_server: str) -> None:
+        """`retrying` is not terminal: the replacement attempt's stages arrive on the same
+        stream, so the read has to carry on and still reach `done`."""
+        result = lf._read_ingestion_stream(sse_server, "ingest_retry", "tok", time.perf_counter())
+
+        assert result.status == "done"
+        assert result.retry_count == 1
+        assert result.stage_count == 2, "stages after the re-queue must still be counted"
+
+    def test_a_clean_ingest_reports_no_retries(self, sse_server: str) -> None:
+        result = lf._read_ingestion_stream(sse_server, "ingest_done", "tok", time.perf_counter())
+
+        assert (result.status, result.retry_count) == ("done", 0)
+
+    def test_inflight_upload_at_shutdown_is_a_failure(self) -> None:
+        """The stranded-document case. Without this the run ends silently and the document
+        is simply missing from the numbers."""
+        fired: list[dict[str, Any]] = []
+        environment = types.SimpleNamespace(
+            events=types.SimpleNamespace(
+                request=types.SimpleNamespace(fire=lambda **kw: fired.append(kw))
+            )
+        )
+        lf._INFLIGHT_UPLOADS["doc-that-never-finished"] = time.perf_counter() - 30
+
+        try:
+            lf._account_for_inflight_uploads(environment)
+        finally:
+            lf._INFLIGHT_UPLOADS.clear()
+
+        assert len(fired) == 1
+        assert fired[0]["name"] == "ingest_done"
+        assert isinstance(fired[0]["exception"], RuntimeError)
+        assert "doc-that-never-finished" in str(fired[0]["exception"])
+
+    def test_completed_uploads_are_not_reported(self) -> None:
+        """Only uploads with no outcome count as unaccounted for — the upload task drops
+        each document from the list as soon as its stream returns anything at all."""
+        fired: list[dict[str, Any]] = []
+        environment = types.SimpleNamespace(
+            events=types.SimpleNamespace(
+                request=types.SimpleNamespace(fire=lambda **kw: fired.append(kw))
+            )
+        )
+
+        lf._account_for_inflight_uploads(environment)
+
+        assert fired == []

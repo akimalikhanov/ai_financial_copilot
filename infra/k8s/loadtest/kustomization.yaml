@@ -11,6 +11,9 @@ resources:
   - loadtest-rbac.yaml
   - results-pv.yaml
   - fixtures-pv.yaml
+  # T8's latency injector. Applied on every run and dialed by nobody unless a scenario sets
+  # OPENSEARCH_HOST=toxiproxy — see toxiproxy.yaml.
+  - toxiproxy.yaml
 
 configMapGenerator:
   # locustfile.py and models.yaml are copies kept in sync by `make k8s-sync-loadtest`
@@ -36,7 +39,7 @@ generatorOptions:
 images:
   - name: copilot/worker
     newName: localhost:5001/copilot/worker
-    newTag: 9aa8c34-df190257
+    newTag: a052b14-8adfc745
 
 # These three must land together with the Job — that coupling is what makes accidental
 # real-LLM spend impossible. worker-ingestion is included because the table summarizer and
@@ -54,3 +57,12 @@ patches:
     target:
       kind: Deployment
       name: worker-ingestion
+  # T7-T9 fault injection. No-ops until `make k8s-loadtest` writes a scenario's values in.
+  - path: patches/worker-chat-faults.yaml
+    target:
+      kind: Deployment
+      name: worker-chat
+  - path: patches/api-faults.yaml
+    target:
+      kind: Deployment
+      name: api

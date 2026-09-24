@@ -32,11 +32,12 @@ spec:
         prometheus.io/port: "9100"
         prometheus.io/path: "/metrics"
     spec:
-      # Above CELERY_TASK_SOFT_TIME_LIMIT_SECONDS (360): SIGTERM is a Celery warm shutdown —
-      # stop accepting, finish in flight — and it needs room to finish the longest task Celery
-      # would itself allow. Below the soft limit, the default 30s SIGKILLs a running answer and
+      # Above CELERY_TASK_TIME_LIMIT_SECONDS (450), the hard limit: SIGTERM is a Celery warm
+      # shutdown — stop accepting, finish in flight — and it needs room to finish the longest
+      # task Celery would itself allow, measured from task start rather than from SIGTERM.
+      # Below that, the kubelet SIGKILLs a running answer before the parent can fail it and
       # acks_late redelivers it, re-billing the provider.
-      terminationGracePeriodSeconds: 420
+      terminationGracePeriodSeconds: 510
       # Same depends_on port as api-deployment.yaml. fluent-bit is gone (Phase 14 tails node
       # logs instead of receiving pushes) and qdrant-hc is gone (Phase 5 retired the sidecar).
       initContainers:

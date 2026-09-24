@@ -165,9 +165,14 @@ k8s-set-images:
 # Leaving one out is not merely a failed deploy. A Job created against a since-renamed
 # ConfigMap can never be repaired by apply, and its pod sits in ContainerCreating on
 # FailedMount indefinitely — observed on es-bootstrap and garage-bootstrap for 22h.
-.PHONY: k8s-deploy
-k8s-deploy: docker-build-api docker-build-frontend docker-build-worker
+# The build half of k8s-deploy, split out so `k8s-loadtest` can ship current code WITHOUT
+# applying the base overlay — see the money-safety note on that target.
+.PHONY: k8s-build-push
+k8s-build-push: docker-build-api docker-build-frontend docker-build-worker
 	$(MAKE) k8s-push-api k8s-push-frontend k8s-push-worker k8s-set-images
+
+.PHONY: k8s-deploy
+k8s-deploy: k8s-build-push
 	kubectl delete job model-preload es-bootstrap garage-bootstrap -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
 
@@ -425,6 +430,36 @@ k8s-loadtest-ingest-limits-restore:
 	  CELERY_TASK_TIME_LIMIT_SECONDS- CELERY_TASK_SOFT_TIME_LIMIT_SECONDS-
 	kubectl rollout status deploy/worker-ingestion -n copilot --timeout=5m
 
+# T8's proxy image. The node pulls only from the kind registry (its containerd hosts.toml),
+# so ghcr.io has to be mirrored through the host's docker. Once per cluster; the registry is
+# a container with --restart=always, so it survives everything short of `kind delete`.
+TOXIPROXY_IMAGE := ghcr.io/shopify/toxiproxy:2.12.0
+.PHONY: k8s-loadtest-toxiproxy-image
+k8s-loadtest-toxiproxy-image: k8s-registry
+	docker pull $(TOXIPROXY_IMAGE)
+	docker tag $(TOXIPROXY_IMAGE) $(REGISTRY)/toxiproxy:2.12.0
+	docker push $(REGISTRY)/toxiproxy:2.12.0
+
+# T9 (dependency down). Scaling the StatefulSet, not deleting the pod: a deleted pod is
+# recreated within seconds and the outage window is too short to ask a question into, which
+# is the whole measurement. Scale-to-0 is also a graceful terminate, so the PVCs come back
+# intact — these carry the real corpus, not throwaway data.
+#
+# Each target names one backend so the three phases of T9 (qdrant alone, opensearch alone,
+# both) are composable from the command line rather than encoded as a fourth target.
+.PHONY: k8s-loadtest-t9-kill-qdrant k8s-loadtest-t9-kill-opensearch k8s-loadtest-t9-restore
+k8s-loadtest-t9-kill-qdrant:
+	kubectl scale statefulset/qdrant -n copilot --replicas=0
+	kubectl wait --for=delete pod/qdrant-0 -n copilot --timeout=180s
+k8s-loadtest-t9-kill-opensearch:
+	kubectl scale statefulset/opensearch -n copilot --replicas=0
+	kubectl wait --for=delete pod/opensearch-0 -n copilot --timeout=300s
+k8s-loadtest-t9-restore:
+	kubectl scale statefulset/qdrant -n copilot --replicas=1
+	kubectl scale statefulset/opensearch -n copilot --replicas=1
+	kubectl rollout status statefulset/qdrant -n copilot --timeout=300s
+	kubectl rollout status statefulset/opensearch -n copilot --timeout=600s
+
 .PHONY: k8s-sync-loadtest
 k8s-sync-loadtest:
 	cp infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
@@ -441,10 +476,27 @@ k8s-check-loadtest:
 # reverts. An initContainer refuses to generate load if that patch has not taken effect,
 # so an accidental run cannot spend real money.
 #
-# Depends on k8s-deploy, not just k8s-set-images: MODELS_CONFIG_PATH is only honoured by
+# Depends on k8s-build-push, not just k8s-set-images: MODELS_CONFIG_PATH is only honoured by
 # config.py::load_models_config, so a cluster running an image built before that landed
 # ignores the env var and silently serves the REAL models config. The gate catches it, but
 # the fix is to ship current code — hence a full build+push here.
+#
+# And build+push ONLY — never k8s-deploy, which is the second money-safety property on this
+# target. k8s-deploy applies the BASE overlay, which by construction carries no fake-LLM
+# patches, so depending on it made every load test roll all six worker-chat pods into the
+# REAL config and then roll them back a minute later. The await-fake-llm-rollout gate does
+# not close that window: `kubectl rollout status` returns once the NEW ReplicaSet is
+# Available and the old one is scaled to 0 *desired*, while old pods stay Running for up to
+# terminationGracePeriodSeconds (420s) finishing the tasks they hold. Measured on
+# 2026-09-20: Job started 09:41:56 with the gate green, old-RS pods worker-chat-66cb4bf75b-*
+# still Terminating at 09:45:45, and $0.0178 of live OpenAI spend over 19 calls from
+# 09:42:13 to 09:46:06. Same failure class as the $0.19 leak recorded below, different
+# cause: that one was apply ordering, this one is termination lag.
+#
+# Applying the loadtest overlay alone loses nothing, because it lists ../overlays/kind-deploy
+# as a resource — it is base PLUS the patches, in one apply, with no real-config pod ever
+# created. The three bootstrap Jobs are deleted here for the same immutability reason
+# k8s-deploy deletes them, since this overlay renders them too.
 #
 # Override per T-series scenario, e.g.:
 #   make k8s-loadtest LOADTEST_USERS=100 LOADTEST_SPAWN_RATE=10 LOADTEST_DURATION=30m
@@ -492,9 +544,32 @@ LOADTEST_RAMP_SPAWN_RATE ?= 10
 LOADTEST_SPIKE_USERS ?= 50
 LOADTEST_SPIKE_SPAWN_SECONDS ?= 10
 LOADTEST_SPIKE_HOLD ?= 2m
+# Log in as a seeded account rather than registering a throwaway one. Required for any run
+# whose measurement depends on retrieval actually returning chunks (T5, T8, T9, T12) — an
+# account owning no documents matches nothing in either backend, so a "degraded" answer and
+# a healthy one are indistinguishable. Empty keeps the throwaway behaviour.
+LOADTEST_CHAT_EMAIL ?=
+LOADTEST_CHAT_PASSWORD ?=
+# Client-side SSE budget. Raise it above the scenario's worst legitimate service time, or the
+# client times out on answers the server is still producing — see loadtest-params.env.
+LOADTEST_SSE_TIMEOUT_S ?= 180
+
+# --- T7-T9 fault injection (docs/notes/loadtest-readiness-audit.md §5) ----------------------
+# Both default to "no fault", so every other scenario is unaffected by their presence.
+#
+# T7 (slow LLM): a fixed FakeAdapter latency instead of its sampled profile, which is the
+# knob the concepts note (§6) prefers over standing up toxiproxy for the LLM leg.
+#   make k8s-loadtest LOADTEST_MODE=ask LOADTEST_SHAPE= LOADTEST_FAKE_LLM_LATENCY_MS=20000 \
+#     LOADTEST_USERS=20 LOADTEST_SPAWN_RATE=2 LOADTEST_DURATION=20m
+LOADTEST_FAKE_LLM_LATENCY_MS ?=
+# T8 (slow OpenSearch): "toxiproxy" routes api + worker-chat through infra/k8s/loadtest/
+# toxiproxy.yaml, which holds an 8s downstream latency toxic. OpenSearch itself stays real,
+# as concepts §6 requires. Run `make k8s-loadtest-toxiproxy-image` once per cluster first.
+LOADTEST_OPENSEARCH_HOST ?= opensearch
 
 .PHONY: k8s-loadtest
-k8s-loadtest: k8s-sync-loadtest k8s-deploy
+k8s-loadtest: k8s-sync-loadtest k8s-build-push
+	kubectl delete job model-preload es-bootstrap garage-bootstrap -n copilot --ignore-not-found
 	@sed -i 's|^\( *newTag: \).*|\1$(GIT_SHA)|' $(K8S_LOADTEST)/kustomization.yaml
 	@sed -i \
 	  -e 's|^LOADTEST_TARGET_HOST=.*|LOADTEST_TARGET_HOST=$(LOADTEST_TARGET_HOST)|' \
@@ -518,7 +593,22 @@ k8s-loadtest: k8s-sync-loadtest k8s-deploy
 	  -e 's|^LOADTEST_SPIKE_USERS=.*|LOADTEST_SPIKE_USERS=$(LOADTEST_SPIKE_USERS)|' \
 	  -e 's|^LOADTEST_SPIKE_SPAWN_SECONDS=.*|LOADTEST_SPIKE_SPAWN_SECONDS=$(LOADTEST_SPIKE_SPAWN_SECONDS)|' \
 	  -e 's|^LOADTEST_SPIKE_HOLD=.*|LOADTEST_SPIKE_HOLD=$(LOADTEST_SPIKE_HOLD)|' \
+	  -e 's|^LOADTEST_CHAT_EMAIL=.*|LOADTEST_CHAT_EMAIL=$(LOADTEST_CHAT_EMAIL)|' \
+	  -e 's|^LOADTEST_CHAT_PASSWORD=.*|LOADTEST_CHAT_PASSWORD=$(LOADTEST_CHAT_PASSWORD)|' \
+	  -e 's|^LOADTEST_SSE_TIMEOUT_S=.*|LOADTEST_SSE_TIMEOUT_S=$(LOADTEST_SSE_TIMEOUT_S)|' \
 	  $(K8S_LOADTEST)/loadtest-params.env
+	# The fault knobs live in Deployment patches, not in loadtest-params: that ConfigMap is
+	# mounted into the Job only, and T7/T8 have to change the api and worker-chat pods.
+	# Rewriting the patch files means the fault lands in the same two-phase apply as the
+	# fake-LLM patches, under the same rollout waits — so a scenario can never be half-applied
+	# with the Job already generating load.
+	@sed -i \
+	  -e 's|^\( *value: \).*\( # FAKE_LLM_LATENCY_MS\)$$|\1"$(LOADTEST_FAKE_LLM_LATENCY_MS)"\2|' \
+	  -e 's|^\( *value: \).*\( # OPENSEARCH_HOST\)$$|\1"$(LOADTEST_OPENSEARCH_HOST)"\2|' \
+	  $(K8S_LOADTEST)/patches/worker-chat-faults.yaml
+	@sed -i \
+	  -e 's|^\( *value: \).*\( # OPENSEARCH_HOST\)$$|\1"$(LOADTEST_OPENSEARCH_HOST)"\2|' \
+	  $(K8S_LOADTEST)/patches/api-faults.yaml
 	kubectl delete job loadtest -n copilot --ignore-not-found
 	# Two-phase apply, and the ordering is a money-safety property, not a nicety.
 	#
@@ -538,6 +628,10 @@ k8s-loadtest: k8s-sync-loadtest k8s-deploy
 	kubectl rollout status deployment/api -n copilot --timeout=300s
 	kubectl rollout status deployment/worker-chat -n copilot --timeout=600s
 	kubectl rollout status deployment/worker-ingestion -n copilot --timeout=600s
+	# Waited on unconditionally, though only T8 dials it: its readiness probe is the proxy's
+	# own existence, so a run that DOES point OPENSEARCH_HOST at it cannot start before the
+	# latency toxic is installed. Starting early would silently measure an un-toxiced leg.
+	kubectl rollout status deployment/toxiproxy -n copilot --timeout=300s
 	# Every LLM-calling workload is now serving the fake config; safe to generate load.
 	kubectl kustomize $(K8S_LOADTEST) \
 	  | python3 -c 'import sys,yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind")=="Job" and d["metadata"]["name"]=="loadtest"]; yaml.safe_dump_all(docs,sys.stdout)' \
@@ -557,6 +651,10 @@ k8s-loadtest-clean: k8s-deploy
 	# loadtest is deleted here rather than by k8s-deploy because k8s-deploy doesn't know about
 	# it; model-preload is already handled there.
 	kubectl delete job loadtest -n copilot --ignore-not-found
+	# Same reason as the Job: k8s-deploy applies the base overlay, which has never heard of
+	# toxiproxy, and apply does not prune. Left behind it would keep answering on :9200 —
+	# harmless until someone re-points OPENSEARCH_HOST at a proxy nobody re-toxiced.
+	kubectl delete -f $(K8S_LOADTEST)/toxiproxy.yaml --ignore-not-found
 	kubectl rollout status deployment/api -n copilot --timeout=300s
 	kubectl rollout status deployment/worker-chat -n copilot --timeout=600s
 	kubectl rollout status deployment/worker-ingestion -n copilot --timeout=600s

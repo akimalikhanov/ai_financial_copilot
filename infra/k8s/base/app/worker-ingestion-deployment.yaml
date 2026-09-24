@@ -39,11 +39,12 @@ spec:
         prometheus.io/port: "9101"
         prometheus.io/path: "/metrics"
     spec:
-      # Above INGEST_TASK_SOFT_TIME_LIMIT_SECONDS (2400) — not the app-wide 360, which
-      # ingest_document overrides on its own decorator. Same reasoning as worker-chat: a warm
-      # shutdown must be able to finish the longest task Celery allows. Ingestion is already
+      # Above INGEST_TASK_TIME_LIMIT_SECONDS (2700) — the hard limit, not the soft 2400, because
+      # the hard limit is the longest task Celery allows and the limit is measured from task
+      # start, not from SIGTERM. A grace below it lets the kubelet SIGKILL a task the parent was
+      # about to fail cleanly, leaving it un-acked for acks_late to redeliver. Ingestion is
       # attempt-capped (INGEST_MAX_ATTEMPTS), but a redelivered parse still costs a GPU slot.
-      terminationGracePeriodSeconds: 2500
+      terminationGracePeriodSeconds: 2800
       initContainers:
         - name: wait-for-pgbouncer
           image: postgres:16.11-alpine

@@ -332,6 +332,18 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   ensure_vector_and_search_indexes: 'Indexing',
   index_and_backup_chunks: 'Indexing',
   finalize_ready: 'Finalizing',
+  retrying: 'Retrying',
+};
+
+const ingestionLabel = (doc: Document): string => {
+  const stage = doc.ingestionStage;
+  if (!stage) return doc.status;
+  const name = INGEST_STAGE_LABELS[stage] ?? stage.replace(/_/g, ' ');
+  if (stage === 'retrying') return doc.ingestionAttempt ? `${name} (attempt ${doc.ingestionAttempt})` : name;
+  if (doc.ingestionStageIndex != null && doc.ingestionStageTotal != null) {
+    return `${name} ${doc.ingestionStageIndex}/${doc.ingestionStageTotal}`;
+  }
+  return name;
 };
 // One *_started event plus its matching *_ended data, once it arrives.
 interface ActivityRecord {
@@ -852,6 +864,7 @@ export default function App() {
           ingestionStage: prevDoc.ingestionStage,
           ingestionStageIndex: prevDoc.ingestionStageIndex,
           ingestionStageTotal: prevDoc.ingestionStageTotal,
+          ingestionAttempt: prevDoc.ingestionAttempt,
         };
       });
     });
@@ -888,6 +901,13 @@ export default function App() {
             // Transport drop, not a failed ingest: re-read the real status while the stream
             // reconnects, so a dropped connection can't mark a healthy document as Error.
             () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
+            // The worker died and the document went back on the queue. Still Processing —
+            // the next attempt's stage events arrive on this same stream.
+            (attempt) => {
+              setDocs(prev => prev.map(d =>
+                d.id === doc.id ? { ...d, ingestionStage: 'retrying', ingestionStageIndex: undefined, ingestionStageTotal: undefined, ingestionAttempt: attempt } : d
+              ));
+            },
           );
           unsubs.push(unsub);
         }
@@ -929,6 +949,11 @@ export default function App() {
       },
       // See the mount-time subscription above: a dropped stream is not a failed ingest.
       () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
+      (attempt) => {
+        setDocs(prev => prev.map(d =>
+          d.id === uploaded.id ? { ...d, ingestionStage: 'retrying', ingestionStageIndex: undefined, ingestionStageTotal: undefined, ingestionAttempt: attempt } : d
+        ));
+      },
     );
   }, [refreshDocs]);
 
@@ -1892,9 +1917,7 @@ export default function App() {
                     >
                       <td className="px-6 py-4 w-40">
                         <Badge variant={doc.status === 'Ready' ? 'success' : doc.status === 'Error' ? 'danger' : 'warning'}>
-                          {doc.status === 'Processing' && doc.ingestionStage
-                            ? `${INGEST_STAGE_LABELS[doc.ingestionStage] ?? doc.ingestionStage.replace(/_/g, ' ')}${doc.ingestionStageIndex != null && doc.ingestionStageTotal != null ? ` ${doc.ingestionStageIndex}/${doc.ingestionStageTotal}` : ''}`
-                            : doc.status}
+                          {doc.status === 'Processing' ? ingestionLabel(doc) : doc.status}
                         </Badge>
                       </td>
                       <td className="px-6 py-4 font-medium text-[var(--text)]">

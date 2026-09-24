@@ -12,6 +12,9 @@ export interface Document {
   ingestionStage?: string;
   ingestionStageIndex?: number;
   ingestionStageTotal?: number;
+  // Which attempt is about to run, when the previous one's worker died and the document was
+  // put back on the queue. Only meaningful while ingestionStage is 'retrying'.
+  ingestionAttempt?: number;
 }
 
 export interface BoundingBox {

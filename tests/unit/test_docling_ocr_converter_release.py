@@ -43,7 +43,7 @@ class TestReleaseOcrConverter:
         explicit collect the models survive until the cyclic GC next runs on its own."""
         calls: list[str] = []
         monkeypatch.setattr(docling_parser.gc, "collect", lambda: calls.append("collect") or 0)
-        monkeypatch.setattr(docling_parser, "_empty_cuda_cache", lambda: calls.append("cuda"))
+        monkeypatch.setattr(docling_parser, "empty_cuda_cache", lambda: calls.append("cuda"))
         docling_parser._ocr_converter = object()  # type: ignore[assignment]
 
         docling_parser.release_ocr_converter()
@@ -55,7 +55,7 @@ class TestReleaseOcrConverter:
         heap is not free."""
         calls: list[str] = []
         monkeypatch.setattr(docling_parser.gc, "collect", lambda: calls.append("collect") or 0)
-        monkeypatch.setattr(docling_parser, "_empty_cuda_cache", lambda: calls.append("cuda"))
+        monkeypatch.setattr(docling_parser, "empty_cuda_cache", lambda: calls.append("cuda"))
 
         docling_parser.release_ocr_converter()
 
@@ -76,4 +76,4 @@ class TestEmptyCudaCache:
 
         monkeypatch.setattr(builtins, "__import__", _no_torch)
 
-        docling_parser._empty_cuda_cache()  # does not raise
+        docling_parser.empty_cuda_cache()  # does not raise

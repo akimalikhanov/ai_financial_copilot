@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import cast
 from uuid import UUID, uuid4
@@ -20,6 +21,11 @@ from sqlalchemy import text
 
 from src.api.deps import CurrentUserDep, RedisDep
 from src.api.exceptions import _sse_event
+from src.api.stream_liveness import (
+    INGEST_TERMINAL_STATUSES,
+    _stream_event_time,
+    _worker_gone,
+)
 from src.db import DbSessionDep, get_session_factory
 from src.models.document import Document
 from src.observability.metrics import (
@@ -36,13 +42,16 @@ from src.schemas.documents import (
     UploadDocumentResponse,
 )
 from src.services.ingestion import opensearch_ingest, qdrant_ingest
+from src.services.ingestion.recovery import reap_abandoned
 from src.services.ingestion.s3_client import build_raw_storage_key, upload_pdf
 from src.services.ingestion.tasks import ingest_document
 from src.utils.config import (
+    get_ingest_stream_abandoned_after_seconds,
     get_s3_access_key,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_endpoint_url,
+    get_s3_pictures_bucket,
     get_s3_raw_bucket,
     get_s3_rendered_bucket,
     get_s3_secret_key,
@@ -60,9 +69,15 @@ logger = logging.getLogger(__name__)
 async def list_documents(
     session: DbSessionDep,
     current_user: CurrentUserDep,
+    redis: RedisDep,
 ) -> ListDocumentsResponse:
     repo = DocumentRepository(session)
     docs = await repo.list_by_user(current_user.id)
+    # This already loads every one of the user's documents, so checking which of the
+    # `processing` ones still have a live worker costs one pipelined round trip. It is also
+    # the request that fires when someone is looking at the list, which is when a document
+    # stranded by a dead worker is worth recovering.
+    await reap_abandoned(redis, list(docs), source="list")
     items = [
         DocumentListItem(
             id=d.id,
@@ -233,6 +248,22 @@ async def delete_document(
                         extra={"bucket": bucket, "key": key},
                     )
 
+        # Crops are one object per picture under `{document_id}/pictures/N.png`
+        # (build_picture_crop_key), so this sweeps a prefix rather than deleting a fixed key.
+        pictures_bucket = get_s3_pictures_bucket()
+        prefix = f"{document_id}/"
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(Bucket=pictures_bucket, Prefix=prefix):
+                batch = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+                if batch:
+                    await s3.delete_objects(Bucket=pictures_bucket, Delete={"Objects": batch})
+        except Exception:
+            logger.warning(
+                "delete_document.s3_failed",
+                extra={"bucket": pictures_bucket, "key": prefix},
+            )
+
     await session.execute(text("DELETE FROM chunks WHERE document_id = :id"), {"id": document_id})
     await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
     await session.commit()
@@ -313,6 +344,41 @@ async def ingestion_stream(
                                 "error", {"message": fresh.processing_error or "Ingestion failed"}
                             )
                             return
+                        if fresh is not None:
+                            # Neither status a dead worker can write. Re-enqueue it and keep
+                            # the stream open: the replacement attempt writes to this same
+                            # stream, so the uploader sees a stall and then stage events
+                            # again rather than a failure it would have to act on.
+                            if await reap_abandoned(redis, [fresh], source="stream"):
+                                empty_polls = 0
+                                yield _sse_event(
+                                    "retrying",
+                                    {"attempt": (fresh.ingest_attempt_count or 0) + 1},
+                                )
+                                continue
+                            # Backstop for the case the lease itself is unreadable: without
+                            # it a Redis outage puts this stream back to heart-beating until
+                            # the client gives up. `created_at`, not `updated_at` — status
+                            # writes do not touch `updated_at`, so it can still hold the
+                            # upload time on a document that has been processing for an hour.
+                            progress_at = _stream_event_time(last_id) or fresh.created_at
+                            if _worker_gone(
+                                fresh.status,
+                                progress_at,
+                                datetime.now(UTC),
+                                terminal=INGEST_TERMINAL_STATUSES,
+                                after_seconds=get_ingest_stream_abandoned_after_seconds(),
+                            ):
+                                outcome = "error"
+                                logger.warning(
+                                    "ingestion_stream.worker_gone",
+                                    extra={"document_id": str(document_id)},
+                                )
+                                yield _sse_event(
+                                    "error",
+                                    {"message": "Processing stopped unexpectedly. Please retry."},
+                                )
+                                return
                     yield ": keepalive\n\n"
                     continue
 

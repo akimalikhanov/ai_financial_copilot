@@ -13,6 +13,7 @@ from src.utils.config import (
     get_chat_events_ttl,
     get_chat_tail_max_messages,
     get_chat_tail_ttl,
+    get_ingest_events_ttl,
     get_rate_limit_max_requests,
     get_rate_limit_window_ms,
     get_redis_app_url,
@@ -24,6 +25,10 @@ CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
 # deploy doesn't mix payload shapes (old workers reject unknown keys, extra="forbid").
 CHAT_TAIL_KEY_PREFIX = "chat:tail:v2:"
 INGESTION_STREAM_PREFIX = "ingestion:events:"
+# One event per pipeline stage, so this is a runaway guard rather than a working limit.
+INGESTION_EVENTS_MAXLEN = 100
+INGESTION_LEASE_PREFIX = "ingest:lease:"
+INGESTION_REAP_PREFIX = "ingest:reap:"
 
 
 def events_stream_key(request_id: str) -> str:
@@ -34,6 +39,26 @@ def events_stream_key(request_id: str) -> str:
 def ingestion_stream_key(document_id: str) -> str:
     """Return Redis stream key for ingestion events."""
     return f"{INGESTION_STREAM_PREFIX}{document_id}"
+
+
+def ingestion_lease_key(document_id: str) -> str:
+    """Return the Redis key holding the ingestion worker's claim on a document.
+
+    The key is both mutual exclusion (only one worker may hold it) and liveness (the holder
+    refreshes its TTL while it works). A document row sitting at `processing` with no lease
+    key means the worker that owned it died without running any exception handler.
+    """
+    return f"{INGESTION_LEASE_PREFIX}{document_id}"
+
+
+def ingestion_reap_key(document_id: str) -> str:
+    """Return the key that debounces re-enqueueing one abandoned document.
+
+    A document sitting in the queue is indistinguishable from an abandoned one — `processing`
+    with no lease — so this key marks the ones already re-enqueued and keeps a backed-up
+    queue from collecting a copy per read.
+    """
+    return f"{INGESTION_REAP_PREFIX}{document_id}"
 
 
 async def create_redis_app_client() -> Redis:
@@ -244,6 +269,28 @@ async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[s
             approximate=True,
         )
         pipe.expire(stream_key, get_chat_events_ttl())
+        event_id, _ = await pipe.execute()
+    return event_id
+
+
+async def add_ingestion_event(
+    redis: Redis, document_id: str, event_type: str, data: dict[str, Any]
+) -> str:
+    """Add an event to a document's ingestion stream. Returns event id.
+
+    The ingestion counterpart of add_event, and a TTL on every write for the same reason:
+    maxlen bounds how much a stream holds but never reclaims the key, and nothing else
+    expires these. An ingestion that is killed mid-document writes no terminal event at all,
+    so its last stage event is the only thing that can ever clean the stream up.
+
+    The cap is small and exact because these carry one event per pipeline stage — a few
+    dozen, against the thousands a chat answer streams.
+    """
+    stream_key = ingestion_stream_key(document_id)
+    payload = json.dumps({"type": event_type, **data})
+    async with redis.pipeline(transaction=False) as pipe:
+        pipe.xadd(stream_key, {"payload": payload}, "*", maxlen=INGESTION_EVENTS_MAXLEN)
+        pipe.expire(stream_key, get_ingest_events_ttl())
         event_id, _ = await pipe.execute()
     return event_id
 

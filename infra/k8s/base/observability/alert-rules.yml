@@ -151,6 +151,41 @@ groups:
             Each replacement reloads the Docling models. Compare rss_end_mb and stage_growth_mb
             across recent pipeline.memory log lines to see what is keeping memory.
 
+  # A document whose worker died is re-enqueued by the API when something reads its row. The
+  # counter is the only outward sign that happened — the document itself recovers silently.
+  - name: ingestion-recovery
+    interval: 30s
+    rules:
+      # One reap means one ingestion worker died mid-document without running any handler:
+      # OOMKill, eviction, node loss. The document is already back on the queue, so this is
+      # not urgent on its own — it is the record that the kill happened at all, which pod
+      # status overwrites on the next restart.
+      - alert: IngestionDocumentsReaped
+        expr: sum(increase(ingestion_documents_reaped_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} stranded document(s) re-queued in the last 15m"
+          description: >-
+            An ingestion worker was killed mid-document. Check the same window for an
+            OOMKill or an eviction of worker-ingestion, and look for ingestion.reaped log
+            lines to see which documents were affected.
+
+      # Recovery that keeps firing is not recovery: the replacement attempt is dying the same
+      # way the first one did. Each attempt re-runs the parse, which is the expensive part,
+      # and the attempt cap ends with the document failing.
+      - alert: IngestionRecoveryNotConverging
+        expr: sum(increase(ingestion_documents_reaped_total[1h])) > 5
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingestion recovery fired {{ $value | printf \"%.0f\" }} times in the last hour"
+          description: >-
+            Documents are being re-queued faster than they are completing. Compare with
+            ingestion_documents_total to see whether any are reaching ready, and check
+            whether one oversized document is killing every worker that picks it up.
+
   - name: scrape-health
     interval: 30s
     rules:

@@ -225,7 +225,7 @@ def configure_worker_logging() -> None:
     if only_ingestion_logs:
         pipeline_filter = IncludeLoggerPrefixFilter(
             prefixes=(
-                "src.services.ingestion.tasks",
+                "src.services.ingestion",
                 "celery.worker.strategy",
                 "docling",
             )

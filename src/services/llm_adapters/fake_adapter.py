@@ -74,8 +74,11 @@ async def _sample_latency_seconds(*, fast: bool = False) -> float:
     should be able to force a slow value everywhere, including onto the fast path, when
     someone wants to test what a slow query_transformer call actually does downstream.
     """
-    fixed_ms = os.environ.get("FAKE_LLM_LATENCY_MS")
-    if fixed_ms is not None:
+    # Blank, not just unset, means "sampled": the k8s load-test patch carries this key on
+    # every run and `make k8s-loadtest` writes the scenario's value into it, so the no-toxic
+    # case arrives as "" rather than as an absent key. float("") would raise on every call.
+    fixed_ms = os.environ.get("FAKE_LLM_LATENCY_MS", "").strip()
+    if fixed_ms:
         delay = float(fixed_ms) / 1000.0
     elif fast:
         low = float(os.environ.get("FAKE_LLM_FAST_LATENCY_MIN_S", _FAST_LATENCY_MIN_S))

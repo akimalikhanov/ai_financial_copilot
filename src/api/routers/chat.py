@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import cast
 from uuid import UUID
@@ -23,6 +24,11 @@ from src.api.deps import (
     chat_rate_limit,
 )
 from src.api.exceptions import _sse_event
+from src.api.stream_liveness import (
+    CHAT_TERMINAL_STATUSES,
+    _stream_event_time,
+    _worker_gone,
+)
 from src.db import DbSessionDep, get_session_factory
 from src.models.llm_request import LLMRequest
 from src.models.message import MessageRole
@@ -40,6 +46,10 @@ from src.repository import (
 from src.schemas import chat as schemas
 from src.services.chat.tasks import process_chat
 from src.services.context import ConversationHistory
+
+# The liveness rule is shared with the ingestion stream, which faces the same dead-worker
+# case; these names are re-exported here because this is where both were written.
+_TERMINAL_STATUSES = CHAT_TERMINAL_STATUSES
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -223,12 +233,28 @@ async def chat_stream_subscribe(
     stream_key = events_stream_key(str(request_id))
     session_factory = get_session_factory()
 
-    async def _failure_message() -> str | None:
-        """Short-lived session for the liveness re-check — opened only when needed."""
+    async def _failure_message(last_event_id: str) -> str | None:
+        """Short-lived session for the liveness re-check — opened only when needed.
+
+        Two ways a request can be over. The worker may have *reported* failure, which is the
+        `failed` status below. Or its process may be gone — OOMKilled, evicted, node lost —
+        in which case no handler ever ran, the status is still whatever it was mid-pipeline,
+        and this check would otherwise keep returning None and keep the client on a
+        heart-beating stream indefinitely. The second case is bounded by elapsed time since
+        the request last made progress: a task that is genuinely running is capped by Celery's
+        hard time limit, so past that limit plus a margin the worker is gone rather than slow.
+        """
         async with session_factory() as s:
             req = await LLMRequestRepository(s).get_by_id(request_id)
-            if req and req.status == "failed":
+            if req is None:
+                return None
+            if req.status == "failed":
                 return req.error_message or "Processing failed"
+            if req.status in _TERMINAL_STATUSES:
+                return None
+            progress_at = _stream_event_time(last_event_id) or req.updated_at
+            if _worker_gone(req.status, progress_at, datetime.now(UTC)):
+                return "Processing stopped unexpectedly. Please ask again."
             return None
 
     async def event_stream() -> AsyncGenerator[str, None]:
@@ -244,7 +270,7 @@ async def chat_stream_subscribe(
                 if not result:
                     empty_polls += 1
                     if empty_polls >= 3:
-                        failure_message = await _failure_message()
+                        failure_message = await _failure_message(last_id)
                         if failure_message is not None:
                             outcome = "error"
                             yield _sse_event(

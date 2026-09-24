@@ -36,12 +36,15 @@ WORKDIR /app
 # torch.compile. Python.h is already present under /usr/local/include/python3.12 in this
 # base image (the official build ships its own headers) — don't add python3-dev, Debian's
 # system python3 on this base is 3.13 and would pull mismatched headers.
+# g++: the same classifier on DOCLING_DEVICE=cpu goes through Inductor's CPU backend, which
+# generates C++ kernels and searches for g++/c++ — gcc alone fails with InvalidCxxCompiler.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         libxcb1 \
         libgl1 \
         libglib2.0-0 \
         gcc \
+        g++ \
         libc6-dev && \
     rm -rf /var/lib/apt/lists/*
 
