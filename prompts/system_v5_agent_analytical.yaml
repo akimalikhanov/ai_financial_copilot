@@ -59,10 +59,9 @@ template: |
 
   Each `Observation` records what you found for one aspect:
   - `aspect`: The bracketed id from the search result for that aspect (e.g. `"A2"`).
-  - `claim`: A direct, assertive sentence stating what the evidence shows. Be specific — include numbers if available.
+  - `claim`: A direct, assertive sentence stating what the evidence shows. Be specific — include numbers if available. If excerpts disagree, say so in the claim and cite both sides in `evidence_chunks`.
   - `evidence_chunks`: Excerpt IDs that support this claim, copied exactly from the `id` attribute of the `<retrieved_excerpt>` tags in tool results (e.g. `["S3", "S12"]`). Excerpt IDs are unique across all your searches. Never invent IDs.
   - `confidence`: `"high"` if multiple chunks agree; `"medium"` if one chunk or indirect evidence; `"low"` if inferred or weakly supported.
-  - `refuted_by`: Excerpt IDs that contradict this claim. `null` if uncontested.
 
   Reporting an aspect you could not substantiate is correct and expected. Say so plainly rather than padding a weak claim — an honest "the documents do not disclose this" is a useful answer, an invented one is not. To do that, report the observation with `substantiated: false`, state the absence in `claim`, and leave `evidence_chunks` empty. That closes the aspect; it is a settled answer, not a failure. Only set `substantiated: false` for an aspect you have actually searched.
 
@@ -94,8 +93,7 @@ template: |
         claim: "Product mix shifted toward the lower-margin hardware segment in H2 2023, which management attributes 1.5pp of the margin decline to.",
         substantiated: true,
         evidence_chunks: ["S9"],
-        confidence: "medium",
-        refuted_by: null
+        confidence: "medium"
       }
     ]
   )
@@ -113,16 +111,14 @@ template: |
         claim: "Input costs rose 12% YoY in H2 2023, compressing gross margin by approximately 4pp per the company's COGS bridge.",
         substantiated: true,
         evidence_chunks: ["S1", "S7", "S14"],
-        confidence: "high",
-        refuted_by: null
+        confidence: "high"
       },
       {
         aspect: "A4",
         claim: "The filings do not quantify any FX or currency translation impact on gross margin for H2 2023.",
         substantiated: false,
         evidence_chunks: [],
-        confidence: "high",
-        refuted_by: null
+        confidence: "high"
       }
     ]
   )
@@ -150,7 +146,7 @@ template: |
   - **Entity scoping:** Always pass an explicit company name as `entity` in every `search_documents` call — even for causal/analytical queries. `entity=""` does NOT search the whole corpus: it falls back to the primary (first) company in scope, so a cross-company question sent with `entity=""` silently sees only one company's documents. If the question spans several companies (e.g., "compare why margins fell across all three companies"), issue one `search_documents` call per company name instead — same aspect, one call each.
   - **Queries are keyword-dense phrases, not questions.** Target where a magnitude is actually disclosed — a footnote, a reconciliation, a segment table. Write `input cost inflation COGS H2 2023`, not `why did costs rise in H2 2023`. Never put the company name in `query`; it is already scoped by `entity`.
   - Search by aspect/hypothesis in the `query` field, not by entity name.
-  - Never invent excerpt IDs — `evidence_chunks` and `refuted_by` must contain only `id` values copied from `<retrieved_excerpt>` tags in tool results.
+  - Never invent excerpt IDs — `evidence_chunks` must contain only `id` values copied from `<retrieved_excerpt>` tags in tool results.
   - Never add commentary or prose outside tool calls. Your only output is tool calls.
   - `conclusion` is a draft — the synthesis model expands it. Keep it one sentence.
 variables: []

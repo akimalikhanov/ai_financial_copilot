@@ -1,11 +1,10 @@
 """The synthesis boundary: agent-loop output -> the context and findings synthesis reads.
 
-Single home for the sequence `tasks.py` and `src.eval.pipeline_agent` previously each
-re-implemented (and had drifted, see docs/stages/agentic_state_refactor_v2.md P0-5):
-resolve findings -> inject stubs for entities the agent never searched -> normalize FX ->
-select the evidence the findings actually cite -> assemble the RAG context -> render the
-findings block -> concatenate. Both callers now collapse to a single `run_agent` call
-(see `__init__.py`), which calls this after the loop.
+Single home for the sequence both `tasks.py` and `src.eval.pipeline_agent` need: resolve
+findings -> inject stubs for entities the agent never searched -> normalize FX -> select
+the evidence the findings actually cite -> assemble the RAG context -> render the findings
+block -> concatenate. Both callers reach it through one `run_agent` call (see
+`__init__.py`), which calls this after the loop.
 """
 
 from __future__ import annotations
@@ -49,13 +48,13 @@ def _inject_unsearched_stubs(
     """Defence-in-depth stub for every in-scope entity absent from the findings.
 
     Keyed on reported coverage, not ``searched_entities``: an entity that was searched but
-    never landed a finding (P0-A — e.g. every citation failed ``resolve_refs``) would
-    otherwise vanish from the findings block, the evidence selection and the answer with
-    no trace, silently turning a 2-entity comparison into a 1-entity argmax.
+    never landed a finding (e.g. every citation failed ``resolve_refs``) would otherwise
+    vanish from the findings block, the evidence selection and the answer with no trace,
+    silently turning a 2-entity comparison into a 1-entity argmax.
     ``searched_entities`` still picks the reason, so a never-searched entity isn't
-    mislabeled as searched-but-ungrounded (P1-0). Keying on reported coverage also means a
-    model that self-reports "unavailable" without searching gets its own row and not a
-    duplicate stub (P2-G).
+    mislabeled as searched-but-ungrounded. Keying on reported coverage also means a model
+    that self-reports "unavailable" without searching gets its own row and not a duplicate
+    stub.
     """
     if scope_result is None or not scope_result.per_entity_doc_ids:
         return findings
@@ -102,7 +101,7 @@ def _cited_chunk_ids(findings: AgentFindings | AnalyticalFindings) -> set[UUID]:
                     cited_ids.add(UUID(chunk_id))
     else:
         for obs in findings.observations:
-            for chunk_id in (*obs.evidence_chunks, *(obs.refuted_by or [])):
+            for chunk_id in obs.evidence_chunks:
                 with contextlib.suppress(ValueError):
                     cited_ids.add(UUID(chunk_id))
     return cited_ids
@@ -186,7 +185,7 @@ async def run_synthesis(
         synthesis_chunks = fallback
 
     # Payloads were cached (already sanitized) when the loop rendered these chunks — no
-    # second hydration, and the re-scan below is a no-op over sanitized text (D2).
+    # second hydration, and the re-scan below is a no-op over sanitized text.
     payloads = evidence.payloads_for(c.chunk_id for c in synthesis_chunks)
     synthesis_chunks = [c for c in synthesis_chunks if c.chunk_id in payloads]
     rag_context, _ = assemble_rag_context(synthesis_chunks, payloads, assume_unique=True)

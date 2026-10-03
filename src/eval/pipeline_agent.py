@@ -24,6 +24,7 @@ from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.retrieval import AnswerCitationSpan, RAGContext, RetrievalTrace
 from src.services.chat.agent import run_agent
+from src.services.chat.agent.loop import tool_model_chain
 from src.services.chat.agent.processor import ProcessedFindings
 from src.services.chat.agent.state import AgentLoopMeta, get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
@@ -156,11 +157,17 @@ async def run_one(
     state.llm_request = _LLMRequestStub()  # type: ignore[assignment]
 
     try:
-        tool_model_id: str = settings.tool_model
-        tool_llm = router.get(tool_model_id)
+        tool_llm, *fallbacks = tool_model_chain(router, settings.tool_model)
 
         agent_result = await run_agent(
-            state, tool_llm, session, _redis, request_id, reranker, get_session_factory()
+            state,
+            tool_llm,
+            session,
+            _redis,
+            request_id,
+            reranker,
+            get_session_factory(),
+            fallbacks=fallbacks,
         )
     finally:
         if _owns_redis:

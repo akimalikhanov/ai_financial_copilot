@@ -12,7 +12,14 @@ from __future__ import annotations
 from docling_core.transforms.chunker.doc_chunk import DocChunk, DocMeta
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.base import BaseTokenizer
-from docling_core.types.doc.document import PictureItem, TextItem
+from docling_core.types.doc.base import BoundingBox
+from docling_core.types.doc.document import (
+    DoclingDocument,
+    PictureItem,
+    ProvenanceItem,
+    SectionHeaderItem,
+    TextItem,
+)
 from docling_core.types.doc.labels import DocItemLabel
 
 from src.services.ingestion.chunker import AnnualReportSerializerProvider, CustomHybridChunker
@@ -55,7 +62,7 @@ def _run_chunk(
     chunker: CustomHybridChunker, docling_chunks: list[DocChunk], monkeypatch
 ) -> list[DocChunk]:
     monkeypatch.setattr(HybridChunker, "chunk", lambda *_a, **_kw: iter(docling_chunks))
-    return [DocChunk.model_validate(c) for c in chunker.chunk(dl_doc=object())]  # type: ignore[arg-type]
+    return [DocChunk.model_validate(c) for c in chunker.chunk(dl_doc=DoclingDocument(name="t"))]
 
 
 class TestMergeLimit:
@@ -118,6 +125,73 @@ class TestMergeLoop:
 
         assert len(result) == 1
         assert "seven" in result[0].text
+
+
+def _doc(*entries: str) -> DoclingDocument:
+    """Build a document from entries; "# text" is a level-1 section header, else body text."""
+    doc = DoclingDocument(name="t")
+    for entry in entries:
+        if entry.startswith("# "):
+            doc.add_heading(text=entry[2:], level=1)
+        else:
+            doc.add_text(label=DocItemLabel.TEXT, text=entry)
+    return doc
+
+
+def _headings(doc: DoclingDocument) -> list[list[str]]:
+    # min_tokens=1 so no chunk is merged into a neighbour: each body item stays its own chunk.
+    chunker = _make_chunker(min_tokens=1, max_merge_multiplier=1.0)
+    return [DocChunk.model_validate(c).meta.headings or [] for c in chunker.chunk(dl_doc=doc)]
+
+
+class TestHeaderRuns:
+    def test_back_to_back_headers_kept_as_trail(self) -> None:
+        doc = _doc(
+            "# Aurora Innovation, Inc.",
+            "# Consolidated Statements of Operations",
+            "# (in millions, except per share data)",
+            "Collaboration revenue 68 82",
+        )
+        assert _headings(doc) == [
+            [
+                "Aurora Innovation, Inc.",
+                "Consolidated Statements of Operations",
+                "(in millions, except per share data)",
+            ]
+        ]
+
+    def test_header_after_content_starts_a_new_trail(self) -> None:
+        doc = _doc("# Note 1", "# Basis of Presentation", "body one", "# Revenue", "body two")
+        assert _headings(doc) == [["Note 1", "Basis of Presentation"], ["Revenue"]]
+
+    def test_repeated_header_in_run_is_not_duplicated(self) -> None:
+        doc = _doc("# SONIC", "# MD&A", "# SONIC", "# MD&A", "# Liquidity", "body")
+        assert _headings(doc) == [["SONIC", "MD&A", "Liquidity"]]
+
+    def test_page_break_ends_run(self) -> None:
+        # Reading order can put a header from the previous page right before this page's title.
+        def prov(page: int) -> ProvenanceItem:
+            return ProvenanceItem(
+                page_no=page, bbox=BoundingBox(l=0, t=1, r=1, b=0), charspan=(0, 1)
+            )
+
+        doc = DoclingDocument(name="t")
+        doc.add_heading(text="Auditor's Report", level=1, prov=prov(61))
+        doc.add_heading(text="Balance Sheets", level=1, prov=prov(62))
+        doc.add_text(label=DocItemLabel.TEXT, text="body", prov=prov(62))
+        assert _headings(doc) == [["Balance Sheets"]]
+
+    def test_run_deeper_than_cap_keeps_first_headers_and_last(self) -> None:
+        doc = _doc(*(f"# H{i}" for i in range(1, 8)), "body")
+        assert _headings(doc) == [["H1", "H2", "H3", "H4", "H7"]]
+
+    def test_header_levels_restored_after_chunking(self) -> None:
+        doc = _doc("# A", "# B", "# C", "body")
+        _headings(doc)
+        levels = [
+            item.level for item, _ in doc.iterate_items() if isinstance(item, SectionHeaderItem)
+        ]
+        assert levels == [1, 1, 1]
 
 
 class _FakeDocItem:

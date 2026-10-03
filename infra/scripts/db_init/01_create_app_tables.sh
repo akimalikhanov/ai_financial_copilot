@@ -797,6 +797,11 @@ ALTER TABLE llm_requests
 COMMENT ON COLUMN llm_requests.query_shape IS
   'Router query shape (extraction/comparison/analytical). Attributes cost drift to workload mix.';
 
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS cached_input_tokens integer;
+COMMENT ON COLUMN llm_requests.cached_input_tokens IS
+  'Prompt tokens served from the provider prompt cache (subset of prompt_tokens). NULL: not reported.';
+
 -- ============================================================================
 -- Add user_id FKs to users (conversations, messages, llm_requests)
 -- ============================================================================

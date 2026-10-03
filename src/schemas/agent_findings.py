@@ -47,10 +47,6 @@ class Observation(BaseModel):
         description='Excerpt IDs from search results that support this claim, exactly as shown (e.g. ["S3", "S7"]).',
     )
     confidence: Literal["high", "medium", "low"]
-    refuted_by: list[str] | None = Field(
-        default=None,
-        description="Excerpt IDs that contradict this claim, exactly as shown in search results.",
-    )
 
 
 class AnalyticalFindings(BaseModel):

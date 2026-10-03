@@ -2,15 +2,14 @@
 
 Pydantic arg models are the single source of truth: their JSON schemas drive the tool
 definitions handed to the LLM, and the same models parse the tool-call arguments back
-— schema and parser cannot drift (P2-10, P0-3).
+— schema and parser cannot drift.
 
-Post-D3 there is no registry: no tool is terminal and no tool has gates, so the only
-thing a caller ever needs is the schema list.
+There is no registry: no tool is terminal and no tool has gates, so the only thing a
+caller ever needs is the schema list.
 
-Each path names its own pool (10b step 7). A shape-invariant pool under a shape-varying
-prompt is what let an extraction run see `report_analytical_findings` — a tool `v3_agent`
-never names, whose payload lands on the wrong ledger kind. `run_loop` assigns prompt and
-pool on one line so neither can be set without the other.
+Each path names its own pool, and `run_loop` assigns prompt and pool on one
+line so neither can be set without the other. The pool is also the dispatch rule: a call
+to a tool outside the turn's pool gets "tool not available" and is never parsed.
 """
 
 from __future__ import annotations
@@ -95,7 +94,7 @@ class _AnalyticalReportArgs(BaseModel):
     searching an aspect the model had already declared dead, and it could contradict a
     later grounded finding with no way to retract it. Negatives now go through
     `Observation.substantiated`, which closes its key like any other entry. The field
-    stays on `AnalyticalFindings` — `projection()` still emits the loop's own keyed gaps.
+    stays on `AnalyticalFindings` — `projection()` still emits one line per open key.
     """
 
     question: str
@@ -114,6 +113,6 @@ REPORT_ANALYTICAL_TOOL = tool_schema(
 ANALYTICAL_TOOLS = [SEARCH_ANALYTICAL_TOOL, REPORT_ANALYTICAL_TOOL]
 EXTRACTION_TOOLS = [SEARCH_TOOL, REPORT_FINDINGS_TOOL]
 
-# The loop partitions each turn on this set, so it must name every report tool across
-# *both* pools — a report tool missing here would be routed to the search path.
+# The loop partitions each turn's offered tools on this set, so it must name every report
+# tool across *both* pools — a report tool missing here would be routed to the search path.
 REPORT_TOOL_NAMES = frozenset({"report_findings", "report_analytical_findings"})

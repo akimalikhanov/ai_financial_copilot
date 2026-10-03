@@ -115,7 +115,6 @@ class TestRoundTrip:
                         "claim": "COGS rose 12%",
                         "evidence_chunks": ["S2"],
                         "confidence": "high",
-                        "refuted_by": None,
                     }
                 ],
             }

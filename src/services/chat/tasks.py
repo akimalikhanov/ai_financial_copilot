@@ -9,7 +9,7 @@ import logging
 import os
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, get_args
 from uuid import UUID
 
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -25,8 +25,11 @@ from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
 from src.observability.metrics import (
     AGENT_ITERATIONS,
+    AGENT_STOP_REASONS,
+    AGENT_TOOL_ARG_ERRORS,
     CHAT_QUEUE_WAIT,
     CHAT_STAGE_DURATION,
+    CHAT_TTFT,
     FOLLOWUP_DIRECT_ANSWER,
     FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
@@ -46,7 +49,9 @@ from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput
 from src.services.chat.agent import run_agent
-from src.services.chat.agent.state import get_agent_settings
+from src.services.chat.agent import tools as agent_tools
+from src.services.chat.agent.loop import prompt_and_tools, tool_model_chain
+from src.services.chat.agent.state import ConvergenceReason, get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
@@ -63,6 +68,7 @@ from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.llm_router import FallbackStream, LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
+from src.services.retrieval import query_transformer
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
@@ -72,12 +78,15 @@ from src.utils.config import (
     get_db_url,
     get_followup_max_inherit_hops,
     get_injection_scan_user_input_enabled,
+    get_query_router_prompt_version,
     get_redis_app_url,
 )
 
 logger = logging.getLogger(__name__)
 
 FINDINGS_BLOCK_MAX_CHARS = 20_000
+
+SYNTHESIS_PROMPT_VERSION = "v4_agent_synthesis"
 
 # Ceiling on acks_late redeliveries of one chat task, mirroring INGEST_MAX_ATTEMPTS. Past it
 # the request is failed rather than retried, so a task that reliably kills its worker cannot
@@ -87,6 +96,33 @@ CHAT_MAX_ATTEMPTS = int(os.getenv("CHAT_MAX_ATTEMPTS", "2"))
 # Ceiling on how stale a redelivered chat task may be and still be worth running. Bounds the
 # hour that the broker's visibility timeout otherwise allows; see the guard in `process_chat`.
 CHAT_MAX_REQUEST_AGE_SECONDS = get_chat_max_request_age_seconds()
+
+
+def _observe_ttft(enqueued_at: datetime, query_shape: str) -> float:
+    """Record the user-perceived time to first token and return it in seconds."""
+    ttft = (datetime.now(UTC) - enqueued_at).total_seconds()
+    CHAT_TTFT.labels(query_shape).observe(ttft)
+    return ttft
+
+
+_QUERY_SHAPES = ("extraction", "comparison", "analytical")
+
+
+def _init_metric_series() -> None:
+    """Create the labelled series at zero in this worker process.
+
+    rate() never counts a series' first sample as an increase, so a series born at 1
+    reads as zero rate and low-traffic quantiles come out NaN. Must run after fork:
+    multiprocess values are per-PID.
+    """
+    for shape in (*_QUERY_SHAPES, "direct"):
+        CHAT_TTFT.labels(shape)
+    for reason in get_args(ConvergenceReason):
+        for shape in (*_QUERY_SHAPES, "none"):
+            AGENT_STOP_REASONS.labels(reason, shape)
+    for tool in agent_tools.EXTRACTION_TOOLS + agent_tools.ANALYTICAL_TOOLS:
+        AGENT_TOOL_ARG_ERRORS.labels(tool["function"]["name"])
+
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
@@ -291,6 +327,7 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     global _worker_loop, _redis_app, _engine, _session_factory, _router, _reranker
     configure_worker_logging()
     _initialize_worker_resources()
+    _init_metric_series()
 
 
 @worker_process_shutdown.connect
@@ -495,7 +532,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     propagate_attributes(
                         user_id=str(llm_request.user_id) if llm_request.user_id else None,
                         session_id=str(state.conversation_id),
-                        metadata={"request_id": request_id, "model": llm_request.model},
+                        metadata={
+                            "request_id": request_id,
+                            "model": llm_request.model,
+                            "tool_model": get_agent_settings().tool_model,
+                            "router_prompt": get_query_router_prompt_version(),
+                            "synthesis_prompt": SYNTHESIS_PROMPT_VERSION,
+                        },
                     )
                 )
 
@@ -752,11 +795,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             # without one — route that case to the no-context path explicitly.
             if state.router_output.route == "retrieval" and llm_request.user_id is not None:
                 _tool_model_id: str = agent_settings.tool_model
-                _tool_llm = router.get(_tool_model_id)
-                if not _tool_llm.capabilities.get("tool_calling", False):
-                    raise RuntimeError(
-                        f"AGENT_TOOL_MODEL={_tool_model_id!r} does not have tool_calling: true in models.yaml"
-                    )
+                _tool_llm, *_tool_fallbacks = tool_model_chain(router, _tool_model_id)
 
                 # Step 25: mark this request as agentic for DB queries/dashboards.
                 # Left pending deliberately: flushing here would reopen the transaction the
@@ -771,6 +810,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
                 _agent_lf_stack = contextlib.ExitStack()
                 if lf:
+                    _query_shape = getattr(state.router_output, "query_shape", None)
+                    _agent_lf_stack.enter_context(
+                        propagate_attributes(
+                            metadata={"agent_prompt": prompt_and_tools(_query_shape)[0]}
+                        )
+                    )
                     _agent_lf_stack.enter_context(
                         lf.start_as_current_observation(
                             as_type="chain",
@@ -791,6 +836,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         request_id,
                         _get_reranker(),
                         _get_session_factory(),
+                        fallbacks=_tool_fallbacks,
                     )
                     agent_meta = agent_result.meta
                     if lf:
@@ -801,19 +847,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "convergence_reason": agent_meta.convergence_reason,
                                 "sealed": agent_meta.sealed,
                                 "chunks_collected": len(agent_result.rag_context.items),
-                                # Step 9: is reporting incremental, or is the model
-                                # one-shotting anyway? The kill criterion for the whole
-                                # decomposition mechanism — was dropped on the floor
-                                # (computed onto AgentLoopMeta, never surfaced here).
+                                # Is reporting incremental, or is the model one-shotting?
                                 "plan_seeded": agent_meta.plan_seeded,
                                 "plan_covered": agent_meta.plan_covered,
                                 "report_calls_total": agent_meta.report_calls_total,
                                 "turns_to_first_report": agent_meta.turns_to_first_report,
                                 "unknown_aspect_keys": agent_meta.unknown_aspect_keys,
-                                "ungrounded_close_rate": agent_meta.ungrounded_close_rate,
-                                "revised_keys": agent_meta.revised_keys,
+                                "unsearched_negatives": agent_meta.unsearched_negatives,
+                                "uncited_claim_rate": agent_meta.uncited_claim_rate,
+                                "search_arg_errors": agent_meta.search_arg_errors,
+                                "report_parse_failures": agent_meta.report_parse_failures,
                             },
                             metadata={
+                                "prompt_version": agent_meta.prompt_version,
+                                "rewrite_model": agent_meta.rewrite_model,
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
@@ -827,14 +874,18 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 trace_id=lf_trace_id,
                             )
                         lf.create_score(
-                            name="agent_ungrounded_close_rate",
-                            value=agent_meta.ungrounded_close_rate,
+                            name="agent_uncited_claim_rate",
+                            value=agent_meta.uncited_claim_rate,
                             trace_id=lf_trace_id,
                         )
                 finally:
                     _agent_lf_stack.close()
 
                 AGENT_ITERATIONS.observe(agent_meta.iterations)
+                AGENT_STOP_REASONS.labels(
+                    agent_meta.convergence_reason,
+                    getattr(state.router_output, "query_shape", None) or "none",
+                ).inc()
                 state.agent_meta = agent_meta
 
                 state.rag_context = agent_result.rag_context
@@ -918,7 +969,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 return
             llm = llm_chain[0]
 
-            prompt_version = "v4_agent_synthesis"
+            prompt_version = SYNTHESIS_PROMPT_VERSION
+            # Agent runs label by the router's shape; everything else answered without
+            # retrieval, whatever shape the router guessed.
+            ttft_shape = (
+                (getattr(state.router_output, "query_shape", None) or "none")
+                if state.agent_meta is not None
+                else "direct"
+            )
+            ttft_s: float | None = None
 
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})
@@ -986,6 +1045,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     result = parser.feed(think_stripper.feed(chunk.text))
                     state.clean_content += result.visible_text
                     if result.visible_text:
+                        if ttft_s is None:
+                            ttft_s = _observe_ttft(llm_request.created_at, ttft_shape)
                         await add_event(
                             redis_app, request_id, "delta", {"text": result.visible_text}
                         )
@@ -1007,6 +1068,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     final_result = parser.finalize()
                     state.clean_content += final_result.visible_text
                     if final_result.visible_text:
+                        if ttft_s is None:
+                            ttft_s = _observe_ttft(llm_request.created_at, ttft_shape)
                         await add_event(
                             redis_app, request_id, "delta", {"text": final_result.visible_text}
                         )
@@ -1098,6 +1161,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "stage_times": stage_times,
                         "activity": await get_activity_log(redis_app, request_id),
                         "total_time": total_time,
+                        "ttft_s": round(ttft_s, 3) if ttft_s is not None else None,
+                        "config": {
+                            "answer_model": llm.model_id,
+                            "prompts": {
+                                "router": get_query_router_prompt_version(),
+                                "synthesis": prompt_version,
+                            },
+                        },
                         "router": {
                             "decision": state.router_output.route,
                             "reasoning": state.router_output.reasoning[:500]
@@ -1115,6 +1186,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     }
                     if state.agent_meta is not None:
                         m = state.agent_meta
+                        trace_payload["config"]["tool_model"] = agent_settings.tool_model
+                        trace_payload["config"]["prompts"]["agent"] = m.prompt_version
+                        if m.rewrite_model is not None:
+                            trace_payload["config"]["rewrite_model"] = m.rewrite_model
+                            trace_payload["config"]["prompts"]["rewrite"] = (
+                                query_transformer.PROMPT_VERSION
+                            )
                         trace_payload["agent"] = {
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,
@@ -1123,16 +1201,17 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "currency_normalized": state.agent_currency_converted,
                             "answer_entity": state.agent_answer_entity,
                             "fx_rates_used": state.agent_fx_rates,
-                            # Step 9 decomposition/coverage instrumentation — previously
-                            # computed onto AgentLoopMeta but never persisted, so it was
-                            # invisible to DB/Grafana queries over Message.trace.
+                            # Decomposition/coverage instrumentation, persisted so DB and
+                            # Grafana queries over Message.trace can see it.
                             "plan_seeded": m.plan_seeded,
                             "plan_covered": m.plan_covered,
                             "report_calls_total": m.report_calls_total,
                             "turns_to_first_report": m.turns_to_first_report,
                             "unknown_aspect_keys": m.unknown_aspect_keys,
-                            "ungrounded_close_rate": m.ungrounded_close_rate,
-                            "revised_keys": m.revised_keys,
+                            "unsearched_negatives": m.unsearched_negatives,
+                            "uncited_claim_rate": m.uncited_claim_rate,
+                            "search_arg_errors": m.search_arg_errors,
+                            "report_parse_failures": m.report_parse_failures,
                         }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,

@@ -19,6 +19,7 @@ def stats_to_request_kwargs(stats: LLMResponseStats | None) -> dict:
         "prompt_tokens": stats.input_tokens,
         "completion_tokens": stats.output_tokens,
         "reasoning_tokens": stats.reasoning_tokens,
+        "cached_input_tokens": stats.cached_input_tokens,
         "total_tokens": stats.total_tokens,
         "cost_usd": Decimal(str(stats.cost_usd)) if stats.cost_usd is not None else None,
         "latency_ms": int(stats.latency_ms) if stats.latency_ms is not None else None,
@@ -181,6 +182,7 @@ class LLMRequestRepository:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -202,6 +204,7 @@ class LLMRequestRepository:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             reasoning_tokens=reasoning_tokens,
+            cached_input_tokens=cached_input_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
             latency_ms=latency_ms,
@@ -221,6 +224,7 @@ class LLMRequestRepository:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -239,6 +243,7 @@ class LLMRequestRepository:
         llm_request.prompt_tokens = prompt_tokens
         llm_request.completion_tokens = completion_tokens
         llm_request.reasoning_tokens = reasoning_tokens
+        llm_request.cached_input_tokens = cached_input_tokens
         llm_request.total_tokens = total_tokens
         llm_request.cost_usd = cost_usd
         llm_request.latency_ms = latency_ms

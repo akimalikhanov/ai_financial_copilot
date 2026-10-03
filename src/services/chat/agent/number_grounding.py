@@ -1,12 +1,11 @@
 """Deterministic number-grounding: does the cited chunk text contain the asserted magnitude?
 
-Pattern 4a's number half. The label half (does the ref resolve to a real chunk) is
-`EvidenceLedger.resolve_refs` + `FindingsLedger._is_grounded`; this is the orthogonal
-question those cannot answer — a correctly-resolved citation to a chunk that does not
-state the number.
+The label half (does the ref resolve to a real chunk) is `EvidenceLedger.resolve_refs` +
+`FindingsLedger.record`'s grounding filter; this is the orthogonal question those cannot
+answer — a correctly-resolved citation to a chunk that does not state the number.
 
 Advisory by construction: this module returns a verdict, never raises and never filters.
-Enforcement would re-create the rejection path D3 deleted (see the plan doc, §2.1).
+Its check has false negatives, so enforcing it would reject correct findings.
 """
 
 from __future__ import annotations

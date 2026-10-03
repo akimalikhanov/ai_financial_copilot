@@ -372,10 +372,115 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 25,
+      "type": "row",
+      "title": "Latency SLOs & Agent Health",
+      "gridPos": { "x": 0, "y": 52, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 26,
+      "title": "Time to First Answer Token by Query Shape (s)",
+      "type": "timeseries",
+      "description": "What the user waits for: enqueue to first answer token, including queue wait, routing and the agent loop. \"direct\" is turns answered without retrieval. The input for latency SLOs and the agent deadline.",
+      "gridPos": { "x": 0, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chat_time_to_first_token_seconds_bucket[15m])) by (le, query_shape))",
+          "legendFormat": "p95 {{query_shape}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chat_time_to_first_token_seconds_bucket[15m])) by (le, query_shape))",
+          "legendFormat": "p50 {{query_shape}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 27,
+      "title": "Agent Stop Reasons",
+      "type": "timeseries",
+      "description": "Why agent runs ended. covered is the healthy case; iteration_cap, budget_cap, deadline and timeout mean the run was cut off and served partial findings.",
+      "gridPos": { "x": 8, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_stop_reasons_total[1h])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" }, "fillOpacity": 70 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 28,
+      "title": "Deadline & Timeout Stops (% of agent runs)",
+      "type": "timeseries",
+      "description": "Share of agent runs cut off by the wall-clock deadline or a turn timeout, by query shape. A rising line means the deadline is too tight for the workload or a provider is slow.",
+      "gridPos": { "x": 16, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_stop_reasons_total{reason=~\"deadline|timeout\"}[1h])) by (reason, query_shape) / on(query_shape) group_left sum(increase(agent_stop_reasons_total[1h])) by (query_shape)",
+          "legendFormat": "{{reason}} {{query_shape}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 29,
+      "title": "Tool Argument Errors per 100 Turns",
+      "type": "timeseries",
+      "description": "Tool calls whose arguments failed schema validation, per 100 agent turns. Each one costs the model a turn to re-issue. Baseline for deciding whether to turn on strict function calling.",
+      "gridPos": { "x": 0, "y": 61, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * sum(increase(agent_tool_arg_errors_total[1h])) by (tool) / scalar(sum(increase(agent_loop_iterations_sum[1h])))",
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 30,
+      "title": "Latency & Argument Errors by Configuration",
+      "type": "table",
+      "description": "Per configuration (query shape, tool-model prompt, tool model) in the selected range: runs, time to first answer token, and tool argument errors per 100 turns. Read before and after a prompt or model change.",
+      "gridPos": { "x": 8, "y": 61, "w": 16, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(l.query_shape, 'direct') AS query_shape, m.trace->'config'->'prompts'->>'agent' AS agent_prompt, m.trace->'config'->>'tool_model' AS tool_model, count(*) AS runs, round(percentile_cont(0.5) WITHIN GROUP (ORDER BY (m.trace->>'ttft_s')::numeric)::numeric, 1) AS p50_ttft_s, round(percentile_cont(0.95) WITHIN GROUP (ORDER BY (m.trace->>'ttft_s')::numeric)::numeric, 1) AS p95_ttft_s, round(100.0 * sum((m.trace->'agent'->>'search_arg_errors')::int + (m.trace->'agent'->>'report_parse_failures')::int) / NULLIF(sum((m.trace->'agent'->>'iterations')::int), 0), 2) AS arg_errors_per_100_turns FROM messages m JOIN llm_requests l ON l.id = m.request_id WHERE m.role = 'assistant' AND m.trace ? 'config' AND $__timeFilter(m.created_at) GROUP BY 1, 2, 3 ORDER BY runs DESC;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "p(50|95)_ttft_s" }, "properties": [{ "id": "unit", "value": "s" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "runs", "desc": true }] }
+    },
+    {
       "id": 14,
       "type": "row",
       "title": "Quality Drill-Down (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 52, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 69, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -383,7 +488,7 @@
       "title": "Per-Request Stage Breakdown (slowest in range)",
       "type": "table",
       "description": "Outlier drill-down: the slowest requests in the dashboard time range. Not possible from aggregate histograms — find the specific requests where a stage blew up.",
-      "gridPos": { "x": 0, "y": 53, "w": 12, "h": 10 },
+      "gridPos": { "x": 0, "y": 70, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -406,7 +511,7 @@
       "title": "Response Quality — Thumbs Down Rate (hourly)",
       "type": "timeseries",
       "description": "Only user-perceived quality signal — catches fast-but-wrong regressions.",
-      "gridPos": { "x": 12, "y": 53, "w": 12, "h": 10 },
+      "gridPos": { "x": 12, "y": 70, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {

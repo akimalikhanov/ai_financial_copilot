@@ -109,7 +109,7 @@ async def process_findings(
     """FX-normalize and rank an extraction run's entity findings. Analytical runs have no
     values to normalize — `run_synthesis` renders those directly and never calls this.
 
-    `chunk_texts` (chunk-UUID string -> sanitized rendered text) enables Pattern 4a's
+    `chunk_texts` (chunk-UUID string -> sanitized rendered text) enables the
     number-grounding check: does the cited excerpt actually contain the asserted value?
     Omitted (the default), every finding's `number_grounding` stays `UNVERIFIABLE` — this
     is purely additive instrumentation, never a filter (see `number_grounding.py`).
@@ -359,8 +359,7 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
         # would let the model cite an ID the citation pipeline can't resolve.
         chunks_str = _map_refs(f.source_chunks or [], rag_context)
         # Only the anomaly is worth a marker — flagging every row trains the synthesis
-        # model to skip it (Pattern 4a, number half; see the plan doc §2.1 for why this
-        # is advisory rather than a filter).
+        # model to skip it. Advisory rather than a filter: see `number_grounding.py`.
         flag = (
             " | ⚠ UNVERIFIED: value not located in cited excerpt"
             if nf.number_grounding is NumberGrounding.NOT_FOUND
@@ -402,11 +401,7 @@ def _render_observations_block(findings: AnalyticalFindings, rag_context: RAGCon
             lines.append(f"{i}. [not disclosed] {obs.claim}")
             continue
         chunks_str = _map_refs(obs.evidence_chunks, rag_context)
-        refuted_str = _map_refs(obs.refuted_by or [], rag_context)
-        lines.append(
-            f"{i}. [{obs.confidence} confidence] {obs.claim}"
-            f" | evidence: {chunks_str} | refuted_by: {refuted_str}"
-        )
+        lines.append(f"{i}. [{obs.confidence} confidence] {obs.claim} | evidence: {chunks_str}")
 
     if findings.conclusion:
         lines.append(f"\nConclusion: {findings.conclusion}")

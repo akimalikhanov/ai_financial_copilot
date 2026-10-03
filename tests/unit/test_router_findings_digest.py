@@ -16,7 +16,7 @@ NuCana plc             | N/A | not available: not found in retrieved context
 OBSERVATIONS = """[AGENT OBSERVATIONS]
 Question: why did margin compress?
 
-1. [high confidence] Input costs rose 12% | evidence: S1, S2 | refuted_by:
+1. [high confidence] Input costs rose 12% | evidence: S1, S2
 2. [not disclosed] FX impact on gross margin
 Conclusion: cost inflation drove the compression
 Unresolved (do not assert as fact): no FX quantification found

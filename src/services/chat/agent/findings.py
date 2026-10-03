@@ -5,21 +5,23 @@ The third state store, beside `Transcript` (the model's view) and `EvidenceLedge
 addressed by a stable key — ``EntityFinding.entity`` or ``Observation.aspect`` — and
 updated in place.
 
-Post-D3 the loop folds in every `report_*` call as it arrives — reports are incremental,
-not terminal — and projects the accumulation back for synthesis via `projection`.
+The loop folds in every `report_*` call as it arrives — reports are incremental, not
+terminal — and projects the accumulation back for synthesis via `projection`.
 
-Contract C4: best-per-aspect by construction — `record` updates in place, so there is no
-best-of comparator. Contract C6: an item whose chunk refs don't resolve in the
-`EvidenceLedger` is dropped, not admitted (the model cannot land an ungrounded
-conclusion); the prior entry for that key is left intact.
+`record` updates in place, so each key holds its latest finding and there is no best-of
+comparator. A positive claim whose chunk refs don't resolve in the `EvidenceLedger` is
+dropped, not admitted, and the prior entry for that key is left intact. This grounding
+filter is the only correctness filter on what reaches synthesis.
 
-With the gates deleted, C6's grounding filter and `drop_evidence_free_observations` are
-the *only* remaining correctness filters on what reaches synthesis.
+Every model-written string is also scanned like a retrieved excerpt before it is stored,
+because it reaches the answering model as findings, outside any excerpt tag: the tool
+model can paraphrase an instruction it read in an excerpt into its own words.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
@@ -29,22 +31,21 @@ from src.schemas.agent_findings import (
     EntityFinding,
     Observation,
 )
+from src.services.security.injection_detector import scan_retrieved_chunk
 
 if TYPE_CHECKING:
     from src.services.chat.agent.evidence import EvidenceLedger
 
+logger = logging.getLogger(__name__)
+
 Candidate = AgentFindings | AnalyticalFindings
+
+# Prefixed to model-written text the injection scan flags; the synthesis prompt names it.
+FLAGGED_MARKER = "[flagged] "
 
 _DEGRADED_CAVEAT = (
     "The search did not fully converge; these findings are partial and may be incomplete."
 )
-
-
-@dataclass
-class FindingEntry:
-    key: str
-    finding: EntityFinding | Observation
-    revisions: int = 0  # 0 on first write, ++ on each in-place update
 
 
 def _resolves(refs: list[str], evidence: EvidenceLedger) -> bool:
@@ -62,20 +63,14 @@ def _resolves(refs: list[str], evidence: EvidenceLedger) -> bool:
     return False
 
 
-def _is_grounded(finding: EntityFinding | Observation, evidence: EvidenceLedger) -> bool:
-    if isinstance(finding, EntityFinding):
-        # A negative finding ("not available") legitimately cites nothing; only a
-        # positive value claim must be grounded.
-        if not finding.available:
-            return True
-        return _resolves(finding.source_chunks, evidence)
-    # The analytical counterpart: a stated negative ("searched, the documents don't
-    # disclose this") is a real conclusion about its aspect and cites nothing by
-    # definition. Without this it could only be expressed as an unkeyed gap string, which
-    # closes no aspect — so the loop kept searching what the model had already settled.
-    if not finding.substantiated:
-        return True
-    return _resolves([*finding.evidence_chunks, *(finding.refuted_by or [])], evidence)
+def _is_positive(finding: EntityFinding | Observation) -> bool:
+    """A stated negative ("not available", `substantiated: false`) is a real conclusion
+    about its key and cites nothing by definition, so only positive claims need grounding."""
+    return finding.available if isinstance(finding, EntityFinding) else finding.substantiated
+
+
+def _citations(finding: EntityFinding | Observation) -> list[str]:
+    return finding.source_chunks if isinstance(finding, EntityFinding) else finding.evidence_chunks
 
 
 def finding_chunk_ids(findings: Candidate) -> set[str]:
@@ -87,73 +82,69 @@ def finding_chunk_ids(findings: Candidate) -> set[str]:
     else:
         for o in findings.observations:
             ids.update(o.evidence_chunks or [])
-            ids.update(o.refuted_by or [])
     return ids
-
-
-def drop_evidence_free_observations(findings: AnalyticalFindings) -> AnalyticalFindings:
-    """Drop observations that assert a substantiated claim while citing nothing.
-
-    Post-D3 this and `_is_grounded` are the only correctness filters on what reaches
-    synthesis — the gates are gone, so grounding carries the whole load. An observation
-    citing `refuted_by` but no `evidence_chunks` is legitimately grounded (a refutation is
-    a finding), matching `_is_grounded`'s either-list rule.
-
-    `substantiated=False` is exempt: that is a stated negative, which cites nothing by
-    design and is kept as a real entry under its aspect key. So what remains here is only
-    the pure hallucination case — a claim asserting support it never produced. Dropping it
-    writes no gap: D4 reconciliation in `_apply_report` already closes the key, and the
-    claim text is exactly what must not reach a user-facing caveat.
-    """
-    kept = tuple(
-        o for o in findings.observations if o.evidence_chunks or o.refuted_by or not o.substantiated
-    )
-    if len(kept) == len(findings.observations):
-        return findings
-    return findings.model_copy(update={"observations": kept})
 
 
 class FindingsLedger:
     def __init__(self) -> None:
-        self._entries: dict[str, FindingEntry] = {}
-        self._kind: Literal["agent", "analytical"] | None = None
-        # Finalizer-envelope metadata, last-write-wins — the per-item entries alone
-        # cannot reconstruct the AgentFindings/AnalyticalFindings shape synthesis and
-        # persistence expect, so the envelope is retained here rather than re-derived.
+        self._entries: dict[str, EntityFinding | Observation] = {}
+        # Set by the first `ingest` or `record`; projection serves None until then.
+        self._reported = False
+        # Report-envelope metadata, last-write-wins — the per-item entries alone cannot
+        # reconstruct the AgentFindings/AnalyticalFindings shape synthesis and persistence
+        # expect, so the envelope is retained here rather than re-derived.
         self._metric_requested: str | None = None
         self._comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
         self._question: str | None = None
         self._conclusion: str | None = None
         self._gaps: list[str] | None = None
-        # D4: keys whose only output is a stated gap, keyed to the reason text that
-        # closed them (not just membership) — so a caller (e.g. retry logic) can join
-        # this against `AgentRunState.aspect_stats` without pattern-matching `_gaps`
-        # strings. `addressed` is derived from keys() | closed_as_gap(), so an aspect
-        # can never close silently.
-        self._closed_as_gap: dict[str, str] = {}
+        # Positive claims seen, and those dropped because none of their citations resolve.
+        self._claims = 0
+        self._uncited = 0
+        # Model-written strings the injection scan flagged or blocked.
+        self._screened = {"flag": 0, "block": 0}
+
+    def _screen(self, text: str | None) -> str | None:
+        """`text` scanned with the excerpt thresholds: None when blocked, the sanitized text
+        behind `FLAGGED_MARKER` when flagged, unchanged when clean."""
+        if not text:
+            return text
+        signal = scan_retrieved_chunk(text)
+        if signal.severity == "clean":
+            return text
+        self._screened[signal.severity] += 1
+        logger.warning(
+            "agent_finding_injection",
+            extra={"severity": signal.severity, "matched_rules": signal.matched_rules},
+        )
+        return None if signal.severity == "block" else FLAGGED_MARKER + signal.sanitized_text
+
+    def _screen_finding(
+        self, finding: EntityFinding | Observation
+    ) -> EntityFinding | Observation | None:
+        field = "claim" if isinstance(finding, Observation) else "reason"
+        text = getattr(finding, field)
+        screened = self._screen(text)
+        if text and screened is None:
+            return None
+        return finding if screened == text else finding.model_copy(update={field: screened})
 
     def record(
         self, key: str, finding: EntityFinding | Observation, evidence: EvidenceLedger
     ) -> bool:
         """Insert or update-in-place. Returns False (and leaves any prior entry intact)
-        when C6's grounding filter drops the item, or when the item's type disagrees with
-        the kind already established for this run."""
-        kind: Literal["agent", "analytical"] = (
-            "agent" if isinstance(finding, EntityFinding) else "analytical"
-        )
-        # Both finalizers are offered on every request, so a stray off-kind call would
-        # otherwise flip _kind and make projection() drop every entry of the real kind.
-        if self._kind is not None and kind != self._kind:
+        when the injection scan blocks the item's text or the grounding filter drops it."""
+        self._reported = True
+        screened = self._screen_finding(finding)
+        if screened is None:
             return False
-        if not _is_grounded(finding, evidence):
-            return False
-        self._kind = kind
-        entry = self._entries.get(key)
-        if entry is None:
-            self._entries[key] = FindingEntry(key=key, finding=finding)
-        else:
-            entry.finding = finding
-            entry.revisions += 1
+        finding = screened
+        if _is_positive(finding):
+            self._claims += 1
+            if not _resolves(_citations(finding), evidence):
+                self._uncited += 1
+                return False
+        self._entries[key] = finding
         return True
 
     def ingest(
@@ -161,113 +152,86 @@ class FindingsLedger:
     ) -> None:
         """Fold one report into the ledger. Accumulates; never prunes.
 
-        Restated keys update in place (revisions++); keys this report omits are left
-        alone. Post-D3 reports are incremental rather than a single terminal restatement,
-        so omission carries no information at all — the model reports an aspect when its
-        evidence settles and never restates the others.
+        Restated keys update in place; keys this report omits are left alone. Reports are
+        incremental rather than a single terminal restatement, so omission carries no
+        information at all — the model reports an aspect when its evidence settles and
+        never restates the others.
 
         Envelope fields are last-write-wins but null-guarded, and `gaps` unions rather than
         replaces: a later report that omits a field, or carries `gaps=[]`, must not erase
-        what an earlier one established (§1b/§1c).
+        what an earlier one established. A field the injection scan blocks counts as
+        omitted.
+
+        One run only ever offers one report tool (the loop answers any other with "tool
+        not available"), so every candidate a ledger sees has the same type.
         """
-        kind: Literal["agent", "analytical"] = (
-            "agent" if isinstance(candidate, AgentFindings) else "analytical"
-        )
-        if self._kind is not None and kind != self._kind:
-            return
+        self._reported = True
         items: list[tuple[str, EntityFinding | Observation]]
         if isinstance(candidate, AgentFindings):
-            self._kind = "agent"
-            self._metric_requested = candidate.metric_requested or self._metric_requested
+            self._metric_requested = (
+                self._screen(candidate.metric_requested) or self._metric_requested
+            )
             self._comparison_op = candidate.comparison_op or self._comparison_op
             items = [(f.entity, f) for f in candidate.findings]
         else:
-            self._kind = "analytical"
-            self._question = candidate.question or self._question
-            if candidate.conclusion is not None:
-                self._conclusion = candidate.conclusion
-            for g in candidate.gaps or ():
-                if g not in (self._gaps or ()):
+            self._question = self._screen(candidate.question) or self._question
+            conclusion = self._screen(candidate.conclusion)
+            if conclusion is not None:
+                self._conclusion = conclusion
+            for gap in candidate.gaps or ():
+                g = self._screen(gap)
+                if g is not None and g not in (self._gaps or ()):
                     self._gaps = [*(self._gaps or []), g]
             items = [(o.aspect, o) for o in candidate.observations]
         for key, finding in items:
             self.record(key, finding, evidence)
 
-    def add_gap(
-        self, gap: str, *, closes: str | None = None, establishes_kind: bool = False
-    ) -> None:
-        """Append a loop-authored caveat to the served envelope's `gaps`.
-
-        `closes` names the aspect this gap accounts for (D4): a key that produced no
-        grounded finding is still *addressed* as long as its failure is stated. Recording
-        it here rather than inferring it later is what lets `addressed` be reconciled
-        against real output instead of taken on trust.
-
-        `establishes_kind` lets the loop's own step-8 gaps set `_kind` when the model never
-        landed a single report. Without it a run where every search failed projects `None`
-        — discarding the very gaps that explain *why* it failed, and falling back to raw
-        excerpts as though nothing had gone wrong.
-        """
-        if gap not in (self._gaps or ()):
-            self._gaps = [*(self._gaps or []), gap]
-        if closes is not None:
-            # Last-write-wins: a key closed more than once keeps its most recent reason.
-            self._closed_as_gap[closes] = gap
-        if establishes_kind and self._kind is None:
-            self._kind = "analytical"
-
-    def gap_reasons(self) -> dict[str, str]:
-        """Keys closed via a stated gap, mapped to the reason text that closed them —
-        the structured counterpart to `closed_as_gap()`'s bare key set, so a caller (e.g.
-        retry logic) can join this against `AgentRunState.aspect_stats` instead of
-        pattern-matching strings out of `_gaps`."""
-        return dict(self._closed_as_gap)
-
-    def closed_as_gap(self) -> set[str]:
-        """Keys that produced no finding but did produce a stated gap (D4)."""
-        return set(self._closed_as_gap)
-
     def keys(self) -> set[str]:
         return set(self._entries)
 
-    def revised_keys(self) -> set[str]:
-        """Keys whose finding was updated in place at least once (step 9).
+    def uncited_claim_rate(self) -> float:
+        """Share of positive claims `record` dropped because no citation resolved. Stated
+        negatives cite nothing by design and are not claims here."""
+        return self._uncited / self._claims if self._claims else 0.0
 
-        Tracked, but never a kill criterion: a run that concludes each aspect once,
-        correctly, is a success. A revision is only expected when later evidence
-        contradicts an earlier conclusion.
-        """
-        return {k for k, e in self._entries.items() if e.revisions > 0}
-
-    def entry(self, key: str) -> FindingEntry | None:
+    def get(self, key: str) -> EntityFinding | Observation | None:
         return self._entries.get(key)
 
-    def projection(self, *, degraded: bool = False) -> AgentFindings | AnalyticalFindings | None:
-        """The findings synthesis serves. None when no finalizer was ever attempted
-        (raw-excerpt fallback); otherwise the accumulated ledger reconstructed into its
-        finalizer shape, marked degraded when the run never sealed (subsumes the old
-        best-effort path, P1-6). Degraded only annotates the analytical path, whose
-        `gaps` field can carry the caveat."""
-        if self._kind == "agent":
-            findings = tuple(
-                e.finding for e in self._entries.values() if isinstance(e.finding, EntityFinding)
-            )
+    def screened(self) -> dict[str, int]:
+        """Model-written strings the injection scan flagged or blocked so far."""
+        return dict(self._screened)
+
+    def projection(
+        self, *, analytical: bool, degraded: bool = False, unresolved: Sequence[str] = ()
+    ) -> AgentFindings | AnalyticalFindings | None:
+        """The findings synthesis serves, in the run's shape. None when no report was ever
+        attempted (raw-excerpt fallback); otherwise the accumulated ledger reconstructed
+        into its report shape, marked degraded when the run never sealed. Degraded only
+        annotates the analytical path, whose `gaps` field can carry the caveat.
+
+        `unresolved` holds one line per plan key still open, appended to `gaps`, so an
+        analytical run where no report ever landed still serves the lines that explain
+        why instead of falling back to raw excerpts.
+        """
+        if not analytical:
+            if not self._reported:
+                return None
+            findings = tuple(f for f in self._entries.values() if isinstance(f, EntityFinding))
             return AgentFindings(
                 metric_requested=self._metric_requested or "",
                 findings=findings,
                 comparison_op=self._comparison_op,
             )
-        if self._kind == "analytical":
-            observations = tuple(
-                e.finding for e in self._entries.values() if isinstance(e.finding, Observation)
-            )
-            gaps = list(self._gaps) if self._gaps else []
-            if degraded:
-                gaps.append(_DEGRADED_CAVEAT)
-            return AnalyticalFindings(
-                question=self._question or "",
-                observations=observations,
-                conclusion=self._conclusion,
-                gaps=gaps or None,
-            )
-        return None
+        if not self._reported and not unresolved:
+            return None
+        observations = tuple(f for f in self._entries.values() if isinstance(f, Observation))
+        gaps = list(self._gaps) if self._gaps else []
+        gaps.extend(g for g in unresolved if g not in gaps)
+        if degraded:
+            gaps.append(_DEGRADED_CAVEAT)
+        return AnalyticalFindings(
+            question=self._question or "",
+            observations=observations,
+            conclusion=self._conclusion,
+            gaps=gaps or None,
+        )

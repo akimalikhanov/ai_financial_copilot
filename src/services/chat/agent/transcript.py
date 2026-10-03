@@ -2,14 +2,14 @@
 
 Token-bounded, ordered, lossy, compacted, written in prose. It is a *view*, not a
 record — compaction is allowed to destroy it, because `EvidenceLedger` (evidence.py)
-retains what it drops (Contract C1).
+retains what it drops: every S-label ever shown stays resolvable.
 
 Compaction is evidence-aware and aggressive: it evicts the bulky rendered tool-result
 context of all but the most recent turn while keeping the assistant's reasoning and
 tool-call structure. That is safe precisely because the ledger owns chunk_id ↔ S-label
 — an evicted tool result drops the label from the model's *view*, but the model can
-still cite it and it resolves via `EvidenceLedger.resolve_refs` (Contract C1). No LLM
-call; this is tool-result eviction (step 9, work item 1 — most of the win).
+still cite it and it resolves via `EvidenceLedger.resolve_refs`. No LLM call; this is
+tool-result eviction.
 
 An evicted result is not blanked to a generic stub: it keeps a one-line breadcrumb of
 which search produced it (entity + query) and which labels it yielded (e.g. S1–S8),
@@ -48,7 +48,7 @@ def _summarize_evicted(content: str, call: ToolCallRef | None) -> str:
     The bulky excerpt bodies go; what the model needs to keep reasoning stays: which
     search this was (entity + query, from the surviving tool call) and which labels it
     yielded — those still resolve via the ledger, so the model can cite them without
-    re-searching (Contract C1).
+    re-searching.
     """
     nums = sorted(int(m[1:]) for m in _LABEL_RE.findall(content))
     span = f"S{nums[0]}" if len(nums) == 1 else f"S{nums[0]}–S{nums[-1]}"
@@ -72,9 +72,9 @@ def cap_history(
 ) -> list[ChatMessage]:
     """Trim prior conversation to the last `max_turns` user/assistant pairs.
 
-    Prior conversation was permanent and *token-unbounded* in the agent transcript — up
-    to 50 messages carried on every turn, dwarfing the system prompt and rivalling the
-    excerpts it exists to contextualize (10b §4, row 2). Assistant content is truncated
+    Uncapped, prior conversation is permanent and *token-unbounded* in the agent
+    transcript — up to 50 messages carried on every turn, dwarfing the system prompt and
+    rivalling the excerpts it exists to contextualize. Assistant content is truncated
     hardest: it is the model's own prose, recoverable-in-gist, while a prior user turn is
     the only record of what was asked.
     """
@@ -104,8 +104,8 @@ def _compress_history(
     compact summary stub (which search, which labels), keeping the turn structure.
 
     Returns (messages, evicted_labels). The labels go to `EvidenceLedger.mark_evicted` so
-    the ledger knows what left the model's view; this module stays ledger-free (single
-    writer, Contract C2).
+    the ledger knows what left the model's view; this module stays ledger-free (the loop
+    is the ledger's single writer).
 
     A "turn" is an assistant message that contains tool_calls followed by its tool
     result messages. Whole turns are compacted so the agent never sees a partial view
@@ -114,8 +114,8 @@ def _compress_history(
     the model never loses *why* something was rejected.
     """
     # A turn boundary is an assistant message that issued at least one *search*. Counting
-    # report-only turns here would shift the cutoff and evict real excerpts a turn early —
-    # live now that reports are non-terminal and can arrive in their own turn (10b §4b).
+    # report-only turns here would shift the cutoff and evict real excerpts a turn early,
+    # since reports are non-terminal and can arrive in their own turn.
     turn_starts: list[int] = [
         i
         for i, m in enumerate(messages)
@@ -167,7 +167,7 @@ class Transcript:
         """Evict bulky tool-result context from all but the most recent turn(s).
 
         Aggressive by default (`keep_last_n_turns=1`): only the latest turn's rendered
-        chunks stay in the model's view. Licensed by Contract C1 — every evicted S-label
+        chunks stay in the model's view. Safe because every evicted S-label
         still resolves through `EvidenceLedger`, so the model can cite it regardless.
 
         The ledger is told which labels left the view so a later search that re-returns

@@ -21,6 +21,7 @@ from src.utils.json_schema import build_response_format
 
 logger = logging.getLogger(__name__)
 
+PROMPT_VERSION = "v2"
 TRANSFORMER_CONV_HISTORY_TOKENS = 1200
 
 
@@ -149,7 +150,7 @@ async def rewrite_query(
         return _fallback(raw_query), None
 
     try:
-        prompt = get_prompt_loader().load("query_transformer", "v2")
+        prompt = get_prompt_loader().load("query_transformer", PROMPT_VERSION)
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("rewrite_query_prompt_missing")

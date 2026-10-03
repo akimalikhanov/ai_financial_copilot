@@ -10,22 +10,28 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace as dc_replace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from fakeredis import FakeAsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.schemas.agent_findings import AnalyticalFindings, Observation
+from src.schemas.agent_findings import AnalyticalFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import DocumentScopeResult, RouterOutput
 from src.schemas.retrieval import ChunkPromptPayload, RetrievalTrace, RetrievedChunk
-from src.services.chat.agent.findings import drop_evidence_free_observations
-from src.services.chat.agent.loop import _SearchResult, run_loop
+from src.services.chat.agent.loop import (
+    _finish_despite_cancel,
+    _SearchResult,
+    run_loop,
+    tool_model_chain,
+)
 from src.services.llm_adapters.base_adapter import AssistantTurnResult, Role, ToolCallRef
 from src.services.llm_router import RoutedLLM
+from src.services.llm_runtime.exceptions import LLMRateLimitError, LLMServerError
 
 
 def _fake_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -483,65 +489,6 @@ async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.Mon
     assert seen[0].keyword_query == "input cost inflation COGS 2023"
 
 
-def test_drop_evidence_free_observations_drops_uncited_claim_without_writing_a_gap() -> None:
-    """A claim asserting support it never produced is dropped. No gap is written: D4
-    already closes the key, and the claim text is what must not reach a user caveat."""
-    findings = AnalyticalFindings(
-        question="q",
-        observations=(
-            Observation(
-                aspect="grounded", claim="Grounded claim", evidence_chunks=["c1"], confidence="high"
-            ),
-            Observation(
-                aspect="ungrounded", claim="Ungrounded claim", evidence_chunks=[], confidence="high"
-            ),
-        ),
-    )
-    result = drop_evidence_free_observations(findings)
-    assert [o.claim for o in result.observations] == ["Grounded claim"]
-    assert not result.gaps
-
-
-def test_drop_evidence_free_observations_keeps_stated_negatives() -> None:
-    """`substantiated=False` cites nothing by design — it is a settled answer about its
-    aspect, not an unsupported claim, and must survive to close its key."""
-    findings = AnalyticalFindings(
-        question="q",
-        observations=(
-            Observation(
-                aspect="A4",
-                claim="The filings do not disclose any FX impact.",
-                substantiated=False,
-                evidence_chunks=[],
-                confidence="high",
-            ),
-        ),
-    )
-    result = drop_evidence_free_observations(findings)
-    assert len(result.observations) == 1
-    assert not result.gaps
-
-
-def test_drop_evidence_free_observations_keeps_refutation_only() -> None:
-    """An observation with no evidence_chunks but a refuted_by ref is grounded via
-    refutation and must survive — matches _is_grounded's OR-of-either-list rule."""
-    findings = AnalyticalFindings(
-        question="q",
-        observations=(
-            Observation(
-                aspect="refuted",
-                claim="This driver is contradicted by S3",
-                evidence_chunks=[],
-                refuted_by=["c1"],
-                confidence="high",
-            ),
-        ),
-    )
-    result = drop_evidence_free_observations(findings)
-    assert [o.claim for o in result.observations] == ["This driver is contradicted by S3"]
-    assert not result.gaps
-
-
 # ---------------------------------------------------------------------------
 # D3/step 2-3: the turn contract and loop-owned termination
 # ---------------------------------------------------------------------------
@@ -729,38 +676,6 @@ async def test_unknown_aspect_key_is_named_back_and_not_ingested() -> None:
 
 
 @pytest.mark.asyncio
-async def test_revised_keys_counts_only_restated_aspects() -> None:
-    """Step 9: an aspect concluded once, correctly, is not a revision — only a key the
-    model writes over counts."""
-    state = _analytical_state()
-    chunk, payloads = _make_chunk_with_payload()
-
-    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
-        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
-
-    once = [
-        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
-        AssistantTurnResult(text="", tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))]),
-    ]
-    _ev, _findings, meta = await _run(state, once, _search)
-    assert meta.revised_keys == 0
-
-    # Coverage stops the run once A1 closes, so the restatement has to share its turn.
-    twice = [
-        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
-        AssistantTurnResult(
-            text="",
-            tool_calls=[
-                _report_tc("r1", "A1", str(chunk.chunk_id)),
-                _report_tc("r2", "A1", str(chunk.chunk_id)),
-            ],
-        ),
-    ]
-    _ev, _findings, meta = await _run(_analytical_state(), twice, _search)
-    assert meta.revised_keys == 1
-
-
-@pytest.mark.asyncio
 async def test_unresolved_aspect_becomes_a_stated_gap() -> None:
     """Step 8: an aspect that never closed reaches the answer as a limitation."""
     state = _analytical_state()
@@ -887,9 +802,8 @@ async def test_every_tool_call_gets_exactly_one_result_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_report_only_turn_does_not_trip_convergence_on_extraction() -> None:
-    """A report-only turn admits no new chunks. On the extraction path an empty round is
-    an immediate Stop("convergence"), so without 'a closed key counts as progress' the
-    run would die on the very turn it reports — before coverage is ever checked."""
+    """A report-only turn admits no new chunks, but closing a key counts as progress, so
+    the turn is not an empty round and coverage ends the run."""
     state = _make_state()  # extraction shape
     chunk, payloads = _make_chunk_with_payload()
 
@@ -922,6 +836,47 @@ async def test_report_only_turn_does_not_trip_convergence_on_extraction() -> Non
     _ev, findings, meta = await _run(state, turns, _search)
     assert meta.convergence_reason == "covered"
     assert findings is not None
+
+
+@pytest.mark.asyncio
+async def test_extraction_reads_grounding_feedback_after_an_empty_round() -> None:
+    """A report that fails grounding closes nothing and admits nothing. Extraction gets
+    the same one-round tolerance as analytical, so the model reads "was not recorded"
+    and re-reports instead of the run stopping on convergence."""
+    state = _make_state()  # extraction shape
+    chunk, payloads = _make_chunk_with_payload()
+
+    def _report(call_id: str, source: str) -> ToolCallRef:
+        return ToolCallRef(
+            id=call_id,
+            name="report_findings",
+            arguments=json.dumps(
+                {
+                    "metric_requested": "revenue",
+                    "findings": [
+                        {
+                            "entity": "Acme",
+                            "available": True,
+                            "value": 100,
+                            "source_chunks": [source],
+                        }
+                    ],
+                }
+            ),
+        )
+
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1")]),
+        AssistantTurnResult(text="", tool_calls=[_report("r1", "S99")]),  # does not resolve
+        AssistantTurnResult(text="", tool_calls=[_report("r2", str(chunk.chunk_id))]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, _f, meta = await _run(state, turns, _search)
+    assert meta.convergence_reason == "covered"
+    assert meta.plan_covered == 1
 
 
 @pytest.mark.asyncio
@@ -1141,16 +1096,41 @@ async def test_analytical_path_is_not_offered_the_extraction_finalizer() -> None
 
 @pytest.mark.asyncio
 async def test_extraction_path_is_not_offered_the_analytical_finalizer() -> None:
-    """A stray Observation on an extraction run flips the ledger kind, and projection()
-    then drops every EntityFinding — so the pool, not just the prompt, must exclude it."""
     assert await _tools_offered(_make_state()) == {"search_documents", "report_findings"}
 
 
+async def _run_capturing(state: ChatPipelineState, turns: list, search) -> tuple:
+    """`_run`, plus the messages each model call received."""
+    adapter = AsyncMock()
+    calls: list[list[Any]] = []
+    pending = iter(turns)
+
+    async def _complete(messages: list[Any], **_k: Any) -> Any:
+        calls.append(list(messages))
+        return next(pending)
+
+    adapter.complete_with_tools = AsyncMock(side_effect=_complete)
+    result = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=search,
+    )
+    return (*result, calls)
+
+
+def _tool_result(calls: list[list[Any]], call_id: str) -> str:
+    return next(m.content for m in calls[-1] if getattr(m, "tool_call_id", None) == call_id)
+
+
 @pytest.mark.asyncio
-async def test_off_kind_report_cannot_hijack_the_ledger() -> None:
-    """Belt-and-braces behind the split pools: even if a path somehow emitted the other
-    finalizer, the first report establishes the kind and the off-kind one is ignored
-    rather than dropping every finding of the real kind."""
+async def test_call_outside_the_pool_is_answered_not_available() -> None:
+    """The pool is the dispatch rule: a report tool this run was not offered is named back
+    as unavailable and never parsed, so it cannot land on the ledger."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1162,7 +1142,7 @@ async def test_off_kind_report_cannot_hijack_the_ledger() -> None:
                 "metric_requested": "revenue",
                 "findings": [
                     {
-                        "entity": "A1",
+                        "entity": "A2",
                         "available": True,
                         "value": 1,
                         "source_chunks": [str(chunk.chunk_id)],
@@ -1173,17 +1153,90 @@ async def test_off_kind_report_cannot_hijack_the_ledger() -> None:
     )
     turns = [
         AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
-        AssistantTurnResult(text="", tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))]),
+        # Reports A1 and opens A2, so the run continues past this turn.
+        AssistantTurnResult(
+            text="",
+            tool_calls=[
+                _report_tc("r1", "A1", str(chunk.chunk_id)),
+                _search_tc("s2", "Did pricing offset?"),
+            ],
+        ),
         AssistantTurnResult(text="", tool_calls=[extraction_report]),
+        AssistantTurnResult(text="done", tool_calls=[]),
     ]
 
     async def _search(*_a: Any, **_k: Any) -> _SearchResult:
         return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
-    _ev, findings, _meta = await _run(state, turns, _search)
+    _ev, findings, _meta, calls = await _run_capturing(state, turns, _search)
 
+    assert _tool_result(calls, "r2").startswith("Tool 'report_findings' is not available.")
     assert isinstance(findings, AnalyticalFindings)
     assert [o.aspect for o in findings.observations] == ["A1"]
+
+
+@pytest.mark.asyncio
+async def test_negative_issued_beside_its_first_search_is_refused() -> None:
+    """Reports fold before the same turn's searches: a negative written alongside the
+    search that mints its key was written without seeing any results."""
+    state = _analytical_state()
+    negative = ToolCallRef(
+        id="r1",
+        name="report_analytical_findings",
+        arguments=json.dumps(
+            {
+                "question": "q",
+                "observations": [
+                    {
+                        "aspect": "A1",
+                        "claim": "Not disclosed.",
+                        "substantiated": False,
+                        "evidence_chunks": [],
+                        "confidence": "high",
+                    }
+                ],
+            }
+        ),
+    )
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?"), negative]),
+        AssistantTurnResult(text="", tool_calls=[dc_replace(negative, id="r2")]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[], payloads={})
+
+    _ev, _f, meta, calls = await _run_capturing(state, turns, _search)
+
+    assert "A1 was not recorded as absent" in _tool_result(calls, "r1")
+    assert meta.unsearched_negatives == 1
+    assert meta.convergence_reason == "covered"
+
+
+@pytest.mark.asyncio
+async def test_final_turn_search_is_not_executed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The final turn offers only the report tool; a search emitted anyway is answered as
+    unavailable instead of running."""
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "2")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s2", "Did pricing offset?")]),
+        AssistantTurnResult(text="done", tool_calls=[]),
+    ]
+    searched: list[str] = []
+
+    async def _search(tc: ToolCallRef, *_a: Any, **_k: Any) -> _SearchResult:
+        searched.append(tc.id)
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, _f, meta, calls = await _run_capturing(state, turns, _search)
+
+    assert searched == ["s1"]
+    assert meta.iterations == 2
+    assert meta.plan_seeded == 1
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1203,4 +1256,130 @@ async def test_run_stops_at_the_wall_clock_deadline(monkeypatch: pytest.MonkeyPa
     _ev, _f, meta = await _run(state, turns, _search)
 
     assert meta.convergence_reason == "deadline"
-    assert meta.iterations == 1  # stopped at the end of the first turn, not the cap
+    assert meta.iterations == 1  # cancelled inside the first turn, not at the cap
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_a_turn_mid_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deadline is not checked between turns: a tool-model call still inside its own
+    turn timeout is cut off when the run's wall-clock bound expires."""
+    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.05")
+    monkeypatch.setenv("AGENT_TURN_TIMEOUT_SECONDS", "30")
+    adapter = AsyncMock()
+
+    async def _hang(*_a: Any, **_k: Any) -> AssistantTurnResult:
+        await asyncio.sleep(10)
+        raise AssertionError("unreachable")
+
+    adapter.complete_with_tools = AsyncMock(side_effect=_hang)
+    state = _analytical_state()
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        raise AssertionError("no search should run")
+
+    async with asyncio.timeout(2):
+        _ev, _f, meta = await run_loop(
+            state,
+            _routed_llm(adapter),
+            state.session,
+            state.redis_app,
+            state.request_id,
+            reranker=None,
+            session_factory=_fake_session_factory(),
+            execute_search=_search,
+        )
+
+    assert meta.convergence_reason == "deadline"
+    assert meta.iterations == 1
+
+
+@pytest.mark.asyncio
+async def test_spend_commit_finishes_before_the_deadline_cancels() -> None:
+    finished = asyncio.Event()
+
+    async def _commit() -> None:
+        await asyncio.sleep(0.05)
+        finished.set()
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.01):
+            await _finish_despite_cancel(_commit())
+
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_provider_error_after_progress_serves_what_was_gathered() -> None:
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
+        LLMRateLimitError("429"),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    evidence, findings, meta = await _run(state, turns, _search)
+
+    assert meta.convergence_reason == "llm_error"
+    assert meta.iterations == 2
+    assert len(evidence) == 1
+    assert isinstance(findings, AnalyticalFindings)
+    assert findings.gaps
+
+
+@pytest.mark.asyncio
+async def test_provider_error_with_nothing_gathered_fails_the_request() -> None:
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        raise AssertionError("no search should run")
+
+    with pytest.raises(LLMRateLimitError):
+        await _run(_analytical_state(), [LLMRateLimitError("429")], _search)
+
+
+@pytest.mark.asyncio
+async def test_fallback_model_answers_when_the_tool_model_errors() -> None:
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    primary = AsyncMock()
+    primary.complete_with_tools = AsyncMock(side_effect=LLMServerError("500"))
+    fallback = AsyncMock()
+    fallback.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
+            AssistantTurnResult(text="", tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))]),
+        ]
+    )
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, _f, meta = await run_loop(
+        state,
+        _routed_llm(primary),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        fallbacks=[_routed_llm(fallback)],
+        execute_search=_search,
+    )
+
+    assert meta.convergence_reason == "covered"
+    assert primary.complete_with_tools.await_count == 2
+    assert fallback.complete_with_tools.await_count == 2
+
+
+def test_tool_model_chain_drops_fallbacks_that_cannot_call_tools() -> None:
+    tool_capable = _routed_llm(AsyncMock())
+    no_tools = dc_replace(tool_capable, model_id="plain", capabilities={})
+    router = MagicMock()
+
+    router.get_with_fallback.return_value = [tool_capable, no_tools]
+    assert tool_model_chain(router, "mock-tool-model") == [tool_capable]
+
+    router.get_with_fallback.return_value = [no_tools, tool_capable]
+    with pytest.raises(RuntimeError, match="tool_calling"):
+        tool_model_chain(router, "plain")

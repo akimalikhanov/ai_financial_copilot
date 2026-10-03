@@ -17,6 +17,7 @@ from docling_core.transforms.chunker.hierarchical_chunker import (
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.transforms.serializer.markdown import MarkdownParams, MarkdownTableSerializer
+from docling_core.types.doc.document import DocItem, InlineGroup, ListGroup, SectionHeaderItem
 from docling_core.types.doc.labels import DocItemLabel
 from pydantic import Field, PrivateAttr
 from transformers import AutoTokenizer
@@ -75,6 +76,52 @@ def _substitute_placeholders(
 # ("Line chart", "Photograph") as prose, which is noise once a real description exists.
 _BLOCKED_META_NAMES = frozenset({"description", "classification"})
 
+# Deepest level a header run is nested to; headers past it replace the deepest slot.
+_MAX_RUN_DEPTH = 5
+
+
+def _nest_header_runs(dl_doc: DoclingDocument) -> list[tuple[SectionHeaderItem, int]]:
+    """Nest each run of back-to-back section headers so the chunker keeps all of them.
+
+    Docling's PDF pipeline gives every section header level 1, and the hierarchical chunker
+    keeps one heading per level, so a statement title split over several lines ("Aurora
+    Innovation, Inc." / "Consolidated Statements of Operations" / "(in millions)") reached
+    the chunk as its last line only. Within a run each header is levelled one below the
+    previous; a repeated header reuses its earlier level, so the chunker drops what was
+    nested under it rather than repeating it. A run ends at a page break: headers carried
+    across one are mostly running titles, siblings or misordered headers, not parents.
+
+    Levels are changed in place; returns (item, original level) pairs for restoring.
+    """
+    changed: list[tuple[SectionHeaderItem, int]] = []
+    run: dict[str, int] = {}  # normalized header text -> level assigned in this run
+    prev = 0
+    run_page: int | None = None
+
+    # Same traversal as HierarchicalChunker.chunk, so "back-to-back" matches its order.
+    for item, _ in dl_doc.iterate_items(with_groups=True):
+        if isinstance(item, SectionHeaderItem):
+            page = item.prov[0].page_no if item.prov else None
+            if page != run_page:
+                run, prev, run_page = {}, 0, page
+            key = " ".join(item.text.split()).casefold()
+            if key in run:
+                level = run[key]
+                run = {k: v for k, v in run.items() if v <= level}
+            elif item.level > prev:
+                level = item.level
+            else:
+                level = min(prev + 1, _MAX_RUN_DEPTH)
+            run[key] = prev = level
+            if level != item.level:
+                changed.append((item, item.level))
+                item.level = level
+        elif isinstance(item, DocItem | ListGroup | InlineGroup):
+            # Content ends the run; plain container groups carry none and are skipped.
+            run, prev = {}, 0
+
+    return changed
+
 
 class AnnualReportSerializerProvider(ChunkingSerializerProvider):
     """Serialize table chunks as markdown tables with stable image placeholders."""
@@ -107,7 +154,12 @@ class CustomHybridChunker(HybridChunker):
     def chunk(self, dl_doc: DoclingDocument, **kwargs: Any) -> Iterator[BaseChunk]:
         self._pieces_by_key.clear()
 
-        chunks = [DocChunk.model_validate(c) for c in super().chunk(dl_doc=dl_doc, **kwargs)]
+        nested = _nest_header_runs(dl_doc)
+        try:
+            chunks = [DocChunk.model_validate(c) for c in super().chunk(dl_doc=dl_doc, **kwargs)]
+        finally:
+            for item, level in nested:
+                item.level = level
 
         for chunk in chunks:
             self._pieces_by_key[self._chunk_key(chunk)] = [self._piece(chunk)]

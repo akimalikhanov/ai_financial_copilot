@@ -1,13 +1,12 @@
 """EvidenceLedger — the agent's durable, chunk-level record for one run.
 
-Absorbs the old `run_agent_loop`'s chunk/ref bookkeeping (chunk_registry, ref_registry,
-next_ref) into one object with a single invariant: for every S-label the transcript has
-ever shown, `resolve_refs` can still resolve it, regardless of what the transcript later
-drops (Contract C1).
+Holds the run's chunk/ref bookkeeping with a single invariant: for every S-label the
+transcript has ever shown, `resolve_refs` can still resolve it, regardless of what the
+transcript later drops.
 
-Contract C2 — single writer: `admit`/`assign_labels` are called only on the loop task,
-only in the post-`gather` reduce. Search handlers are pure and never receive a ledger
-reference, so `next_ref` label allocation stays deterministic under concurrent search.
+Single writer: `admit`/`assign_labels` are called only on the loop task, only in the
+post-`gather` reduce. Search handlers are pure and never receive a ledger reference, so
+`next_ref` label allocation stays deterministic under concurrent search.
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ class EvidenceLedger:
         self._items: dict[UUID, ContextItem] = {}
         self._excerpts: dict[UUID, str] = {}
         # Sanitized payloads as rendered, so synthesis re-assembles without a second
-        # DB hydration or a second injection scan over the same text (D2).
+        # DB hydration or a second injection scan over the same text.
         self._payloads: dict[UUID, ChunkPromptPayload] = {}
         # Subset of _items currently visible in the model's transcript. Compaction
         # removes from here (via mark_evicted); a re-returned chunk is re-rendered.
@@ -82,10 +81,9 @@ class EvidenceLedger:
         """Assemble one tool result's RAGContext, numbering S-labels globally across the
         request so labels never restart at S1 between searches.
 
-        A chunk already labelled — by an earlier search this run, or seeded from a prior
-        turn via `from_carryover` — keeps its one stable label and is not re-rendered:
-        re-surfacing updates provenance in `admit`, never mints a second S-label. This is
-        the dedup step 11's carried-evidence seeding depends on.
+        A chunk already labelled by an earlier search this run keeps its one stable label
+        and is not re-rendered: re-surfacing updates provenance in `admit`, never mints a
+        second S-label.
 
         A chunk that *was* rendered but has since been evicted by compaction, and is now
         re-returned by a later search, is **revived**: re-emitted verbatim under its
@@ -94,8 +92,8 @@ class EvidenceLedger:
         claim could be grounded on text the model never actually read. `max_revivals`
         bounds that per turn so a search re-returning a large evicted set cannot reinflate
         what compaction just shrank; the loop passes
-        `EffortPrior.max_revivals_per_turn`, and the default here serves the callers
-        outside the loop (synthesis re-assembly, tests) that have no effort prior.
+        `AgentSettings.max_revivals_per_turn`, and the default here serves the callers
+        outside the loop (synthesis re-assembly, tests).
         """
         fresh = [c for c in chunks if c.chunk_id not in self._items]
         revived = [
@@ -142,7 +140,7 @@ class EvidenceLedger:
 
     def mark_evicted(self, ref_ids: Iterable[str]) -> None:
         """Compaction dropped these labels from the model's view. Their chunks stay in
-        `_items` (still resolvable, Contract C1) but leave `_rendered`, so a later search
+        `_items` (still resolvable) but leave `_rendered`, so a later search
         that re-returns one revives it rather than silently assuming it is still readable.
         """
         for ref_id in ref_ids:
@@ -172,14 +170,14 @@ class EvidenceLedger:
         return resolved, unresolved
 
     def payloads_for(self, chunk_ids: Iterable[UUID]) -> dict[UUID, ChunkPromptPayload]:
-        """Sanitized payloads cached at render time — no second hydration (D2). Every
+        """Sanitized payloads cached at render time — no second hydration. Every
         chunk synthesis can select was rendered, so a cached payload always exists."""
         return {cid: self._payloads[cid] for cid in chunk_ids if cid in self._payloads}
 
     def texts_for(self, chunk_ids: Iterable[str]) -> dict[str, str]:
         """Sanitized rendered text keyed by chunk-UUID *string* — the form findings carry
-        after refs are resolved to UUIDs. Number grounding (Pattern 4a) reads this; the
-        payloads are already cached, so this is zero-I/O like `payloads_for` (D2)."""
+        after refs are resolved to UUIDs. Number grounding reads this; the payloads are
+        already cached, so this is zero-I/O like `payloads_for`."""
         out: dict[str, str] = {}
         for raw in chunk_ids:
             with contextlib.suppress(ValueError):

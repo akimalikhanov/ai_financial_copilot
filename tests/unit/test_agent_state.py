@@ -1,15 +1,20 @@
-"""Unit tests for EffortPrior.for_shape (Stage 1.5's per-query_shape effort prior),
-per-model spend attribution, AgentSettings' validation boundaries (P2-15), and the
-loop-minted decomposition plan (10b step 1)."""
+"""Unit tests for AgentSettings (per-shape iteration cap, validation boundaries),
+per-model spend attribution, and the loop-minted decomposition plan."""
 
 from __future__ import annotations
 
+from typing import ClassVar
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from src.schemas.agent_findings import AnalyticalFindings, Observation
+from src.schemas.agent_findings import (
+    AgentFindings,
+    AnalyticalFindings,
+    EntityFinding,
+    Observation,
+)
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.findings import _DEGRADED_CAVEAT
 from src.services.chat.agent.loop import _apply_report
@@ -17,9 +22,10 @@ from src.services.chat.agent.loop import _mint as _mint_with_cap
 from src.services.chat.agent.state import (
     AgentRunState,
     AgentSettings,
-    EffortPrior,
+    AspectStats,
     open_aspects,
     render_status,
+    unresolved_lines,
 )
 from src.services.chat.agent.transcript import Transcript
 from src.services.llm_adapters.base_adapter import LLMResponseStats, ToolCallRef
@@ -28,13 +34,12 @@ from tests.unit.test_findings import _seed_evidence
 
 def _settings(**overrides: object) -> AgentSettings:
     defaults: dict[str, object] = {
-        "enabled": True,
         "tool_model": "gpt-test",
         "max_iterations": 5,
         "token_budget": 150_000,
         "max_concurrent_searches": 3,
         "max_chunks_per_entity": 5,
-        "max_empty_analytical_rounds": 1,
+        "max_empty_rounds": 1,
         "turn_timeout_seconds": 60.0,
         "deadline_seconds": 180.0,
         "max_iterations_analytical": 7,
@@ -47,41 +52,24 @@ def _settings(**overrides: object) -> AgentSettings:
     return AgentSettings(**defaults)  # type: ignore[arg-type]
 
 
-class TestEffortPriorForShape:
+class TestMaxIterationsFor:
     def test_analytical_uses_its_own_iteration_cap(self) -> None:
-        prior = EffortPrior.for_shape(_settings(), "analytical")
-        assert prior.max_iterations == 7
+        assert _settings().max_iterations_for("analytical") == 7
 
     def test_non_analytical_shapes_use_max_iterations(self) -> None:
         for shape in ("extraction", "comparison", None):
-            prior = EffortPrior.for_shape(_settings(), shape)
-            assert prior.max_iterations == 5
+            assert _settings().max_iterations_for(shape) == 5
 
-    def test_defaults_to_shape_invariant_when_not_tuned(self) -> None:
-        # get_agent_settings() defaults max_iterations_analytical to max_iterations
-        # when AGENT_MAX_ITERATIONS_ANALYTICAL is unset — for_shape must then be a
-        # no-op across shapes.
-        settings = _settings(max_iterations=5, max_iterations_analytical=5)
-        assert EffortPrior.for_shape(settings, "analytical").max_iterations == 5
-        assert EffortPrior.for_shape(settings, "extraction").max_iterations == 5
-
-    def test_carries_shape_independent_fields_unchanged(self) -> None:
-        settings = _settings()
-        prior = EffortPrior.for_shape(settings, "analytical")
-        assert prior.max_empty_rounds == settings.max_empty_analytical_rounds
-        assert prior.max_concurrent_searches == settings.max_concurrent_searches
-        # Every per-turn bound the loop enforces reaches it through the effort prior —
-        # no module-level constant beside the config it would silently disagree with.
-        assert prior.max_plan_items == settings.max_plan_items
-        assert prior.max_revivals_per_turn == settings.max_revivals_per_turn
-        assert prior.max_chunks_per_lookup == settings.max_chunks_per_entity
+    def test_settings_are_frozen(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings().max_iterations = 9  # type: ignore[misc]
 
 
 def _state(**overrides: object) -> AgentRunState:
+    settings = overrides.pop("settings", None) or _settings(token_budget=1000)
     defaults: dict[str, object] = {
-        "effort": EffortPrior.for_shape(_settings(), None),
-        "token_budget": 1000,
-        "turn_timeout_seconds": 60.0,
+        "settings": settings,
+        "max_iterations": settings.max_iterations_for(None),  # type: ignore[union-attr]
         "transcript": Transcript([]),
         "evidence": EvidenceLedger(),
         "expected_entities": set(),
@@ -115,13 +103,13 @@ class TestSpendAttribution:
 
 class TestSpendWithinBudget:
     def test_at_budget_is_within(self) -> None:
-        state = _state(token_budget=100)
-        state.record_spend("model-a", LLMResponseStats(input_tokens=100))
+        state = _state()
+        state.record_spend("model-a", LLMResponseStats(input_tokens=1000))
         assert state.spend_within_budget() is True
 
     def test_over_budget_is_not_within(self) -> None:
-        state = _state(token_budget=100)
-        state.record_spend("model-a", LLMResponseStats(input_tokens=101))
+        state = _state()
+        state.record_spend("model-a", LLMResponseStats(input_tokens=1001))
         assert state.spend_within_budget() is False
 
 
@@ -192,14 +180,11 @@ class TestPlanMinting:
 
 
 class TestOpenAspects:
-    def test_shrinks_as_keys_are_addressed(self) -> None:
-        """D4: `addressed` is derived from real output, so an aspect can only close by
-        producing a grounded finding or a stated gap — never by being asserted closed."""
-        state = _state(plan={"A1": "q1", "A2": "q2", "A3": "q3"})
-        assert open_aspects(state) == ["A1", "A2", "A3"]
-
-        state.findings.add_gap("Not resolved: q2", closes="A2")
-        assert open_aspects(state) == ["A1", "A3"]
+    def test_shrinks_only_as_findings_land(self) -> None:
+        """`addressed` is derived from the ledger, so an aspect can only close by
+        producing a grounded finding — never by being asserted closed."""
+        state = _state(plan={"A1": "q1", "A2": "q2"})
+        assert open_aspects(state) == ["A1", "A2"]
 
         evidence, ids = _seed_evidence(1)
         state.evidence = evidence
@@ -208,11 +193,43 @@ class TestOpenAspects:
             Observation(aspect="A1", claim="c", evidence_chunks=[ids[0]], confidence="high"),
             evidence,
         )
-        state.findings.add_gap("Not resolved: q3", closes="A3")
-        assert open_aspects(state) == []
+        assert open_aspects(state) == ["A2"]
 
     def test_empty_plan_has_no_open_aspects(self) -> None:
         assert open_aspects(_state()) == []
+
+
+class TestUnresolvedLines:
+    def test_one_line_per_open_key(self) -> None:
+        evidence, ids = _seed_evidence(1)
+        state = _state(plan={"A1": "q1", "A2": "q2"}, evidence=evidence)
+        state.findings.record(
+            "A1",
+            Observation(aspect="A1", claim="c", evidence_chunks=[ids[0]], confidence="high"),
+            evidence,
+        )
+        assert unresolved_lines(state) == ["Not resolved: q2"]
+
+    def test_all_errored_searches_read_as_unchecked(self) -> None:
+        """A key whose every search errored was never checked; saying "not resolved"
+        would read as "not in the documents"."""
+        state = _state(
+            plan={"A1": "q1", "A2": "q2"},
+            aspect_stats={
+                "A1": AspectStats(searches=2, errored=2),
+                "A2": AspectStats(searches=2, errored=1),
+            },
+        )
+        assert unresolved_lines(state) == [
+            "Could not be checked — document search was unavailable: q1",
+            "Not resolved: q2",
+        ]
+
+    def test_reading_lines_leaves_coverage_unchanged(self) -> None:
+        state = _state(plan={"A1": "q1"})
+        unresolved_lines(state)
+        assert open_aspects(state) == ["A1"]
+        assert state.addressed == set()
 
     def test_ungrounded_finding_does_not_close_an_aspect_on_its_own(self) -> None:
         """The D4 hazard: `findings.record` drops an ungrounded item (C6), so a key that
@@ -228,8 +245,8 @@ class TestOpenAspects:
     def test_ungrounded_report_leaves_its_aspect_open_and_unsealed(self) -> None:
         """No mid-loop gap reconciliation: gapping an ungrounded report here would close
         its key → `addressed` → `Stop("covered")` → `sealed`, promoting a run that
-        produced no grounded output for the aspect to a converged run's trust level. The
-        end-of-run sweep writes the gap instead, after `plan_covered_at_stop` is read."""
+        produced no grounded output for the aspect to a converged run's trust level.
+        Projection renders it as unresolved instead."""
         state = _state(plan={"A1": "Why did gross margin fall?"})
         tc = ToolCallRef(
             id="c1",
@@ -260,7 +277,9 @@ class TestOpenAspects:
     def test_substantiated_false_report_closes_its_aspect(self) -> None:
         """The honest exit the final-turn nudge routes toward: a stated negative is
         grounded by definition and closes its key as a real keyed entry."""
-        state = _state(plan={"A1": "Why did gross margin fall?"})
+        state = _state(
+            plan={"A1": "Why did gross margin fall?"}, aspect_stats={"A1": AspectStats(searches=1)}
+        )
         tc = ToolCallRef(
             id="c1",
             name="report_analytical_findings",
@@ -308,7 +327,7 @@ class TestRenderStatusNudges:
         citing a real-but-irrelevant label passes grounding, closes its key, and silently
         promotes an iteration-capped run to a converged run's trust level."""
         state = _state(plan={"A1": "q1"})
-        state.iteration = state.effort.max_iterations - 1
+        state.iteration = state.max_iterations - 1
 
         status = render_status(state)
 
@@ -319,7 +338,7 @@ class TestRenderStatusNudges:
 
     def test_no_final_turn_notice_before_the_last_iteration(self) -> None:
         state = _state(plan={"A1": "q1"})
-        state.iteration = state.effort.max_iterations - 2
+        state.iteration = state.max_iterations - 2
 
         status = render_status(state)
 
@@ -355,7 +374,7 @@ class TestSealed:
             Observation(aspect="A1", claim="c", evidence_chunks=[ids[0]], confidence="high"),
             evidence,
         )
-        projected = state.findings.projection(degraded=not state.sealed)
+        projected = state.findings.projection(analytical=True, degraded=not state.sealed)
         assert isinstance(projected, AnalyticalFindings)
         assert _DEGRADED_CAVEAT not in (projected.gaps or [])
 
@@ -364,18 +383,55 @@ class TestStatedNegatives:
     """`Observation.substantiated=False` is the analytical counterpart to
     `EntityFinding(available=False)` — the typed channel for "searched, not disclosed"."""
 
-    def _report(self, state, *observations) -> None:
+    _PLAN: ClassVar[dict[str, str]] = {"A4": "Did FX move the margin?"}
+    _NEGATIVE = Observation(
+        aspect="A4",
+        claim="The filings do not quantify FX impact.",
+        substantiated=False,
+        evidence_chunks=[],
+        confidence="high",
+    )
+
+    def _report(self, state, *observations) -> str:
         tc = ToolCallRef(
             id="c",
             name="report_analytical_findings",
             arguments=AnalyticalFindings(question="q", observations=observations).model_dump_json(),
         )
+        return _apply_report(tc, state, "req")
+
+    def test_negative_for_an_unsearched_aspect_is_refused(self) -> None:
+        state = _state(plan=self._PLAN)
+
+        result = self._report(state, self._NEGATIVE)
+
+        assert open_aspects(state) == ["A4"]
+        assert state.unsearched_negatives == 1
+        assert "A4 was not recorded as absent — no earlier search covered it." in result
+
+    def test_negative_for_an_unsearched_entity_is_refused(self) -> None:
+        state = _state(plan={"Acme": "Acme", "Globex": "Globex"}, searched_entities={"Acme"})
+        tc = ToolCallRef(
+            id="c",
+            name="report_findings",
+            arguments=AgentFindings(
+                metric_requested="revenue",
+                findings=(
+                    EntityFinding(entity="Acme", available=False, reason="not disclosed"),
+                    EntityFinding(entity="Globex", available=False, reason="not disclosed"),
+                ),
+            ).model_dump_json(),
+        )
+
         _apply_report(tc, state, "req")
+
+        assert state.addressed == {"Acme"}
+        assert state.unsearched_negatives == 1
 
     def test_negative_closes_its_aspect_without_a_gap(self) -> None:
         """Before the typed channel, the only way to state a negative was a `gaps` string,
         which closed nothing — the loop kept searching an aspect the model had settled."""
-        state = _state(plan={"A4": "Did FX move the margin?"})
+        state = _state(plan=self._PLAN, aspect_stats={"A4": AspectStats(searches=1)})
         self._report(
             state,
             Observation(
@@ -388,14 +444,14 @@ class TestStatedNegatives:
         )
         assert open_aspects(state) == []
         assert state.findings._gaps is None
-        # Not an ungrounded close: honesty must not be counted as hallucination, or
-        # `ungrounded_close_rate` conflates the two.
-        assert state.ungrounded_closes == 0
+        # Not an uncited claim: honesty must not be counted as hallucination, or
+        # `uncited_claim_rate` conflates the two.
+        assert state.findings.uncited_claim_rate() == 0.0
 
     def test_later_substantiation_overwrites_the_negative(self) -> None:
         """P1-B dissolved: per-aspect state lives in the keyed entry store, so a negative
         superseded by real evidence is overwritten — there is no gap left to retract."""
-        state = _state(plan={"A4": "Did FX move the margin?"})
+        state = _state(plan=self._PLAN, aspect_stats={"A4": AspectStats(searches=1)})
         evidence, ids = _seed_evidence(1)
         state.evidence = evidence
         self._report(
@@ -418,7 +474,7 @@ class TestStatedNegatives:
                 confidence="high",
             ),
         )
-        projected = state.findings.projection(degraded=False)
+        projected = state.findings.projection(analytical=True, degraded=False)
         assert isinstance(projected, AnalyticalFindings)
         assert [o.claim for o in projected.observations] == ["FX was a 3.1pp headwind."]
         assert not projected.gaps

@@ -83,6 +83,15 @@ CHAT_QUEUE_WAIT = Histogram(
     "Enqueue -> task start",
     buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
 )
+# What the user waits for: enqueue -> first answer delta, so it includes queue wait, routing
+# and the agent loop. query_shape: extraction | comparison | analytical, or "direct" for
+# turns answered without retrieval.
+CHAT_TTFT = Histogram(
+    "chat_time_to_first_token_seconds",
+    "Chat request enqueue -> first answer token emitted",
+    ["query_shape"],
+    buckets=(0.5, 1, 2, 3, 5, 10, 20, 30, 60, 120, 300, 600),
+)
 CHAT_ADMISSION_REJECTED = Counter(
     "chat_admission_rejected_total",
     "Chat requests refused with 503 because the queue was at CHAT_QUEUE_MAX_DEPTH",
@@ -148,6 +157,19 @@ AGENT_ITERATIONS = Histogram(
     buckets=(1, 2, 3, 4, 5, 8),
 )
 AGENT_TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["tool", "status"])
+# Subset of AGENT_TOOL_CALLS{status="error"} that excludes timeouts and backend failures.
+# Per-turn rate: divide by rate(agent_loop_iterations_sum).
+AGENT_TOOL_ARG_ERRORS = Counter(
+    "agent_tool_arg_errors_total",
+    "Tool calls whose arguments failed schema validation",
+    ["tool"],
+)
+# reason: ConvergenceReason. query_shape: extraction | comparison | analytical | none.
+AGENT_STOP_REASONS = Counter(
+    "agent_stop_reasons_total",
+    "Agent runs by stop reason",
+    ["reason", "query_shape"],
+)
 CITATION_REFS_DROPPED = Counter(
     "citation_refs_dropped_total",
     "Finding citations dropped (no excerpt in synthesis context)",

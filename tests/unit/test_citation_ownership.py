@@ -9,12 +9,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 from src.observability.metrics import CITATION_REFS_DROPPED
-from src.schemas.agent_findings import AnalyticalFindings, Observation
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat.agent import synthesis
-from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.processor import _map_refs
-from src.services.chat.agent.state import AgentLoopMeta
 from src.services.retrieval.context_assembler import assemble_rag_context
 
 
@@ -72,43 +68,3 @@ class TestMapRefs:
         ctx, _ = assemble_rag_context([chunk], {chunk.chunk_id: _payload(chunk)})
 
         assert _map_refs([str(uuid4())], ctx) == "—"
-
-
-class TestRefutedByNarrowing:
-    async def test_refuted_by_only_chunk_survives_synthesis_narrowing(self) -> None:
-        """tasks.py:773-777 regression guard: a chunk cited only via `refuted_by` must not
-        be narrowed out of the synthesis context."""
-        evidence_chunk, refuted_chunk = _chunk(), _chunk()
-        chunks = (evidence_chunk, refuted_chunk)
-        ledger = EvidenceLedger()
-        ledger.admit(chunks)
-        ledger.assign_labels(chunks, {c.chunk_id: _payload(c) for c in chunks})
-        findings = AnalyticalFindings(
-            question="Is revenue growing?",
-            observations=(
-                Observation(
-                    aspect="revenue_trend",
-                    claim="Revenue grew",
-                    evidence_chunks=[str(evidence_chunk.chunk_id)],
-                    confidence="high",
-                    refuted_by=[str(refuted_chunk.chunk_id)],
-                ),
-            ),
-        )
-
-        result = await synthesis.run_synthesis(
-            ledger,
-            findings,
-            AgentLoopMeta(iterations=1, tool_calls_total=1, convergence_reason="natural"),
-            None,
-            None,
-            max_chunks_per_entity=100,
-        )
-
-        assert {item.chunk_id for item in result.rag_context.items} == {
-            evidence_chunk.chunk_id,
-            refuted_chunk.chunk_id,
-        }
-        refuted_ref = result.rag_context.ref_for(refuted_chunk.chunk_id)
-        assert refuted_ref is not None
-        assert f"refuted_by: {refuted_ref}" in result.synthesis_context

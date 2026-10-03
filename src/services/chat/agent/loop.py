@@ -1,15 +1,11 @@
 """The agent tool-calling loop.
 
-Turn control flow is explicit: `_run_turn` returns a `TurnOutcome` (`Continue` or `Stop`)
-instead of the old ~8 scattered `convergence_reason = ...; break` sites threaded through
-one function.
+Turn control flow is explicit: `_run_turn` returns a `TurnOutcome` (`Continue` or `Stop`).
 
-Post-D3 there is one termination model and no terminal tool. Reports are incremental —
+There is one termination model and no terminal tool. Reports are incremental —
 `_apply_report` folds each into the `FindingsLedger` and returns a tool result — and the
-*loop* decides when the run is done, by checking plan coverage. That deletes the whole
-rejection subsystem (gates, `reject`, stubbed calls, retry budgets): nothing is ever
-un-done, so nothing has to be re-attempted, and the coercion-to-restate that forced the
-revert of `2d43ed8` has no reason to exist.
+*loop* decides when the run is done, by checking plan coverage. Nothing a report lands is
+ever un-done, so there is no rejection path and nothing has to be re-attempted or restated.
 """
 
 from __future__ import annotations
@@ -17,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from time import perf_counter
@@ -31,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.observability import langfuse as lf_client
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
+    AGENT_TOOL_ARG_ERRORS,
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
     LLM_CACHE_HIT_TOKENS,
@@ -45,19 +42,18 @@ from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent import tools as tools_module
 from src.services.chat.agent.evidence import EvidenceLedger
-from src.services.chat.agent.findings import Candidate, drop_evidence_free_observations
+from src.services.chat.agent.findings import Candidate
 from src.services.chat.agent.state import (
     AgentLoopMeta,
     AgentRunState,
     AspectStats,
     ConvergenceReason,
-    EffortPrior,
     build_meta,
-    debug_snapshot,
     get_agent_settings,
     open_aspects,
     render_status,
-    turn_snapshot,
+    snapshot,
+    unresolved_lines,
 )
 from src.services.chat.agent.tools import SearchDocumentsArgs
 from src.services.chat.agent.transcript import Transcript, cap_history
@@ -69,6 +65,7 @@ from src.services.llm_adapters.base_adapter import (
     Role,
     ToolCallRef,
 )
+from src.services.llm_runtime.exceptions import LLMError
 from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
@@ -79,7 +76,7 @@ from src.utils.config import get_injection_scan_user_input_enabled, get_query_tr
 if TYPE_CHECKING:
     from src.schemas.chat import ChatMessage as SchemaChatMessage
     from src.schemas.chat import ChatPipelineState
-    from src.services.llm_router import RoutedLLM
+    from src.services.llm_router import LLMRouter, RoutedLLM
     from src.services.retrieval.reranker import Reranker
 
 logger = logging.getLogger(__name__)
@@ -94,10 +91,11 @@ class _SearchResult:
     payloads: dict[UUID, ChunkPromptPayload]
     error_str: str | None = None
     rewrite_stats: LLMResponseStats | None = None
-    # D6 must not conflate "the corpus was unreachable" with "the model sent bad
+    # Never conflate "the corpus was unreachable" with "the model sent bad
     # arguments" — only the former justifies Stop("search_unavailable") or a
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
     backend_failed: bool = False
+    args_invalid: bool = False
     # Capabilities this search ran without ("dense", "keyword", "rerank"). Partial
     # degradation, as opposed to backend_failed's total outage: the search still returned
     # usable chunks, just from fewer sources than it should have.
@@ -118,6 +116,26 @@ ExecuteSearchFn = Callable[
 ]
 
 
+@dataclass(frozen=True)
+class RunDeps:
+    """Everything a turn needs that is fixed for the whole run."""
+
+    # The tool model first, then its fallbacks. A provider error moves a turn to the next.
+    llms: tuple[RoutedLLM, ...]
+    chat_state: ChatPipelineState
+    # The loop's own serial DB work (sub-request logging). Concurrent searches each open
+    # their own session from `session_factory` instead.
+    session: AsyncSession
+    session_factory: async_sessionmaker[AsyncSession]
+    reranker: Reranker | None
+    redis_app: Redis
+    request_id: str
+    is_analytical: bool
+    search_sem: asyncio.Semaphore
+    execute_search: ExecuteSearchFn
+    rewrite_model_id: str
+
+
 # ---------------------------------------------------------------------------
 # Turn outcome
 # ---------------------------------------------------------------------------
@@ -133,9 +151,19 @@ class Stop:
     reason: ConvergenceReason
 
 
-# No `Finalize`: post-D3 no tool call ends the run. The loop decides, so every exit is a
-# `Stop` with a reason — including `covered`, which is what a successful run now looks like.
+# No tool call ends the run. The loop decides, so every exit is a `Stop` with a reason —
+# including `covered`, which is what a successful run looks like.
 TurnOutcome = Continue | Stop
+
+
+@dataclass(frozen=True)
+class TurnFacts:
+    """What one turn's tool calls did — all `decide` needs beyond the run state."""
+
+    searches: int
+    backend_failures: int
+    new_chunks: int
+    closed: frozenset[str]  # plan keys that produced their first finding this turn
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +229,13 @@ async def _execute_search(
             extra={"request_id": request_id, "raw_args": tc.arguments[:500]},
         )
         AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+        AGENT_TOOL_ARG_ERRORS.labels("search_documents").inc()
         return _SearchResult(
             entity="",
             chunks=[],
             payloads={},
             error_str="search_documents call had invalid arguments — entity and query are required strings.",
+            args_invalid=True,
         )
     raw_query = search_args.query
 
@@ -232,7 +262,7 @@ async def _execute_search(
     await add_event(redis_app, request_id, "activity", start_data)
 
     # Rewrite at tool boundary — cheap model, eval-independent. Skipped on the analytical
-    # path (10b step 5): there the tool model composes a targeted, hypothesis-shaped query
+    # path: there the tool model composes a targeted, hypothesis-shaped query
     # per aspect, so the rewriter is a second model second-guessing it — it blurs specific
     # causal terms into generic finance vocabulary, and costs 3-5 calls per turn on the
     # critical path. BM25 loses its differentiated keyword_query; acceptable because the
@@ -369,7 +399,7 @@ async def _execute_search(
 
 
 # ---------------------------------------------------------------------------
-# Finalizer handling
+# Report handling
 # ---------------------------------------------------------------------------
 
 
@@ -378,7 +408,7 @@ def _resolve_candidate_refs(
     state: AgentRunState,
     request_id: str,
 ) -> AgentFindings | AnalyticalFindings:
-    """Rewrite source_chunks / evidence_chunks / refuted_by S-labels into chunk UUIDs.
+    """Rewrite source_chunks / evidence_chunks S-labels into chunk UUIDs.
 
     Unresolvable refs are dropped (never propagated downstream — a leaked label would
     surface in the synthesis prompt as a citable ID that has no matching excerpt).
@@ -398,13 +428,7 @@ def _resolve_candidate_refs(
         for o in candidate.observations:
             evidence, unresolved = state.evidence.resolve_refs(o.evidence_chunks)
             all_unresolved.extend(unresolved)
-            refuted: list[str] | None = o.refuted_by
-            if o.refuted_by is not None:
-                refuted, unresolved = state.evidence.resolve_refs(o.refuted_by)
-                all_unresolved.extend(unresolved)
-            new_obs.append(
-                o.model_copy(update={"evidence_chunks": evidence, "refuted_by": refuted})
-            )
+            new_obs.append(o.model_copy(update={"evidence_chunks": evidence}))
         result = candidate.model_copy(update={"observations": tuple(new_obs)})
 
     if all_unresolved:
@@ -442,30 +466,41 @@ def _filter_to_keys(candidate: Candidate, keys: set[str]) -> Candidate:
     )
 
 
-def _analytical_insufficiency(findings: AnalyticalFindings) -> str | None:
-    """Advisory text, never a gate (D3).
+def _searched(state: AgentRunState, key: str) -> bool:
+    stats = state.aspect_stats.get(key)
+    return key in state.searched_entities or (stats is not None and stats.searches > 0)
 
-    Post-D3 there is no rejection to attach this to: it is appended to the report result
-    so the model can act on it, and ignoring it costs nothing but a weaker answer. Its one
-    surviving clause carries the real sufficiency signal — self-reported gaps are
-    deliberately *not* penalized (10b §1e), since firing on honesty trains the model to
-    stop reporting gaps at all.
-    """
-    # Stated negatives are excluded, not counted as low-confidence: nudging a re-search on
-    # an aspect the model has already settled as absent is the same "firing on honesty"
-    # this advisory exists to avoid, and `confidence` is meaningless on a negative.
-    substantiated = [o for o in findings.observations if o.substantiated]
-    if not substantiated:
-        return None
-    if all(o.confidence == "low" for o in substantiated):
-        return (
-            "Every observation so far is low-confidence. Search differently — likely a "
-            "footnote, reconciliation, or segment table — to corroborate."
+
+def _drop_unsearched_negatives(
+    candidate: Candidate, state: AgentRunState
+) -> tuple[Candidate, set[str]]:
+    """The candidate without stated negatives for keys no search has covered, and those
+    keys. A negative closes its key with nothing cited, so it must at least follow a search
+    for that key."""
+    if isinstance(candidate, AgentFindings):
+        dropped = {
+            f.entity
+            for f in candidate.findings
+            if not f.available and not _searched(state, f.entity)
+        }
+        kept_findings = tuple(
+            f for f in candidate.findings if f.available or f.entity not in dropped
         )
-    return None
+        return candidate.model_copy(update={"findings": kept_findings}), dropped
+    dropped = {
+        o.aspect
+        for o in candidate.observations
+        if not o.substantiated and not _searched(state, o.aspect)
+    }
+    kept_observations = tuple(
+        o for o in candidate.observations if o.substantiated or o.aspect not in dropped
+    )
+    return candidate.model_copy(update={"observations": kept_observations}), dropped
 
 
-def _render_report_result(state: AgentRunState, closed: set[str], unknown: set[str]) -> str:
+def _render_report_result(
+    state: AgentRunState, closed: set[str], unknown: set[str], unsearched: set[str]
+) -> str:
     """The tool result for one report: what landed, what didn't, and what is still open.
 
     Deliberately echoes only *this turn's* change plus the open list. That open list goes
@@ -478,9 +513,17 @@ def _render_report_result(state: AgentRunState, closed: set[str], unknown: set[s
     # was "recorded" would be the one message that stops it retrying the aspect.
     addressed = state.addressed
     landed = sorted(closed & addressed)
-    dropped = sorted(closed - addressed)
+    dropped = sorted(closed - addressed - unsearched)
     if landed:
         parts.append(f"Recorded {', '.join(landed)}.")
+    if unsearched - addressed:
+        keys = sorted(unsearched - addressed)
+        plural = len(keys) != 1
+        parts.append(
+            f"{', '.join(keys)} {'were' if plural else 'was'} not recorded as absent — no "
+            f"earlier search covered {'them' if plural else 'it'}. Search first, then report "
+            f"what the results show."
+        )
     if dropped:
         plural = len(dropped) != 1
         parts.append(
@@ -505,21 +548,15 @@ def _render_report_result(state: AgentRunState, closed: set[str], unknown: set[s
         parts.append("Open: " + ", ".join(f"{a} ({state.plan[a]})" for a in still_open))
     else:
         parts.append("All planned items are now reported.")
-    projection = state.findings.projection()
-    if isinstance(projection, AnalyticalFindings):
-        advisory = _analytical_insufficiency(projection)
-        if advisory:
-            parts.append(advisory)
     return " ".join(parts)
 
 
 def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str:
     """Fold one report into the ledger and return its tool result.
 
-    Partial acceptance, never rejection (D3): unknown keys are dropped from the candidate
-    and named in the result; known ones land. Nothing is un-done, so there is no rejection
-    path, no stub and no restatement to coerce — which is precisely why the coverage
-    pressure `2d43ed8` had to revert is safe to apply here.
+    Partial acceptance, never rejection: unknown keys are dropped from the candidate and
+    named in the result; known ones land. Nothing is un-done, so there is no rejection
+    path, no stub and no restatement to coerce.
     """
     state.report_calls_total += 1
     if state.turns_to_first_report is None:
@@ -529,12 +566,14 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
         parsed = _parse_report(tc)
     except ValidationError:
         AGENT_TOOL_CALLS.labels(tc.name, "error").inc()
+        AGENT_TOOL_ARG_ERRORS.labels(tc.name).inc()
+        state.report_parse_failures += 1
         logger.warning(
             "agent_report_parse_failed",
             extra={"request_id": request_id, "raw_args": tc.arguments[:500]},
         )
-        # A parse failure is a tool result, not the end of the run: non-terminal means the
-        # model gets told and retries, where today a malformed finalizer ends the run.
+        # A parse failure is a tool result, not the end of the run: the model is told and
+        # retries.
         return (
             f"{tc.name} arguments did not parse against the schema. "
             "Re-issue the call with valid arguments."
@@ -550,27 +589,16 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
     if unknown:
         state.unknown_aspect_keys += len(unknown)
         candidate = _filter_to_keys(candidate, known)
+    candidate, unsearched = _drop_unsearched_negatives(candidate, state)
+    state.unsearched_negatives += len(unsearched)
 
-    # Recorded from the *raw* keys, before the grounding filter, so the report result can
-    # name back what the model claimed to close. Note this only tracks the attempt: a key
-    # is `addressed` (D4) solely via findings ∪ closed_as_gap, so an ungrounded report
-    # leaves its key open rather than closing it here.
-    state.reported_keys |= known
-    if isinstance(candidate, AnalyticalFindings):
-        before = len(candidate.observations)
-        candidate = drop_evidence_free_observations(candidate)
-        state.ungrounded_closes += before - len(candidate.observations)
+    # A reported-but-ungrounded key stays open: closing it would let `Stop("covered")`
+    # seal a run that produced no grounded output for that aspect. Left open, it stays
+    # searchable, and if it is still open at the end projection renders it as unresolved.
     state.findings.ingest(candidate, state.evidence)
 
-    # No mid-loop gap reconciliation. Gapping a reported-but-ungrounded key here would
-    # close it → `addressed` → `Stop("covered")` → `sealed_by_coverage`, promoting a run
-    # that produced no grounded output for that aspect to the same trust level as a
-    # converged one. Left open, the aspect stays searchable, and the end-of-run sweep in
-    # `run_loop` writes its gap after `plan_covered_at_stop` is snapshotted — so `sealed`
-    # correctly stays False.
-
     AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
-    return _render_report_result(state, closed=known, unknown=unknown)
+    return _render_report_result(state, closed=known, unknown=unknown, unsearched=unsearched)
 
 
 # ---------------------------------------------------------------------------
@@ -578,29 +606,248 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
 # ---------------------------------------------------------------------------
 
 
-async def _run_turn(
+def fold_searches(
     state: AgentRunState,
-    llm: RoutedLLM,
-    tools: list[dict],
-    chat_state: ChatPipelineState,
-    session: AsyncSession,
-    session_factory: async_sessionmaker[AsyncSession],
-    reranker: Reranker | None,
-    redis_app: Redis,
-    request_id: str,
-    is_analytical: bool,
-    search_sem: asyncio.Semaphore,
-    execute_search: ExecuteSearchFn,
+    searches: list[ToolCallRef],
+    results: list[_SearchResult],
+    minted: dict[str, str | None],
     rewrite_model_id: str,
-) -> TurnOutcome:
+) -> tuple[dict[str, str], list[int]]:
+    """Fold one turn's search results into the state, in call order.
+
+    Returns the tool-result text per call id and the count of newly admitted chunks per
+    search. No awaits and no I/O: labels are assigned here, sequentially, so S-labels
+    continue across searches instead of restarting at S1, and stay deterministic however
+    the concurrent searches finished.
+    """
+    texts: dict[str, str] = {}
+    new_per_search: list[int] = []
+    for tc, result in zip(searches, results, strict=True):
+        if result.rewrite_stats:
+            state.record_spend(rewrite_model_id, result.rewrite_stats)
+        entity_new = state.evidence.admit(result.chunks)
+        new_per_search.append(entity_new)
+        if result.entity:
+            state.searched_entities.add(result.entity)
+        state.degraded_capabilities |= result.degraded
+        if result.chunks and not result.scores_are_rerank:
+            state.scores_are_rerank = False
+        if result.args_invalid:
+            state.search_arg_errors += 1
+
+        # Per-aspect search provenance, written at the one instant everything is in
+        # hand. A failed or empty search admits no chunks, so this cannot be
+        # reconstructed from the EvidenceLedger afterwards — and `unresolved_lines`
+        # needs it to tell "backend down" from "not in the documents".
+        aspect = minted.get(tc.id)
+        if aspect is not None:
+            stats = state.aspect_stats.setdefault(aspect, AspectStats())
+            stats.searches += 1
+            stats.new_chunks += entity_new
+            if result.backend_failed:
+                stats.errored += 1
+
+        if result.error_str is not None:
+            texts[tc.id] = result.error_str
+            continue
+        # Admit the full result above for provenance, but render only the top-N into the
+        # transcript — uncapped tool results are the biggest per-turn token cost. The
+        # record stays complete; only the view is capped.
+        ctx = state.evidence.assign_labels(
+            result.chunks[: state.settings.max_chunks_per_entity],
+            result.payloads,
+            max_revivals=state.settings.max_revivals_per_turn,
+        )
+        body = ctx.formatted_context or "(no results)"
+        # The aspect id is echoed back so "reuse the key in brackets" is a copy from
+        # adjacent context, not a slug reconstructed from memory.
+        texts[tc.id] = f"[{aspect}] {body}" if aspect else body
+    return texts, new_per_search
+
+
+def fold_reports(
+    state: AgentRunState, reports: list[ToolCallRef], request_id: str
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Fold one turn's reports into the ledger, in call order.
+
+    Returns the tool-result text per call id and the plan keys this turn closed. Called
+    after minting and before this turn's searches run: the model wrote these reports
+    without seeing those results, so they are judged against the state the previous turn
+    left — they cite only earlier labels, and a negative needs an earlier search.
+    """
+    before = set(state.addressed)
+    texts = {tc.id: _apply_report(tc, state, request_id) for tc in reports}
+    return texts, frozenset(state.addressed - before)
+
+
+def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
+    """Whether the run stops after this turn, and why.
+
+    Called once the turn's tool results are in the transcript. Writes only the two fields
+    the decision owns, `sealed_by_coverage` and `empty_rounds`.
+    """
+    # Ordering is load-bearing: minting happened before this, so a turn that closes the
+    # last open key *and* opens a new thread continues rather than stopping.
+    if state.plan and not open_aspects(state):
+        state.sealed_by_coverage = True
+        return Stop("covered")
+
+    # A dead backend is not an empty corpus: without this stop it produces
+    # new_chunks == 0 and the model is told to reformulate while burning its budget.
+    if facts.searches and facts.backend_failures == facts.searches:
+        return Stop("search_unavailable")
+
+    # Progress = new chunks *or* a key closed. A turn that settles a key from evidence
+    # already in hand is real progress; without this, resolving the last aspects from
+    # admitted evidence trips convergence one turn before coverage.
+    if facts.new_chunks == 0 and not facts.closed:
+        state.empty_rounds += 1
+        if state.empty_rounds > state.settings.max_empty_rounds:
+            return Stop("convergence")
+        # The stall nudge lives in `render_status`, recomputed per call from
+        # `empty_rounds`, so it never accumulates in the transcript.
+    else:
+        # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative.
+        state.empty_rounds = 0
+
+    if not state.spend_within_budget():
+        return Stop("budget_cap")
+    return Continue()
+
+
+async def _call_tool_model(
+    state: AgentRunState, deps: RunDeps, messages: list[ChatMessage], tools: list[dict]
+) -> tuple[RoutedLLM, AssistantTurnResult]:
+    """The first model in the chain that answers, and its turn. The last model's provider
+    error propagates; a timeout does not fall back."""
+
+    async def complete(llm: RoutedLLM) -> AssistantTurnResult:
+        return await asyncio.wait_for(
+            llm.complete_with_tools(messages, tools=tools, temperature=0.0),
+            timeout=state.settings.turn_timeout_seconds,
+        )
+
+    *fallible, last = deps.llms
+    for llm in fallible:
+        try:
+            return llm, await complete(llm)
+        except LLMError as e:
+            logger.warning(
+                "agent_tool_model_fallback",
+                extra={
+                    "request_id": deps.request_id,
+                    "iteration": state.iteration,
+                    "from_model": llm.model_id,
+                    "error": type(e).__name__,
+                },
+            )
+    return last, await complete(last)
+
+
+async def _finish_despite_cancel(aw: Awaitable[None]) -> None:
+    """Run `aw` to completion even if the run deadline cancels this task meanwhile, then
+    let the cancellation through. A commit interrupted on the shared session would leave it
+    unusable for the pipeline's own writes after the loop."""
+    task = asyncio.ensure_future(aw)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+async def _record_turn_spend(
+    state: AgentRunState, deps: RunDeps, llm: RoutedLLM, turn: AssistantTurnResult
+) -> None:
+    """Spend, metrics and the `llm_requests` sub-request row for one tool-model call."""
+    stats = turn.stats
+    if stats is None:
+        return
+    state.record_spend(llm.model_id, stats)
+    if stats.input_tokens:
+        LLM_TOKENS.labels("input", llm.model_id).inc(stats.input_tokens)
+    if stats.output_tokens:
+        LLM_TOKENS.labels("output", llm.model_id).inc(stats.output_tokens)
+    if stats.cached_input_tokens:
+        LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(stats.cached_input_tokens)
+    if stats.cost_usd:
+        LLM_COST.labels(llm.model_id).inc(stats.cost_usd)
+    observe_llm_latency(llm.model_id, "agent_tool_call", stats)
+
+    llm_request = deps.chat_state.llm_request
+    if llm_request is None or llm_request.conversation_id is None:
+        return
+    with contextlib.suppress(Exception):
+        await LLMRequestRepository(deps.session).create_subrequest(
+            parent_request_id=llm_request.id,
+            conversation_id=llm_request.conversation_id,
+            user_id=llm_request.user_id,
+            provider=llm.provider,
+            model=llm.model_id,
+            request_type="agent_tool_call",
+            request_params={
+                "iteration": state.iteration,
+                "tool_calls_issued": len(turn.tool_calls or []),
+            },
+            status="completed",
+            **stats_to_request_kwargs(stats),
+        )
+        # Release the pgbouncer server connection between turns. create_subrequest only
+        # flushes, so without this the transaction it opens stays open across the next
+        # turn's LLM call — converting transaction pooling into session pooling for the
+        # whole loop. Committed here and not inside create_subrequest because naming.py's
+        # caller depends on NOT committing: its sub-request and the title update have to
+        # land together.
+        await deps.session.commit()
+
+
+async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) -> _SearchResult:
+    """One search, bounded by the turn timeout; a timeout becomes a backend failure."""
+    try:
+        async with asyncio.timeout(state.settings.turn_timeout_seconds):
+            # A fresh session per concurrent search — the shared `deps.session` is not
+            # safe for concurrent use under asyncio.gather.
+            async with deps.search_sem, deps.session_factory() as task_session:
+                return await deps.execute_search(
+                    tc,
+                    deps.chat_state,
+                    task_session,
+                    deps.reranker,
+                    deps.redis_app,
+                    deps.request_id,
+                    state.iteration,
+                    deps.is_analytical,
+                )
+    except TimeoutError:
+        logger.warning(
+            "agent_search_timeout",
+            extra={
+                "request_id": deps.request_id,
+                "iteration": state.iteration,
+                "timeout_s": state.settings.turn_timeout_seconds,
+            },
+        )
+        AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+        return _SearchResult(
+            entity="",
+            chunks=[],
+            payloads={},
+            error_str="search timed out — the search backend did not respond in time.",
+            backend_failed=True,
+        )
+
+
+async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> TurnOutcome:
+    """One turn: call the tool model, dispatch its calls, fold the results, decide."""
     iteration = state.iteration
+    request_id = deps.request_id
     _, round_data = build_activity_event(
         "round_started",
         event_id=f"round-{iteration}",
         label=f"Round {iteration + 1}",
         detail={"iteration": iteration},
     )
-    await add_event(redis_app, request_id, "activity", round_data)
+    await add_event(deps.redis_app, request_id, "activity", round_data)
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
     # The status view is computed per call and appended last — never stored, so it never
@@ -611,6 +858,9 @@ async def _run_turn(
     # re-dumping all of `state.transcript.messages` on every turn would repeat turn 0's
     # content N times by turn N for no new information.
     status = render_status(state)
+    new_chunks = 0
+    turn: AssistantTurnResult | None = None
+    results_by_id: dict[str, str] = {}
     with lf_span(
         f"agent_turn_{iteration}",
         input={
@@ -619,311 +869,141 @@ async def _run_turn(
             "status": status,
         },
     ) as obs:
-        return await _run_turn_inner(
-            state,
-            llm,
-            tools,
-            chat_state,
-            session,
-            session_factory,
-            reranker,
-            redis_app,
-            request_id,
-            is_analytical,
-            search_sem,
-            execute_search,
-            rewrite_model_id,
-            iteration,
-            status,
-            obs,
-        )
+        try:
+            prompt_messages = [
+                *state.transcript.messages,
+                *([ChatMessage(role=Role.user, content=status)] if status else []),
+            ]
+            served, turn = await _call_tool_model(state, deps, prompt_messages, tools)
+            await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn))
 
+            if not turn.tool_calls:
+                # With no terminal tool this is a normal exit, not a rare one: the model
+                # emitted prose instead of a call. projection() still serves whatever the
+                # ledger accumulated (None only if nothing was ever reported).
+                return Stop("natural")
 
-async def _run_turn_inner(
-    state: AgentRunState,
-    llm: RoutedLLM,
-    tools: list[dict],
-    chat_state: ChatPipelineState,
-    session: AsyncSession,
-    session_factory: async_sessionmaker[AsyncSession],
-    reranker: Reranker | None,
-    redis_app: Redis,
-    request_id: str,
-    is_analytical: bool,
-    search_sem: asyncio.Semaphore,
-    execute_search: ExecuteSearchFn,
-    rewrite_model_id: str,
-    iteration: int,
-    status: str | None,
-    obs: object,
-) -> TurnOutcome:
-    """Body of one turn, run inside `_run_turn`'s `agent_turn_{N}` span.
-
-    Split out only so the span in `_run_turn` can wrap it with a plain `with` (the span
-    needs `status` computed before it opens, to use as trimmed trace input instead of the
-    full transcript replay) while this keeps the turn's own try/finally for tool-call output.
-    """
-    new_chunks = 0
-    turn: AssistantTurnResult | None = None
-    results_by_id: dict[str, str] = {}
-    try:
-        prompt_messages = [
-            *state.transcript.messages,
-            *([ChatMessage(role=Role.user, content=status)] if status else []),
-        ]
-        turn = await asyncio.wait_for(
-            llm.complete_with_tools(prompt_messages, tools=tools, temperature=0.0),
-            timeout=state.turn_timeout_seconds,
-        )
-        if turn.stats:
-            state.record_spend(llm.model_id, turn.stats)
-            if turn.stats.input_tokens:
-                LLM_TOKENS.labels("input", llm.model_id).inc(turn.stats.input_tokens)
-            if turn.stats.output_tokens:
-                LLM_TOKENS.labels("output", llm.model_id).inc(turn.stats.output_tokens)
-            if turn.stats.cached_input_tokens:
-                LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(turn.stats.cached_input_tokens)
-            if turn.stats.cost_usd:
-                LLM_COST.labels(llm.model_id).inc(turn.stats.cost_usd)
-            observe_llm_latency(llm.model_id, "agent_tool_call", turn.stats)
-
-            if chat_state.llm_request and chat_state.llm_request.conversation_id is not None:
-                with contextlib.suppress(Exception):
-                    await LLMRequestRepository(session).create_subrequest(
-                        parent_request_id=chat_state.llm_request.id,
-                        conversation_id=chat_state.llm_request.conversation_id,
-                        user_id=chat_state.llm_request.user_id,
-                        provider=llm.provider,
-                        model=llm.model_id,
-                        request_type="agent_tool_call",
-                        request_params={
-                            "iteration": iteration,
-                            "tool_calls_issued": len(turn.tool_calls or []),
-                        },
-                        status="completed",
-                        **stats_to_request_kwargs(turn.stats),
+            # A call to a tool outside this turn's pool is answered and never parsed: an
+            # extraction run cannot land an Observation, and a final-turn search does not
+            # run.
+            offered = {t["function"]["name"] for t in tools}
+            report_names = offered & tools_module.REPORT_TOOL_NAMES
+            reports = [tc for tc in turn.tool_calls if tc.name in report_names]
+            searches = [tc for tc in turn.tool_calls if tc.name in offered - report_names]
+            for tc in turn.tool_calls:
+                if tc.name not in offered:
+                    logger.warning(
+                        "agent_tool_not_available",
+                        extra={"request_id": request_id, "tool": tc.name},
                     )
-                    # Release the pgbouncer server connection between turns. create_subrequest
-                    # only flushes, so without this the transaction it opens stays open across
-                    # the next turn's LLM call — converting transaction pooling into session
-                    # pooling for the whole loop (readiness audit §4.1; T4 measured 17 such
-                    # holds at 50 users). Committed here and not inside create_subrequest
-                    # because naming.py's caller depends on NOT committing: its sub-request and
-                    # the title update have to land together (tasks.py:1222).
-                    await session.commit()
+                    results_by_id[tc.id] = (
+                        f"Tool {tc.name!r} is not available. "
+                        f"Available: {', '.join(sorted(offered))}."
+                    )
 
-        if not turn.tool_calls:
-            # With no terminal tool this is a normal exit, not a rare one: the model
-            # emitted prose instead of a call. projection() still serves whatever the
-            # ledger accumulated (None only if nothing was ever reported).
-            return Stop("natural")
+            # The assistant message is appended ONCE, verbatim, in emission order, and
+            # (below) there is exactly one role=tool result per tool_call id. An assistant
+            # tool_calls entry without a matching result — or vice versa — is a 400 on
+            # every OpenAI-compatible provider.
+            state.transcript.append_tool_calls(turn.tool_calls)
+            state.tool_calls_total += len(turn.tool_calls)
 
-        reports = [tc for tc in turn.tool_calls if tc.name in tools_module.REPORT_TOOL_NAMES]
-        searches = [tc for tc in turn.tool_calls if tc.name not in tools_module.REPORT_TOOL_NAMES]
+            # Mint before execution, so the tool result can echo the id the model must cite.
+            minted: dict[str, str | None] = {
+                tc.id: _mint(state.plan, _sub_question_of(tc), state.settings.max_plan_items)
+                for tc in searches
+            }
 
-        # Rule 1: the assistant message is appended ONCE, verbatim, in emission order.
-        # Rule 2 (below): exactly one role=tool result per tool_call id. An assistant
-        # tool_calls entry without a matching result — or vice versa — is a 400 on every
-        # OpenAI-compatible provider. Both are easy to honour now that no branch executes
-        # some calls and discards others (the bug at the old loop.py:520-524).
-        state.transcript.append_tool_calls(turn.tool_calls)
-        state.tool_calls_total += len(turn.tool_calls)
+            report_texts, closed = fold_reports(state, reports, request_id)
+            results_by_id |= report_texts
+            for _ in reports:
+                report_id, report_start = build_activity_event(
+                    "tool_call_started",
+                    label="Recording findings",
+                    parent_id=f"round-{iteration}",
+                    detail={"tool": "report"},
+                )
+                await add_event(deps.redis_app, request_id, "activity", report_start)
+                _, report_end = build_activity_event("tool_call_ended", event_id=report_id)
+                await add_event(deps.redis_app, request_id, "activity", report_end)
 
-        # Mint before execution, so the tool result can echo the id the model must cite.
-        minted: dict[str, str | None] = {
-            tc.id: _mint(state.plan, _sub_question_of(tc), state.effort.max_plan_items)
-            for tc in searches
-        }
-
-        async def _guarded_search(tc: ToolCallRef) -> _SearchResult:
-            try:
-                async with asyncio.timeout(state.turn_timeout_seconds):
-                    async with search_sem, session_factory() as task_session:
-                        # A fresh session per concurrent search — the shared `session` is
-                        # not safe for concurrent use under asyncio.gather (P0-1).
-                        return await execute_search(
-                            tc,
-                            chat_state,
-                            task_session,
-                            reranker,
-                            redis_app,
-                            request_id,
-                            iteration,
-                            is_analytical,
-                        )
-            except TimeoutError:
-                logger.warning(
-                    "agent_search_timeout",
+            results = list(
+                await asyncio.gather(*[_guarded_search(tc, state, deps) for tc in searches])
+            )
+            search_texts, new_per_search = fold_searches(
+                state, searches, results, minted, deps.rewrite_model_id
+            )
+            results_by_id |= search_texts
+            new_chunks = sum(new_per_search)
+            for tc, result, entity_new in zip(searches, results, new_per_search, strict=True):
+                logger.debug(
+                    "tool_call_completed",
                     extra={
                         "request_id": request_id,
                         "iteration": iteration,
-                        "timeout_s": state.turn_timeout_seconds,
+                        "entity": result.entity,
+                        "aspect": minted.get(tc.id),
+                        "chunks_returned": len(result.chunks),
+                        "new_chunks_added": entity_new,
                     },
                 )
-                AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
-                return _SearchResult(
-                    entity="",
-                    chunks=[],
-                    payloads={},
-                    error_str="search timed out — the search backend did not respond in time.",
-                    backend_failed=True,
+                if result.activity_id is not None:
+                    _, end_data = build_activity_event(
+                        "tool_call_ended",
+                        event_id=result.activity_id,
+                        detail={
+                            "chunks_returned": len(result.chunks),
+                            "new_chunks_added": entity_new,
+                        },
+                    )
+                    await add_event(deps.redis_app, request_id, "activity", end_data)
+
+            # Exactly one result per call id, in turn.tool_calls order.
+            for tc in turn.tool_calls:
+                state.transcript.append(
+                    ChatMessage(
+                        role=Role.tool,
+                        tool_call_id=tc.id,
+                        content=results_by_id.get(tc.id, "(no result)"),
+                    )
                 )
 
-        results: list[_SearchResult] = []
-        if searches:
-            results = list(await asyncio.gather(*[_guarded_search(tc) for tc in searches]))
-
-        backend_failures = 0
-        for tc, result in zip(searches, results, strict=False):
-            if result.rewrite_stats:
-                state.record_spend(rewrite_model_id, result.rewrite_stats)
-            entity_new = state.evidence.admit(result.chunks)
-            new_chunks += entity_new
-            if result.entity:
-                state.searched_entities.add(result.entity)
-            state.degraded_capabilities |= result.degraded
-            if result.chunks and not result.scores_are_rerank:
-                state.scores_are_rerank = False
-
-            # D5: per-aspect search provenance, written at the one instant everything is
-            # in hand. A failed or empty search admits no chunks, so this cannot be
-            # reconstructed from the EvidenceLedger afterwards — which is exactly the
-            # case D6 has to tell apart.
-            aspect = minted.get(tc.id)
-            if aspect is not None:
-                stats = state.aspect_stats.setdefault(aspect, AspectStats())
-                stats.searches += 1
-                stats.new_chunks += entity_new
-                if result.backend_failed:
-                    stats.errored += 1
-            if result.backend_failed:
-                backend_failures += 1
-
-            logger.debug(
-                "tool_call_completed",
-                extra={
-                    "request_id": request_id,
-                    "iteration": iteration,
-                    "entity": result.entity,
-                    "aspect": aspect,
-                    "chunks_returned": len(result.chunks),
-                    "new_chunks_added": entity_new,
-                },
+            outcome = decide(
+                state,
+                TurnFacts(
+                    searches=len(searches),
+                    backend_failures=sum(r.backend_failed for r in results),
+                    new_chunks=new_chunks,
+                    closed=closed,
+                ),
             )
-            if result.activity_id is not None:
-                _, end_data = build_activity_event(
-                    "tool_call_ended",
-                    event_id=result.activity_id,
-                    detail={"chunks_returned": len(result.chunks), "new_chunks_added": entity_new},
+            if isinstance(outcome, Continue):
+                state.transcript.compress(state.evidence)
+            return outcome
+        finally:
+            if obs:
+                obs.update(
+                    output={
+                        "tool_calls": [
+                            {"name": tc.name, "arguments": tc.arguments}
+                            for tc in (turn.tool_calls if turn and turn.tool_calls else [])
+                        ],
+                        # The `role: tool` results this turn actually appended to the
+                        # transcript, keyed by tool_call_id — what the *next* turn's model
+                        # call will read back. Without this, a search's rendered excerpts or
+                        # a report's fold-in result are visible only inside the next turn's
+                        # full GENERATION input, not on this span.
+                        "tool_results": results_by_id,
+                        # State *after* this turn's effects landed — the structured
+                        # counterpart to the prose `status` this span took as input (state
+                        # *before* the turn ran).
+                        "state_after": snapshot(state),
+                    },
+                    metadata={
+                        "token_spend_cumulative": state.input_tokens_total(),
+                        "new_chunks": new_chunks,
+                    },
                 )
-                await add_event(redis_app, request_id, "activity", end_data)
-            # Assemble the tool-result context here (sequentially) so S-labels continue
-            # across searches instead of restarting at S1 each time.
-            if result.error_str is not None:
-                results_by_id[tc.id] = result.error_str
-            else:
-                # P2 (audit finding): admit the full result above for provenance, but
-                # render only the top-N into the transcript — mid-loop, uncapped tool
-                # results were the single biggest per-turn token cost (~106k chars
-                # measured). The record stays complete; only the view is capped.
-                ctx = state.evidence.assign_labels(
-                    result.chunks[: state.effort.max_chunks_per_lookup],
-                    result.payloads,
-                    max_revivals=state.effort.max_revivals_per_turn,
-                )
-                body = ctx.formatted_context or "(no results)"
-                # The aspect id is echoed back so "reuse the key in brackets" is a copy
-                # from adjacent context, not a slug reconstructed from memory.
-                results_by_id[tc.id] = f"[{aspect}] {body}" if aspect else body
-
-        # Reports fold after searches but read nothing from them: the model composed these
-        # before seeing this turn's results, so it cannot cite them.
-        before_addressed = set(state.addressed)
-        for tc in reports:
-            report_id, report_start = build_activity_event(
-                "tool_call_started",
-                label="Recording findings",
-                parent_id=f"round-{iteration}",
-                detail={"tool": "report"},
-            )
-            await add_event(redis_app, request_id, "activity", report_start)
-            results_by_id[tc.id] = _apply_report(tc, state, request_id)
-            _, report_end = build_activity_event("tool_call_ended", event_id=report_id)
-            await add_event(redis_app, request_id, "activity", report_end)
-        closed_this_turn = state.addressed - before_addressed
-
-        # Rule 2: exactly one result per call id, in turn.tool_calls order.
-        for tc in turn.tool_calls:
-            state.transcript.append(
-                ChatMessage(
-                    role=Role.tool,
-                    tool_call_id=tc.id,
-                    content=results_by_id.get(tc.id, "(no result)"),
-                )
-            )
-
-        # --- termination, loop-owned (step 3) ---
-        # Ordering is load-bearing: minting happened before this, so a turn that closes the
-        # last open key *and* opens a new thread continues rather than stopping. Today the
-        # same emission stops the run and discards the model's own statement that a thread
-        # remains open.
-        if state.plan and not open_aspects(state):
-            state.sealed_by_coverage = True
-            return Stop("covered")
-
-        # A dead backend is not an empty corpus. Today it produces new_chunks == 0 and the
-        # model is told to "reformulate with different terms" while burning its budget.
-        if searches and backend_failures == len(searches):
-            return Stop("search_unavailable")
-
-        # Progress = new chunks *or* a key closed. A turn that settles a key from evidence
-        # already in hand is real progress; without this, resolving the last aspects from
-        # admitted evidence trips convergence one turn before coverage — the most likely
-        # spurious stop in this design.
-        if new_chunks == 0 and not closed_this_turn:
-            state.empty_rounds += 1
-            if not is_analytical or state.empty_rounds > state.effort.max_empty_rounds:
-                return Stop("convergence")
-            # The stall nudge is no longer appended here: a permanent user message that
-            # accumulates one copy per empty round (10b §4, row 8). It moved into
-            # `render_status`, which is recomputed per call and keyed off `empty_rounds`.
-        else:
-            # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative (P0-2).
-            state.empty_rounds = 0
-
-        if not state.spend_within_budget():
-            return Stop("budget_cap")
-        if state.past_deadline():
-            return Stop("deadline")
-
-        state.transcript.compress(state.evidence)
-        return Continue()
-    finally:
-        if obs:
-            obs.update(  # type: ignore[attr-defined]
-                output={
-                    "tool_calls": [
-                        {"name": tc.name, "arguments": tc.arguments}
-                        for tc in (turn.tool_calls if turn is not None and turn.tool_calls else [])
-                    ],
-                    # The `role: tool` results this turn actually appended to the
-                    # transcript, keyed by tool_call_id — what the *next* turn's model
-                    # call will read back. Without this, the only place a search's
-                    # rendered excerpts or a report's fold-in result are visible is
-                    # buried inside the next turn's full llm.complete_with_tools
-                    # GENERATION input (present, but not this span's — nothing on
-                    # agent_turn_N itself showed what this turn actually produced).
-                    "tool_results": results_by_id,
-                    # Structured coverage state *after* this turn's effects landed — the
-                    # per-turn counterpart to the prose `status` string the model saw as
-                    # this span's input (which reflects state *before* the turn ran).
-                    "coverage_after": turn_snapshot(state),
-                },
-                metadata={
-                    "token_spend_cumulative": state.input_tokens_total(),
-                    "new_chunks": new_chunks,
-                },
-            )
 
 
 CARRYOVER_STUB = "[prior turn: restated earlier results in a different format]"
@@ -937,7 +1017,7 @@ def build_agent_history(
 ) -> list[ChatMessage]:
     """Project conversation history into the agent's transcript.
 
-    Contract F1: only role and content cross. `findings_block` cannot reach the agent —
+    Only role and content cross. `findings_block` cannot reach the agent —
     ChatMessage here is the frozen/slotted adapter type with no such field — and an
     answer derived from a carried block is stubbed, since its prose restates numbers the
     agent has no evidence for.
@@ -965,6 +1045,80 @@ def build_agent_history(
 # ---------------------------------------------------------------------------
 
 
+def prompt_and_tools(query_shape: str | None) -> tuple[str, list[dict]]:
+    """The tool-model prompt and tool pool for a shape.
+
+    Returned together because a prompt naming a tool the model was not given is a broken
+    run. Public so the pipeline can tag traces with the prompt before the loop starts.
+    """
+    if query_shape == "analytical":
+        return "v5_agent_analytical", tools_module.ANALYTICAL_TOOLS
+    return "v3_agent", tools_module.EXTRACTION_TOOLS
+
+
+def tool_model_chain(router: LLMRouter, model_id: str) -> list[RoutedLLM]:
+    """The tool model followed by its configured fallback, keeping only models that can
+    call tools. Raises when the tool model itself cannot."""
+    chain = router.get_with_fallback(model_id)
+    if not chain[0].capabilities.get("tool_calling", False):
+        raise RuntimeError(
+            f"AGENT_TOOL_MODEL={model_id!r} does not have tool_calling: true in models.yaml"
+        )
+    return [m for m in chain if m.capabilities.get("tool_calling", False)]
+
+
+async def _iterate(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> None:
+    """Run turns until one stops the run or the iteration cap is reached; records the stop
+    reason on `state`."""
+    request_id = deps.request_id
+    for iteration in range(state.max_iterations):
+        state.iteration = iteration
+        # An aspect whose evidence is already admitted but never written up dies as
+        # "Not resolved" at the iteration cap. Withholding search on the last turn — the
+        # turn that was going to run anyway — gives the model one pass to convert what it
+        # already holds, at no extra cost. `tool_choice` stays "auto": if the model emits
+        # prose instead, the turn returns Stop("natural") and accumulated findings still
+        # serve, so this fails safe.
+        final_turn = iteration == state.max_iterations - 1
+        turn_tools = (
+            [t for t in tools if t["function"]["name"] in tools_module.REPORT_TOOL_NAMES]
+            if final_turn
+            else tools
+        )
+        try:
+            outcome = await _run_turn(state, deps, turn_tools)
+        except TimeoutError:
+            logger.warning(
+                "agent_turn_timeout",
+                extra={
+                    "request_id": request_id,
+                    "iteration": iteration,
+                    "timeout": state.settings.turn_timeout_seconds,
+                },
+            )
+            state.convergence_reason = "timeout"
+            return
+        except LLMError as e:
+            # Earlier turns' evidence and findings are already in the ledgers, so a late
+            # provider error serves them degraded. With neither, there is nothing to serve.
+            if len(state.evidence) == 0 and not state.findings.keys():
+                raise
+            logger.warning(
+                "agent_tool_model_error",
+                extra={
+                    "request_id": request_id,
+                    "iteration": iteration,
+                    "error": type(e).__name__,
+                },
+            )
+            state.convergence_reason = "llm_error"
+            return
+
+        if isinstance(outcome, Stop):
+            state.convergence_reason = outcome.reason
+            return
+
+
 async def run_loop(
     chat_state: ChatPipelineState,
     llm: RoutedLLM,
@@ -974,6 +1128,7 @@ async def run_loop(
     reranker: Reranker | None,
     session_factory: async_sessionmaker[AsyncSession],
     *,
+    fallbacks: Sequence[RoutedLLM] = (),
     execute_search: ExecuteSearchFn = _execute_search,
 ) -> tuple[
     EvidenceLedger,
@@ -983,16 +1138,20 @@ async def run_loop(
     """Run the agent tool-calling loop for retrieval queries.
 
     Returns (evidence, agent_findings, meta). The ledger carries the ordered chunks, the
-    payloads cached at render time (so synthesis hydrates nothing, D2), and the rendered
+    payloads cached at render time (so synthesis hydrates nothing), and the rendered
     subset — what the model could actually read, the only defensible pool for synthesis to
     fall back on. agent_findings is the FindingsLedger projection — the accumulated
-    findings, marked degraded when no finalizer sealed the run, and None only when no
-    finalizer was ever attempted.
+    findings, marked degraded when the run did not seal, and None only when no report
+    was ever attempted.
+
+    ``fallbacks`` are tried in order when ``llm`` raises a provider error. When the whole
+    chain fails, the run stops as ``llm_error`` and serves what it gathered; with nothing
+    gathered the error propagates and the request fails.
 
     ``session`` is used for the loop's own serial DB work (subrequest logging).
     Concurrent searches each open their own session from ``session_factory``:
     SQLAlchemy's AsyncSession is not safe for concurrent use, so the fan-out under
-    asyncio.gather must never share one (P0-1).
+    asyncio.gather must never share one.
     """
     settings = get_agent_settings()
 
@@ -1002,15 +1161,8 @@ async def run_loop(
         else None
     )
     is_analytical = query_shape == "analytical"
-    # One branch, prompt and pool on the same line: a prompt naming a tool the model was
-    # not given is a broken run, so nothing may assign one without the other.
-    prompt_name, tools = (
-        ("v5_agent_analytical", tools_module.ANALYTICAL_TOOLS)
-        if is_analytical
-        else ("v3_agent", tools_module.EXTRACTION_TOOLS)
-    )
-    effort = EffortPrior.for_shape(settings, query_shape)
-    search_sem = asyncio.Semaphore(effort.max_concurrent_searches)
+    prompt_name, tools = prompt_and_tools(query_shape)
+    max_iterations = settings.max_iterations_for(query_shape)
     rewrite_model_id = get_query_transformer_model()
 
     system_content = get_system_prompt(version=prompt_name)
@@ -1022,15 +1174,14 @@ async def run_loop(
     # `req.content` at the API layer, while `scan_user_input` runs later in the worker and
     # rewrites only the *current* turn. So a prior turn that scored "block" — one the
     # pipeline refused to answer — still lands in the agent transcript verbatim, because
-    # it was written to the chat tail before the task ran. Scan them here (10b §4d):
-    # strip invisibles/role markers as the current turn gets, and drop a blocked turn
+    # it was written to the chat tail before the task ran. Scan them here: strip invisibles/role markers as the current turn gets, and drop a blocked turn
     # outright rather than handing the agent the exact text the guardrail rejected.
     scan = get_injection_scan_user_input_enabled()
     history_messages = build_agent_history(history, scan=scan, request_id=request_id)
     messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
-        # Row 2 of 10b §4 was the largest unbounded cost in the turn: up to 50 prior
-        # messages, permanent, dwarfing the excerpts they contextualize.
+        # Uncapped, history is the largest unbounded cost in a turn: up to 50 prior
+        # messages, resent every turn, dwarfing the excerpts they contextualize.
         *cap_history(
             history_messages,
             max_turns=settings.history_turns,
@@ -1053,7 +1204,7 @@ async def run_loop(
 
     # Seeded regardless of query_shape: the entity-injection message below and
     # `_inject_unsearched_stubs` at the synthesis boundary both read this to tell
-    # "searched and found nothing" from "never searched", whichever finalizer runs.
+    # "searched and found nothing" from "never searched", on either path.
     expected_entities: set[str] = set()
     if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
         expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
@@ -1092,102 +1243,49 @@ async def run_loop(
     messages.append(ChatMessage(role=Role.user, content=chat_state.user_query_raw))
 
     state = AgentRunState(
-        effort=effort,
-        token_budget=settings.token_budget,
-        turn_timeout_seconds=settings.turn_timeout_seconds,
-        deadline_seconds=settings.deadline_seconds,
+        settings=settings,
+        max_iterations=max_iterations,
         transcript=Transcript(messages),
         expected_entities=expected_entities,
     )
 
-    # D3: one termination model. Extraction's plan is loop-authored — seeded from the
-    # entities the router resolved, keyed by entity name so the model reports under the
-    # name it was given. `missing_entity_gate` computed exactly this set as a rejection
-    # reason; now it is the same coverage check the analytical path uses. The analytical
-    # plan seeds itself from turn-1 search `sub_question`s instead.
+    # One termination model for both paths. Extraction's plan is loop-authored — seeded
+    # from the entities the router resolved, keyed by entity name so the model reports
+    # under the name it was given. The analytical plan seeds itself from search
+    # `sub_question`s instead.
     if not is_analytical:
         for name in sorted(expected_entities):
             state.plan[name] = name
 
-    iterations_run = 0
-    for iteration in range(effort.max_iterations):
-        # Checked before the turn as well as after it: the post-turn check at the end of
-        # _run_turn cannot stop a turn that starts at t=deadline-1s and then runs a full
-        # turn timeout plus a search fan-out on top of it.
-        if state.past_deadline():
-            state.convergence_reason = "deadline"
-            break
-        state.iteration = iteration
-        iterations_run = iteration + 1
-        # An aspect whose evidence is already admitted but never written up dies as
-        # "Not resolved" at the iteration cap. Withholding search on the last turn — the
-        # turn that was going to run anyway — gives the model one pass to convert what it
-        # already holds, at no extra cost. `tool_choice` stays "auto": if the model emits
-        # prose instead, the turn returns Stop("natural") and accumulated findings still
-        # serve, so this fails safe.
-        final_turn = iteration == effort.max_iterations - 1
-        turn_tools = (
-            [t for t in tools if t["function"]["name"] in tools_module.REPORT_TOOL_NAMES]
-            if final_turn
-            else tools
+    deps = RunDeps(
+        llms=(llm, *fallbacks),
+        chat_state=chat_state,
+        session=session,
+        session_factory=session_factory,
+        reranker=reranker,
+        redis_app=redis_app,
+        request_id=request_id,
+        is_analytical=is_analytical,
+        search_sem=asyncio.Semaphore(settings.max_concurrent_searches),
+        execute_search=execute_search,
+        rewrite_model_id=rewrite_model_id,
+    )
+    # One wall-clock bound for the whole run. It cancels a turn mid-flight: that turn's
+    # in-flight results are lost, while earlier turns are already in the ledgers.
+    try:
+        async with asyncio.timeout(settings.deadline_seconds):
+            await _iterate(state, deps, tools)
+    except TimeoutError:
+        logger.warning(
+            "agent_run_deadline",
+            extra={
+                "request_id": request_id,
+                "iteration": state.iteration,
+                "deadline_s": settings.deadline_seconds,
+            },
         )
-        try:
-            outcome = await _run_turn(
-                state,
-                llm,
-                turn_tools,
-                chat_state,
-                session,
-                session_factory,
-                reranker,
-                redis_app,
-                request_id,
-                is_analytical,
-                search_sem,
-                execute_search,
-                rewrite_model_id,
-            )
-        except TimeoutError:
-            logger.warning(
-                "agent_turn_timeout",
-                extra={
-                    "request_id": request_id,
-                    "iteration": iteration,
-                    "timeout": state.turn_timeout_seconds,
-                },
-            )
-            state.convergence_reason = "timeout"
-            break
-
-        if isinstance(outcome, Stop):
-            state.convergence_reason = outcome.reason
-            break
-        # Continue(): fall through to the next iteration
-
-    # Step 8: an aspect that never closed becomes a stated limitation rather than
-    # vanishing. `_render_observations_block` already renders gaps as "Unresolved (do not
-    # assert as fact)", so there is no synthesis-side change. Ordered before the degraded
-    # caveat so a non-converged run reads "here is specifically what is missing" rather
-    # than the generic caveat alone. Depends on §1c: without the gaps-union fix a later
-    # report with gaps=[] would wipe these before they are read.
-    # Snapshot coverage *before* the step-8 gaps below, which mark every remaining key
-    # addressed. Reading it afterwards would score an unresolved key as covered and make
-    # plan_covered/plan_seeded — step 9's kill criterion — permanently 1.0.
-    state.plan_covered_at_stop = len(state.plan.keys() & state.addressed)
-
-    for aspect in open_aspects(state):
-        stats = state.aspect_stats.get(aspect)
-        # D6: a permanently-open aspect whose every search errored is a backend failure,
-        # not an absence in the corpus. Saying "not in the documents" there would be
-        # confidently, silently wrong.
-        if stats is not None and stats.searches > 0 and stats.errored == stats.searches:
-            gap = f"Could not be checked — document search was unavailable: {state.plan[aspect]}"
-        else:
-            gap = f"Not resolved: {state.plan[aspect]}"
-        # Only the analytical envelope has a `gaps` field to carry these. On the extraction
-        # path an unreported entity is already surfaced by `_inject_unsearched_stubs`, and
-        # forcing a kind here would make an all-failed run project the wrong shape.
-        state.findings.add_gap(gap, closes=aspect, establishes_kind=is_analytical)
+        state.convergence_reason = "deadline"
+    iterations_run = state.iteration + 1
 
     logger.debug(
         "agent_synthesis_starting",
@@ -1198,7 +1296,12 @@ async def run_loop(
         },
     )
 
-    meta = build_meta(state, iterations_run)
+    meta = build_meta(
+        state,
+        iterations_run,
+        prompt_version=prompt_name,
+        rewrite_model=None if is_analytical else rewrite_model_id,
+    )
     # Terminal state, attached to the enclosing "agent_loop" chain span (opened by the
     # caller, current here since no per-turn span is open past the loop) — otherwise a
     # non-converged/degraded run's final ledger contents are only reconstructable by
@@ -1206,9 +1309,15 @@ async def run_loop(
     lf = lf_client.get_client()
     if lf:
         with contextlib.suppress(Exception):
-            lf.update_current_span(metadata={"final_state": debug_snapshot(state)})
-    # Serve the ledger projection, not a single accepted candidate: a non-converged run
-    # now yields its accumulated partial findings marked degraded, instead of None →
-    # raw-excerpt fallback (P1-6). None only when no finalizer was ever attempted.
-    findings = state.findings.projection(degraded=not state.sealed)
+            lf.update_current_span(metadata={"final_state": snapshot(state)})
+    # Serve the ledger projection: a non-converged run yields its accumulated partial
+    # findings marked degraded. None only when no report was ever attempted.
+    # Keys still open are stated as limitations rather than vanishing. Only the analytical
+    # envelope carries gaps; on extraction an unreported entity is surfaced by
+    # `_inject_unsearched_stubs` instead.
+    findings = state.findings.projection(
+        analytical=is_analytical,
+        degraded=not state.sealed,
+        unresolved=unresolved_lines(state) if is_analytical else (),
+    )
     return state.evidence, findings, meta
