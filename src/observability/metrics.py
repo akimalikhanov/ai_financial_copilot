@@ -174,10 +174,10 @@ CITATION_REFS_DROPPED = Counter(
     "citation_refs_dropped_total",
     "Finding citations dropped (no excerpt in synthesis context)",
 )
-REVIVED_CHUNKS_PER_TURN = Histogram(
-    "agent_revived_chunks_per_turn",
-    "Evicted-then-re-returned chunks re-emitted under their original label",
-    buckets=(0, 1, 2, 3, 5, 10),
+AGENT_LAST_TURN_INPUT_TOKENS = Histogram(
+    "agent_last_turn_input_tokens",
+    "Tool-model input tokens on a run's last call: the size the transcript reached",
+    buckets=(2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000),
 )
 AGENT_TOOL_DURATION = Histogram(
     "agent_tool_duration_seconds",

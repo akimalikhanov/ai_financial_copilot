@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from src.schemas.chat import Turn
+
 
 class ExtractedEntity(BaseModel):
     name: str
@@ -27,9 +29,8 @@ class ChatScope(BaseModel):
 class RouterInput(BaseModel):
     query: str
     scope: ChatScope | None = None
-    # Full loaded tail; the router caps it to ROUTER_HISTORY_TURNS pairs and truncates
-    # assistant turns to 150 tokens when building its prompt.
-    conversation_history: list[dict] = []
+    # Every prior turn: the router indexes all of them and shows the recent ones in full.
+    prior_turns: list[Turn] = []
     # Prior turn's findings block: lets the router tell a follow-up answerable from
     # already-retrieved data from one that needs a new value out of the corpus.
     prior_findings_block: str | None = None

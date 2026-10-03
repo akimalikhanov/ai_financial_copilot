@@ -47,7 +47,7 @@ from src.repository import ConversationRepository, LLMRequestRepository, Message
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
-from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput
+from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput, RouterOutput
 from src.services.chat.agent import run_agent
 from src.services.chat.agent import tools as agent_tools
 from src.services.chat.agent.loop import prompt_and_tools, tool_model_chain
@@ -66,6 +66,7 @@ from src.services.chat.events import (
 )
 from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
+from src.services.context.turns import prior_turns
 from src.services.llm_router import FallbackStream, LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval import query_transformer
@@ -181,6 +182,24 @@ def _latest_findings_block(
                 m.findings_block, next_hops, m.findings_block_doc_ids, "carried"
             )
     return _CarriedFindings(None, 0, None, "none")
+
+
+def _turn_summary(
+    router_output: RouterOutput | None, scope: DocumentScopeResult | None
+) -> schemas.TurnSummary | None:
+    """This turn's line in later turns' session index: what the router resolved."""
+    if router_output is None:
+        return None
+    if scope is not None and scope.per_entity_doc_ids:
+        entities = sorted(scope.per_entity_doc_ids)
+    else:
+        entities = [e.name for e in router_output.entities]
+    return schemas.TurnSummary(
+        route=router_output.route,
+        query_shape=router_output.query_shape,
+        entities=entities,
+        doc_count=len(scope.doc_ids) if scope is not None and scope.doc_ids is not None else None,
+    )
 
 
 def _scope_moved(before: list[str] | None, now: list[str] | None) -> bool:
@@ -640,6 +659,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     logger.info("pipeline.injection_blocked", extra={"request_id": request_id})
                     return
 
+            # Prior questions were written to the tail raw at the API layer; the scan above
+            # covered only the current one, so `prior_turns` scans each of them.
+            state.prior_turns = prior_turns(
+                state.context_messages,
+                scan=get_injection_scan_user_input_enabled(),
+                request_id=request_id,
+            )
+
             # 3. route_query
             await _log_stage("route_query")
             router = _get_router()
@@ -659,12 +686,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             router_input = RouterInput(
                 query=state.user_query_raw,
                 scope=chat_scope,
-                # context_messages ends with the current user turn, which `query` already
-                # carries — drop it so the router isn't shown the same question twice.
-                conversation_history=[
-                    {"role": m.role.value, "content": m.content}
-                    for m in (state.context_messages or [])[:-1]
-                ],
+                prior_turns=state.prior_turns,
                 prior_findings_block=prior_findings.block,
             )
             # Release before the router's LLM call. update_status above only flushes, and the
@@ -864,6 +886,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
+                                "last_turn_input_tokens": agent_meta.last_turn_input_tokens,
                             },
                         )
                         lf_trace_id = UUID(request_id).hex
@@ -982,7 +1005,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})
             state.adapter_messages = assemble_prompt(
-                history=state.context_messages,
+                prior=state.prior_turns,
                 system_prompt=get_system_prompt(version=prompt_version),
                 rag_context=state.rag_context_str,
                 user_query=state.user_query_raw,
@@ -993,7 +1016,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     input={
                         "prompt_version": prompt_version,
                         "num_chunks": num_chunks,
-                        "context_messages": len(state.context_messages),
+                        "prior_turns": len(state.prior_turns),
                     },
                     output={
                         "num_messages": len(state.adapter_messages),
@@ -1212,6 +1235,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "uncited_claim_rate": m.uncited_claim_rate,
                             "search_arg_errors": m.search_arg_errors,
                             "report_parse_failures": m.report_parse_failures,
+                            "last_turn_input_tokens": m.last_turn_input_tokens,
                         }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,
@@ -1242,6 +1266,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     citation_meta["route"] = (
                         state.router_output.route if state.router_output else None
                     )
+                    turn_summary = _turn_summary(state.router_output, state.scope_result)
+                    if turn_summary is not None:
+                        citation_meta["turn_summary"] = turn_summary.model_dump()
                     if degraded:
                         citation_meta["degraded_retrieval"] = degraded
 
@@ -1347,6 +1374,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             answer_derived_from_carryover=state.answer_derived_from_carryover,
                             findings_block_hops=state.findings_block_hops,
                             findings_block_doc_ids=citation_meta.get("findings_block_doc_ids"),
+                            turn_summary=turn_summary,
                         )
                     except Exception:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})

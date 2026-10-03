@@ -216,8 +216,9 @@ def get_chat_tail_ttl() -> int:
 
 
 def get_chat_tail_max_messages() -> int:
-    """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 50)."""
-    return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
+    """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 70). The tail is
+    every model's history source, so it must hold a 30-turn session (60 messages)."""
+    return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "70"))
 
 
 def get_chat_events_maxlen() -> int:
@@ -339,6 +340,77 @@ def get_followup_max_inherit_hops() -> int:
     (FOLLOWUP_MAX_INHERIT_HOPS, default 3). Past the cap the block is dropped, so the
     router sees no carried data and the next follow-up re-retrieves."""
     return int(os.getenv("FOLLOWUP_MAX_INHERIT_HOPS", "3"))
+
+
+# --- Conversation history (prior turns), one budget per model ---
+# MAX_ANSWER_TOKENS=0 keeps answers whole. STEP: the window may start only at a turn index
+# that is a multiple of it, so the cached prompt prefix holds between moves.
+def get_router_history_budget_tokens() -> int:
+    """Recent-turn history the router sees (ROUTER_HISTORY_BUDGET_TOKENS, default 2000)."""
+    return int(os.getenv("ROUTER_HISTORY_BUDGET_TOKENS", "2000"))
+
+
+def get_router_history_max_answer_tokens() -> int:
+    """Per-answer cap in the router's history (ROUTER_HISTORY_MAX_ANSWER_TOKENS, default
+    400). Long enough to keep the list or table a "the second one" refers to."""
+    return int(os.getenv("ROUTER_HISTORY_MAX_ANSWER_TOKENS", "400"))
+
+
+def get_router_history_step() -> int:
+    """Window step for the router's history (ROUTER_HISTORY_STEP, default 1)."""
+    return int(os.getenv("ROUTER_HISTORY_STEP", "1"))
+
+
+def get_router_session_index_question_chars() -> int:
+    """Question length per line of the router's session index
+    (ROUTER_SESSION_INDEX_QUESTION_CHARS, default 80)."""
+    return int(os.getenv("ROUTER_SESSION_INDEX_QUESTION_CHARS", "80"))
+
+
+def get_agent_history_budget_tokens() -> int:
+    """Recent-turn history the agent tool model sees (AGENT_HISTORY_BUDGET_TOKENS,
+    default 4000)."""
+    return int(os.getenv("AGENT_HISTORY_BUDGET_TOKENS", "4000"))
+
+
+def get_agent_history_max_answer_tokens() -> int:
+    """Per-answer cap in the tool model's history (AGENT_HISTORY_MAX_ANSWER_TOKENS,
+    default 800)."""
+    return int(os.getenv("AGENT_HISTORY_MAX_ANSWER_TOKENS", "800"))
+
+
+def get_agent_history_step() -> int:
+    """Window step for the tool model's history (AGENT_HISTORY_STEP, default 1)."""
+    return int(os.getenv("AGENT_HISTORY_STEP", "1"))
+
+
+def get_answer_history_budget_tokens() -> int:
+    """Recent-turn history the answering model sees (ANSWER_HISTORY_BUDGET_TOKENS,
+    default 12000)."""
+    return int(os.getenv("ANSWER_HISTORY_BUDGET_TOKENS", "12000"))
+
+
+def get_answer_history_max_answer_tokens() -> int:
+    """Per-answer cap in the answering model's history (ANSWER_HISTORY_MAX_ANSWER_TOKENS,
+    default 0: whole turns, since a cut answer loses its conclusion and table totals)."""
+    return int(os.getenv("ANSWER_HISTORY_MAX_ANSWER_TOKENS", "0"))
+
+
+def get_answer_history_step() -> int:
+    """Window step for the answering model's history (ANSWER_HISTORY_STEP, default 5)."""
+    return int(os.getenv("ANSWER_HISTORY_STEP", "5"))
+
+
+def get_agent_shown_heading_chars() -> int:
+    """Heading length when a search result names a chunk already shown
+    ("Already shown above: S3 <heading>") (AGENT_SHOWN_HEADING_CHARS, default 40)."""
+    return int(os.getenv("AGENT_SHOWN_HEADING_CHARS", "40"))
+
+
+def get_agent_trace_chunk_chars() -> int:
+    """Chunk text kept per search hit on the agent turn's trace span; the full text is in
+    the next turn's GENERATION input (AGENT_TRACE_CHUNK_CHARS, default 200)."""
+    return int(os.getenv("AGENT_TRACE_CHUNK_CHARS", "200"))
 
 
 # --- Redis ---
@@ -881,13 +953,6 @@ def get_query_router_prompt_version() -> str:
     """Router prompt version (QUERY_ROUTER_PROMPT_VERSION, default v4). v3 has no
     follow-up carry-over guidance — set it to roll back routing behavior."""
     return os.getenv("QUERY_ROUTER_PROMPT_VERSION", "v4")
-
-
-def get_router_history_turns() -> int:
-    """User/assistant pairs of prior conversation shown to the router
-    (ROUTER_HISTORY_TURNS, default 3). Enough to resolve coreference; the findings
-    digest carries the substance."""
-    return int(os.getenv("ROUTER_HISTORY_TURNS", "3"))
 
 
 def get_query_router_model() -> str:

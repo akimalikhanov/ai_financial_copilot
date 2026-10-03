@@ -36,6 +36,7 @@ def _db_message_to_chat_message(message: Message) -> schemas.ChatMessage:
         answer_derived_from_carryover=bool(meta.get("answer_derived_from_carryover", False)),
         findings_block_hops=int(meta.get("findings_block_hops", 0) or 0),
         findings_block_doc_ids=meta.get("findings_block_doc_ids"),
+        turn_summary=meta.get("turn_summary"),
     )
 
 
@@ -107,6 +108,7 @@ class ConversationHistory:
         answer_derived_from_carryover: bool = False,
         findings_block_hops: int = 0,
         findings_block_doc_ids: list[str] | None = None,
+        turn_summary: schemas.TurnSummary | None = None,
     ) -> None:
         await append_chat_tail(
             self._redis,
@@ -118,6 +120,7 @@ class ConversationHistory:
                 answer_derived_from_carryover=answer_derived_from_carryover,
                 findings_block_hops=findings_block_hops,
                 findings_block_doc_ids=findings_block_doc_ids,
+                turn_summary=turn_summary,
             ).model_dump(mode="json"),
             seq,
         )

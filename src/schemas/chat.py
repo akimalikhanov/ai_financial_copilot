@@ -28,6 +28,35 @@ class Role(str, Enum):
     tool = "tool"
 
 
+class TurnSummary(BaseModel):
+    """What the router resolved for a turn, stored on its answer for the session index.
+    Router-resolved fields only, never model-written prose."""
+
+    model_config = ConfigDict(frozen=True)
+
+    route: str
+    query_shape: str | None = None
+    entities: list[str] = []
+    # Documents the turn was scoped to; None means all of the user's documents.
+    doc_count: int | None = None
+
+
+class Turn(BaseModel):
+    """One prior question and its answer, the only shape conversation history takes.
+
+    No field can hold a findings block, so a carried block cannot reach any model's
+    history through here (Contract F1).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int  # position in the loaded tail, counting dropped turns
+    question: str  # sanitized
+    answer: str | None  # None when the turn produced no answer
+    from_carryover: bool = False
+    summary: TurnSummary | None = None
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -35,6 +64,8 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    # Set on an answer: what the router resolved for its turn (session index).
+    turn_summary: TurnSummary | None = None
     # Rendered findings/observations block, for the router and synthesis only.
     # Contract F1: must never reach the agent transcript.
     findings_block: str | None = None
@@ -62,6 +93,8 @@ class ChatPipelineState:
     assistant_seq: int = 0
     history: ConversationHistory | None = None
     context_messages: list[ChatMessage] | None = None
+    # Prior turns from `prior_turns()`; each model caps and formats its own view.
+    prior_turns: list[Turn] = field(default_factory=list)
     user_query_raw: str = ""
     router_output: RouterOutput | None = None
     scope_result: DocumentScopeResult | None = None

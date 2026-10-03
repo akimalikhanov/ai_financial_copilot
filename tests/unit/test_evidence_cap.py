@@ -109,7 +109,7 @@ def _routed_llm(adapter: Any) -> RoutedLLM:
 @pytest.fixture(autouse=True)
 def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "3")
-    monkeypatch.setenv("AGENT_TOKEN_BUDGET", "1000000")
+    monkeypatch.setenv("AGENT_COST_BUDGET_USD", "100")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "1")
     monkeypatch.setenv("AGENT_MAX_CHUNKS_PER_ENTITY", "2")
 

@@ -42,7 +42,9 @@ class AgentSettings(BaseModel):
 
     tool_model: str
     max_iterations: int = Field(ge=1, le=20)
-    token_budget: int = Field(ge=1000)
+    # Run spend across every model, priced as billed: output and reasoning at the output
+    # rate, cached input at the cached rate. A model with no pricing adds nothing.
+    cost_budget_usd: float = Field(gt=0)
     max_concurrent_searches: int = Field(ge=1, le=16)
     max_chunks_per_entity: int = Field(ge=1)
     # Consecutive turns with no new chunks and no key closed before Stop("convergence").
@@ -55,15 +57,9 @@ class AgentSettings(BaseModel):
     deadline_seconds: float = Field(gt=0)
     # Analytical runs open several aspects and corroborate each, so they get more turns.
     max_iterations_analytical: int = Field(ge=1, le=20)
-    # Prior conversation is resent on every turn, so it is capped in turns and tokens.
-    history_turns: int = Field(ge=0)
-    history_assistant_tokens: int = Field(ge=1)
     # Ceiling on loop-minted plan entries. Near-duplicate sub_questions each mint their
     # own id (no fuzzy matching), so this is what bounds the cost of that choice.
     max_plan_items: int = Field(ge=1)
-    # Per-turn cap on revivals, so a search re-returning a large evicted set cannot
-    # reinflate what transcript compaction just shrank.
-    max_revivals_per_turn: int = Field(ge=0)
 
     def max_iterations_for(self, shape: str | None) -> int:
         return self.max_iterations_analytical if shape == "analytical" else self.max_iterations
@@ -76,17 +72,14 @@ def get_agent_settings() -> AgentSettings:
     return AgentSettings(
         tool_model=os.getenv("AGENT_TOOL_MODEL", get_query_transformer_model()),
         max_iterations=max_iterations,
-        token_budget=int(os.getenv("AGENT_TOKEN_BUDGET", "150000")),
+        cost_budget_usd=float(os.getenv("AGENT_COST_BUDGET_USD", "0.10")),
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
         max_chunks_per_entity=int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
         max_empty_rounds=int(os.getenv("AGENT_MAX_EMPTY_ROUNDS", "1")),
         turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
         deadline_seconds=float(os.getenv("AGENT_DEADLINE_SECONDS", "180")),
         max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "7")),
-        history_turns=int(os.getenv("AGENT_HISTORY_TURNS", "2")),
-        history_assistant_tokens=int(os.getenv("AGENT_HISTORY_ASSISTANT_TOKENS", "600")),
         max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "6")),
-        max_revivals_per_turn=int(os.getenv("AGENT_MAX_REVIVALS_PER_TURN", "3")),
     )
 
 
@@ -124,7 +117,7 @@ class AgentRunState:
     settings: AgentSettings
     max_iterations: int  # settings.max_iterations_for(query_shape)
 
-    # --- transcript: the model's view. Lossy, compactable, never authoritative. ---
+    # --- transcript: the model's view. Append-only, never authoritative. ---
     transcript: Transcript
 
     # --- durable record: complete, never truncated ---
@@ -162,6 +155,9 @@ class AgentRunState:
     # Tool calls whose arguments failed schema validation; each one costs a turn.
     search_arg_errors: int = 0
     report_parse_failures: int = 0
+    # Input tokens of the latest tool-model call. The transcript is append-only, so this
+    # is how large it grew; it is the signal for adding an overflow valve.
+    last_turn_input_tokens: int = 0
 
     @property
     def addressed(self) -> set[str]:
@@ -197,8 +193,11 @@ class AgentRunState:
     def input_tokens_total(self) -> int:
         return sum(ts.input_tokens for ts in self.spend.values())
 
+    def cost_usd_total(self) -> float:
+        return sum(ts.cost_usd for ts in self.spend.values())
+
     def spend_within_budget(self) -> bool:
-        return self.input_tokens_total() <= self.settings.token_budget
+        return self.cost_usd_total() <= self.settings.cost_budget_usd
 
 
 @dataclass
@@ -209,10 +208,12 @@ class AgentLoopMeta:
     # False means the served findings are a degraded projection of accumulated partial
     # findings: the plan was not covered.
     sealed: bool = False
-    # Summed across the tool model and the query-rewrite model; the budget cap checks it.
+    # Summed across the tool model and the query-rewrite model; the budget cap checks cost.
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     cost_usd_total: float = 0.0
+    # Input tokens of the run's last tool-model call: the size the transcript reached.
+    last_turn_input_tokens: int = 0
     # Entities the loop actually called search_documents for — the synthesis boundary uses
     # this (not reported coverage) to label stubs for entities the agent never searched.
     searched_entities: frozenset[str] = field(default_factory=frozenset)
@@ -268,10 +269,10 @@ def render_status(state: AgentRunState) -> str | None:
     """Coverage status, computed per call and appended last — never stored.
 
     Keys and sub-questions only, never claim bodies: the model has nothing to copy, so it
-    cannot restate an earlier conclusion instead of reporting a new one. Being a computed
-    view makes it the single source of coverage truth — the report result's own open list
-    goes stale, and this wins by recency. The stall nudge lives here too rather than being
-    appended once and never removed.
+    cannot restate an earlier conclusion instead of reporting a new one. It is the only
+    place coverage is stated: nothing stored in the transcript states it, so nothing there
+    goes stale. The stall nudge lives here too rather than being appended once and never
+    removed.
     """
     if not state.plan:
         return None
@@ -348,7 +349,7 @@ def build_meta(
         sealed=state.sealed,
         input_tokens_total=state.input_tokens_total(),
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
-        cost_usd_total=sum(ts.cost_usd for ts in state.spend.values()),
+        cost_usd_total=state.cost_usd_total(),
         searched_entities=frozenset(state.searched_entities),
         degraded_capabilities=frozenset(state.degraded_capabilities),
         scores_are_rerank=state.scores_are_rerank,
@@ -361,6 +362,7 @@ def build_meta(
         uncited_claim_rate=state.findings.uncited_claim_rate(),
         search_arg_errors=state.search_arg_errors,
         report_parse_failures=state.report_parse_failures,
+        last_turn_input_tokens=state.last_turn_input_tokens,
         prompt_version=prompt_version,
         rewrite_model=rewrite_model,
     )

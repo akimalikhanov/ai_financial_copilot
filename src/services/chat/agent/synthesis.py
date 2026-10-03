@@ -118,7 +118,7 @@ async def run_synthesis(
     ordered = evidence.ordered_chunks()
     # The fallback pool is what the model could actually read: falling back to excerpts
     # it never saw would let synthesis cite text no reasoning was ever grounded in.
-    fallback = evidence.rendered_chunks()[:max_chunks_per_entity]
+    fallback = evidence.labelled_chunks()[:max_chunks_per_entity]
 
     findings = agent_findings
     processed: ProcessedFindings | None = None

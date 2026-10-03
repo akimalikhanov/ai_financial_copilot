@@ -35,6 +35,8 @@ template: |
 
   Extract all companies, funds, indices, and persons mentioned or implied. Use recent conversation turns to resolve coreferences ("their", "that company", "same period").
 
+  The user message may include a **Session** list with one line per earlier turn (T1, T2, …): its route, the entities it resolved, how many documents it searched, and the question asked. Use it for references to turns no longer shown in full ("go back to the Siemens comparison", "same years as before").
+
   If an active document scope is present, resolve coreferences ("the company", "they", "it") to the scoped company first — conversation history is secondary.
 
   For each entity:

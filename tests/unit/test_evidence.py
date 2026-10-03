@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import UUID, uuid4
 
+import pytest
+
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent.evidence import EvidenceLedger
 
@@ -102,8 +104,8 @@ class TestAssignLabels:
         assert unresolved == []
 
 
-class TestRenderedChunks:
-    def test_only_rendered_chunks_are_returned(self) -> None:
+class TestLabelledChunks:
+    def test_only_labelled_chunks_are_returned(self) -> None:
         """Admitted-but-never-rendered chunks are not a legitimate synthesis fallback —
         the model never saw them."""
         ledger = EvidenceLedger()
@@ -111,19 +113,37 @@ class TestRenderedChunks:
         ledger.admit([shown, unshown])
         ledger.assign_labels([shown], {shown.chunk_id: _payload(shown)})
 
-        assert [c.chunk_id for c in ledger.rendered_chunks()] == [shown.chunk_id]
+        assert [c.chunk_id for c in ledger.labelled_chunks()] == [shown.chunk_id]
 
-    def test_evicted_chunk_leaves_the_rendered_set(self) -> None:
+
+class TestShownBefore:
+    def test_names_earlier_labels_with_their_heading(self) -> None:
         ledger = EvidenceLedger()
-        c1 = _chunk()
-        ledger.admit([c1])
-        ctx = ledger.assign_labels([c1], {c1.chunk_id: _payload(c1)})
+        old = replace(_chunk(), heading_trail=["Annual Report", "Consolidated Statements"])
+        new = _chunk()
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
 
-        ledger.mark_evicted([ctx.items[0].ref_id])
-        assert ledger.rendered_chunks() == []
-        # ...but it still resolves — Contract C1 is untouched by eviction.
-        resolved, _ = ledger.resolve_refs([ctx.items[0].ref_id])
-        assert resolved == [str(c1.chunk_id)]
+        assert ledger.shown_before([new, old]) == ["S1 Consolidated Statements"]
+
+    def test_long_headings_are_cut_to_the_configured_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_SHOWN_HEADING_CHARS", "12")
+        ledger = EvidenceLedger()
+        old = replace(_chunk(), heading_trail=["x" * 60])
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
+
+        assert ledger.shown_before([old]) == ["S1 " + "x" * 12 + "…"]
+
+    def test_a_chunk_without_a_heading_is_named_by_label(self) -> None:
+        ledger = EvidenceLedger()
+        old = _chunk()
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
+
+        assert ledger.shown_before([old]) == ["S1"]
 
 
 class TestContractC2:

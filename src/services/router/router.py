@@ -16,6 +16,7 @@ from src.schemas.query_router import (
     RouterInput,
     RouterOutput,
 )
+from src.services.context.turns import cap_turns, router_history, session_index
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
@@ -26,7 +27,6 @@ from src.utils.config import (
     get_query_router_model,
     get_query_router_prompt_version,
     get_router_config,
-    get_router_history_turns,
 )
 from src.utils.json_schema import build_response_format
 
@@ -51,15 +51,6 @@ def _router_response_format() -> dict:
     return build_response_format("query_router", RouterOutput.model_json_schema())
 
 
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Rough token estimation: ~1 token per 4 chars. Truncates aggressively to stay under limit."""
-    token_count = len(text) // 4
-    if token_count <= max_tokens:
-        return text
-    char_limit = max_tokens * 4
-    return text[:char_limit].rstrip() + "..."
-
-
 def _digest_findings_block(block: str, max_chars: int = 1500) -> str:
     """Strip a findings block down to what the router needs to classify a follow-up.
 
@@ -79,38 +70,27 @@ def _digest_findings_block(block: str, max_chars: int = 1500) -> str:
     return digest[:max_chars] if len(digest) > max_chars else digest
 
 
-def _cap_turns(history: list[dict], max_turns: int) -> list[dict]:
-    """Keep the last `max_turns` user/assistant pairs. A turn starts at its user message,
-    so the window never opens on an answer whose question was dropped."""
-    if max_turns <= 0:
-        return []
-    user_idx = [i for i, t in enumerate(history) if t.get("role") == "user"]
-    if len(user_idx) <= max_turns:
-        return history
-    return history[user_idx[-max_turns] :]
+def _build_messages(inp: RouterInput, system: str) -> list[ChatMessage]:
+    """The router's one user message: scope, carried findings digest, the session index,
+    the recent turns, then the query.
 
-
-def _build_messages(
-    inp: RouterInput, system: str, max_assistant_tokens: int = 150
-) -> list[ChatMessage]:
-    """Build router messages with assistant turns truncated to token budget.
-
-    Args:
-        inp: Router input with query and conversation history
-        system: System prompt
-        max_assistant_tokens: Max tokens per assistant turn (default 150 per spec)
+    The index covers every prior turn, so a reference to a turn outside the recent window
+    ("go back to the Siemens comparison") still resolves.
     """
     history_block = ""
-    if inp.conversation_history:
-        turns = []
-        for turn in _cap_turns(inp.conversation_history, get_router_history_turns()):
-            role = turn.get("role", "user")
-            content = turn.get("content", "")
-            # Truncate assistant turns to stay within token budget
-            if role == "assistant":
-                content = _truncate_to_tokens(content, max_assistant_tokens)
-            turns.append(f"{role}: {content}")
-        history_block = "Recent conversation:\n" + "\n".join(turns) + "\n\n"
+    if inp.prior_turns:
+        lines: list[str] = []
+        for t in cap_turns(inp.prior_turns, router_history()):
+            lines.append(f"user: {t.question}")
+            if t.answer is not None:
+                lines.append(f"assistant: {t.answer}")
+        history_block = (
+            "Session:\n"
+            + session_index(inp.prior_turns)
+            + "\n\nRecent conversation:\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
 
     scope_block = ""
     if inp.scope is not None:
@@ -185,7 +165,7 @@ async def route_query(
         return _FALLBACK, None
 
     response_format = _router_response_format()
-    messages = _build_messages(inp, system, max_assistant_tokens=150)
+    messages = _build_messages(inp, system)
 
     cfg = get_router_config()
     request_params = {

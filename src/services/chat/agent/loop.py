@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from src.observability import langfuse as lf_client
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
+    AGENT_LAST_TURN_INPUT_TOKENS,
     AGENT_TOOL_ARG_ERRORS,
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
@@ -56,8 +57,9 @@ from src.services.chat.agent.state import (
     unresolved_lines,
 )
 from src.services.chat.agent.tools import SearchDocumentsArgs
-from src.services.chat.agent.transcript import Transcript, cap_history
+from src.services.chat.agent.transcript import Transcript
 from src.services.chat.events import build_activity_event
+from src.services.context.turns import as_messages, cap_turns, tool_model_history
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -70,12 +72,10 @@ from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
 from src.services.retrieval.query_transformer import rewrite_query
-from src.services.security.injection_detector import scan_user_input
-from src.utils.config import get_injection_scan_user_input_enabled, get_query_transformer_model
+from src.utils.config import get_agent_trace_chunk_chars, get_query_transformer_model
 
 if TYPE_CHECKING:
-    from src.schemas.chat import ChatMessage as SchemaChatMessage
-    from src.schemas.chat import ChatPipelineState
+    from src.schemas.chat import ChatPipelineState, Turn
     from src.services.llm_router import LLMRouter, RoutedLLM
     from src.services.retrieval.reranker import Reranker
 
@@ -162,7 +162,7 @@ class TurnFacts:
 
     searches: int
     backend_failures: int
-    new_chunks: int
+    new_labels: int  # chunks shown to the model for the first time this turn
     closed: frozenset[str]  # plan keys that produced their first finding this turn
 
 
@@ -501,11 +501,11 @@ def _drop_unsearched_negatives(
 def _render_report_result(
     state: AgentRunState, closed: set[str], unknown: set[str], unsearched: set[str]
 ) -> str:
-    """The tool result for one report: what landed, what didn't, and what is still open.
+    """The tool result for one report: what landed and what didn't, nothing else.
 
-    Deliberately echoes only *this turn's* change plus the open list. That open list goes
-    stale as the run proceeds, which is acceptable because the status view (appended last
-    on every subsequent call) is the single source of coverage truth and wins by recency.
+    It never states coverage. The transcript is append-only, so an open list here would
+    stay on screen and go stale; the status view (appended last on every call) is the
+    only view of what is still open.
     """
     parts: list[str] = []
     # Split on what actually landed, not on what was claimed: with no mid-loop gap
@@ -543,11 +543,6 @@ def _render_report_result(
         )
     if not parts:
         parts.append("Nothing was recorded — no known key was reported.")
-    still_open = open_aspects(state)
-    if still_open:
-        parts.append("Open: " + ", ".join(f"{a} ({state.plan[a]})" for a in still_open))
-    else:
-        parts.append("All planned items are now reported.")
     return " ".join(parts)
 
 
@@ -612,21 +607,23 @@ def fold_searches(
     results: list[_SearchResult],
     minted: dict[str, str | None],
     rewrite_model_id: str,
-) -> tuple[dict[str, str], list[int]]:
+) -> tuple[dict[str, str], list[int], dict[str, object]]:
     """Fold one turn's search results into the state, in call order.
 
-    Returns the tool-result text per call id and the count of newly admitted chunks per
-    search. No awaits and no I/O: labels are assigned here, sequentially, so S-labels
-    continue across searches instead of restarting at S1, and stay deterministic however
-    the concurrent searches finished.
+    Returns the tool-result text per call id, the count of new labels each search
+    showed the model, and a trace view per call id (chunk ids with trimmed text — the
+    full text already lands in the next turn's GENERATION input). No awaits and no I/O:
+    labels are assigned here, sequentially, so S-labels continue across searches instead
+    of restarting at S1, and stay deterministic however the concurrent searches finished.
     """
     texts: dict[str, str] = {}
+    traces: dict[str, object] = {}
     new_per_search: list[int] = []
+    trace_chars = get_agent_trace_chunk_chars()
     for tc, result in zip(searches, results, strict=True):
         if result.rewrite_stats:
             state.record_spend(rewrite_model_id, result.rewrite_stats)
         entity_new = state.evidence.admit(result.chunks)
-        new_per_search.append(entity_new)
         if result.entity:
             state.searched_entities.add(result.entity)
         state.degraded_capabilities |= result.degraded
@@ -648,21 +645,40 @@ def fold_searches(
                 stats.errored += 1
 
         if result.error_str is not None:
-            texts[tc.id] = result.error_str
+            texts[tc.id] = traces[tc.id] = result.error_str
+            new_per_search.append(0)
             continue
         # Admit the full result above for provenance, but render only the top-N into the
         # transcript — uncapped tool results are the biggest per-turn token cost. The
         # record stays complete; only the view is capped.
-        ctx = state.evidence.assign_labels(
-            result.chunks[: state.settings.max_chunks_per_entity],
-            result.payloads,
-            max_revivals=state.settings.max_revivals_per_turn,
-        )
-        body = ctx.formatted_context or "(no results)"
+        top = result.chunks[: state.settings.max_chunks_per_entity]
+        # A chunk an earlier search rendered is still on screen, so it is named, not
+        # rendered again. Saying "no results" for it would send the model searching again.
+        shown = state.evidence.shown_before(top)
+        ctx = state.evidence.assign_labels(top, result.payloads)
+        # Progress counts only what the model can read: a chunk admitted below the top-N
+        # cut is never shown, so it can't make a near-repeat search look productive.
+        new_per_search.append(len(ctx.items))
+        parts = [ctx.formatted_context] if ctx.formatted_context else []
+        if shown:
+            parts.append("Already shown above: " + " · ".join(shown))
+        body = "\n\n".join(parts) or "(no results)"
         # The aspect id is echoed back so "reuse the key in brackets" is a copy from
         # adjacent context, not a slug reconstructed from memory.
         texts[tc.id] = f"[{aspect}] {body}" if aspect else body
-    return texts, new_per_search
+        traces[tc.id] = {
+            "aspect": aspect,
+            "chunks": [
+                {
+                    "ref": item.ref_id,
+                    "chunk_id": str(item.chunk_id),
+                    "text": item.prompt_text[:trace_chars],
+                }
+                for item in ctx.items
+            ],
+            "already_shown": shown,
+        }
+    return texts, new_per_search, traces
 
 
 def fold_reports(
@@ -693,14 +709,14 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
         return Stop("covered")
 
     # A dead backend is not an empty corpus: without this stop it produces
-    # new_chunks == 0 and the model is told to reformulate while burning its budget.
+    # new_labels == 0 and the model is told to reformulate while burning its budget.
     if facts.searches and facts.backend_failures == facts.searches:
         return Stop("search_unavailable")
 
-    # Progress = new chunks *or* a key closed. A turn that settles a key from evidence
-    # already in hand is real progress; without this, resolving the last aspects from
-    # admitted evidence trips convergence one turn before coverage.
-    if facts.new_chunks == 0 and not facts.closed:
+    # Progress = a new label shown *or* a key closed. A turn that settles a key from
+    # evidence already in hand is real progress; without this, resolving the last aspects
+    # from earlier evidence trips convergence one turn before coverage.
+    if facts.new_labels == 0 and not facts.closed:
         state.empty_rounds += 1
         if state.empty_rounds > state.settings.max_empty_rounds:
             return Stop("convergence")
@@ -764,6 +780,7 @@ async def _record_turn_spend(
     if stats is None:
         return
     state.record_spend(llm.model_id, stats)
+    state.last_turn_input_tokens = stats.input_tokens or 0
     if stats.input_tokens:
         LLM_TOKENS.labels("input", llm.model_id).inc(stats.input_tokens)
     if stats.output_tokens:
@@ -858,9 +875,10 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
     # re-dumping all of `state.transcript.messages` on every turn would repeat turn 0's
     # content N times by turn N for no new information.
     status = render_status(state)
-    new_chunks = 0
+    new_labels = 0
     turn: AssistantTurnResult | None = None
     results_by_id: dict[str, str] = {}
+    search_traces: dict[str, object] = {}
     with lf_span(
         f"agent_turn_{iteration}",
         input={
@@ -930,12 +948,12 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
             results = list(
                 await asyncio.gather(*[_guarded_search(tc, state, deps) for tc in searches])
             )
-            search_texts, new_per_search = fold_searches(
+            search_texts, new_per_search, search_traces = fold_searches(
                 state, searches, results, minted, deps.rewrite_model_id
             )
             results_by_id |= search_texts
-            new_chunks = sum(new_per_search)
-            for tc, result, entity_new in zip(searches, results, new_per_search, strict=True):
+            new_labels = sum(new_per_search)
+            for tc, result, search_new in zip(searches, results, new_per_search, strict=True):
                 logger.debug(
                     "tool_call_completed",
                     extra={
@@ -944,7 +962,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                         "entity": result.entity,
                         "aspect": minted.get(tc.id),
                         "chunks_returned": len(result.chunks),
-                        "new_chunks_added": entity_new,
+                        "new_labels": search_new,
                     },
                 )
                 if result.activity_id is not None:
@@ -953,7 +971,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                         event_id=result.activity_id,
                         detail={
                             "chunks_returned": len(result.chunks),
-                            "new_chunks_added": entity_new,
+                            "new_chunks_added": search_new,
                         },
                     )
                     await add_event(deps.redis_app, request_id, "activity", end_data)
@@ -968,18 +986,15 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                     )
                 )
 
-            outcome = decide(
+            return decide(
                 state,
                 TurnFacts(
                     searches=len(searches),
                     backend_failures=sum(r.backend_failed for r in results),
-                    new_chunks=new_chunks,
+                    new_labels=new_labels,
                     closed=closed,
                 ),
             )
-            if isinstance(outcome, Continue):
-                state.transcript.compress(state.evidence)
-            return outcome
         finally:
             if obs:
                 obs.update(
@@ -988,12 +1003,11 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                             {"name": tc.name, "arguments": tc.arguments}
                             for tc in (turn.tool_calls if turn and turn.tool_calls else [])
                         ],
-                        # The `role: tool` results this turn actually appended to the
-                        # transcript, keyed by tool_call_id — what the *next* turn's model
-                        # call will read back. Without this, a search's rendered excerpts or
-                        # a report's fold-in result are visible only inside the next turn's
-                        # full GENERATION input, not on this span.
-                        "tool_results": results_by_id,
+                        # The `role: tool` results this turn appended, keyed by
+                        # tool_call_id. Report results verbatim; a search as chunk ids with
+                        # trimmed text — its full excerpts are in the next turn's
+                        # GENERATION input.
+                        "tool_results": {**results_by_id, **search_traces},
                         # State *after* this turn's effects landed — the structured
                         # counterpart to the prose `status` this span took as input (state
                         # *before* the turn ran).
@@ -1001,7 +1015,8 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                     },
                     metadata={
                         "token_spend_cumulative": state.input_tokens_total(),
-                        "new_chunks": new_chunks,
+                        "cost_usd_cumulative": state.cost_usd_total(),
+                        "new_labels": new_labels,
                     },
                 )
 
@@ -1009,35 +1024,20 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
 CARRYOVER_STUB = "[prior turn: restated earlier results in a different format]"
 
 
-def build_agent_history(
-    history: list[SchemaChatMessage],
-    *,
-    scan: bool,
-    request_id: str = "",
-) -> list[ChatMessage]:
-    """Project conversation history into the agent's transcript.
+def agent_history(turns: Sequence[Turn]) -> list[ChatMessage]:
+    """Prior turns as the tool model sees them, capped to `tool_model_history()`.
 
-    Only role and content cross. `findings_block` cannot reach the agent —
-    ChatMessage here is the frozen/slotted adapter type with no such field — and an
-    answer derived from a carried block is stubbed, since its prose restates numbers the
-    agent has no evidence for.
+    An answer derived from a carried block is stubbed, since its prose restates numbers
+    the agent has no evidence for (Contract F1). Stubbing happens before capping, so the
+    budget counts what is actually sent.
     """
-    out: list[ChatMessage] = []
-    for m in history:
-        content = m.content or ""
-        if m.role.value == "assistant" and m.answer_derived_from_carryover:
-            content = CARRYOVER_STUB
-        elif scan and m.role.value == "user" and content:
-            signal = scan_user_input(content)
-            if signal.severity == "block":
-                logger.info(
-                    "agent_history_turn_blocked",
-                    extra={"request_id": request_id, "matched_rules": signal.matched_rules},
-                )
-                continue
-            content = signal.sanitized_text
-        out.append(ChatMessage(role=Role(m.role.value), content=content))
-    return out
+    stubbed = [
+        t.model_copy(update={"answer": CARRYOVER_STUB})
+        if t.from_carryover and t.answer is not None
+        else t
+        for t in turns
+    ]
+    return as_messages(cap_turns(stubbed, tool_model_history()))
 
 
 # ---------------------------------------------------------------------------
@@ -1166,27 +1166,9 @@ async def run_loop(
     rewrite_model_id = get_query_transformer_model()
 
     system_content = get_system_prompt(version=prompt_name)
-    # context_messages always ends with the current-turn user message (loaded with
-    # before_seq=assistant_seq, which includes it) — drop it here since it's appended
-    # explicitly below via chat_state.user_query_raw (post prompt-injection sanitization).
-    history = (chat_state.context_messages or [])[:-1]
-    # Prior user turns reach the agent unsanitized: `history.append_user` writes the raw
-    # `req.content` at the API layer, while `scan_user_input` runs later in the worker and
-    # rewrites only the *current* turn. So a prior turn that scored "block" — one the
-    # pipeline refused to answer — still lands in the agent transcript verbatim, because
-    # it was written to the chat tail before the task ran. Scan them here: strip invisibles/role markers as the current turn gets, and drop a blocked turn
-    # outright rather than handing the agent the exact text the guardrail rejected.
-    scan = get_injection_scan_user_input_enabled()
-    history_messages = build_agent_history(history, scan=scan, request_id=request_id)
     messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
-        # Uncapped, history is the largest unbounded cost in a turn: up to 50 prior
-        # messages, resent every turn, dwarfing the excerpts they contextualize.
-        *cap_history(
-            history_messages,
-            max_turns=settings.history_turns,
-            max_assistant_chars=settings.history_assistant_tokens * 4,
-        ),
+        *agent_history(chat_state.prior_turns),
     ]
 
     # Inject exact entity names from the router so the agent uses correct strings and
@@ -1209,38 +1191,33 @@ async def run_loop(
     if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
         expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
 
+    # The task is one user message: the scope (entities and years) above the question.
+    scope_block: str | None = None
     if not is_analytical and expected_entities:
         lines: list[str] = []
         for name in sorted(expected_entities):
             years = _entity_years.get(name)
             suffix = f" (available years: {', '.join(str(y) for y in years)})" if years else ""
             lines.append(f"- {name}{suffix}")
-        messages.append(
-            ChatMessage(
-                role=Role.user,
-                content=(
-                    "Entities to search (you MUST call search_documents for each before report_findings).\n"
-                    "Use ONLY the listed years in your search queries — do not guess or invent fiscal years:\n"
-                    + "\n".join(lines)
-                ),
-            )
+        scope_block = (
+            "Entities to search (you MUST call search_documents for each before report_findings).\n"
+            "Use ONLY the listed years in your search queries — do not guess or invent fiscal years:\n"
+            + "\n".join(lines)
         )
     elif is_analytical and _entity_years:
         year_lines = [
             f"- {name}: {', '.join(str(y) for y in years)}"
             for name, years in sorted(_entity_years.items())
         ]
-        messages.append(
-            ChatMessage(
-                role=Role.user,
-                content=(
-                    "Available document years (use ONLY these in search queries — do not invent fiscal years):\n"
-                    + "\n".join(year_lines)
-                ),
-            )
+        scope_block = (
+            "Available document years (use ONLY these in search queries — do not invent fiscal years):\n"
+            + "\n".join(year_lines)
         )
 
-    messages.append(ChatMessage(role=Role.user, content=chat_state.user_query_raw))
+    task = chat_state.user_query_raw
+    if scope_block is not None:
+        task = f"{scope_block}\n\nQuestion: {chat_state.user_query_raw}"
+    messages.append(ChatMessage(role=Role.user, content=task))
 
     state = AgentRunState(
         settings=settings,
@@ -1286,6 +1263,8 @@ async def run_loop(
         )
         state.convergence_reason = "deadline"
     iterations_run = state.iteration + 1
+    if state.last_turn_input_tokens:
+        AGENT_LAST_TURN_INPUT_TOKENS.observe(state.last_turn_input_tokens)
 
     logger.debug(
         "agent_synthesis_starting",

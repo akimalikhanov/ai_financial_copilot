@@ -36,17 +36,14 @@ def _settings(**overrides: object) -> AgentSettings:
     defaults: dict[str, object] = {
         "tool_model": "gpt-test",
         "max_iterations": 5,
-        "token_budget": 150_000,
+        "cost_budget_usd": 0.10,
         "max_concurrent_searches": 3,
         "max_chunks_per_entity": 5,
         "max_empty_rounds": 1,
         "turn_timeout_seconds": 60.0,
         "deadline_seconds": 180.0,
         "max_iterations_analytical": 7,
-        "history_turns": 2,
-        "history_assistant_tokens": 600,
         "max_plan_items": 8,
-        "max_revivals_per_turn": 3,
     }
     defaults.update(overrides)
     return AgentSettings(**defaults)  # type: ignore[arg-type]
@@ -66,7 +63,7 @@ class TestMaxIterationsFor:
 
 
 def _state(**overrides: object) -> AgentRunState:
-    settings = overrides.pop("settings", None) or _settings(token_budget=1000)
+    settings = overrides.pop("settings", None) or _settings(cost_budget_usd=0.01)
     defaults: dict[str, object] = {
         "settings": settings,
         "max_iterations": settings.max_iterations_for(None),  # type: ignore[union-attr]
@@ -104,12 +101,23 @@ class TestSpendAttribution:
 class TestSpendWithinBudget:
     def test_at_budget_is_within(self) -> None:
         state = _state()
-        state.record_spend("model-a", LLMResponseStats(input_tokens=1000))
+        state.record_spend("model-a", LLMResponseStats(cost_usd=0.006))
+        state.record_spend("model-b", LLMResponseStats(cost_usd=0.004))
         assert state.spend_within_budget() is True
 
     def test_over_budget_is_not_within(self) -> None:
         state = _state()
-        state.record_spend("model-a", LLMResponseStats(input_tokens=1001))
+        state.record_spend("model-a", LLMResponseStats(cost_usd=0.006))
+        state.record_spend("model-b", LLMResponseStats(cost_usd=0.0041))
+        assert state.spend_within_budget() is False
+
+    def test_cheap_input_does_not_hide_expensive_output(self) -> None:
+        # 8k input and 4k reasoning on gpt-5-mini: the output is 80% of the bill.
+        state = _state()
+        state.record_spend(
+            "model-a", LLMResponseStats(input_tokens=8_000, output_tokens=4_000, cost_usd=0.01)
+        )
+        state.record_spend("model-a", LLMResponseStats(input_tokens=100, cost_usd=0.001))
         assert state.spend_within_budget() is False
 
 
@@ -122,9 +130,9 @@ class TestAgentSettingsValidation:
         with pytest.raises(ValidationError):
             _settings(max_iterations=21)
 
-    def test_token_budget_below_minimum_rejected(self) -> None:
+    def test_cost_budget_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
-            _settings(token_budget=999)
+            _settings(cost_budget_usd=0)
 
     def test_turn_timeout_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):

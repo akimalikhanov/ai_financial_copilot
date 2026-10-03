@@ -160,7 +160,7 @@ async def test_hung_search_does_not_run_past_the_turn_timeout(
     """The fan-out sits outside the per-turn wait_for, so before this only the Celery hard
     limit bounded it — one hung backend held a worker slot for 20 minutes."""
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "1")
-    monkeypatch.setenv("AGENT_TOKEN_BUDGET", "1000000")
+    monkeypatch.setenv("AGENT_COST_BUDGET_USD", "100")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "2")
     monkeypatch.setenv("AGENT_TURN_TIMEOUT_SECONDS", "0.2")
 

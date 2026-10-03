@@ -269,6 +269,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         "cost_usd_total": m.cost_usd_total,
                         "input_tokens_total": m.input_tokens_total,
                         "output_tokens_total": m.output_tokens_total,
+                        "last_turn_input_tokens": m.last_turn_input_tokens,
                     }
                     logger.info(
                         "agent_meta qid=%s query_shape=%s iterations=%d tool_calls=%d "
