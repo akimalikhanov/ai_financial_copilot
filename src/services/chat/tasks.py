@@ -50,8 +50,8 @@ from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput, RouterOutput
 from src.services.chat.agent import run_agent
 from src.services.chat.agent import tools as agent_tools
-from src.services.chat.agent.loop import prompt_and_tools, tool_model_chain
-from src.services.chat.agent.state import ConvergenceReason, get_agent_settings
+from src.services.chat.agent.loop import tool_model_chain
+from src.services.chat.agent.state import ConvergenceReason, get_agent_settings, shape_config
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
 from src.services.chat.events import (
@@ -69,7 +69,6 @@ from src.services.context import ConversationHistory, assemble_prompt
 from src.services.context.turns import prior_turns
 from src.services.llm_router import FallbackStream, LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
-from src.services.retrieval import query_transformer
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
@@ -87,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 FINDINGS_BLOCK_MAX_CHARS = 20_000
 
-SYNTHESIS_PROMPT_VERSION = "v4_agent_synthesis"
+SYNTHESIS_PROMPT_VERSION = "v5_agent_synthesis"
 
 # Ceiling on acks_late redeliveries of one chat task, mirroring INGEST_MAX_ATTEMPTS. Past it
 # the request is failed rather than retried, so a task that reliably kills its worker cannot
@@ -121,8 +120,8 @@ def _init_metric_series() -> None:
     for reason in get_args(ConvergenceReason):
         for shape in (*_QUERY_SHAPES, "none"):
             AGENT_STOP_REASONS.labels(reason, shape)
-    for tool in agent_tools.EXTRACTION_TOOLS + agent_tools.ANALYTICAL_TOOLS:
-        AGENT_TOOL_ARG_ERRORS.labels(tool["function"]["name"])
+    for tool in ("search_documents", agent_tools.REPORT_TOOL_NAME):
+        AGENT_TOOL_ARG_ERRORS.labels(tool)
 
 
 _STAGE_OBS_TYPES: dict[str, str] = {
@@ -835,7 +834,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     _query_shape = getattr(state.router_output, "query_shape", None)
                     _agent_lf_stack.enter_context(
                         propagate_attributes(
-                            metadata={"agent_prompt": prompt_and_tools(_query_shape)[0]}
+                            metadata={
+                                "agent_prompt": shape_config(_query_shape, agent_settings).prompt
+                            }
                         )
                     )
                     _agent_lf_stack.enter_context(
@@ -882,7 +883,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             },
                             metadata={
                                 "prompt_version": agent_meta.prompt_version,
-                                "rewrite_model": agent_meta.rewrite_model,
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
@@ -1211,11 +1211,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         m = state.agent_meta
                         trace_payload["config"]["tool_model"] = agent_settings.tool_model
                         trace_payload["config"]["prompts"]["agent"] = m.prompt_version
-                        if m.rewrite_model is not None:
-                            trace_payload["config"]["rewrite_model"] = m.rewrite_model
-                            trace_payload["config"]["prompts"]["rewrite"] = (
-                                query_transformer.PROMPT_VERSION
-                            )
                         trace_payload["agent"] = {
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,

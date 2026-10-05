@@ -12,9 +12,10 @@ from typing import Any
 
 import pytest
 
+from src.schemas.agent_findings import FindingsReport
 from src.schemas.query_router import RouterOutput
-from src.schemas.query_transform import TransformedQuery
 from src.services.chat.agent.loop import _SearchResult, run_loop
+from src.services.chat.agent.tools import SearchDocumentsArgs
 from src.services.llm_adapters import fake_adapter as fake_adapter_module
 from src.services.llm_adapters.base_adapter import ChatMessage, ChatRequest, Role
 from src.services.llm_adapters.fake_adapter import FakeAdapter
@@ -113,23 +114,6 @@ async def test_complete_query_router_response_parses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_complete_query_transformer_response_parses() -> None:
-    adapter = FakeAdapter(default_model="fake")
-    response_format = build_response_format(
-        "query_transformer", TransformedQuery.model_json_schema()
-    )
-    req = ChatRequest(
-        messages=(_user_message("What was Acme's revenue?"),),
-        model="fake",
-        extra_params={"response_format": response_format},
-    )
-    resp = await adapter._complete(req)
-    parsed = TransformedQuery.model_validate(json.loads(resp.text))
-    assert parsed.semantic_query
-    assert parsed.fallback is False
-
-
-@pytest.mark.asyncio
 async def test_complete_generic_response_is_nonempty_text() -> None:
     adapter = FakeAdapter(default_model="fake")
     req = ChatRequest(messages=(_user_message("hello"),), model="fake")
@@ -165,7 +149,8 @@ async def test_complete_with_tools_scripts_search_then_report_then_stop() -> Non
         turn = await adapter.complete_with_tools(messages, tools)
         assert len(turn.tool_calls) == 1
         assert turn.tool_calls[0].name == "search_documents"
-        json.loads(turn.tool_calls[0].arguments)  # must be valid JSON
+        # Must parse as a search call, including the keywords the schema requires.
+        assert SearchDocumentsArgs.model_validate_json(turn.tool_calls[0].arguments).keywords
         messages = [
             *messages,
             ChatMessage(role=Role.tool, tool_call_id=turn.tool_calls[0].id, content="found stuff"),
@@ -185,11 +170,11 @@ async def test_complete_with_tools_scripts_search_then_report_then_stop() -> Non
 
 
 @pytest.mark.asyncio
-async def test_complete_with_tools_uses_analytical_report_when_offered() -> None:
+async def test_scripted_report_parses_against_the_report_schema() -> None:
     adapter = FakeAdapter(default_model="fake")
-    analytical_tools: list[dict[str, Any]] = [
+    tools: list[dict[str, Any]] = [
         {"type": "function", "function": {"name": "search_documents"}},
-        {"type": "function", "function": {"name": "report_analytical_findings"}},
+        {"type": "function", "function": {"name": "report_findings"}},
     ]
     messages = [
         _user_message("Compare Acme and Beta"),
@@ -198,9 +183,9 @@ async def test_complete_with_tools_uses_analytical_report_when_offered() -> None
             for i in range(fake_adapter_module._SEARCH_TURNS)
         ),
     ]
-    turn = await adapter.complete_with_tools(messages, analytical_tools)
-    assert turn.tool_calls[0].name == "report_analytical_findings"
-    json.loads(turn.tool_calls[0].arguments)
+    turn = await adapter.complete_with_tools(messages, tools)
+    report = FindingsReport.model_validate_json(turn.tool_calls[0].arguments)
+    assert report.findings[0].key == "Fake Entity"
 
 
 @pytest.mark.asyncio
@@ -231,14 +216,13 @@ async def test_complete_with_tools_turn_is_derived_from_transcript_not_shared_st
 
 
 @pytest.mark.asyncio
-async def test_structured_output_calls_stay_under_query_transformer_timeout(
+async def test_structured_output_calls_stay_under_router_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """query_transformer.py wraps its LLM call in a 10s asyncio.wait_for
-    (QUERY_TRANSFORMER_TIMEOUT, config.py). Sampling from the slow ~2-20s agent-turn profile
-    for this call regularly raced that timeout and spammed rewrite_query_llm_error on every
-    load test run (harmless — it falls back — but noise, not a real finding). Confirmed by an
-    actual load test run on 2026-09-09."""
+    """router.py wraps its LLM call in a 10s asyncio.wait_for (ROUTER_TIMEOUT, config.py).
+    Sampling structured-output calls from the slow ~2-20s agent-turn profile raced that
+    timeout on every load test run, falling back and logging an error that isn't a real
+    finding."""
     recorded: list[float] = []
 
     async def _recording_sleep(seconds: float) -> None:
@@ -246,9 +230,7 @@ async def test_structured_output_calls_stay_under_query_transformer_timeout(
 
     monkeypatch.setattr("asyncio.sleep", _recording_sleep)
     adapter = FakeAdapter(default_model="fake")
-    response_format = build_response_format(
-        "query_transformer", TransformedQuery.model_json_schema()
-    )
+    response_format = build_response_format("query_router", RouterOutput.model_json_schema())
     req = ChatRequest(
         messages=(_user_message("hello"),),
         model="fake",

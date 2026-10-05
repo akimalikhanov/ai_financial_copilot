@@ -131,13 +131,13 @@ async def test_mid_loop_tool_message_capped_but_ledger_holds_full_set() -> None:
         name="report_findings",
         arguments=json.dumps(
             {
-                "metric_requested": "revenue",
                 "findings": [
                     {
-                        "entity": "Acme",
-                        "available": True,
-                        "value": 100,
-                        "source_chunks": [str(chunks[0].chunk_id)],
+                        "key": "Acme",
+                        "claim": "Acme's revenue was 100.",
+                        "supported": True,
+                        "evidence": [str(chunks[0].chunk_id)],
+                        "confidence": "high",
                     }
                 ],
             }

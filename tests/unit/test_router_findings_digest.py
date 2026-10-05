@@ -5,50 +5,38 @@ from __future__ import annotations
 from src.schemas.query_router import RouterInput
 from src.services.router.router import _build_messages, _digest_findings_block
 
-FINDINGS = """[STRUCTURED FINDINGS]
-Metric: net income | Operation: argmin
+FINDINGS = """[FINDINGS]
+Target currency: EUR | Operation: argmin
 
-Atreca, Inc.           | USD -97,157.0K | native | period: 2022-12-31 | chunks: S1, S8
-Datalogic              | EUR 30,126.0K  | from USD 32,000.0K | rate: 0.9414 | period: 2022-12-31 | chunks: S3
-NuCana plc             | N/A | not available: not found in retrieved context
-[END STRUCTURED FINDINGS]"""
+1. Atreca, Inc. [high confidence] Atreca's net loss was $97.2M. | evidence: S1, S8
+   - net income (FY2022 / 2022-12-31): USD -97,157.0K
+2. Datalogic [high confidence] Datalogic's net income was $32.0M. | evidence: S3
+   - net income (FY2022 / 2022-12-31): EUR 30,126.0K | from USD 32,000.0K | rate: 0.9414 | ⚠ UNVERIFIED: value not located in cited excerpt
+3. NuCana plc [not disclosed] The filings do not report net income.
 
-OBSERVATIONS = """[AGENT OBSERVATIONS]
-Question: why did margin compress?
-
-1. [high confidence] Input costs rose 12% | evidence: S1, S2
-2. [not disclosed] FX impact on gross margin
 Conclusion: cost inflation drove the compression
-Unresolved (do not assert as fact): no FX quantification found
-[END AGENT OBSERVATIONS]"""
+Unresolved: Not resolved: Globex
+[END FINDINGS]"""
 
 
 def test_digest_keeps_values_drops_refs() -> None:
     d = _digest_findings_block(FINDINGS)
 
-    assert "Atreca, Inc. | USD -97,157.0K" in d
-    assert "Datalogic | EUR 30,126.0K" in d
-    assert "NuCana plc | N/A | not available" in d
-    # Routing-irrelevant detail is dropped.
-    assert "chunks:" not in d
-    assert "rate:" not in d
-    assert "native" not in d
-    # Block markers are not signal.
-    assert "[STRUCTURED FINDINGS]" not in d
-
-
-def test_digest_handles_observations() -> None:
-    d = _digest_findings_block(OBSERVATIONS)
-
-    assert "Input costs rose 12%" in d
-    assert "[not disclosed] FX impact on gross margin" in d
+    assert "- net income (FY2022 / 2022-12-31): USD -97,157.0K" in d
+    assert "- net income (FY2022 / 2022-12-31): EUR 30,126.0K" in d
+    assert "3. NuCana plc [not disclosed] The filings do not report net income." in d
     assert "Conclusion: cost inflation drove the compression" in d
+    assert "Unresolved: Not resolved: Globex" in d
+    # Routing-irrelevant detail is dropped.
     assert "evidence:" not in d
-    assert "Question:" not in d
+    assert "rate:" not in d
+    assert "UNVERIFIED" not in d
+    # Block markers are not signal.
+    assert "[FINDINGS]" not in d
 
 
 def test_digest_is_capped() -> None:
-    huge = "[STRUCTURED FINDINGS]\n" + "\n".join(f"Entity{i} | USD 1.0M" for i in range(500))
+    huge = "[FINDINGS]\n" + "\n".join(f"   - revenue (FY{i}): USD 1.0M" for i in range(500))
     assert len(_digest_findings_block(huge, max_chars=200)) <= 200
 
 
@@ -60,7 +48,7 @@ def test_block_reaches_the_router_prompt() -> None:
     user = msgs[-1].content or ""
 
     assert "Data already retrieved in this conversation" in user
-    assert "Atreca, Inc. | USD -97,157.0K" in user
+    assert "- net income (FY2022 / 2022-12-31): USD -97,157.0K" in user
     assert "User query: summarize as a table" in user
 
 

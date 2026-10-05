@@ -49,9 +49,9 @@ class PerQuestionResult(BaseModel):
     query_shape: str | None = None
     expected_query_shape: str | None = None  # gold label, from EvalQuestion.query_shape
     agent_meta: dict[str, Any] | None = None
-    observations_count: int | None = None
+    findings_count: int | None = None
     confidence_counts: dict[str, int] | None = None
-    gaps_count: int | None = None
+    unresolved_count: int | None = None
     ref_id_to_chunk_id: dict[str, str] = {}
 
 

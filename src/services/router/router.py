@@ -54,18 +54,16 @@ def _router_response_format() -> dict:
 def _digest_findings_block(block: str, max_chars: int = 1500) -> str:
     """Strip a findings block down to what the router needs to classify a follow-up.
 
-    Keeps the entity/metric/value lines; drops chunk refs, FX detail and grounding
-    markers, which cost tokens on every routed turn and carry no routing signal.
+    Keeps the claim, metric and value lines; drops what follows their first ` | ` (chunk
+    refs, FX detail and grounding markers), which costs tokens on every routed turn and
+    carries no routing signal.
     """
     lines: list[str] = []
     for raw in block.splitlines():
         line = raw.strip()
-        if not line or line.startswith("[") or line.startswith("Question:"):
+        if not line or line.startswith("["):
             continue
-        for sep in (" | chunks:", " | evidence:", " | from ", " | rate:"):
-            line = line.split(sep, 1)[0]
-        line = line.replace(" | native", "").replace(" | ⚠ UNVERIFIED", "")
-        lines.append(" ".join(line.split()))
+        lines.append(" ".join(line.split(" | ", 1)[0].split()))
     digest = "\n".join(lines)
     return digest[:max_chars] if len(digest) > max_chars else digest
 

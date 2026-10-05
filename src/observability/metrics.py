@@ -216,7 +216,7 @@ LLM_TOKENS = Counter("llm_tokens_total", "Tokens", ["direction", "model"])
 LLM_COST = Counter("llm_cost_usd_total", "Cost USD", ["model"])
 LLM_CACHE_HIT_TOKENS = Counter("llm_cache_hit_tokens_total", "Cached input tokens", ["model"])
 # request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
-# router | rewrite_query | conversation_naming.
+# router | conversation_naming.
 LLM_DURATION = Histogram(
     "llm_request_duration_seconds",
     "LLM call latency, first byte to last",

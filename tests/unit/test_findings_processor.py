@@ -1,4 +1,4 @@
-"""Unit tests for findings_processor (currency normalization, comparison logic).
+"""Unit tests for findings_processor (currency normalization, comparison logic, rendering).
 
 Note: no ISO-4217 validation exists anywhere in this codebase — currencies are
 opaque strings end-to-end. This is a possible gap, not something fixed/tested here.
@@ -6,23 +6,34 @@ opaque strings end-to-end. This is a possible gap, not something fixed/tested he
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 import respx
 
-from src.schemas.agent_findings import AgentFindings, EntityFinding
+from src.schemas.agent_findings import AgentFindings, Figure, Finding
+from src.schemas.retrieval import RAGContext
 from src.services.chat.agent.number_grounding import NumberGrounding
-from src.services.chat.agent.processor import _normalize_date, process_findings, to_millions
+from src.services.chat.agent.processor import (
+    _normalize_date,
+    _render_findings_block,
+    process_findings,
+    to_millions,
+)
 
 FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
+_NO_EXCERPTS = RAGContext(formatted_context="", items=(), chunk_count=0)
 
 
 class TestNormalizeDate:
     def test_iso_passthrough(self) -> None:
         assert _normalize_date("2023-12-31") == "2023-12-31"
 
-    def test_bare_year_becomes_dec_31(self) -> None:
-        assert _normalize_date("2023") == "2023-12-31"
+    def test_bare_year_is_not_guessed(self) -> None:
+        # Dec 31 is wrong for every non-calendar fiscal year; the latest rate is used and
+        # the row says so.
+        assert _normalize_date("2023") is None
 
     def test_invalid_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level("WARNING"):
@@ -50,21 +61,39 @@ class TestToMillions:
     def test_empty_string_scales_by_1e_minus_6(self) -> None:
         assert to_millions(2_000_000.0, "") == pytest.approx(2.0)
 
-    def test_none_unit_scales_by_1(self) -> None:
-        assert to_millions(2.0, None) == 2.0
 
-
-def _finding(entity: str, value: float | None, currency: str | None, **overrides) -> EntityFinding:
-    defaults = {
-        "entity": entity,
-        "available": value is not None,
-        "value": value,
+def _figure(amount: float, currency: str | None, **overrides: Any) -> Figure:
+    fields: dict[str, Any] = {
+        "metric": "revenue",
+        "amount": amount,
+        "unit": "M",
         "currency": currency,
         "period_end": "2023-12-31",
-        "unit": "M",
+        "fiscal_label": "FY2023",
     }
-    defaults.update(overrides)
-    return EntityFinding(**defaults)
+    fields.update(overrides)
+    return Figure(**fields)
+
+
+def _finding(key: str, *figures: Figure, evidence: list[str] | None = None) -> Finding:
+    return Finding(
+        key=key,
+        claim=f"{key} reported revenue.",
+        supported=True,
+        evidence=evidence or [],
+        confidence="high",
+        figures=list(figures),
+    )
+
+
+def _negative(key: str) -> Finding:
+    return Finding(
+        key=key, claim=f"{key} does not report it.", supported=False, evidence=[], confidence="high"
+    )
+
+
+def _findings(*items: Finding, op: Any = "none") -> AgentFindings:
+    return AgentFindings(findings=items, comparison_op=op)
 
 
 @pytest.fixture(autouse=True)
@@ -77,20 +106,15 @@ def _disable_langfuse(monkeypatch: pytest.MonkeyPatch):
 class TestCurrencyResolutionPriority:
     @pytest.mark.asyncio
     async def test_requested_currency_wins(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "USD"),),
-            comparison_op="none",
+        result = await process_findings(
+            _findings(_finding("A", _figure(100.0, "USD"))), requested_currency="EUR"
         )
-        result = await process_findings(findings, requested_currency="EUR")
         assert result.target_currency == "EUR"
 
     @pytest.mark.asyncio
     async def test_multi_currency_comparison_defaults_to_usd(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "EUR"), _finding("B", 200.0, "GBP")),
-            comparison_op="argmax",
+        findings = _findings(
+            _finding("A", _figure(100.0, "EUR")), _finding("B", _figure(200.0, "GBP")), op="argmax"
         )
         with respx.mock:
             respx.get(url__startswith=FRANKFURTER_BASE).mock(
@@ -103,24 +127,25 @@ class TestCurrencyResolutionPriority:
 
     @pytest.mark.asyncio
     async def test_no_conversion_needed_same_currency(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "USD"),),
-            comparison_op="none",
-        )
-        result = await process_findings(findings)
+        result = await process_findings(_findings(_finding("A", _figure(100.0, "USD"))))
         assert result.target_currency is None
         assert result.currency_converted is False
-        assert result.findings[0].normalized_value == 100.0
+        assert result.figures[0].normalized_amount == 100.0
+
+    @pytest.mark.asyncio
+    async def test_findings_without_figures_pass_through(self) -> None:
+        findings = _findings(_finding("A1"), _negative("A2"))
+        result = await process_findings(findings)
+        assert result.figures == ()
+        assert result.findings is findings
+        assert result.answer_note is None
 
 
 class TestPartialFailurePolicy:
     @pytest.mark.asyncio
     async def test_argmax_aborts_entirely_on_any_fx_failure(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "EUR"), _finding("B", 200.0, "USD")),
-            comparison_op="argmax",
+        findings = _findings(
+            _finding("A", _figure(100.0, "EUR")), _finding("B", _figure(200.0, "USD")), op="argmax"
         )
         with respx.mock:
             respx.get(url__startswith=FRANKFURTER_BASE).mock(return_value=httpx.Response(500))
@@ -128,16 +153,14 @@ class TestPartialFailurePolicy:
 
         assert result.answer_entity is None
         assert result.currency_converted is False
-        assert all(nf.normalized_value is None for nf in result.findings)
+        assert all(n.normalized_amount is None for n in result.figures)
         assert result.answer_note is not None
         assert "comparison not possible" in result.answer_note
 
     @pytest.mark.asyncio
     async def test_list_op_degrades_partially_on_fx_failure(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "EUR"), _finding("B", 200.0, "USD")),
-            comparison_op="list",
+        findings = _findings(
+            _finding("A", _figure(100.0, "EUR")), _finding("B", _figure(200.0, "USD")), op="list"
         )
         with respx.mock:
             respx.get(url__startswith=FRANKFURTER_BASE).mock(return_value=httpx.Response(500))
@@ -145,38 +168,39 @@ class TestPartialFailurePolicy:
 
         assert result.answer_note is not None
         assert "FX conversion failed" in result.answer_note
-        by_entity = {nf.finding.entity: nf for nf in result.findings}
-        assert by_entity["A"].normalized_value is None  # failed conversion
-        assert by_entity["B"].normalized_value == 200.0  # same currency, no conversion needed
+        by_key = {n.key: n for n in result.figures}
+        assert by_key["A"].normalized_amount is None  # failed conversion
+        assert by_key["B"].normalized_amount == 200.0  # same currency, no conversion needed
 
 
 class TestComparisonOp:
     @pytest.mark.asyncio
     async def test_argmin_picks_smallest(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 300.0, "USD"), _finding("B", 100.0, "USD")),
-            comparison_op="argmin",
+        findings = _findings(
+            _finding("A", _figure(300.0, "USD")), _finding("B", _figure(100.0, "USD")), op="argmin"
         )
-        result = await process_findings(findings)
-        assert result.answer_entity == "B"
+        assert (await process_findings(findings)).answer_entity == "B"
 
     @pytest.mark.asyncio
     async def test_argmax_picks_largest(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 300.0, "USD"), _finding("B", 100.0, "USD")),
-            comparison_op="argmax",
+        findings = _findings(
+            _finding("A", _figure(300.0, "USD")), _finding("B", _figure(100.0, "USD")), op="argmax"
         )
-        result = await process_findings(findings)
-        assert result.answer_entity == "A"
+        assert (await process_findings(findings)).answer_entity == "A"
+
+    @pytest.mark.asyncio
+    async def test_ranking_respects_scale(self) -> None:
+        findings = _findings(
+            _finding("A", _figure(900.0, "USD", unit="M")),
+            _finding("B", _figure(1.0, "USD", unit="B")),
+            op="argmax",
+        )
+        assert (await process_findings(findings)).answer_entity == "B"
 
     @pytest.mark.asyncio
     async def test_null_currency_excluded_from_ranking(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 300.0, None), _finding("B", 100.0, "USD")),
-            comparison_op="argmax",
+        findings = _findings(
+            _finding("A", _figure(300.0, None)), _finding("B", _figure(100.0, "USD")), op="argmax"
         )
         result = await process_findings(findings)
         assert result.answer_entity == "B"
@@ -184,60 +208,83 @@ class TestComparisonOp:
         assert "excluded from ranking" in result.answer_note
 
     @pytest.mark.asyncio
-    async def test_only_one_available_entity_note(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(
-                _finding("A", 100.0, "USD"),
-                _finding("B", None, None, available=False, reason="not found"),
-            ),
-            comparison_op="none",
+    async def test_unstated_scale_excluded_from_ranking(self) -> None:
+        # An unknown scale is never read as millions: 300 of unknown scale could be the
+        # smallest or the largest.
+        findings = _findings(
+            _finding("A", _figure(300.0, "USD", unit=None)),
+            _finding("B", _figure(100.0, "USD")),
+            op="argmax",
         )
         result = await process_findings(findings)
+        assert result.answer_entity == "B"
+        assert result.answer_note is not None
+        assert "A" in result.answer_note
+
+    @pytest.mark.asyncio
+    async def test_several_figures_per_key_are_not_ranked(self) -> None:
+        findings = _findings(
+            _finding("A", _figure(300.0, "USD"), _figure(250.0, "USD", period_end="2022-12-31")),
+            _finding("B", _figure(100.0, "USD")),
+            op="argmax",
+        )
+        result = await process_findings(findings)
+        assert result.answer_entity is None
+        assert result.answer_note == "not ranked — several figures per entity"
+
+    @pytest.mark.asyncio
+    async def test_only_one_available_entity_note(self) -> None:
+        findings = _findings(_finding("A", _figure(100.0, "USD")), _negative("B"), op="list")
+        result = await process_findings(findings)
         assert result.answer_note == "only one entity had available data"
+
+    @pytest.mark.asyncio
+    async def test_one_entity_note_needs_a_comparison(self) -> None:
+        # An analytical run with one numeric aspect is not "one entity had data".
+        findings = _findings(_finding("A1", _figure(100.0, "USD")), _finding("A2"))
+        assert (await process_findings(findings)).answer_note is None
 
 
 class TestNumberGroundingWiring:
     @pytest.mark.asyncio
     async def test_no_chunk_texts_stays_unverifiable(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
-            comparison_op="none",
-        )
+        findings = _findings(_finding("A", _figure(100.0, "USD"), evidence=["c1"]))
         result = await process_findings(findings)
-        assert result.findings[0].number_grounding is NumberGrounding.UNVERIFIABLE
+        assert result.figures[0].number_grounding is NumberGrounding.UNVERIFIABLE
 
     @pytest.mark.asyncio
     async def test_missing_chunk_text_is_unverifiable_not_not_found(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
-            comparison_op="none",
-        )
+        findings = _findings(_finding("A", _figure(100.0, "USD"), evidence=["c1"]))
         result = await process_findings(findings, chunk_texts={})
-        assert result.findings[0].number_grounding is NumberGrounding.UNVERIFIABLE
+        assert result.figures[0].number_grounding is NumberGrounding.UNVERIFIABLE
 
     @pytest.mark.asyncio
-    async def test_grounded_when_native_value_in_cited_text(self) -> None:
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "USD", source_chunks=["c1"]),),
-            comparison_op="none",
+    async def test_each_figure_is_checked(self) -> None:
+        findings = _findings(
+            _finding(
+                "A",
+                _figure(100.0, "USD"),
+                _figure(80.0, "USD", period_end="2022-12-31"),
+                evidence=["c1"],
+            )
         )
-        result = await process_findings(findings, chunk_texts={"c1": "Total revenue was 100.0"})
-        assert result.findings[0].number_grounding is NumberGrounding.GROUNDED
+        result = await process_findings(findings, chunk_texts={"c1": "Revenue was 100.0"})
+        assert [n.number_grounding for n in result.figures] == [
+            NumberGrounding.GROUNDED,
+            NumberGrounding.NOT_FOUND,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unstated_scale_must_appear_as_printed(self) -> None:
+        findings = _findings(_finding("A", _figure(41.2, None, unit=None), evidence=["c1"]))
+        result = await process_findings(findings, chunk_texts={"c1": "Gross margin 41.2%"})
+        assert result.figures[0].number_grounding is NumberGrounding.GROUNDED
 
     @pytest.mark.asyncio
     async def test_verifies_native_value_not_fx_converted_value(self) -> None:
-        """Regression guard: checking `normalized_value` instead of the native value would
-        make every converted finding read as a false NOT_FOUND, since the converted figure
-        never appears in the filing text."""
-        findings = AgentFindings(
-            metric_requested="revenue",
-            findings=(_finding("A", 100.0, "EUR", source_chunks=["c1"]),),
-            comparison_op="none",
-        )
+        """Regression guard: checking the converted amount would make every converted
+        figure read as a false NOT_FOUND, since it never appears in the filing text."""
+        findings = _findings(_finding("A", _figure(100.0, "EUR"), evidence=["c1"]))
         with respx.mock:
             respx.get(url__startswith=FRANKFURTER_BASE).mock(
                 return_value=httpx.Response(200, json={"rates": {"USD": 1.1}})
@@ -247,5 +294,37 @@ class TestNumberGroundingWiring:
                 requested_currency="USD",
                 chunk_texts={"c1": "Total revenue was EUR 100.0"},
             )
-        assert result.findings[0].normalized_value == pytest.approx(110.0)
-        assert result.findings[0].number_grounding is NumberGrounding.GROUNDED
+        assert result.figures[0].normalized_amount == pytest.approx(110.0)
+        assert result.figures[0].number_grounding is NumberGrounding.GROUNDED
+
+
+class TestRenderedBlock:
+    @pytest.mark.asyncio
+    async def test_one_block_for_every_shape(self) -> None:
+        findings = AgentFindings(
+            findings=(
+                _finding(
+                    "Acme",
+                    _figure(120.0, "USD"),
+                    _figure(100.0, "USD", period_end="2022-12-31", fiscal_label="FY2022"),
+                ),
+                _negative("A2"),
+            ),
+            conclusion="Revenue grew.",
+            unresolved=("Not resolved: Globex",),
+        )
+        block = _render_findings_block(await process_findings(findings), _NO_EXCERPTS)
+
+        assert block.startswith("[FINDINGS]") and block.endswith("[END FINDINGS]")
+        assert "1. Acme [high confidence] Acme reported revenue. | evidence: —" in block
+        assert "   - revenue (FY2023 / 2023-12-31): USD 120.0M" in block
+        assert "   - revenue (FY2022 / 2022-12-31): USD 100.0M" in block
+        assert "2. A2 [not disclosed] A2 does not report it." in block
+        assert "Conclusion: Revenue grew." in block
+        assert "Unresolved: Not resolved: Globex" in block
+
+    @pytest.mark.asyncio
+    async def test_unstated_scale_is_said_not_assumed(self) -> None:
+        findings = _findings(_finding("A", _figure(41.2, None, unit=None, period_end=None)))
+        block = _render_findings_block(await process_findings(findings), _NO_EXCERPTS)
+        assert "   - revenue (FY2023): 41.2 (scale not stated)" in block

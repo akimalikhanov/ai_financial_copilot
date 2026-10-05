@@ -38,32 +38,30 @@ from src.observability.metrics import (
 )
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.schemas.query_transform import ScopeDocSummary, TransformedQuery
+from src.schemas.agent_findings import AgentFindings, FindingsReport
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
-from src.services.chat.agent import tools as tools_module
 from src.services.chat.agent.evidence import EvidenceLedger
-from src.services.chat.agent.findings import Candidate
 from src.services.chat.agent.state import (
     AgentLoopMeta,
     AgentRunState,
     AspectStats,
     ConvergenceReason,
+    ShapeConfig,
     build_meta,
     get_agent_settings,
     open_aspects,
     render_status,
+    shape_config,
     snapshot,
     unresolved_lines,
 )
-from src.services.chat.agent.tools import SearchDocumentsArgs
+from src.services.chat.agent.tools import REPORT_TOOL_NAME, SearchDocumentsArgs
 from src.services.chat.agent.transcript import Transcript
 from src.services.chat.events import build_activity_event
 from src.services.context.turns import as_messages, cap_turns, tool_model_history
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
-    LLMResponseStats,
     Role,
     ToolCallRef,
 )
@@ -71,8 +69,7 @@ from src.services.llm_runtime.exceptions import LLMError
 from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
-from src.services.retrieval.query_transformer import rewrite_query
-from src.utils.config import get_agent_trace_chunk_chars, get_query_transformer_model
+from src.utils.config import get_agent_trace_chunk_chars
 
 if TYPE_CHECKING:
     from src.schemas.chat import ChatPipelineState, Turn
@@ -90,7 +87,6 @@ class _SearchResult:
     # S-labels can be numbered globally across all searches in the request.
     payloads: dict[UUID, ChunkPromptPayload]
     error_str: str | None = None
-    rewrite_stats: LLMResponseStats | None = None
     # Never conflate "the corpus was unreachable" with "the model sent bad
     # arguments" — only the former justifies Stop("search_unavailable") or a
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
@@ -111,7 +107,7 @@ class _SearchResult:
 
 
 ExecuteSearchFn = Callable[
-    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", Redis, str, int, bool],
+    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", Redis, str, int],
     Awaitable[_SearchResult],
 ]
 
@@ -130,10 +126,9 @@ class RunDeps:
     reranker: Reranker | None
     redis_app: Redis
     request_id: str
-    is_analytical: bool
+    shape: ShapeConfig
     search_sem: asyncio.Semaphore
     execute_search: ExecuteSearchFn
-    rewrite_model_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -199,16 +194,20 @@ def _mint(plan: dict[str, str], sub_question: str | None, max_plan_items: int) -
     return aid
 
 
-def _sub_question_of(tc: ToolCallRef) -> str | None:
-    """The search call's `sub_question`, or None if absent/malformed.
+def _search_key(tc: ToolCallRef, state: AgentRunState, shape: ShapeConfig) -> str | None:
+    """The plan key one search works on: an aspect id minted from its `sub_question`, or
+    the seeded entity it names. None when it maps to no key.
 
     Deliberately tolerant: a call whose arguments don't parse still executes (and fails
-    with its own error downstream), it just mints no aspect.
+    with its own error downstream), it just maps to no key.
     """
     try:
-        return SearchDocumentsArgs.model_validate_json(tc.arguments).sub_question
+        args = SearchDocumentsArgs.model_validate_json(tc.arguments)
     except ValidationError:
         return None
+    if shape.search_takes_sub_question:
+        return _mint(state.plan, args.sub_question, state.settings.max_plan_items)
+    return args.entity if args.entity in state.plan else None
 
 
 async def _execute_search(
@@ -219,7 +218,6 @@ async def _execute_search(
     redis_app: Redis,
     request_id: str,
     iteration: int,
-    is_analytical: bool,
 ) -> _SearchResult:
     try:
         search_args = SearchDocumentsArgs.model_validate_json(tc.arguments)
@@ -261,26 +259,12 @@ async def _execute_search(
     )
     await add_event(redis_app, request_id, "activity", start_data)
 
-    # Rewrite at tool boundary — cheap model, eval-independent. Skipped on the analytical
-    # path: there the tool model composes a targeted, hypothesis-shaped query
-    # per aspect, so the rewriter is a second model second-guessing it — it blurs specific
-    # causal terms into generic finance vocabulary, and costs 3-5 calls per turn on the
-    # critical path. BM25 loses its differentiated keyword_query; acceptable because the
-    # v5 prompt asks for keyword-dense queries without the company name, and retrieval is
-    # already scoped to this entity's doc_ids so a leaked entity term has ~zero IDF.
-    scope_docs: list[ScopeDocSummary] = []
-    if state.scope_result and state.scope_result.entity_manifest:
-        for item in state.scope_result.entity_manifest:
-            if item.entity_name == entity:
-                scope_docs = [
-                    ScopeDocSummary(
-                        document_id=s["doc_id"],
-                        company=entity,
-                        year=s.get("year"),
-                    )
-                    for s in (item.doc_summaries or [])
-                ]
-                break
+    # The tool model writes both retrievers' queries: `query` feeds the embedder and the
+    # reranker, `keywords` feeds BM25. The schema requires `keywords`; a call that omits
+    # it anyway still searches, with `query` on both legs.
+    keyword_query = search_args.keywords or raw_query
+    if not search_args.keywords:
+        logger.warning("agent_search_keywords_missing", extra={"entity": entity})
 
     with lf_span(
         f"tool_search_{entity}_{iteration}",
@@ -288,6 +272,7 @@ async def _execute_search(
         input={
             "entity": entity,
             "query": raw_query,
+            "keywords": keyword_query,
             # Show the resolved scope this search was constrained to, so the
             # trace makes clear which docs the agent could actually see.
             "scope_doc_ids": [str(d) for d in doc_ids] if doc_ids else "all",
@@ -295,37 +280,11 @@ async def _execute_search(
             "scoped_via_entity": entity in per_entity,
         },
     ) as obs:
-        rewrite_stats: LLMResponseStats | None = None
-        if is_analytical:
-            transformed = TransformedQuery(
-                semantic_query=raw_query, keyword_query=raw_query, fallback=False
-            )
-        else:
-            try:
-                transformed, rewrite_stats = await rewrite_query(
-                    raw_query,
-                    scope_docs=scope_docs or None,
-                    session=session,
-                    parent_request_id=state.llm_request.id if state.llm_request else None,
-                    conversation_id=state.conversation_id,
-                    user_id=state.llm_request.user_id if state.llm_request else None,
-                    extra_request_params={
-                        "entity": entity,
-                        "iteration": iteration,
-                        "source": "agent",
-                    },
-                )
-            except Exception:
-                logger.warning("agent_rewrite_failed", extra={"entity": entity, "query": raw_query})
-                transformed = TransformedQuery(
-                    semantic_query=raw_query,
-                    keyword_query=raw_query,
-                    fallback=True,
-                )
         try:
             _, retrieval_trace, raw_chunks = await run_chat_rag_pipeline(
                 session,
-                transformed=transformed,
+                semantic_query=raw_query,
+                keyword_query=keyword_query,
                 user_id=state.llm_request.user_id,  # type: ignore[union-attr]
                 doc_ids=doc_ids,
                 reranker=reranker,
@@ -349,7 +308,6 @@ async def _execute_search(
                     chunks=[],
                     payloads={},
                     error_str=f"Search failed for entity: {entity}",
-                    rewrite_stats=rewrite_stats,
                     backend_failed=True,
                     activity_id=activity_id,
                 )
@@ -364,7 +322,6 @@ async def _execute_search(
                 chunks=[],
                 payloads={},
                 error_str=f"Search failed for entity: {entity}",
-                rewrite_stats=rewrite_stats,
                 backend_failed=True,
                 activity_id=activity_id,
             )
@@ -391,7 +348,6 @@ async def _execute_search(
         entity=entity,
         chunks=chunks,
         payloads=payloads,
-        rewrite_stats=rewrite_stats,
         degraded=degraded,
         scores_are_rerank=retrieval_trace.scores_are_rerank,
         activity_id=activity_id,
@@ -403,99 +359,29 @@ async def _execute_search(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_candidate_refs(
-    candidate: AgentFindings | AnalyticalFindings,
-    state: AgentRunState,
-    request_id: str,
-) -> AgentFindings | AnalyticalFindings:
-    """Rewrite source_chunks / evidence_chunks S-labels into chunk UUIDs.
+def _resolve_refs(report: FindingsReport, state: AgentRunState, request_id: str) -> FindingsReport:
+    """Rewrite each finding's `evidence` S-labels into chunk UUIDs.
 
     Unresolvable refs are dropped (never propagated downstream — a leaked label would
     surface in the synthesis prompt as a citable ID that has no matching excerpt).
     """
     all_unresolved: list[str] = []
-    result: AgentFindings | AnalyticalFindings
-
-    if isinstance(candidate, AgentFindings):
-        new_findings = []
-        for f in candidate.findings:
-            resolved, unresolved = state.evidence.resolve_refs(f.source_chunks)
-            all_unresolved.extend(unresolved)
-            new_findings.append(f.model_copy(update={"source_chunks": resolved}))
-        result = candidate.model_copy(update={"findings": tuple(new_findings)})
-    else:
-        new_obs = []
-        for o in candidate.observations:
-            evidence, unresolved = state.evidence.resolve_refs(o.evidence_chunks)
-            all_unresolved.extend(unresolved)
-            new_obs.append(o.model_copy(update={"evidence_chunks": evidence}))
-        result = candidate.model_copy(update={"observations": tuple(new_obs)})
-
+    findings = []
+    for f in report.findings:
+        resolved, unresolved = state.evidence.resolve_refs(f.evidence)
+        all_unresolved.extend(unresolved)
+        findings.append(f.model_copy(update={"evidence": resolved}))
     if all_unresolved:
         logger.warning(
             "agent_chunk_refs_unresolved",
             extra={"request_id": request_id, "unresolved_refs": all_unresolved},
         )
-    return result
-
-
-def _parse_report(tc: ToolCallRef) -> Candidate:
-    """Parse a report tool call against its Pydantic schema.
-
-    Raises ``pydantic.ValidationError`` on malformed JSON or a schema violation, surfaced
-    at the caller instead of silently constructing garbage via ``.get()``.
-    """
-    if tc.name == "report_findings":
-        return AgentFindings.model_validate_json(tc.arguments)
-    return AnalyticalFindings.model_validate_json(tc.arguments)
-
-
-def _candidate_keys(candidate: Candidate) -> set[str]:
-    if isinstance(candidate, AgentFindings):
-        return {f.entity for f in candidate.findings}
-    return {o.aspect for o in candidate.observations}
-
-
-def _filter_to_keys(candidate: Candidate, keys: set[str]) -> Candidate:
-    if isinstance(candidate, AgentFindings):
-        return candidate.model_copy(
-            update={"findings": tuple(f for f in candidate.findings if f.entity in keys)}
-        )
-    return candidate.model_copy(
-        update={"observations": tuple(o for o in candidate.observations if o.aspect in keys)}
-    )
+    return report.model_copy(update={"findings": tuple(findings)})
 
 
 def _searched(state: AgentRunState, key: str) -> bool:
     stats = state.aspect_stats.get(key)
-    return key in state.searched_entities or (stats is not None and stats.searches > 0)
-
-
-def _drop_unsearched_negatives(
-    candidate: Candidate, state: AgentRunState
-) -> tuple[Candidate, set[str]]:
-    """The candidate without stated negatives for keys no search has covered, and those
-    keys. A negative closes its key with nothing cited, so it must at least follow a search
-    for that key."""
-    if isinstance(candidate, AgentFindings):
-        dropped = {
-            f.entity
-            for f in candidate.findings
-            if not f.available and not _searched(state, f.entity)
-        }
-        kept_findings = tuple(
-            f for f in candidate.findings if f.available or f.entity not in dropped
-        )
-        return candidate.model_copy(update={"findings": kept_findings}), dropped
-    dropped = {
-        o.aspect
-        for o in candidate.observations
-        if not o.substantiated and not _searched(state, o.aspect)
-    }
-    kept_observations = tuple(
-        o for o in candidate.observations if o.substantiated or o.aspect not in dropped
-    )
-    return candidate.model_copy(update={"observations": kept_observations}), dropped
+    return stats is not None and stats.searches > 0
 
 
 def _render_report_result(
@@ -528,9 +414,9 @@ def _render_report_result(
         plural = len(dropped) != 1
         parts.append(
             f"{', '.join(dropped)} {'were' if plural else 'was'} not recorded — "
-            f"{'their' if plural else 'its'} observations cited no chunk from the evidence "
+            f"{'their' if plural else 'its'} findings cited no chunk from the evidence "
             f"you retrieved. Re-report citing chunk labels from a search result, or, if the "
-            f"documents do not support the aspect, report it with substantiated: false."
+            f"documents do not support it, report it with supported: false."
         )
     if unknown:
         plural = len(unknown) != 1
@@ -538,8 +424,7 @@ def _render_report_result(
             f"{', '.join(repr(k) for k in sorted(unknown))} "
             f"{'are' if plural else 'is'} not an open key and "
             f"{'were' if plural else 'was'} not recorded. "
-            "Use the key shown in brackets in the search result, or issue search_documents "
-            "with a new sub_question first."
+            "Use the key shown in brackets in a search result."
         )
     if not parts:
         parts.append("Nothing was recorded — no known key was reported.")
@@ -558,7 +443,7 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
         state.turns_to_first_report = state.iteration
 
     try:
-        parsed = _parse_report(tc)
+        parsed = FindingsReport.model_validate_json(tc.arguments)
     except ValidationError:
         AGENT_TOOL_CALLS.labels(tc.name, "error").inc()
         AGENT_TOOL_ARG_ERRORS.labels(tc.name).inc()
@@ -574,23 +459,28 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
             "Re-issue the call with valid arguments."
         )
 
-    candidate = _resolve_candidate_refs(parsed, state, request_id)
-    raw_keys = _candidate_keys(candidate)
+    report = _resolve_refs(parsed, state, request_id)
+    raw_keys = {f.key for f in report.findings}
 
-    # Plan keys are loop-minted (extraction seeds them from expected_entities), so a key
-    # the loop never minted has no referent — it is named back rather than recorded.
+    # Plan keys come only from the loop (seeded entities or minted aspect ids), so a key
+    # it never created has no referent — it is named back rather than recorded.
     known = raw_keys & state.plan.keys()
-    unknown = raw_keys - state.plan.keys()
-    if unknown:
-        state.unknown_aspect_keys += len(unknown)
-        candidate = _filter_to_keys(candidate, known)
-    candidate, unsearched = _drop_unsearched_negatives(candidate, state)
+    unknown = raw_keys - known
+    state.unknown_aspect_keys += len(unknown)
+    # A negative closes its key with nothing cited, so it must at least follow a search
+    # for that key.
+    unsearched = {
+        f.key for f in report.findings if not f.supported and not _searched(state, f.key)
+    } & known
     state.unsearched_negatives += len(unsearched)
+    kept = tuple(
+        f for f in report.findings if f.key in known and (f.supported or f.key not in unsearched)
+    )
 
     # A reported-but-ungrounded key stays open: closing it would let `Stop("covered")`
-    # seal a run that produced no grounded output for that aspect. Left open, it stays
+    # seal a run that produced no grounded output for that key. Left open, it stays
     # searchable, and if it is still open at the end projection renders it as unresolved.
-    state.findings.ingest(candidate, state.evidence)
+    state.findings.ingest(report.model_copy(update={"findings": kept}), state.evidence)
 
     AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
     return _render_report_result(state, closed=known, unknown=unknown, unsearched=unsearched)
@@ -605,8 +495,7 @@ def fold_searches(
     state: AgentRunState,
     searches: list[ToolCallRef],
     results: list[_SearchResult],
-    minted: dict[str, str | None],
-    rewrite_model_id: str,
+    keys: dict[str, str | None],
 ) -> tuple[dict[str, str], list[int], dict[str, object]]:
     """Fold one turn's search results into the state, in call order.
 
@@ -621,22 +510,18 @@ def fold_searches(
     new_per_search: list[int] = []
     trace_chars = get_agent_trace_chunk_chars()
     for tc, result in zip(searches, results, strict=True):
-        if result.rewrite_stats:
-            state.record_spend(rewrite_model_id, result.rewrite_stats)
         entity_new = state.evidence.admit(result.chunks)
-        if result.entity:
-            state.searched_entities.add(result.entity)
         state.degraded_capabilities |= result.degraded
         if result.chunks and not result.scores_are_rerank:
             state.scores_are_rerank = False
         if result.args_invalid:
             state.search_arg_errors += 1
 
-        # Per-aspect search provenance, written at the one instant everything is in
-        # hand. A failed or empty search admits no chunks, so this cannot be
-        # reconstructed from the EvidenceLedger afterwards — and `unresolved_lines`
-        # needs it to tell "backend down" from "not in the documents".
-        aspect = minted.get(tc.id)
+        # Per-key search provenance, written at the one instant everything is in hand. A
+        # failed or empty search admits no chunks, so this cannot be reconstructed from
+        # the EvidenceLedger afterwards — and `unresolved_lines` needs it to tell "never
+        # searched" and "backend down" from "not in the documents".
+        aspect = keys.get(tc.id)
         if aspect is not None:
             stats = state.aspect_stats.setdefault(aspect, AspectStats())
             stats.searches += 1
@@ -663,8 +548,8 @@ def fold_searches(
         if shown:
             parts.append("Already shown above: " + " · ".join(shown))
         body = "\n\n".join(parts) or "(no results)"
-        # The aspect id is echoed back so "reuse the key in brackets" is a copy from
-        # adjacent context, not a slug reconstructed from memory.
+        # The key is echoed back so "reuse the key in brackets" is a copy from adjacent
+        # context, not a slug reconstructed from memory.
         texts[tc.id] = f"[{aspect}] {body}" if aspect else body
         traces[tc.id] = {
             "aspect": aspect,
@@ -833,7 +718,6 @@ async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) 
                     deps.redis_app,
                     deps.request_id,
                     state.iteration,
-                    deps.is_analytical,
                 )
     except TimeoutError:
         logger.warning(
@@ -901,13 +785,11 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                 # ledger accumulated (None only if nothing was ever reported).
                 return Stop("natural")
 
-            # A call to a tool outside this turn's pool is answered and never parsed: an
-            # extraction run cannot land an Observation, and a final-turn search does not
-            # run.
+            # A call to a tool outside this turn's pool is answered and never parsed: a
+            # final-turn search does not run.
             offered = {t["function"]["name"] for t in tools}
-            report_names = offered & tools_module.REPORT_TOOL_NAMES
-            reports = [tc for tc in turn.tool_calls if tc.name in report_names]
-            searches = [tc for tc in turn.tool_calls if tc.name in offered - report_names]
+            reports = [tc for tc in turn.tool_calls if tc.name == REPORT_TOOL_NAME]
+            searches = [tc for tc in turn.tool_calls if tc.name in offered - {REPORT_TOOL_NAME}]
             for tc in turn.tool_calls:
                 if tc.name not in offered:
                     logger.warning(
@@ -926,11 +808,8 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
             state.transcript.append_tool_calls(turn.tool_calls)
             state.tool_calls_total += len(turn.tool_calls)
 
-            # Mint before execution, so the tool result can echo the id the model must cite.
-            minted: dict[str, str | None] = {
-                tc.id: _mint(state.plan, _sub_question_of(tc), state.settings.max_plan_items)
-                for tc in searches
-            }
+            # Key before execution, so the tool result can echo the key the model must cite.
+            keys = {tc.id: _search_key(tc, state, deps.shape) for tc in searches}
 
             report_texts, closed = fold_reports(state, reports, request_id)
             results_by_id |= report_texts
@@ -949,7 +828,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                 await asyncio.gather(*[_guarded_search(tc, state, deps) for tc in searches])
             )
             search_texts, new_per_search, search_traces = fold_searches(
-                state, searches, results, minted, deps.rewrite_model_id
+                state, searches, results, keys
             )
             results_by_id |= search_texts
             new_labels = sum(new_per_search)
@@ -960,7 +839,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                         "request_id": request_id,
                         "iteration": iteration,
                         "entity": result.entity,
-                        "aspect": minted.get(tc.id),
+                        "aspect": keys.get(tc.id),
                         "chunks_returned": len(result.chunks),
                         "new_labels": search_new,
                     },
@@ -1045,17 +924,6 @@ def agent_history(turns: Sequence[Turn]) -> list[ChatMessage]:
 # ---------------------------------------------------------------------------
 
 
-def prompt_and_tools(query_shape: str | None) -> tuple[str, list[dict]]:
-    """The tool-model prompt and tool pool for a shape.
-
-    Returned together because a prompt naming a tool the model was not given is a broken
-    run. Public so the pipeline can tag traces with the prompt before the loop starts.
-    """
-    if query_shape == "analytical":
-        return "v5_agent_analytical", tools_module.ANALYTICAL_TOOLS
-    return "v3_agent", tools_module.EXTRACTION_TOOLS
-
-
 def tool_model_chain(router: LLMRouter, model_id: str) -> list[RoutedLLM]:
     """The tool model followed by its configured fallback, keeping only models that can
     call tools. Raises when the tool model itself cannot."""
@@ -1081,9 +949,7 @@ async def _iterate(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> No
         # serve, so this fails safe.
         final_turn = iteration == state.max_iterations - 1
         turn_tools = (
-            [t for t in tools if t["function"]["name"] in tools_module.REPORT_TOOL_NAMES]
-            if final_turn
-            else tools
+            [t for t in tools if t["function"]["name"] == REPORT_TOOL_NAME] if final_turn else tools
         )
         try:
             outcome = await _run_turn(state, deps, turn_tools)
@@ -1132,7 +998,7 @@ async def run_loop(
     execute_search: ExecuteSearchFn = _execute_search,
 ) -> tuple[
     EvidenceLedger,
-    AgentFindings | AnalyticalFindings | None,
+    AgentFindings | None,
     AgentLoopMeta,
 ]:
     """Run the agent tool-calling loop for retrieval queries.
@@ -1142,7 +1008,7 @@ async def run_loop(
     subset — what the model could actually read, the only defensible pool for synthesis to
     fall back on. agent_findings is the FindingsLedger projection — the accumulated
     findings, marked degraded when the run did not seal, and None only when no report
-    was ever attempted.
+    was ever attempted and no plan key is open.
 
     ``fallbacks`` are tried in order when ``llm`` raises a provider error. When the whole
     chain fails, the run stops as ``llm_error`` and serves what it gathered; with nothing
@@ -1160,12 +1026,9 @@ async def run_loop(
         if chat_state.router_output and hasattr(chat_state.router_output, "query_shape")
         else None
     )
-    is_analytical = query_shape == "analytical"
-    prompt_name, tools = prompt_and_tools(query_shape)
-    max_iterations = settings.max_iterations_for(query_shape)
-    rewrite_model_id = get_query_transformer_model()
+    shape = shape_config(query_shape, settings)
 
-    system_content = get_system_prompt(version=prompt_name)
+    system_content = get_system_prompt(version=shape.prompt)
     messages: list[ChatMessage] = [
         ChatMessage(role=Role.system, content=system_content),
         *agent_history(chat_state.prior_turns),
@@ -1184,16 +1047,13 @@ async def run_loop(
             if years:
                 _entity_years[item.entity_name] = years
 
-    # Seeded regardless of query_shape: the entity-injection message below and
-    # `_inject_unsearched_stubs` at the synthesis boundary both read this to tell
-    # "searched and found nothing" from "never searched", on either path.
     expected_entities: set[str] = set()
     if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
         expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
 
     # The task is one user message: the scope (entities and years) above the question.
     scope_block: str | None = None
-    if not is_analytical and expected_entities:
+    if shape.seed_plan_from_entities and expected_entities:
         lines: list[str] = []
         for name in sorted(expected_entities):
             years = _entity_years.get(name)
@@ -1204,7 +1064,7 @@ async def run_loop(
             "Use ONLY the listed years in your search queries — do not guess or invent fiscal years:\n"
             + "\n".join(lines)
         )
-    elif is_analytical and _entity_years:
+    elif not shape.seed_plan_from_entities and _entity_years:
         year_lines = [
             f"- {name}: {', '.join(str(y) for y in years)}"
             for name, years in sorted(_entity_years.items())
@@ -1221,16 +1081,15 @@ async def run_loop(
 
     state = AgentRunState(
         settings=settings,
-        max_iterations=max_iterations,
+        max_iterations=shape.max_iterations,
         transcript=Transcript(messages),
-        expected_entities=expected_entities,
     )
 
-    # One termination model for both paths. Extraction's plan is loop-authored — seeded
-    # from the entities the router resolved, keyed by entity name so the model reports
-    # under the name it was given. The analytical plan seeds itself from search
-    # `sub_question`s instead.
-    if not is_analytical:
+    # One termination model for both shapes. A seeded plan is keyed by the entity names
+    # the router resolved, so the model reports under the name it was given; otherwise the
+    # plan grows from search `sub_question`s. An entity never searched is then an open key
+    # like any other, and `unresolved_lines` says so.
+    if shape.seed_plan_from_entities:
         for name in sorted(expected_entities):
             state.plan[name] = name
 
@@ -1242,16 +1101,15 @@ async def run_loop(
         reranker=reranker,
         redis_app=redis_app,
         request_id=request_id,
-        is_analytical=is_analytical,
+        shape=shape,
         search_sem=asyncio.Semaphore(settings.max_concurrent_searches),
         execute_search=execute_search,
-        rewrite_model_id=rewrite_model_id,
     )
     # One wall-clock bound for the whole run. It cancels a turn mid-flight: that turn's
     # in-flight results are lost, while earlier turns are already in the ledgers.
     try:
         async with asyncio.timeout(settings.deadline_seconds):
-            await _iterate(state, deps, tools)
+            await _iterate(state, deps, shape.tools)
     except TimeoutError:
         logger.warning(
             "agent_run_deadline",
@@ -1275,12 +1133,7 @@ async def run_loop(
         },
     )
 
-    meta = build_meta(
-        state,
-        iterations_run,
-        prompt_version=prompt_name,
-        rewrite_model=None if is_analytical else rewrite_model_id,
-    )
+    meta = build_meta(state, iterations_run, prompt_version=shape.prompt)
     # Terminal state, attached to the enclosing "agent_loop" chain span (opened by the
     # caller, current here since no per-turn span is open past the loop) — otherwise a
     # non-converged/degraded run's final ledger contents are only reconstructable by
@@ -1290,13 +1143,9 @@ async def run_loop(
         with contextlib.suppress(Exception):
             lf.update_current_span(metadata={"final_state": snapshot(state)})
     # Serve the ledger projection: a non-converged run yields its accumulated partial
-    # findings marked degraded. None only when no report was ever attempted.
-    # Keys still open are stated as limitations rather than vanishing. Only the analytical
-    # envelope carries gaps; on extraction an unreported entity is surfaced by
-    # `_inject_unsearched_stubs` instead.
+    # findings marked degraded, and keys still open are stated as limitations rather than
+    # vanishing.
     findings = state.findings.projection(
-        analytical=is_analytical,
-        degraded=not state.sealed,
-        unresolved=unresolved_lines(state) if is_analytical else (),
+        degraded=not state.sealed, unresolved=unresolved_lines(state)
     )
     return state.evidence, findings, meta

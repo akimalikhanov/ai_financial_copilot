@@ -43,7 +43,6 @@ from src.eval.schemas import (
     RunManifest,
     RunOutput,
 )
-from src.schemas.agent_findings import AnalyticalFindings
 from src.services.llm_router import get_router
 from src.utils.config import (
     get_eval_judge_model,
@@ -96,8 +95,8 @@ def _build_args() -> argparse.Namespace:
     p.add_argument("--model", default="gpt-4o-mini")
     p.add_argument(
         "--prompt-version",
-        default="v4_agent_synthesis",
-        help="System prompt version for the synthesis step (e.g. v4_agent_synthesis, v3_bracket)",
+        default="v5_agent_synthesis",
+        help="System prompt version for the synthesis step (e.g. v5_agent_synthesis, v3_bracket)",
     )
     p.add_argument("--judge-model", default=None)
     p.add_argument("--user-id", default=None)
@@ -283,11 +282,11 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         m.cost_usd_total,
                     )
 
-                if isinstance(pr.agent_findings, AnalyticalFindings):
+                if pr.agent_findings is not None:
                     af = pr.agent_findings
-                    result.observations_count = len(af.observations)
-                    result.confidence_counts = dict(Counter(o.confidence for o in af.observations))
-                    result.gaps_count = len(af.gaps) if af.gaps else 0
+                    result.findings_count = len(af.findings)
+                    result.confidence_counts = dict(Counter(f.confidence for f in af.findings))
+                    result.unresolved_count = len(af.unresolved)
 
                 if pr.rag_context and pr.rag_context.items:
                     retrieved_keys = context_to_page_keys(pr.rag_context)
@@ -492,15 +491,15 @@ def _compute_aggregate(
             iterations: list[int] = []
             tool_calls: list[int] = []
             costs: list[float] = []
-            gaps: list[int] = []
+            unresolved: list[int] = []
             for r in rows:
                 m = r.agent_meta or {}
                 conv[m.get("convergence_reason", "unknown")] += 1
                 iterations.append(m.get("iterations", 0))
                 tool_calls.append(m.get("tool_calls_total", 0))
                 costs.append(m.get("cost_usd_total", 0.0))
-                if r.gaps_count is not None:
-                    gaps.append(r.gaps_count)
+                if r.unresolved_count is not None:
+                    unresolved.append(r.unresolved_count)
                 if r.confidence_counts:
                     conf.update(r.confidence_counts)
             return {
@@ -509,8 +508,10 @@ def _compute_aggregate(
                 "mean_iterations": round(sum(iterations) / n, 2),
                 "mean_tool_calls": round(sum(tool_calls) / n, 2),
                 "mean_cost_usd": round(sum(costs) / n, 4),
-                "gaps_nonempty_rate": (
-                    round(sum(1 for g in gaps if g > 0) / len(gaps), 4) if gaps else None
+                "unresolved_nonempty_rate": (
+                    round(sum(1 for u in unresolved if u > 0) / len(unresolved), 4)
+                    if unresolved
+                    else None
                 ),
                 "confidence_counts": dict(conf),
             }
@@ -597,7 +598,7 @@ def _print_summary(output: RunOutput, out_path: Path) -> None:
         for shape, s in (agg.agent.get("by_query_shape") or {}).items():
             conv = ", ".join(f"{k}={v}" for k, v in s["convergence_reason"].items())
             conf = ", ".join(f"{k}={v}" for k, v in s["confidence_counts"].items()) or "—"
-            gaps_rate = s["gaps_nonempty_rate"]
+            unresolved_rate = s["unresolved_nonempty_rate"]
             print(f"    {shape:<12} n={s['n']}  convergence: {conv}")
             print(
                 f"      {'':<12} mean_iter={s['mean_iterations']:.2f}  "
@@ -605,7 +606,8 @@ def _print_summary(output: RunOutput, out_path: Path) -> None:
             )
             print(
                 f"      {'':<12} confidence: {conf}  "
-                f"gaps_nonempty_rate={gaps_rate if gaps_rate is None else f'{gaps_rate:.2f}'}"
+                "unresolved_nonempty_rate="
+                f"{unresolved_rate if unresolved_rate is None else f'{unresolved_rate:.2f}'}"
             )
 
     print("  COST & LATENCY")

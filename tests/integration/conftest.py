@@ -45,7 +45,7 @@ RETRIEVAL_ROUTER_JSON = json.dumps(
 _REPORT_FINDINGS_TC = ToolCallRef(
     id="call_1",
     name="report_findings",
-    arguments=json.dumps({"metric_requested": "revenue", "findings": []}),
+    arguments=json.dumps({"findings": []}),
 )
 
 

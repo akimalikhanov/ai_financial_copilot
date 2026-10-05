@@ -313,7 +313,7 @@
       "id": 22,
       "title": "LLM Call Latency by Type (s)",
       "type": "timeseries",
-      "description": "Per-call-site LLM latency — router / rewrite_query / agent_tool_call / chat. Replaces the old avg-from-Postgres panel: real percentiles, no query against the primary DB.",
+      "description": "Per-call-site LLM latency — router / agent_tool_call / chat. Replaces the old avg-from-Postgres panel: real percentiles, no query against the primary DB.",
       "gridPos": { "x": 0, "y": 44, "w": 8, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [

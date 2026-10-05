@@ -355,51 +355,76 @@ def test_system_prompt_with_real_templates():
 
 
 # -------------------------
-# v5 analytical agent prompt (10b step 6)
+# Agent tool-model prompts
 # -------------------------
 
 
-def test_v5_analytical_prompt_renders_and_names_only_its_tools():
-    """The prompt must name every tool the analytical pool offers and no other: a prompt
-    naming a tool the model was not given produces a call the provider rejects."""
-    prompt = get_system_prompt(version="v5_agent_analytical")
+@pytest.mark.parametrize("version", ["v4_agent", "v6_agent_analytical"])
+def test_agent_prompt_names_only_the_offered_tools(version: str):
+    """A prompt naming a tool the model was not given produces a call the dispatch rule
+    answers as unavailable."""
+    prompt = get_system_prompt(version=version)
 
-    assert "search_documents" in prompt
-    assert "report_analytical_findings" in prompt
-    # `report_findings` is the extraction finalizer — naming it here would invite a call
-    # whose AgentFindings payload lands on the wrong ledger kind.
-    assert "report_findings(" not in prompt
-    assert "call report_findings" not in prompt
+    assert "search_documents(" in prompt
+    assert "report_findings(" in prompt
+    assert "report_analytical_findings" not in prompt
 
 
-def test_v5_analytical_prompt_drops_the_one_shot_finalizer_framing():
-    """D3: the report tool is non-terminal and the loop owns termination. Prose telling
-    the model to call it ONCE, or that it ends the search phase, contradicts the loop."""
-    prompt = get_system_prompt(version="v5_agent_analytical")
+@pytest.mark.parametrize("version", ["v4_agent", "v6_agent_analytical"])
+def test_agent_prompt_names_only_current_finding_fields(version: str):
+    prompt = get_system_prompt(version=version)
+
+    for retired in ("metric_requested", "source_chunks", "evidence_chunks", "substantiated"):
+        assert retired not in prompt
+    for field in ("key", "claim", "supported", "evidence", "figures"):
+        assert f"`{field}`" in prompt
+
+
+def test_analytical_prompt_drops_the_one_shot_finalizer_framing():
+    """The report tool is non-terminal and the loop owns termination. Prose telling the
+    model to call it ONCE, or that it ends the search phase, contradicts the loop."""
+    prompt = get_system_prompt(version="v6_agent_analytical")
 
     assert "ONCE" not in prompt
     assert "ends the search phase" not in prompt
     assert "as soon as its evidence settles" in prompt
 
 
-def test_v5_analytical_prompt_fixes_no_aspect_count():
+def test_analytical_prompt_fixes_no_aspect_count():
     """Width is anchored on the question, not a number: every seeded aspect is an
     obligation that either lands a finding or surfaces as an unresolved gap, so a fixed
     count spends searches on invented hypotheses and pads the answer with manufactured gaps."""
-    prompt = get_system_prompt(version="v5_agent_analytical")
+    prompt = get_system_prompt(version="v6_agent_analytical")
 
     assert "3–4" not in prompt
     assert "sub_question" in prompt  # the mechanism that opens an aspect
 
 
-def test_v5_analytical_prompt_caps_fanout_at_max_concurrent_searches():
+def test_synthesis_prompt_describes_the_one_block():
+    prompt = get_system_prompt(version="v5_agent_synthesis")
+
+    assert "[FINDINGS]" in prompt
+    assert "[STRUCTURED FINDINGS]" not in prompt
+    assert "[AGENT OBSERVATIONS]" not in prompt
+    # Every marker the renderer and the projection can emit is explained.
+    for marker in (
+        "[not disclosed]",
+        "(scale not stated)",
+        "UNVERIFIED: value not located in cited excerpt",
+        "Not searched:",
+        "Could not be checked",
+    ):
+        assert marker in prompt
+
+
+def test_analytical_prompt_caps_fanout_at_max_concurrent_searches():
     """The turn-1 fan-out must not exceed AGENT_MAX_CONCURRENT_SEARCHES (default 3), or
     the extra searches queue behind the semaphore instead of running in parallel."""
     import re
 
     from src.services.chat.agent.state import get_agent_settings
 
-    prompt = get_system_prompt(version="v5_agent_analytical")
+    prompt = get_system_prompt(version="v6_agent_analytical")
     example = prompt.split("## Example")[1]
     turn_1 = example.split("Turn 2")[0]
 

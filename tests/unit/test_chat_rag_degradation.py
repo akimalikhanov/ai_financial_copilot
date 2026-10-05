@@ -13,7 +13,6 @@ from uuid import uuid4
 
 import pytest
 
-from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RetrievedChunk
 from src.services.retrieval import chat_rag
 from src.services.retrieval.reranker import RerankOutcome
@@ -79,7 +78,8 @@ def _patched(monkeypatch: pytest.MonkeyPatch):
 async def _run(**kwargs):
     return await chat_rag.run_chat_rag_pipeline(
         None,  # type: ignore[arg-type]  — session only reaches the patched hydrator
-        transformed=TransformedQuery(semantic_query="q", keyword_query="q"),
+        semantic_query="q",
+        keyword_query="q",
         user_id=uuid4(),
         doc_ids=None,
         reranker=_StubReranker(),
@@ -159,7 +159,8 @@ class TestRerankDegradation:
 
         _ctx, trace, _chunks = await chat_rag.run_chat_rag_pipeline(
             None,  # type: ignore[arg-type]
-            transformed=TransformedQuery(semantic_query="q", keyword_query="q"),
+            semantic_query="q",
+            keyword_query="q",
             user_id=uuid4(),
             doc_ids=None,
             reranker=_StubReranker(RerankOutcome(chunks=[_chunk()], scored=False, degraded=True)),

@@ -294,9 +294,9 @@ def get_llm_connect_timeout_seconds() -> float:
 def get_llm_max_retries() -> int:
     """SDK-level retries (LLM_MAX_RETRIES, default 1).
 
-    Attempts multiply across layers: 2 attempts times the app-level parse retry in
-    query_transformer/router is 4 HTTP calls for one rewrite (the openai default of 2
-    retries would make it 6). Each layer is separately bounded by its own timeout.
+    Attempts multiply across layers: 2 attempts times the router's app-level parse retry
+    is 4 HTTP calls for one routing decision (the openai default of 2 retries would make
+    it 6). Each layer is separately bounded by its own timeout.
     """
     return int(os.getenv("LLM_MAX_RETRIES", "1"))
 
@@ -958,21 +958,6 @@ def get_query_router_prompt_version() -> str:
 def get_query_router_model() -> str:
     """Model ID for query routing (QUERY_ROUTER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
-
-
-def get_query_transformer_model() -> str:
-    """Model ID for query transformation (QUERY_TRANSFORMER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
-    return os.getenv("QUERY_TRANSFORMER_MODEL", "gpt-4o-mini")
-
-
-def get_query_transformer_config() -> dict:
-    return {
-        "temperature": float(os.getenv("QUERY_TRANSFORMER_TEMPERATURE", "0.0")),
-        "max_tokens": int(os.getenv("QUERY_TRANSFORMER_MAX_TOKENS", "1200")),
-        "timeout": float(os.getenv("QUERY_TRANSFORMER_TIMEOUT", "10.0")),
-        "max_scope_docs": int(os.getenv("QUERY_TRANSFORMER_MAX_SCOPE_DOCS", "10")),
-        "conv_history_tokens": int(os.getenv("QUERY_TRANSFORMER_CONV_HISTORY_TOKENS", "1200")),
-    }
 
 
 # Agent config lives in src.services.chat.agent.state.get_agent_settings() (validated,

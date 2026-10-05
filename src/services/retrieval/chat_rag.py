@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
-from src.schemas.query_transform import TransformedQuery
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
 from src.services.ingestion.embedder import embed_query
 from src.services.retrieval.context_assembler import assemble_rag_context
@@ -129,7 +128,8 @@ async def _run_single_pass(
 async def run_chat_rag_pipeline(
     session: AsyncSession,
     *,
-    transformed: TransformedQuery,
+    semantic_query: str,
+    keyword_query: str,
     user_id: UUID,
     doc_ids: list[UUID] | None,
     timeout: float | None = None,
@@ -138,6 +138,8 @@ async def run_chat_rag_pipeline(
     top_k_override: int | None = None,
 ) -> tuple[RAGContext, RetrievalTrace, list[RetrievedChunk]]:
     """Embed query, run retrieval (single-pass), rerank, assemble RAGContext.
+
+    `semantic_query` is embedded and drives the reranker; `keyword_query` goes to BM25.
 
     search_mode controls which backends run:
       - "hybrid": Qdrant + OpenSearch in parallel, fused via RRF (default)
@@ -157,10 +159,10 @@ async def run_chat_rag_pipeline(
     # letting it raise would take keyword search down with it while OpenSearch is healthy,
     # which is the one thing the per-backend fail-open below exists to prevent.
     semantic_vector: list[float] | None = None
-    with lf_span("embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
+    with lf_span("embed_query", as_type="embedding", input=[semantic_query]) as obs:
         _t = perf_counter()
         try:
-            semantic_vector = await asyncio.to_thread(embed_query, transformed.semantic_query)
+            semantic_vector = await asyncio.to_thread(embed_query, semantic_query)
         except Exception as e:
             logger.warning("embed_query_failed", extra={"error": str(e)})
         RAG_RETRIEVAL.labels("embed").observe(perf_counter() - _t)
@@ -178,8 +180,8 @@ async def run_chat_rag_pipeline(
         "hybrid_retrieve",
         as_type="retriever",
         input={
-            "semantic_query": transformed.semantic_query,
-            "keyword_query": transformed.keyword_query,
+            "semantic_query": semantic_query,
+            "keyword_query": keyword_query,
             "search_mode": search_mode,
         },
         mode="single_pass",
@@ -187,7 +189,7 @@ async def run_chat_rag_pipeline(
         _t = perf_counter()
         _pass = await _run_single_pass(
             semantic_vector,
-            transformed.keyword_query,
+            keyword_query,
             user_id,
             doc_ids,
             timeout,
@@ -231,14 +233,14 @@ async def run_chat_rag_pipeline(
         "rerank",
         as_type="retriever",
         input={
-            "query": transformed.semantic_query,
+            "query": semantic_query,
             "input_count": len(capped),
             "chunks": [{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in capped],
         },
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        outcome = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        outcome = await reranker.rerank(semantic_query, capped, texts_map)
         reranked = outcome.chunks
         RAG_RETRIEVAL.labels("rerank").observe(perf_counter() - _t)
         RAG_CHUNKS.labels("reranked").observe(len(reranked))

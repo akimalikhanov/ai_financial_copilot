@@ -40,12 +40,11 @@ _DEFAULT_LATENCY_MIN_S = 2.0
 _DEFAULT_LATENCY_MODE_S = 6.0
 _DEFAULT_LATENCY_MAX_S = 20.0
 
-# Structured-output supporting calls (query router, query transformer) are real gpt-4o-mini
-# calls that return in ~1-2s, not full agent turns — and query_transformer specifically wraps
-# its call in a 10s asyncio.wait_for (QUERY_TRANSFORMER_TIMEOUT, config.py). Sampling from the
-# slow profile above regularly exceeded that timeout and spammed rewrite_query_llm_error on
-# every load test run (harmless — query_transformer falls back — but it's noise that isn't a
-# real finding). Keep this comfortably under the smallest known caller timeout.
+# Structured-output supporting calls (query router) are real gpt-4o-mini calls that return in
+# ~1-2s, not full agent turns — and the router wraps its call in a 10s asyncio.wait_for
+# (ROUTER_TIMEOUT, config.py). Sampling from the slow profile above regularly exceeded that
+# timeout on every load test run (harmless — the router falls back — but it's noise that isn't
+# a real finding). Keep this comfortably under the smallest known caller timeout.
 _FAST_LATENCY_MIN_S = 0.3
 _FAST_LATENCY_MODE_S = 1.0
 _FAST_LATENCY_MAX_S = 3.0
@@ -68,11 +67,11 @@ async def _sample_latency_seconds(*, fast: bool = False) -> float:
     """Sleep for a realistic-but-fake LLM call duration. Re-read from env on every call —
     the adapter instance is a shared singleton, so this must not be cached on self.
 
-    `fast=True` is for structured-output supporting calls (query router/transformer) — see
-    the module-level comment on _FAST_LATENCY_* above. FAKE_LLM_LATENCY_MS still overrides
+    `fast=True` is for structured-output supporting calls (query router) — see the
+    module-level comment on _FAST_LATENCY_* above. FAKE_LLM_LATENCY_MS still overrides
     both profiles unconditionally — it's the deliberate T7 dependency-slow-LLM knob and
     should be able to force a slow value everywhere, including onto the fast path, when
-    someone wants to test what a slow query_transformer call actually does downstream.
+    someone wants to test what a slow router call actually does downstream.
     """
     # Blank, not just unset, means "sampled": the k8s load-test patch carries this key on
     # every run and `make k8s-loadtest` writes the scenario's value into it, so the no-toxic
@@ -126,10 +125,9 @@ def _response_format_name(req: ChatRequest) -> str | None:
 
 
 def _canned_text_for(req: ChatRequest) -> str:
-    """Structured-output callers (query router, query transformer) parse this with
-    json.loads + strict Pydantic validation — see src/services/router/parser.py and
-    src/services/retrieval/query_transformer.py::_parse_response. Anything else (naming,
-    table summarizer, picture enricher) just needs non-empty text."""
+    """Structured-output callers (query router) parse this with json.loads + strict
+    Pydantic validation — see src/services/router/parser.py. Anything else (naming, table
+    summarizer, picture enricher) just needs non-empty text."""
     name = _response_format_name(req)
     if name == "query_router":
         return json.dumps(
@@ -142,9 +140,6 @@ def _canned_text_for(req: ChatRequest) -> str:
                 "requested_currency": None,
             }
         )
-    if name == "query_transformer":
-        query = _last_user_content(req.messages)
-        return json.dumps({"semantic_query": query, "keyword_query": query, "fallback": False})
     return "Fake adapter canned response for load testing."
 
 
@@ -160,8 +155,8 @@ class FakeAdapter(LLMAdapter):
         pass
 
     async def _complete(self, req: ChatRequest) -> LLMResponse:
-        # response_format present => a structured-output supporting call (query router/
-        # transformer), not a full agent turn or answer — see _FAST_LATENCY_* above.
+        # response_format present => a structured-output supporting call (query router),
+        # not a full agent turn or answer — see _FAST_LATENCY_* above.
         is_fast_call = _response_format_name(req) is not None
         latency_s = await _sample_latency_seconds(fast=is_fast_call)
         text = _canned_text_for(req)
@@ -185,57 +180,46 @@ class FakeAdapter(LLMAdapter):
     async def complete_with_tools(
         self,
         messages: Sequence[ChatMessage],
-        tools: list[dict[str, Any]],
+        tools: list[dict[str, Any]],  # noqa: ARG002 — callers pass it by keyword
         **_kwargs: Any,
     ) -> AssistantTurnResult:
         latency_s = await _sample_latency_seconds()
         tool_turns_so_far = sum(1 for m in messages if m.role == Role.tool)
-        tool_names = {t.get("function", {}).get("name") for t in tools}
 
         if tool_turns_so_far < _SEARCH_TURNS:
-            args = json.dumps(
-                {"entity": "Fake Entity", "query": _last_user_content(messages)[:200]}
-            )
+            query = _last_user_content(messages)[:200]
+            args = json.dumps({"entity": "Fake Entity", "query": query, "keywords": query})
             tool_calls = [
                 ToolCallRef(id=f"fake-{uuid4()}", name="search_documents", arguments=args)
             ]
             text = ""
         elif tool_turns_so_far == _SEARCH_TURNS:
-            if "report_analytical_findings" in tool_names:
-                args = json.dumps(
-                    {
-                        "question": _last_user_content(messages)[:200],
-                        "observations": [
-                            {
-                                "aspect": "A1",
-                                "claim": "Fake adapter synthetic observation for load testing.",
-                                "substantiated": True,
-                                "evidence_chunks": ["S1"],
-                                "confidence": "medium",
-                            }
-                        ],
-                        "conclusion": None,
-                    }
-                )
-                report_name = "report_analytical_findings"
-            else:
-                args = json.dumps(
-                    {
-                        "metric_requested": "fake metric",
-                        "findings": [
-                            {
-                                "entity": "Fake Entity",
-                                "available": True,
-                                "value": 1.0,
-                                "currency": "USD",
-                                "source_chunks": ["S1"],
-                                "unit": "",
-                            }
-                        ],
-                    }
-                )
-                report_name = "report_findings"
-            tool_calls = [ToolCallRef(id=f"fake-{uuid4()}", name=report_name, arguments=args)]
+            args = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "key": "Fake Entity",
+                            "claim": "Fake adapter synthetic finding for load testing.",
+                            "supported": True,
+                            "evidence": ["S1"],
+                            "confidence": "medium",
+                            "figures": [
+                                {
+                                    "metric": "fake metric",
+                                    "amount": 1.0,
+                                    "unit": "",
+                                    "currency": "USD",
+                                    "period_end": None,
+                                    "fiscal_label": None,
+                                }
+                            ],
+                        }
+                    ],
+                    "comparison_op": None,
+                    "conclusion": None,
+                }
+            )
+            tool_calls = [ToolCallRef(id=f"fake-{uuid4()}", name="report_findings", arguments=args)]
             text = ""
         else:
             tool_calls = []

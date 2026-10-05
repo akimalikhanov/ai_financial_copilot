@@ -2,16 +2,17 @@
 
 The third state store, beside `Transcript` (the model's view) and `EvidenceLedger`
 (retrieved chunks). Where the transcript logs *interactions*, this stores *conclusions*,
-addressed by a stable key — ``EntityFinding.entity`` or ``Observation.aspect`` — and
-updated in place.
+addressed by their plan key (an entity name or an aspect id) and updated in place.
 
-The loop folds in every `report_*` call as it arrives — reports are incremental, not
-terminal — and projects the accumulation back for synthesis via `projection`.
+The loop folds in every `report_findings` call as it arrives — reports are incremental,
+not terminal — and projects the accumulation back for synthesis via `projection`.
 
 `record` updates in place, so each key holds its latest finding and there is no best-of
-comparator. A positive claim whose chunk refs don't resolve in the `EvidenceLedger` is
-dropped, not admitted, and the prior entry for that key is left intact. This grounding
-filter is the only correctness filter on what reaches synthesis.
+comparator. The exception is figures: a supported finding restated with figures for
+another metric or period adds them to the ones already held, so a two-period question
+keeps both periods. A positive claim whose chunk refs don't resolve in the
+`EvidenceLedger` is dropped, not admitted, and the prior entry for that key is left
+intact. This grounding filter is the only correctness filter on what reaches synthesis.
 
 Every model-written string is also scanned like a retrieved excerpt before it is stored,
 because it reaches the answering model as findings, outside any excerpt tag: the tool
@@ -25,20 +26,13 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
-from src.schemas.agent_findings import (
-    AgentFindings,
-    AnalyticalFindings,
-    EntityFinding,
-    Observation,
-)
+from src.schemas.agent_findings import AgentFindings, Figure, Finding, FindingsReport
 from src.services.security.injection_detector import scan_retrieved_chunk
 
 if TYPE_CHECKING:
     from src.services.chat.agent.evidence import EvidenceLedger
 
 logger = logging.getLogger(__name__)
-
-Candidate = AgentFindings | AnalyticalFindings
 
 # Prefixed to model-written text the injection scan flags; the synthesis prompt names it.
 FLAGGED_MARKER = "[flagged] "
@@ -63,41 +57,26 @@ def _resolves(refs: list[str], evidence: EvidenceLedger) -> bool:
     return False
 
 
-def _is_positive(finding: EntityFinding | Observation) -> bool:
-    """A stated negative ("not available", `substantiated: false`) is a real conclusion
-    about its key and cites nothing by definition, so only positive claims need grounding."""
-    return finding.available if isinstance(finding, EntityFinding) else finding.substantiated
+def _figure_key(figure: Figure) -> tuple[str, str | None]:
+    return figure.metric.strip().casefold(), figure.period_end or figure.fiscal_label
 
 
-def _citations(finding: EntityFinding | Observation) -> list[str]:
-    return finding.source_chunks if isinstance(finding, EntityFinding) else finding.evidence_chunks
-
-
-def finding_chunk_ids(findings: Candidate) -> set[str]:
-    """All chunk-id strings referenced by the findings."""
-    ids: set[str] = set()
-    if isinstance(findings, AgentFindings):
-        for f in findings.findings:
-            ids.update(f.source_chunks or [])
-    else:
-        for o in findings.observations:
-            ids.update(o.evidence_chunks or [])
-    return ids
+def _merge(prior: Finding, new: Finding) -> Finding:
+    """`new` with the prior figures it doesn't restate, and the evidence they cite."""
+    figures = {_figure_key(f): f for f in prior.figures}
+    figures.update((_figure_key(f), f) for f in new.figures)
+    evidence = list(dict.fromkeys([*prior.evidence, *new.evidence]))
+    return new.model_copy(update={"figures": list(figures.values()), "evidence": evidence})
 
 
 class FindingsLedger:
     def __init__(self) -> None:
-        self._entries: dict[str, EntityFinding | Observation] = {}
+        self._entries: dict[str, Finding] = {}
         # Set by the first `ingest` or `record`; projection serves None until then.
         self._reported = False
-        # Report-envelope metadata, last-write-wins — the per-item entries alone cannot
-        # reconstruct the AgentFindings/AnalyticalFindings shape synthesis and persistence
-        # expect, so the envelope is retained here rather than re-derived.
-        self._metric_requested: str | None = None
+        # Report-envelope fields, last write wins.
         self._comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
-        self._question: str | None = None
         self._conclusion: str | None = None
-        self._gaps: list[str] | None = None
         # Positive claims seen, and those dropped because none of their citations resolve.
         self._claims = 0
         self._uncited = 0
@@ -119,19 +98,20 @@ class FindingsLedger:
         )
         return None if signal.severity == "block" else FLAGGED_MARKER + signal.sanitized_text
 
-    def _screen_finding(
-        self, finding: EntityFinding | Observation
-    ) -> EntityFinding | Observation | None:
-        field = "claim" if isinstance(finding, Observation) else "reason"
-        text = getattr(finding, field)
-        screened = self._screen(text)
-        if text and screened is None:
+    def _screen_finding(self, finding: Finding) -> Finding | None:
+        """The finding with its free-text fields screened; None if any is blocked."""
+        claim = self._screen(finding.claim)
+        if claim is None:
             return None
-        return finding if screened == text else finding.model_copy(update={field: screened})
+        figures: list[Figure] = []
+        for fig in finding.figures:
+            metric, label = self._screen(fig.metric), self._screen(fig.fiscal_label)
+            if metric is None or (fig.fiscal_label and label is None):
+                return None
+            figures.append(fig.model_copy(update={"metric": metric, "fiscal_label": label}))
+        return finding.model_copy(update={"claim": claim, "figures": figures})
 
-    def record(
-        self, key: str, finding: EntityFinding | Observation, evidence: EvidenceLedger
-    ) -> bool:
+    def record(self, key: str, finding: Finding, evidence: EvidenceLedger) -> bool:
         """Insert or update-in-place. Returns False (and leaves any prior entry intact)
         when the injection scan blocks the item's text or the grounding filter drops it."""
         self._reported = True
@@ -139,52 +119,34 @@ class FindingsLedger:
         if screened is None:
             return False
         finding = screened
-        if _is_positive(finding):
+        if finding.supported:
             self._claims += 1
-            if not _resolves(_citations(finding), evidence):
+            if not _resolves(finding.evidence, evidence):
                 self._uncited += 1
                 return False
+            prior = self._entries.get(key)
+            if prior is not None and prior.supported:
+                finding = _merge(prior, finding)
         self._entries[key] = finding
         return True
 
-    def ingest(
-        self, candidate: AgentFindings | AnalyticalFindings, evidence: EvidenceLedger
-    ) -> None:
+    def ingest(self, report: FindingsReport, evidence: EvidenceLedger) -> None:
         """Fold one report into the ledger. Accumulates; never prunes.
 
         Restated keys update in place; keys this report omits are left alone. Reports are
         incremental rather than a single terminal restatement, so omission carries no
-        information at all — the model reports an aspect when its evidence settles and
-        never restates the others.
+        information at all — the model reports a key when its evidence settles and never
+        restates the others.
 
-        Envelope fields are last-write-wins but null-guarded, and `gaps` unions rather than
-        replaces: a later report that omits a field, or carries `gaps=[]`, must not erase
-        what an earlier one established. A field the injection scan blocks counts as
-        omitted.
-
-        One run only ever offers one report tool (the loop answers any other with "tool
-        not available"), so every candidate a ledger sees has the same type.
+        Envelope fields are last-write-wins but null-guarded: a later report that omits a
+        field must not erase what an earlier one established. A field the injection scan
+        blocks counts as omitted.
         """
         self._reported = True
-        items: list[tuple[str, EntityFinding | Observation]]
-        if isinstance(candidate, AgentFindings):
-            self._metric_requested = (
-                self._screen(candidate.metric_requested) or self._metric_requested
-            )
-            self._comparison_op = candidate.comparison_op or self._comparison_op
-            items = [(f.entity, f) for f in candidate.findings]
-        else:
-            self._question = self._screen(candidate.question) or self._question
-            conclusion = self._screen(candidate.conclusion)
-            if conclusion is not None:
-                self._conclusion = conclusion
-            for gap in candidate.gaps or ():
-                g = self._screen(gap)
-                if g is not None and g not in (self._gaps or ()):
-                    self._gaps = [*(self._gaps or []), g]
-            items = [(o.aspect, o) for o in candidate.observations]
-        for key, finding in items:
-            self.record(key, finding, evidence)
+        self._comparison_op = report.comparison_op or self._comparison_op
+        self._conclusion = self._screen(report.conclusion) or self._conclusion
+        for finding in report.findings:
+            self.record(finding.key, finding, evidence)
 
     def keys(self) -> set[str]:
         return set(self._entries)
@@ -194,7 +156,7 @@ class FindingsLedger:
         negatives cite nothing by design and are not claims here."""
         return self._uncited / self._claims if self._claims else 0.0
 
-    def get(self, key: str) -> EntityFinding | Observation | None:
+    def get(self, key: str) -> Finding | None:
         return self._entries.get(key)
 
     def screened(self) -> dict[str, int]:
@@ -202,36 +164,21 @@ class FindingsLedger:
         return dict(self._screened)
 
     def projection(
-        self, *, analytical: bool, degraded: bool = False, unresolved: Sequence[str] = ()
-    ) -> AgentFindings | AnalyticalFindings | None:
-        """The findings synthesis serves, in the run's shape. None when no report was ever
-        attempted (raw-excerpt fallback); otherwise the accumulated ledger reconstructed
-        into its report shape, marked degraded when the run never sealed. Degraded only
-        annotates the analytical path, whose `gaps` field can carry the caveat.
+        self, *, degraded: bool = False, unresolved: Sequence[str] = ()
+    ) -> AgentFindings | None:
+        """The findings synthesis serves. None when no report was ever attempted and no
+        key is left open (raw-excerpt fallback).
 
-        `unresolved` holds one line per plan key still open, appended to `gaps`, so an
-        analytical run where no report ever landed still serves the lines that explain
-        why instead of falling back to raw excerpts.
+        `unresolved` holds one line per plan key still open, so a run where no report
+        ever landed still serves the lines that explain why. A run that never sealed also
+        carries the degraded caveat.
         """
-        if not analytical:
-            if not self._reported:
-                return None
-            findings = tuple(f for f in self._entries.values() if isinstance(f, EntityFinding))
-            return AgentFindings(
-                metric_requested=self._metric_requested or "",
-                findings=findings,
-                comparison_op=self._comparison_op,
-            )
         if not self._reported and not unresolved:
             return None
-        observations = tuple(f for f in self._entries.values() if isinstance(f, Observation))
-        gaps = list(self._gaps) if self._gaps else []
-        gaps.extend(g for g in unresolved if g not in gaps)
-        if degraded:
-            gaps.append(_DEGRADED_CAVEAT)
-        return AnalyticalFindings(
-            question=self._question or "",
-            observations=observations,
+        lines = [*unresolved, *([_DEGRADED_CAVEAT] if degraded else [])]
+        return AgentFindings(
+            findings=tuple(self._entries.values()),
+            comparison_op=self._comparison_op,
             conclusion=self._conclusion,
-            gaps=gaps or None,
+            unresolved=tuple(lines),
         )

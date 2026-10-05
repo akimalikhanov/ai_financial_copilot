@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db import get_session_factory
 from src.eval.schemas import EvalQuestion
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
+from src.schemas.agent_findings import AgentFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
 from src.schemas.retrieval import AnswerCitationSpan, RAGContext, RetrievalTrace
@@ -54,7 +54,7 @@ class AgentPipelineResult(PipelineResult):
     """PipelineResult extended with agentic metadata."""
 
     agent_meta: AgentLoopMeta | None = None
-    agent_findings: AgentFindings | AnalyticalFindings | None = None
+    agent_findings: AgentFindings | None = None
     processed_findings: ProcessedFindings | None = None
     query_shape: str | None = None
 
@@ -68,7 +68,7 @@ async def run_one(
     session: AsyncSession,
     user_id: UUID,
     model_id: str,
-    prompt_version: str = "v4_agent_synthesis",
+    prompt_version: str = "v5_agent_synthesis",
     reasoning_effort: str | None = None,
     max_tokens: int | None = None,
     verbosity: str | None = None,

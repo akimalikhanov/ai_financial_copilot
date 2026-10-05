@@ -36,8 +36,8 @@ async def generate_conversation_title(
     """Call a cheap LLM to produce a short title. Returns None on any failure.
 
     Registers a Langfuse generation (via ``_lf_name``) and a completed
-    ``llm_requests`` sub-request — matching the pattern used by rewrite_query /
-    query_router / table_summarizer.
+    ``llm_requests`` sub-request — matching the pattern used by query_router /
+    table_summarizer.
     """
     request_params: dict = {"temperature": 0.3, "max_tokens": 30}
 

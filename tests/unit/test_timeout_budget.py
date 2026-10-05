@@ -56,65 +56,6 @@ def test_gemini_adapter_applies_configured_timeout_in_milliseconds() -> None:
     assert opts.retry_options.attempts == get_llm_max_retries() + 1
 
 
-# --- 3.2 the dead QUERY_TRANSFORMER_TIMEOUT is now enforced ---
-
-
-class _HangingLLM:
-    """An LLM that never answers — the degraded-upstream case the timeout exists for."""
-
-    provider = "openai"
-    model_id = "m"
-
-    async def complete(self, **_kwargs: Any) -> Any:
-        await asyncio.sleep(30)
-        raise AssertionError("should have timed out")
-
-
-class _HangingRouter:
-    def get(self, _model_id: str) -> Any:
-        return _HangingLLM()
-
-
-@pytest.mark.asyncio
-async def test_slow_rewrite_falls_back_to_the_raw_query(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A rewrite is an optimisation: exceeding its budget must degrade to the un-rewritten
-    query, not fail the request. Before this the configured value was never applied and the
-    effective timeout was the SDK's 600s."""
-    monkeypatch.setenv("QUERY_TRANSFORMER_TIMEOUT", "0.05")
-
-    from src.services.retrieval import query_transformer as qt
-
-    started = asyncio.get_running_loop().time()
-    result, _stats = await qt.rewrite_query(
-        "what was revenue in 2023",
-        llm_router=_HangingRouter(),  # type: ignore[arg-type]
-    )
-    elapsed = asyncio.get_running_loop().time() - started
-
-    assert result.fallback is True
-    assert result.semantic_query == "what was revenue in 2023"
-    assert elapsed < 5.0, f"rewrite was not bounded by its timeout (took {elapsed:.1f}s)"
-
-
-@pytest.mark.asyncio
-async def test_rewrite_timeout_is_read_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Raising the configured budget must actually lengthen the wait — proof the value is
-    applied at the use site rather than merely loaded into cfg."""
-    from src.services.retrieval import query_transformer as qt
-
-    monkeypatch.setenv("QUERY_TRANSFORMER_TIMEOUT", "0.05")
-    t0 = asyncio.get_running_loop().time()
-    await qt.rewrite_query("q", llm_router=_HangingRouter())  # type: ignore[arg-type]
-    short = asyncio.get_running_loop().time() - t0
-
-    monkeypatch.setenv("QUERY_TRANSFORMER_TIMEOUT", "0.6")
-    t0 = asyncio.get_running_loop().time()
-    await qt.rewrite_query("q", llm_router=_HangingRouter())  # type: ignore[arg-type]
-    longer = asyncio.get_running_loop().time() - t0
-
-    assert longer > short
-
-
 # --- 3.3 the search fan-out is bounded, and bounding it stays fail-open ---
 
 

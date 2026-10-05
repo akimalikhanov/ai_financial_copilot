@@ -57,6 +57,7 @@ template: |
   - **analytical**: Causal, narrative, or explanatory intent — the user wants to understand *why* or *how* something happened, not just retrieve numbers.
     Requires explicit causal/explanatory language: "why", "how did", "what caused", "what drove", "explain", "what happened to", "what led to".
     "Analyze" or "get indicators" alone does NOT make a query analytical — if the result is a set of retrieved numbers (even with currency conversion), use `extraction` or `comparison`.
+    "How did X change from A to B" (or "between A and B", "over the last N years") asks for the values in each period: that is `comparison`, not `analytical`, unless the query also asks why or what drove the change.
     Examples: "Why did gross margin compress in H2 2023?", "What drove the revenue decline?", "Explain the restructuring impact."
 
   When uncertain between `extraction` and `comparison`, choose `comparison`.
@@ -119,6 +120,32 @@ template: |
     "query_shape": "comparison",
     "requested_currency": null,
     "reasoning": "Multi-entity comparison across multiple years. No output currency named."
+  }
+  ```
+
+  **Query:** "How did ACME's revenue change from FY2021 to FY2022?"
+  **recent_turns:** []
+  ```json
+  {
+    "route": "retrieval",
+    "entities": [{"name": "ACME Corp.", "entity_type": "company", "raw_span": "ACME"}],
+    "user_intent": "trend_analysis",
+    "query_shape": "comparison",
+    "requested_currency": null,
+    "reasoning": "Same entity across two periods; asks what the values were, not why — comparison."
+  }
+  ```
+
+  **Query:** "How did ACME's revenue change from FY2021 to FY2022, and what drove it?"
+  **recent_turns:** []
+  ```json
+  {
+    "route": "retrieval",
+    "entities": [{"name": "ACME Corp.", "entity_type": "company", "raw_span": "ACME"}],
+    "user_intent": "trend_analysis",
+    "query_shape": "analytical",
+    "requested_currency": null,
+    "reasoning": "Asks what drove the change — causal, so analytical."
   }
   ```
 

@@ -45,7 +45,6 @@ async def run_agent(
         evidence,
         findings,
         meta,
-        state.scope_result,
         requested_currency,
         max_chunks_per_entity=get_agent_settings().max_chunks_per_entity,
     )

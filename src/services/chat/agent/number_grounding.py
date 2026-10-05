@@ -15,18 +15,17 @@ import re
 from collections.abc import Sequence
 from enum import StrEnum
 
-UNIT_TO_MILLIONS: dict[str | None, float] = {
+UNIT_TO_MILLIONS: dict[str, float] = {
     "B": 1_000.0,
     "M": 1.0,
     "K": 0.001,
     "": 0.000_001,  # absolute / units
-    None: 1.0,  # assume millions when unspecified
 }
 
 
-def to_millions(value: float, unit: str | None) -> float:
+def to_millions(value: float, unit: str) -> float:
     """Scale value to millions for unit-safe comparison."""
-    return value * UNIT_TO_MILLIONS.get(unit, 1.0)
+    return value * UNIT_TO_MILLIONS[unit]
 
 
 class NumberGrounding(StrEnum):
@@ -68,9 +67,9 @@ def _parse_number(token: str) -> float | None:
     return -value if negative else value
 
 
-def _candidates(raw: float, trailing: str, finding_unit: str | None) -> list[float]:
+def _candidates(raw: float, trailing: str, finding_unit: str) -> list[float]:
     """Magnitudes (in millions) a bare number token could plausibly denote."""
-    out = [raw * UNIT_TO_MILLIONS.get("", 1.0)]  # literal, treated as an absolute value
+    out = [raw * UNIT_TO_MILLIONS[""]]  # literal, treated as an absolute value
     word_match = re.match(r"\s*([a-zA-Z]+)", trailing)
     if word_match:
         scale = _SCALE_WORDS.get(word_match.group(1).lower())
@@ -91,10 +90,12 @@ def verify_value(
     unit: str | None,
     texts: Sequence[str],
 ) -> NumberGrounding:
-    """Scan `texts` for a number matching `value` (scaled by `unit`) within tolerance."""
+    """Scan `texts` for a number matching `value` (scaled by `unit`) within tolerance.
+    With no stated unit, the value must appear as printed."""
     if value is None or not texts:
         return NumberGrounding.UNVERIFIABLE
 
+    unit = "" if unit is None else unit
     target = to_millions(value, unit)
     for text in texts:
         for m in _NUMBER_RE.finditer(text):

@@ -15,8 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.findings import FindingsLedger
+from src.services.chat.agent.tools import REPORT_FINDINGS_TOOL, SEARCH_ANALYTICAL_TOOL, SEARCH_TOOL
 from src.services.chat.agent.transcript import Transcript
-from src.utils.config import get_query_transformer_model
 
 if TYPE_CHECKING:
     from src.services.llm_adapters.base_adapter import LLMResponseStats
@@ -35,8 +35,8 @@ ConvergenceReason = Literal[
 
 
 class AgentSettings(BaseModel):
-    """Validated agent env config. The loop reads these directly; the only per-shape
-    value is the iteration cap, via `max_iterations_for`."""
+    """Validated agent env config. The loop reads these directly; what differs per shape
+    is resolved once into a `ShapeConfig`."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -61,8 +61,39 @@ class AgentSettings(BaseModel):
     # own id (no fuzzy matching), so this is what bounds the cost of that choice.
     max_plan_items: int = Field(ge=1)
 
-    def max_iterations_for(self, shape: str | None) -> int:
-        return self.max_iterations_analytical if shape == "analytical" else self.max_iterations
+
+@dataclass(frozen=True)
+class ShapeConfig:
+    """Everything that differs between query shapes. Findings are reported, stored,
+    checked and rendered the same way for every shape."""
+
+    prompt: str
+    # Analytical searches carry a `sub_question` that mints an aspect key; extraction
+    # searches are keyed by the entity they name.
+    search_takes_sub_question: bool
+    seed_plan_from_entities: bool
+    max_iterations: int
+
+    @property
+    def tools(self) -> list[dict]:
+        search = SEARCH_ANALYTICAL_TOOL if self.search_takes_sub_question else SEARCH_TOOL
+        return [search, REPORT_FINDINGS_TOOL]
+
+
+def shape_config(query_shape: str | None, settings: AgentSettings) -> ShapeConfig:
+    if query_shape == "analytical":
+        return ShapeConfig(
+            prompt="v6_agent_analytical",
+            search_takes_sub_question=True,
+            seed_plan_from_entities=False,
+            max_iterations=settings.max_iterations_analytical,
+        )
+    return ShapeConfig(
+        prompt="v4_agent",
+        search_takes_sub_question=False,
+        seed_plan_from_entities=True,
+        max_iterations=settings.max_iterations,
+    )
 
 
 def get_agent_settings() -> AgentSettings:
@@ -70,7 +101,7 @@ def get_agent_settings() -> AgentSettings:
     env overrides (incl. in tests) always take effect."""
     max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "5"))
     return AgentSettings(
-        tool_model=os.getenv("AGENT_TOOL_MODEL", get_query_transformer_model()),
+        tool_model=os.getenv("AGENT_TOOL_MODEL", "gpt-4o-mini"),
         max_iterations=max_iterations,
         cost_budget_usd=float(os.getenv("AGENT_COST_BUDGET_USD", "0.10")),
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
@@ -115,7 +146,7 @@ class AgentRunState:
 
     # --- input: not state, but read throughout the loop ---
     settings: AgentSettings
-    max_iterations: int  # settings.max_iterations_for(query_shape)
+    max_iterations: int  # ShapeConfig.max_iterations
 
     # --- transcript: the model's view. Append-only, never authoritative. ---
     transcript: Transcript
@@ -126,8 +157,6 @@ class AgentRunState:
     # Set when Stop("covered") closes every planned key. Read `sealed`, not this — an
     # empty plan can never set it, and would otherwise report "didn't finish covering".
     sealed_by_coverage: bool = False
-    expected_entities: set[str] = field(default_factory=set)
-    searched_entities: set[str] = field(default_factory=set)
     # Retrieval capabilities that were unavailable for at least one search this run
     # ("dense", "keyword", "rerank"). A run can be partly degraded without any single
     # search failing outright, so this accumulates rather than describing the last search.
@@ -136,8 +165,8 @@ class AgentRunState:
     scores_are_rerank: bool = True
     spend: dict[str, TokenSpend] = field(default_factory=dict)
 
-    # --- decomposition plan: loop-minted aspect ids, same shape/role as expected_entities ---
-    plan: dict[str, str] = field(default_factory=dict)  # "A1" -> sub_question, insertion-ordered
+    # --- plan: entity names seeded by the loop, or aspect ids minted from sub_questions ---
+    plan: dict[str, str] = field(default_factory=dict)  # key -> label, insertion-ordered
     aspect_stats: dict[str, AspectStats] = field(default_factory=dict)
 
     # --- control: loop counters + outcome ---
@@ -208,15 +237,12 @@ class AgentLoopMeta:
     # False means the served findings are a degraded projection of accumulated partial
     # findings: the plan was not covered.
     sealed: bool = False
-    # Summed across the tool model and the query-rewrite model; the budget cap checks cost.
+    # Summed across the tool model and its fallbacks; the budget cap checks cost.
     input_tokens_total: int = 0
     output_tokens_total: int = 0
     cost_usd_total: float = 0.0
     # Input tokens of the run's last tool-model call: the size the transcript reached.
     last_turn_input_tokens: int = 0
-    # Entities the loop actually called search_documents for — the synthesis boundary uses
-    # this (not reported coverage) to label stubs for entities the agent never searched.
-    searched_entities: frozenset[str] = field(default_factory=frozenset)
     # Retrieval capabilities unavailable for at least one search ("dense", "keyword",
     # "rerank"). Drives the user-facing degradation badge and the trace; distinct from a
     # total outage, which surfaces as a search error and gap text instead.
@@ -237,8 +263,6 @@ class AgentLoopMeta:
     report_parse_failures: int = 0
     # Configuration the run actually used, so traces can be sliced by it.
     prompt_version: str | None = None
-    # None when the run's shape skips query rewriting.
-    rewrite_model: str | None = None
 
 
 def open_aspects(state: AgentRunState) -> list[str]:
@@ -251,17 +275,20 @@ def unresolved_lines(state: AgentRunState) -> list[str]:
     """One stated limitation per open plan key, for the served findings.
 
     A key whose every search errored was never checked, so it says the backend was down
-    rather than "not in the documents".
+    rather than "not in the documents". Only a seeded key can be unsearched; a minted one
+    exists because a search named it.
     """
     lines: list[str] = []
-    for aspect in open_aspects(state):
-        stats = state.aspect_stats.get(aspect)
-        if stats is not None and stats.searches > 0 and stats.errored == stats.searches:
+    for key in open_aspects(state):
+        stats = state.aspect_stats.get(key)
+        if stats is None or stats.searches == 0:
+            lines.append(f"Not searched: {state.plan[key]}")
+        elif stats.errored == stats.searches:
             lines.append(
-                f"Could not be checked — document search was unavailable: {state.plan[aspect]}"
+                f"Could not be checked — document search was unavailable: {state.plan[key]}"
             )
         else:
-            lines.append(f"Not resolved: {state.plan[aspect]}")
+            lines.append(f"Not resolved: {state.plan[key]}")
     return lines
 
 
@@ -294,16 +321,16 @@ def render_status(state: AgentRunState) -> str | None:
     # recorded is the normal state of a run about to drill down, so such a nudge trades
     # the second search pass for an early report.
     # Final turn: search tools are withheld, so the only move left is converting admitted
-    # evidence into observations. Deliberately routes the pressure into `substantiated:
-    # false` rather than into closure — a coerced substantiated claim citing a real but
-    # irrelevant label passes grounding, closes its aspect, and silently promotes an
-    # iteration-capped run to `sealed`, dropping the "did not fully converge" caveat.
+    # evidence into findings. Deliberately routes the pressure into `supported: false`
+    # rather than into closure — a coerced supported claim citing a real but irrelevant
+    # label passes grounding, closes its key, and silently promotes an iteration-capped
+    # run to `sealed`, dropping the "did not fully converge" caveat.
     if state.iteration == state.max_iterations - 1:
         parts.append(
-            "Final turn — no further searches will run. Report every open aspect from the "
-            "evidence you have already retrieved. If an aspect is not supported by what "
-            "you have, report it with `substantiated: false` and state the absence in "
-            "`claim`. Anything left unreported is recorded as unresolved."
+            "Final turn — no further searches will run. Report every open key from the "
+            "evidence you have already retrieved. If a key is not supported by what you "
+            "have, report it with `supported: false` and state the absence in `claim`. "
+            "Anything left unreported is recorded as unresolved."
         )
     return " · ".join(parts) if parts else None
 
@@ -330,8 +357,6 @@ def snapshot(state: AgentRunState) -> dict:
         "findings_screened": state.findings.screened(),
         "evidence_chunk_count": len(state.evidence),
         "transcript_message_count": len(state.transcript.messages),
-        "searched_entities": sorted(state.searched_entities),
-        "expected_entities": sorted(state.expected_entities),
     }
 
 
@@ -340,7 +365,6 @@ def build_meta(
     iterations: int,
     *,
     prompt_version: str | None = None,
-    rewrite_model: str | None = None,
 ) -> AgentLoopMeta:
     return AgentLoopMeta(
         iterations=iterations,
@@ -350,7 +374,6 @@ def build_meta(
         input_tokens_total=state.input_tokens_total(),
         output_tokens_total=sum(ts.output_tokens for ts in state.spend.values()),
         cost_usd_total=state.cost_usd_total(),
-        searched_entities=frozenset(state.searched_entities),
         degraded_capabilities=frozenset(state.degraded_capabilities),
         scores_are_rerank=state.scores_are_rerank,
         plan_seeded=len(state.plan),
@@ -364,5 +387,4 @@ def build_meta(
         report_parse_failures=state.report_parse_failures,
         last_turn_input_tokens=state.last_turn_input_tokens,
         prompt_version=prompt_version,
-        rewrite_model=rewrite_model,
     )

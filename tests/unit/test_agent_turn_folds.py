@@ -8,7 +8,6 @@ from dataclasses import replace as dc_replace
 
 import pytest
 
-from src.schemas.agent_findings import Observation
 from src.services.chat.agent.loop import (
     Continue,
     Stop,
@@ -21,24 +20,25 @@ from src.services.chat.agent.loop import (
 from src.services.llm_adapters.base_adapter import LLMResponseStats, ToolCallRef
 from tests.unit.test_agent_loop_smoke import _make_chunk_with_payload
 from tests.unit.test_agent_state import _settings, _state
+from tests.unit.test_findings import _neg
 
 
 def _search(call_id: str) -> ToolCallRef:
     return ToolCallRef(id=call_id, name="search_documents", arguments="{}")
 
 
-def _report(call_id: str, aspect: str, chunk_id: str) -> ToolCallRef:
+def _report(call_id: str, key: str, chunk_id: str) -> ToolCallRef:
     return ToolCallRef(
         id=call_id,
-        name="report_analytical_findings",
+        name="report_findings",
         arguments=json.dumps(
             {
-                "question": "q",
-                "observations": [
+                "findings": [
                     {
-                        "aspect": aspect,
+                        "key": key,
                         "claim": "c",
-                        "evidence_chunks": [chunk_id],
+                        "supported": True,
+                        "evidence": [chunk_id],
                         "confidence": "high",
                     }
                 ],
@@ -69,13 +69,13 @@ class TestFoldSearches:
         ]
 
         texts, new, traces = fold_searches(
-            state, [_search("s1"), _search("s2")], results, {"s1": "A1", "s2": None}, "rw"
+            state, [_search("s1"), _search("s2")], results, {"s1": "A1", "s2": None}
         )
 
         assert new == [1, 1]
         assert texts["s1"].startswith("[A1] ") and 'id="S1"' in texts["s1"]
         assert 'id="S2"' in texts["s2"]
-        assert state.searched_entities == {"Acme"}
+        assert set(state.aspect_stats) == {"A1"}
         assert vars(state.aspect_stats["A1"]) == {"searches": 1, "errored": 0, "new_chunks": 1}
         assert traces["s1"]["chunks"][0]["ref"] == "S1"  # type: ignore[index]
         assert traces["s1"]["chunks"][0]["chunk_id"] == str(c1.chunk_id)  # type: ignore[index]
@@ -86,7 +86,7 @@ class TestFoldSearches:
         c, p = _make_chunk_with_payload()
 
         texts, _, traces = fold_searches(
-            state, [_search("s1")], [_SearchResult("Acme", [c], p)], {"s1": "A1"}, "rw"
+            state, [_search("s1")], [_SearchResult("Acme", [c], p)], {"s1": "A1"}
         )
 
         [hit] = traces["s1"]["chunks"]  # type: ignore[index]
@@ -98,7 +98,7 @@ class TestFoldSearches:
             entity="Acme", chunks=[], payloads={}, error_str="down", backend_failed=True
         )
 
-        texts, new, traces = fold_searches(state, [_search("s1")], [failed], {"s1": "A1"}, "rw")
+        texts, new, traces = fold_searches(state, [_search("s1")], [failed], {"s1": "A1"})
 
         assert texts == traces == {"s1": "down"}
         assert new == [0]
@@ -109,16 +109,13 @@ class TestFoldSearches:
         old, p_old = _make_chunk_with_payload()
         old = dc_replace(old, heading_trail=["Consolidated Statements of Operations"])
         new, p_new = _make_chunk_with_payload()
-        fold_searches(
-            state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"}, "rw"
-        )
+        fold_searches(state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"})
 
         texts, labels, _ = fold_searches(
             state,
             [_search("s2")],
             [_SearchResult("Acme", [old, new], p_old | p_new)],
             {"s2": "A1"},
-            "rw",
         )
 
         assert labels == [1]
@@ -130,12 +127,10 @@ class TestFoldSearches:
         model searching again for text already on screen."""
         state = _state(plan={"A1": "q"})
         old, p_old = _make_chunk_with_payload()
-        fold_searches(
-            state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"}, "rw"
-        )
+        fold_searches(state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"})
 
         texts, labels, _ = fold_searches(
-            state, [_search("s2")], [_SearchResult("Acme", [old], p_old)], {"s2": "A1"}, "rw"
+            state, [_search("s2")], [_SearchResult("Acme", [old], p_old)], {"s2": "A1"}
         )
 
         assert labels == [0]
@@ -145,16 +140,13 @@ class TestFoldSearches:
         state = _state(plan={"A1": "q"}, settings=_settings(max_chunks_per_entity=1))
         top, p_top = _make_chunk_with_payload()
         below, p_below = _make_chunk_with_payload()
-        fold_searches(
-            state, [_search("s1")], [_SearchResult("Acme", [top], p_top)], {"s1": "A1"}, "rw"
-        )
+        fold_searches(state, [_search("s1")], [_SearchResult("Acme", [top], p_top)], {"s1": "A1"})
 
         _texts, labels, _ = fold_searches(
             state,
             [_search("s2")],
             [_SearchResult("Acme", [top, below], p_top | p_below)],
             {"s2": "A1"},
-            "rw",
         )
 
         assert labels == [0]  # `below` was admitted but never shown
@@ -163,7 +155,7 @@ class TestFoldSearches:
     def test_an_empty_search_says_no_results(self) -> None:
         state = _state(plan={"A1": "q"})
         texts, _, _ = fold_searches(
-            state, [_search("s1")], [_SearchResult("Acme", [], {})], {"s1": "A1"}, "rw"
+            state, [_search("s1")], [_SearchResult("Acme", [], {})], {"s1": "A1"}
         )
         assert texts["s1"] == "[A1] (no results)"
 
@@ -191,10 +183,7 @@ class TestFoldReports:
 class TestDecide:
     def test_covered_plan_seals(self) -> None:
         state = _state(plan={"A1": "q"})
-        negative = Observation(
-            aspect="A1", claim="c", substantiated=False, evidence_chunks=[], confidence="high"
-        )
-        state.findings.record("A1", negative, state.evidence)
+        state.findings.record("A1", _neg("A1"), state.evidence)
 
         assert decide(state, _facts()) == Stop("covered")
         assert state.sealed_by_coverage

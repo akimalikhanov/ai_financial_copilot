@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -19,7 +19,7 @@ import pytest
 from fakeredis import FakeAsyncRedis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.schemas.agent_findings import AnalyticalFindings
+from src.schemas.agent_findings import AgentFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import DocumentScopeResult, RouterOutput
 from src.schemas.retrieval import ChunkPromptPayload, RetrievalTrace, RetrievedChunk
@@ -110,6 +110,22 @@ def _routed_llm(adapter: Any) -> RoutedLLM:
     )
 
 
+def _report_args(key: str, chunk_id: str | None, *, supported: bool = True) -> str:
+    return json.dumps(
+        {
+            "findings": [
+                {
+                    "key": key,
+                    "claim": f"claim for {key}",
+                    "supported": supported,
+                    "evidence": [chunk_id] if chunk_id else [],
+                    "confidence": "high",
+                }
+            ]
+        }
+    )
+
+
 @pytest.fixture(autouse=True)
 def _agent_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "3")
@@ -137,19 +153,7 @@ async def test_agent_loop_runs_search_then_finalizes() -> None:
     findings_tc = ToolCallRef(
         id="call_2",
         name="report_findings",
-        arguments=json.dumps(
-            {
-                "metric_requested": "revenue",
-                "findings": [
-                    {
-                        "entity": "Acme",
-                        "available": True,
-                        "value": 100,
-                        "source_chunks": [str(found_chunk.chunk_id)],
-                    }
-                ],
-            }
-        ),
+        arguments=_report_args("Acme", str(found_chunk.chunk_id)),
     )
 
     adapter = AsyncMock()
@@ -218,7 +222,11 @@ async def test_agent_loop_stops_at_iteration_cap() -> None:
 
     assert meta.iterations == 3  # AGENT_MAX_ITERATIONS
     assert meta.convergence_reason == "iteration_cap"
-    assert agent_findings is None
+    # Nothing was reported, but the seeded entity is still open, so it is served as a
+    # stated limitation rather than vanishing.
+    assert agent_findings is not None
+    assert agent_findings.findings == ()
+    assert agent_findings.unresolved[0] == "Not resolved: Acme"
 
 
 @pytest.mark.asyncio
@@ -248,19 +256,7 @@ async def test_concurrent_searches_each_open_a_distinct_session(
     findings_tc = ToolCallRef(
         id="call_fin",
         name="report_findings",
-        arguments=json.dumps(
-            {
-                "metric_requested": "revenue",
-                "findings": [
-                    {
-                        "entity": "Acme",
-                        "available": True,
-                        "value": 100,
-                        "source_chunks": [str(shared_chunk.chunk_id)],
-                    }
-                ],
-            }
-        ),
+        arguments=_report_args("Acme", str(shared_chunk.chunk_id)),
     )
     adapter = AsyncMock()
     adapter.complete_with_tools = AsyncMock(
@@ -315,12 +311,6 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
     state = _make_state()
     chunk, payloads = _make_chunk_with_payload()
 
-    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
-        return (
-            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
-            None,
-        )
-
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
         return None, RetrievalTrace(), [chunk]
 
@@ -332,7 +322,6 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
     async def _fake_add_event(_redis: Any, _rid: str, name: str, payload: dict) -> None:
         events.append((name, payload))
 
-    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
     monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
     monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", _fake_payloads)
     monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
@@ -340,10 +329,10 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
     tc = ToolCallRef(
         id="call_1",
         name="search_documents",
-        arguments=json.dumps({"entity": "", "query": "revenue"}),
+        arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
     )
     result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, False
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
     )
 
     assert result.entity == "Acme"
@@ -363,29 +352,22 @@ async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.Monk
     # reaching the pipeline stub, and the generic except would mask the real result.
     state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
 
-    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
-        return (
-            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
-            None,
-        )
-
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
         return None, RetrievalTrace(all_backends_failed=True), []
 
     async def _fake_add_event(*_a: Any, **_k: Any) -> None:
         return None
 
-    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
     monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
     monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
 
     tc = ToolCallRef(
         id="call_1",
         name="search_documents",
-        arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
+        arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
     result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, False
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
     )
 
     assert result.backend_failed is True
@@ -406,12 +388,6 @@ async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
     # reaching the pipeline stub, and the generic except would mask the real result.
     state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
 
-    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
-        return (
-            loop_module.TransformedQuery(semantic_query="q", keyword_query="q", fallback=False),
-            None,
-        )
-
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
         return None, RetrievalTrace(all_backends_failed=False), []
 
@@ -421,7 +397,6 @@ async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
     async def _fake_add_event(*_a: Any, **_k: Any) -> None:
         return None
 
-    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
     monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
     monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", _fake_payloads)
     monkeypatch.setattr(loop_module, "add_event", _fake_add_event)
@@ -429,20 +404,21 @@ async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
     tc = ToolCallRef(
         id="call_1",
         name="search_documents",
-        arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
+        arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
     result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, False
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
     )
 
     assert result.backend_failed is False
     assert result.chunks == []
 
 
-@pytest.mark.asyncio
-async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Step 5: on the analytical path the model's own query goes to both channels
-    unchanged — no rewrite call, so no second model second-guessing a targeted query."""
+async def _search_queries_for(
+    monkeypatch: pytest.MonkeyPatch, arguments: dict[str, str]
+) -> tuple[str, str]:
+    """Run one `_execute_search` with `arguments`; return the (semantic, keyword) queries
+    the retrieval pipeline was handed."""
     from src.services.chat.agent import loop as loop_module
 
     state = _make_state()
@@ -450,42 +426,75 @@ async def test_analytical_search_skips_the_query_rewrite(monkeypatch: pytest.Mon
     # the stub can record what it was handed.
     state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
     chunk, payloads = _make_chunk_with_payload()
-    rewrites = 0
-    seen: list[Any] = []
-
-    async def _fake_rewrite(*_a: Any, **_k: Any) -> Any:
-        nonlocal rewrites
-        rewrites += 1
-        return (
-            loop_module.TransformedQuery(semantic_query="x", keyword_query="x", fallback=False),
-            None,
-        )
+    seen: list[tuple[str, str]] = []
 
     async def _fake_pipeline(*_a: Any, **kwargs: Any) -> Any:
-        seen.append(kwargs["transformed"])
+        seen.append((kwargs["semantic_query"], kwargs["keyword_query"]))
         return None, RetrievalTrace(), [chunk]
 
     async def _fake_payloads(*_a: Any, **_k: Any) -> dict:
         return payloads
 
-    monkeypatch.setattr(loop_module, "rewrite_query", _fake_rewrite)
     monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
     monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", _fake_payloads)
     monkeypatch.setattr(loop_module, "add_event", AsyncMock())
 
-    tc = ToolCallRef(
-        id="call_1",
-        name="search_documents",
-        arguments=json.dumps({"entity": "Acme", "query": "input cost inflation COGS 2023"}),
+    tc = ToolCallRef(id="call_1", name="search_documents", arguments=json.dumps(arguments))
+    await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0, True
+    return seen[0]
+
+
+@pytest.mark.asyncio
+async def test_search_sends_query_to_dense_and_keywords_to_bm25(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tool model writes both retrievers' queries; the loop passes them through
+    unchanged — no rewrite call in between."""
+    semantic, keyword = await _search_queries_for(
+        monkeypatch,
+        {
+            "entity": "Acme",
+            "query": "input cost increases in cost of goods sold 2023",
+            "keywords": "COGS cost of sales raw materials 2023",
+        },
+    )
+    assert semantic == "input cost increases in cost of goods sold 2023"
+    assert keyword == "COGS cost of sales raw materials 2023"
+
+
+@pytest.mark.asyncio
+async def test_search_without_keywords_uses_query_for_bm25(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The schema requires `keywords`, but a call that omits it still searches."""
+    semantic, keyword = await _search_queries_for(
+        monkeypatch, {"entity": "Acme", "query": "total revenue 2023"}
+    )
+    assert semantic == keyword == "total revenue 2023"
+
+
+@pytest.mark.asyncio
+async def test_search_span_records_both_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trace shows what the tool model wrote for each retriever, so a run where
+    `keywords` just repeats `query` is visible without replaying it."""
+    from src.services.chat.agent import loop as loop_module
+
+    spans: list[dict[str, Any]] = []
+
+    @contextlib.contextmanager
+    def _recording_span(_name: str, **kwargs: Any) -> Iterator[None]:
+        spans.append(kwargs.get("input") or {})
+        yield None
+
+    monkeypatch.setattr(loop_module, "lf_span", _recording_span)
+    await _search_queries_for(
+        monkeypatch, {"entity": "Acme", "query": "revenue 2023", "keywords": "net sales 2023"}
     )
 
-    assert rewrites == 0
-    assert result.rewrite_stats is None
-    assert seen[0].semantic_query == "input cost inflation COGS 2023"
-    assert seen[0].keyword_query == "input cost inflation COGS 2023"
+    assert spans[0]["query"] == "revenue 2023"
+    assert spans[0]["keywords"] == "net sales 2023"
 
 
 # ---------------------------------------------------------------------------
@@ -513,24 +522,8 @@ def _search_tc(call_id: str, sub_question: str | None = None) -> ToolCallRef:
     )
 
 
-def _report_tc(call_id: str, aspect: str, chunk_id: str | None) -> ToolCallRef:
-    return ToolCallRef(
-        id=call_id,
-        name="report_analytical_findings",
-        arguments=json.dumps(
-            {
-                "question": "why?",
-                "observations": [
-                    {
-                        "aspect": aspect,
-                        "claim": f"claim for {aspect}",
-                        "evidence_chunks": [chunk_id] if chunk_id else [],
-                        "confidence": "high",
-                    }
-                ],
-            }
-        ),
-    )
+def _report_tc(call_id: str, key: str, chunk_id: str | None) -> ToolCallRef:
+    return ToolCallRef(id=call_id, name="report_findings", arguments=_report_args(key, chunk_id))
 
 
 async def _run(state: ChatPipelineState, turns: list, search) -> tuple:
@@ -635,7 +628,7 @@ async def test_malformed_report_returns_a_tool_result_and_continues() -> None:
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
-    bad = ToolCallRef(id="r1", name="report_analytical_findings", arguments="{not json")
+    bad = ToolCallRef(id="r1", name="report_findings", arguments="{not json")
     turns = [
         AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "q?")]),
         AssistantTurnResult(text="", tool_calls=[bad]),
@@ -670,8 +663,8 @@ async def test_unknown_aspect_key_is_named_back_and_not_ingested() -> None:
 
     _ev, findings, meta = await _run(state, turns, _search)
     assert meta.unknown_aspect_keys == 1
-    assert isinstance(findings, AnalyticalFindings)
-    assert {o.aspect for o in findings.observations} == {"A1"}
+    assert isinstance(findings, AgentFindings)
+    assert {f.key for f in findings.findings} == {"A1"}
 
 
 @pytest.mark.asyncio
@@ -698,11 +691,10 @@ async def test_unresolved_aspect_becomes_a_stated_gap() -> None:
         return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
     _ev, findings, _meta = await _run(state, turns, _search)
-    assert isinstance(findings, AnalyticalFindings)
-    gaps = findings.gaps or []
-    assert any("Not resolved: Did pricing offset?" in g for g in gaps)
+    assert isinstance(findings, AgentFindings)
+    lines = list(findings.unresolved)
     # Ordered before the degraded caveat, so the specific miss reads first.
-    assert gaps.index("Not resolved: Did pricing offset?") < len(gaps) - 1
+    assert lines.index("Not resolved: Did pricing offset?") < len(lines) - 1
 
 
 @pytest.mark.asyncio
@@ -726,10 +718,9 @@ async def test_d6_backend_failure_gap_differs_from_absence() -> None:
         )
 
     _ev, findings, _meta = await _run(state, turns, _search)
-    assert isinstance(findings, AnalyticalFindings)
-    gaps = findings.gaps or []
-    assert any("document search was unavailable" in g for g in gaps)
-    assert not any(g.startswith("Not resolved:") for g in gaps)
+    assert isinstance(findings, AgentFindings)
+    assert any("document search was unavailable" in line for line in findings.unresolved)
+    assert not any(line.startswith("Not resolved:") for line in findings.unresolved)
 
 
 @pytest.mark.asyncio
@@ -807,21 +798,7 @@ async def test_report_only_turn_does_not_trip_convergence_on_extraction() -> Non
     chunk, payloads = _make_chunk_with_payload()
 
     report = ToolCallRef(
-        id="r1",
-        name="report_findings",
-        arguments=json.dumps(
-            {
-                "metric_requested": "revenue",
-                "findings": [
-                    {
-                        "entity": "Acme",
-                        "available": True,
-                        "value": 100,
-                        "source_chunks": [str(chunk.chunk_id)],
-                    }
-                ],
-            }
-        ),
+        id="r1", name="report_findings", arguments=_report_args("Acme", str(chunk.chunk_id))
     )
     turns = [
         AssistantTurnResult(text="", tool_calls=[_search_tc("s1")]),
@@ -847,21 +824,7 @@ async def test_extraction_reads_grounding_feedback_after_an_empty_round() -> Non
 
     def _report(call_id: str, source: str) -> ToolCallRef:
         return ToolCallRef(
-            id=call_id,
-            name="report_findings",
-            arguments=json.dumps(
-                {
-                    "metric_requested": "revenue",
-                    "findings": [
-                        {
-                            "entity": "Acme",
-                            "available": True,
-                            "value": 100,
-                            "source_chunks": [source],
-                        }
-                    ],
-                }
-            ),
+            id=call_id, name="report_findings", arguments=_report_args("Acme", source)
         )
 
     turns = [
@@ -879,9 +842,30 @@ async def test_extraction_reads_grounding_feedback_after_an_empty_round() -> Non
 
 
 @pytest.mark.asyncio
+async def test_extraction_search_echoes_its_entity_key() -> None:
+    """An extraction search is keyed by the seeded entity it names, so its result carries
+    the key the report must copy, and its stats tell "not searched" from "not found"."""
+    state = _make_state()
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1")]),
+        AssistantTurnResult(text="done", tool_calls=[]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, findings, _meta, calls = await _run_capturing(state, turns, _search)
+
+    assert _tool_result(calls, "s1").startswith("[Acme] ")
+    assert findings is not None
+    assert findings.unresolved[0] == "Not resolved: Acme"
+
+
+@pytest.mark.asyncio
 async def test_extraction_plan_is_seeded_from_expected_entities() -> None:
-    """D3: extraction's coverage comes from a loop-authored plan, replacing
-    missing_entity_gate. An entity that is never reported keeps the run from closing."""
+    """Extraction's coverage comes from a loop-authored plan. An entity that is never
+    reported keeps the run from closing."""
     state = _make_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1089,16 +1073,9 @@ async def _tools_offered(state: ChatPipelineState) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_analytical_path_is_not_offered_the_extraction_finalizer() -> None:
-    assert await _tools_offered(_analytical_state()) == {
-        "search_documents",
-        "report_analytical_findings",
-    }
-
-
-@pytest.mark.asyncio
-async def test_extraction_path_is_not_offered_the_analytical_finalizer() -> None:
-    assert await _tools_offered(_make_state()) == {"search_documents", "report_findings"}
+async def test_every_shape_reports_through_one_tool() -> None:
+    for state in (_analytical_state(), _make_state()):
+        assert await _tools_offered(state) == {"search_documents", "report_findings"}
 
 
 async def _run_capturing(state: ChatPipelineState, turns: list, search) -> tuple:
@@ -1131,27 +1108,15 @@ def _tool_result(calls: list[list[Any]], call_id: str) -> str:
 
 @pytest.mark.asyncio
 async def test_call_outside_the_pool_is_answered_not_available() -> None:
-    """The pool is the dispatch rule: a report tool this run was not offered is named back
-    as unavailable and never parsed, so it cannot land on the ledger."""
+    """The pool is the dispatch rule: a tool this run was not offered is named back as
+    unavailable and never parsed, so it cannot land on the ledger."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
-    extraction_report = ToolCallRef(
+    retired_report = ToolCallRef(
         id="r2",
-        name="report_findings",
-        arguments=json.dumps(
-            {
-                "metric_requested": "revenue",
-                "findings": [
-                    {
-                        "entity": "A2",
-                        "available": True,
-                        "value": 1,
-                        "source_chunks": [str(chunk.chunk_id)],
-                    }
-                ],
-            }
-        ),
+        name="report_analytical_findings",
+        arguments=_report_args("A2", str(chunk.chunk_id)),
     )
     turns = [
         AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
@@ -1163,7 +1128,7 @@ async def test_call_outside_the_pool_is_answered_not_available() -> None:
                 _search_tc("s2", "Did pricing offset?"),
             ],
         ),
-        AssistantTurnResult(text="", tool_calls=[extraction_report]),
+        AssistantTurnResult(text="", tool_calls=[retired_report]),
         AssistantTurnResult(text="done", tool_calls=[]),
     ]
 
@@ -1172,9 +1137,11 @@ async def test_call_outside_the_pool_is_answered_not_available() -> None:
 
     _ev, findings, _meta, calls = await _run_capturing(state, turns, _search)
 
-    assert _tool_result(calls, "r2").startswith("Tool 'report_findings' is not available.")
-    assert isinstance(findings, AnalyticalFindings)
-    assert [o.aspect for o in findings.observations] == ["A1"]
+    assert _tool_result(calls, "r2").startswith(
+        "Tool 'report_analytical_findings' is not available."
+    )
+    assert isinstance(findings, AgentFindings)
+    assert [f.key for f in findings.findings] == ["A1"]
 
 
 @pytest.mark.asyncio
@@ -1183,22 +1150,7 @@ async def test_negative_issued_beside_its_first_search_is_refused() -> None:
     search that mints its key was written without seeing any results."""
     state = _analytical_state()
     negative = ToolCallRef(
-        id="r1",
-        name="report_analytical_findings",
-        arguments=json.dumps(
-            {
-                "question": "q",
-                "observations": [
-                    {
-                        "aspect": "A1",
-                        "claim": "Not disclosed.",
-                        "substantiated": False,
-                        "evidence_chunks": [],
-                        "confidence": "high",
-                    }
-                ],
-            }
-        ),
+        id="r1", name="report_findings", arguments=_report_args("A1", None, supported=False)
     )
     turns = [
         AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?"), negative]),
@@ -1327,8 +1279,8 @@ async def test_provider_error_after_progress_serves_what_was_gathered() -> None:
     assert meta.convergence_reason == "llm_error"
     assert meta.iterations == 2
     assert len(evidence) == 1
-    assert isinstance(findings, AnalyticalFindings)
-    assert findings.gaps
+    assert isinstance(findings, AgentFindings)
+    assert findings.unresolved
 
 
 @pytest.mark.asyncio
