@@ -55,6 +55,38 @@ class TestRetrieveEdgeCases:
         assert client.calls == []
 
 
+class TestDocIdsFilter:
+    @staticmethod
+    def _filters(client: FakeClient) -> list[dict]:
+        return client.calls[0]["body"]["query"]["bool"]["filter"]
+
+    @pytest.mark.asyncio
+    async def test_empty_doc_ids_returns_empty_no_client_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient([_hit()])
+        monkeypatch.setattr(opensearch_retriever, "get_client", lambda: client)
+        assert await retrieve("revenue", uuid4(), doc_ids=[], top_k=5) == []
+        assert client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_none_doc_ids_applies_no_document_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient([])
+        monkeypatch.setattr(opensearch_retriever, "get_client", lambda: client)
+        await retrieve("revenue", uuid4(), doc_ids=None, top_k=5)
+        assert [next(iter(f["term"])) for f in self._filters(client)] == ["user_id"]
+
+    @pytest.mark.asyncio
+    async def test_doc_ids_filter_by_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient([])
+        monkeypatch.setattr(opensearch_retriever, "get_client", lambda: client)
+        did = uuid4()
+        await retrieve("revenue", uuid4(), doc_ids=[did], top_k=5)
+        assert {"terms": {"document_id": [str(did)]}} in self._filters(client)
+
+
 class TestRetrieveHappyPath:
     @pytest.mark.asyncio
     async def test_correct_chunk_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:

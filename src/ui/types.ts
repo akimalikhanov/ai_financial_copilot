@@ -70,6 +70,35 @@ export interface MessageMetadata {
   degraded_retrieval?: string[] | null;
 }
 
+export interface ClarificationCandidate {
+  company: string;
+  years: number[];
+  doc_count: number;
+}
+
+export interface ClarificationEntity {
+  raw_span: string;
+  outcome: 'ambiguous' | 'none' | 'outside_scope';
+  candidates: ClarificationCandidate[];
+}
+
+/** The `scope_clarification` event, also stored on the card's message metadata. */
+export interface ScopeClarification {
+  clarification_id: string;
+  outcome: 'entities' | 'too_broad';
+  named_companies: boolean;
+  unresolved: ClarificationEntity[];
+  resolved: string[];
+  covered_count: number | null;
+  max_companies: number;
+}
+
+export interface ClarificationPick {
+  raw_span: string;
+  company?: string;
+  include_outside_scope?: boolean;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
@@ -80,6 +109,9 @@ export interface Message {
   timestamp: number;
   feedback?: MessageFeedback | null;
   metadata?: MessageMetadata;
+  // Set when this assistant message is a clarification card instead of an answer.
+  clarification?: ScopeClarification;
+  clarificationAnswered?: boolean;
 }
 
 export interface Chat {

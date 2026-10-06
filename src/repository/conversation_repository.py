@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.conversation import Conversation
@@ -66,6 +67,29 @@ class ConversationRepository:
             select(Conversation).where(Conversation.id == conversation_id)
         )
         return result.scalar_one_or_none()
+
+    async def get_entity_bindings(self, conversation_id: UUID) -> dict[str, dict]:
+        """The conversation's clarification answers: normalized span → binding."""
+        conversation = await self.get_by_id(conversation_id)
+        if conversation is None:
+            return {}
+        return dict((conversation.conversation_metadata or {}).get("entity_bindings") or {})
+
+    async def merge_entity_bindings(self, conversation_id: UUID, bindings: dict[str, dict]) -> None:
+        """Merge bindings into `metadata.entity_bindings` in one statement, so two quick
+        replies can't overwrite each other."""
+        await self.session.execute(
+            text("""
+                UPDATE conversations
+                SET metadata = jsonb_set(
+                    coalesce(metadata, '{}'::jsonb),
+                    '{entity_bindings}',
+                    coalesce(metadata->'entity_bindings', '{}'::jsonb)
+                        || CAST(:bindings AS jsonb))
+                WHERE id = :id
+            """),
+            {"id": conversation_id, "bindings": json.dumps(bindings)},
+        )
 
     async def update(
         self,

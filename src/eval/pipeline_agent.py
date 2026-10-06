@@ -28,12 +28,14 @@ from src.services.chat.agent.loop import tool_model_chain
 from src.services.chat.agent.processor import ProcessedFindings
 from src.services.chat.agent.state import AgentLoopMeta, get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
+from src.services.chat.events import too_broad_response
 from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
-from src.utils.config import get_redis_app_url
+from src.services.router.scope_resolver import scope_outcome
+from src.utils.config import get_redis_app_url, get_scope_max_companies
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,8 @@ class AgentPipelineResult(PipelineResult):
     agent_findings: AgentFindings | None = None
     processed_findings: ProcessedFindings | None = None
     query_shape: str | None = None
+    # llm_requests.scope_outcome for this question; eval never shows a clarification card.
+    scope_outcome: str | None = None
 
 
 def _make_redis() -> Redis:
@@ -100,6 +104,22 @@ async def run_one(
     )
     route = router_out.route
     query_shape = getattr(router_out, "query_shape", None)
+    outcome = scope_outcome(router_out, scope_result) if scope_result else None
+
+    # Too broad ends the run before the agent, as in production with clarification off.
+    if scope_result is not None and scope_result.too_broad_count is not None:
+        return AgentPipelineResult(
+            route=route,
+            rag_context=None,
+            retrieval_trace=None,
+            answer=None
+            if retrieval_only
+            else too_broad_response(scope_result.too_broad_count, get_scope_max_companies()),
+            citation_spans=[],
+            usage=None,
+            query_shape=query_shape,
+            scope_outcome=outcome,
+        )
 
     if route != "retrieval":
         if retrieval_only:
@@ -129,6 +149,7 @@ async def run_one(
             citation_spans=spans,
             usage=stats,
             query_shape=query_shape,
+            scope_outcome=outcome,
         )
 
     # Build a minimal ChatPipelineState for run_agent
@@ -187,6 +208,7 @@ async def run_one(
             agent_findings=agent_result.findings,
             processed_findings=agent_result.processed,
             query_shape=query_shape,
+            scope_outcome=outcome,
         )
 
     # Synthesise answer using the agent synthesis prompt (same model as classic eval)
@@ -212,6 +234,7 @@ async def run_one(
         agent_findings=agent_result.findings,
         processed_findings=agent_result.processed,
         query_shape=query_shape,
+        scope_outcome=outcome,
     )
 
 

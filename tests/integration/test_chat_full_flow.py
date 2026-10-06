@@ -261,3 +261,131 @@ async def test_chat_error_propagation_sse(async_client, monkeypatch: pytest.Monk
     assert "error_type" in err_data
     assert err_data["message"] == error_msg
     assert err_data["error_type"] == "RuntimeError"
+
+
+_AURORA_ROUTER_JSON = json.dumps(
+    {
+        "route": "retrieval",
+        "entities": [{"name": "Aurora", "entity_type": "company", "raw_span": "aurora"}],
+        "user_intent": "single_lookup",
+        "reasoning": "names aurora",
+        "query_shape": "extraction",
+    }
+)
+
+
+async def _chat(async_client, headers: dict, conversation_id: str, **body: Any) -> list:
+    """POST /v1/chat, then read its SSE stream until the persisted usage event."""
+    resp = await async_client.post(
+        "/v1/chat",
+        json={
+            "conversation_id": conversation_id,
+            "client_msg_id": str(uuid4()),
+            "client_request_id": str(uuid4()),
+            "model": "gpt-4o-mini",
+            "params": {},
+            **body,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    events: list[tuple[str, dict]] = []
+    async with async_client.stream(
+        "GET",
+        "/v1/chat/stream",
+        params={"request_id": resp.json()["request_id"]},
+        timeout=15.0,
+        headers=headers,
+    ) as stream_response:
+        current_event: str | None = None
+        async for line in stream_response.aiter_lines():
+            if line.startswith("event: "):
+                current_event = line[7:].strip()
+            elif line.startswith("data: ") and current_event:
+                data = json.loads(line[6:])
+                events.append((current_event, data))
+                if current_event in ("error",) or (
+                    current_event == "usage" and data.get("persisted") is True
+                ):
+                    break
+    return events
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clarification_card_reply_and_binding(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two Auroras: the question gets a card, a pick answers it, a follow-up uses the binding."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.document import Document
+    from src.models.user import User
+    from src.services.router.company_name import normalize_company
+
+    # The router names "aurora"; the disambiguator gets the same mock reply, can't parse it,
+    # and falls back to the trigram candidates: both Auroras, so the card asks.
+    router = create_agentic_router(MockStreamingLLM(router_json=_AURORA_ROUTER_JSON))
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"clarify-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    async with get_session_factory()() as s:
+        user_id = (await s.execute(select(User.id).where(User.email == email))).scalar_one()
+        for company in ("Aurora Innovation, Inc.", "Aurora Mobile Limited"):
+            s.add(
+                Document(
+                    user_id=user_id,
+                    original_filename=f"{company}.pdf",
+                    storage_key=f"uploads/{uuid4()}.pdf",
+                    status="ready",
+                    document_metadata={"company": company, "year": "2023"},
+                    company_norm=normalize_company(company),
+                )
+            )
+        await s.commit()
+    conv = await async_client.post("/v1/conversations", json={"title": "c"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+
+    # 1. The question ends in a card, not an answer.
+    events = await _chat(async_client, headers, conversation_id, content="aurora's revenue")
+    [card] = [d for t, d in events if t == "scope_clarification"]
+    assert card["outcome"] == "entities"
+    [entity] = card["unresolved"]
+    assert entity["outcome"] == "ambiguous"
+    assert {c["company"] for c in entity["candidates"]} == {
+        "Aurora Innovation, Inc.",
+        "Aurora Mobile Limited",
+    }
+
+    # 2. A pick re-runs the question and answers it, without a second user message.
+    reply = {
+        "clarification_id": card["clarification_id"],
+        "picks": [{"raw_span": "aurora", "company": "Aurora Innovation, Inc."}],
+    }
+    events = await _chat(
+        async_client,
+        headers,
+        conversation_id,
+        content="aurora's revenue",
+        clarification_reply=reply,
+    )
+    assert not [d for t, d in events if t == "scope_clarification"]
+    assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+    msgs = (
+        await async_client.get(f"/v1/conversations/{conversation_id}/messages", headers=headers)
+    ).json()["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant", "assistant"]
+    assert msgs[1]["metadata"]["kind"] == "clarification"
+    assert msgs[1]["metadata"]["answered"] is True
+
+    # 3. A later mention of "aurora" uses the binding: no second card.
+    events = await _chat(async_client, headers, conversation_id, content="and aurora's debt?")
+    assert not [d for t, d in events if t == "scope_clarification"]
+    assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")

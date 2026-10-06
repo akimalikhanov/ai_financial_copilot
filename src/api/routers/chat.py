@@ -14,6 +14,7 @@ from celery import Task
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import (
     CurrentUserDep,
@@ -30,8 +31,9 @@ from src.api.stream_liveness import (
     _worker_gone,
 )
 from src.db import DbSessionDep, get_session_factory
+from src.models.conversation import Conversation
 from src.models.llm_request import LLMRequest
-from src.models.message import MessageRole
+from src.models.message import Message, MessageRole
 from src.observability.metrics import (
     SSE_STREAM_DURATION,
     sse_stream_closed,
@@ -43,9 +45,11 @@ from src.repository import (
     LLMRequestRepository,
     MessageRepository,
 )
+from src.repository.document_repository import DocumentRepository
 from src.schemas import chat as schemas
 from src.services.chat.tasks import process_chat
 from src.services.context import ConversationHistory
+from src.services.router.company_name import normalize_company
 
 # The liveness rule is shared with the ingestion stream, which faces the same dead-worker
 # case; these names are re-exported here because this is where both were written.
@@ -160,8 +164,15 @@ async def chat_enqueue(
     # back instead of a 503.
     await chat_admission_control(redis_broker)
 
-    # Create or find user message (idempotent by client_msg_id)
-    user_message = await message_repo.get_by_client_msg_id(req.conversation_id, req.client_msg_id)
+    if req.clarification_reply is not None:
+        # Re-run the question the card was about; no new user message.
+        user_message = await _apply_clarification_reply(
+            session, current_user.id, conversation, req.clarification_reply
+        )
+    else:
+        user_message = await message_repo.get_by_client_msg_id(
+            req.conversation_id, req.client_msg_id
+        )
     if not user_message:
         user_message = await message_repo.create(
             conversation_id=req.conversation_id,
@@ -187,10 +198,13 @@ async def chat_enqueue(
         request_params=req.params,
         initial_status="queued",
     )
+    if not req.allow_clarification:
+        assistant_placeholder.message_metadata = {"allow_clarification": False}
     await session.commit()
 
-    history = ConversationHistory(redis, message_repo)
-    await history.append_user(req.conversation_id, req.content, user_message.seq)
+    if req.clarification_reply is None:
+        history = ConversationHistory(redis, message_repo)
+        await history.append_user(req.conversation_id, req.content, user_message.seq)
 
     cast(Task, process_chat).delay(str(llm_request.id))
 
@@ -202,6 +216,61 @@ async def chat_enqueue(
         assistant_seq=assistant_placeholder.seq,
         status="queued",
     )
+
+
+async def _apply_clarification_reply(
+    session: AsyncSession,
+    user_id: UUID,
+    conversation: Conversation,
+    reply: schemas.ClarificationReply,
+) -> Message:
+    """Check each pick against the card and the user's companies, store the picks as
+    conversation bindings, mark the card answered, and return the user message to re-run."""
+    message_repo = MessageRepository(session)
+    card_msg = await message_repo.get_by_id(reply.clarification_id)
+    meta = dict(card_msg.message_metadata or {}) if card_msg else {}
+    if (
+        card_msg is None
+        or card_msg.conversation_id != conversation.id
+        or meta.get("kind") != "clarification"
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Clarification not found")
+    if meta.get("answered"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Clarification already answered")
+    # The re-run takes the latest question from history, so only the last card can answer.
+    if (conversation.last_seq or 0) > card_msg.seq:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The conversation has moved on")
+
+    asked = {u["raw_span"]: u for u in meta["clarification"]["unresolved"]}
+    companies = {c.company_norm for c in await DocumentRepository(session).list_companies(user_id)}
+    bindings: dict[str, dict] = {}
+    for pick in reply.picks:
+        entity = asked.get(pick.raw_span)
+        if entity is None:
+            raise HTTPException(422, f"{pick.raw_span!r} is not on this clarification")
+        binding: dict[str, str] = {}
+        if pick.include_outside_scope is not None:
+            if entity["outcome"] != "outside_scope" or not entity["candidates"]:
+                raise HTTPException(422, f"{pick.raw_span!r} is not outside the scope")
+            company = entity["candidates"][0]["company"]
+            binding["outside_scope"] = "include" if pick.include_outside_scope else "exclude"
+        elif pick.company:
+            company = pick.company
+        else:
+            raise HTTPException(422, f"No choice for {pick.raw_span!r}")
+        company_norm = normalize_company(company)
+        if company_norm not in companies:
+            raise HTTPException(422, f"{company!r} is not one of your companies")
+        bindings[normalize_company(pick.raw_span)] = {"company_norm": company_norm, **binding}
+    if not bindings:
+        raise HTTPException(422, "No picks")
+
+    await ConversationRepository(session).merge_entity_bindings(conversation.id, bindings)
+    card_msg.message_metadata = {**meta, "answered": True}
+    user_message = await message_repo.get_by_id(UUID(meta["user_message_id"]))
+    if user_message is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Original question not found")
+    return user_message
 
 
 @router.get("/stream")

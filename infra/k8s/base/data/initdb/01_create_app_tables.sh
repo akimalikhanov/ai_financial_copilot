@@ -358,6 +358,9 @@ CREATE TABLE IF NOT EXISTS llm_requests (
   -- Router's shape verdict ('extraction'/'comparison'/'analytical'), NULL on non-routed rows.
   -- Separates "the workload got harder" from "a config change made every query cost more".
 
+  scope_outcome      text,
+  -- Scope resolution result ('resolved'/'unresolved'/'no_entities'), NULL on non-retrieval rows.
+
   attempt_count      integer NOT NULL DEFAULT 0,
   -- Number of times the chat pipeline has been attempted (caps acks_late redelivery loops).
 
@@ -581,6 +584,9 @@ CREATE TABLE IF NOT EXISTS documents (
   extracted_title    text,
   -- Document title (from first page or filename).
 
+  company_norm       text,
+  -- metadata.company normalized (normalize_company); the entity-resolution match key.
+
   ingest_time_seconds jsonb,
   -- JSON: {stages: {stage_name: seconds}, total_time: float}. Per-stage + total ingestion times.
 
@@ -669,6 +675,21 @@ CREATE INDEX IF NOT EXISTS documents_status_idx
   ON documents (user_id, status);
 COMMENT ON INDEX documents_status_idx IS
   'Filter by processing status per user.';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS company_norm text;
+COMMENT ON COLUMN documents.company_norm IS
+  'metadata.company normalized (normalize_company); the entity-resolution match key.';
+
+CREATE INDEX IF NOT EXISTS documents_company_norm_trgm
+  ON documents USING gin (company_norm gin_trgm_ops);
+COMMENT ON INDEX documents_company_norm_trgm IS
+  'Trigram candidate lookup for entity resolution.';
+
+CREATE INDEX IF NOT EXISTS documents_user_company_norm
+  ON documents (user_id, company_norm);
+COMMENT ON INDEX documents_user_company_norm IS
+  'Exact company match and per-user company catalogue.';
 
 DROP TRIGGER IF EXISTS trg_documents_updated_at ON documents;
 CREATE TRIGGER trg_documents_updated_at
@@ -796,6 +817,11 @@ ALTER TABLE llm_requests
   ADD COLUMN IF NOT EXISTS query_shape text;
 COMMENT ON COLUMN llm_requests.query_shape IS
   'Router query shape (extraction/comparison/analytical). Attributes cost drift to workload mix.';
+
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS scope_outcome text;
+COMMENT ON COLUMN llm_requests.scope_outcome IS
+  'Scope resolution result (resolved/unresolved/no_entities). NULL on non-retrieval rows.';
 
 ALTER TABLE llm_requests
   ADD COLUMN IF NOT EXISTS cached_input_tokens integer;

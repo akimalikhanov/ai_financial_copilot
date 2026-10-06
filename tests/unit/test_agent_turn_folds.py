@@ -104,6 +104,21 @@ class TestFoldSearches:
         assert new == [0]
         assert state.aspect_stats["A1"].errored == 1
 
+    def test_not_found_search_closes_its_entity_key_as_a_negative(self) -> None:
+        state = _state(plan={"Aurora": "Aurora", "RWE AG": "RWE AG"})
+        missing = _SearchResult(
+            entity="Aurora", chunks=[], payloads={}, error_str="no match", not_found=True
+        )
+
+        texts, _, _ = fold_searches(state, [_search("s1")], [missing], {"s1": "Aurora"})
+
+        assert texts["s1"] == "no match"
+        finding = state.findings.get("Aurora")
+        assert finding is not None and finding.supported is False
+        assert decide(state, _facts(new_labels=0, closed=frozenset({"Aurora"}))) == Continue()
+        state.findings.record("RWE AG", _neg("RWE AG"), state.evidence)
+        assert decide(state, _facts(new_labels=0)) == Stop("covered")
+
     def test_a_re_returned_chunk_is_named_not_rendered_again(self) -> None:
         state = _state(plan={"A1": "q"})
         old, p_old = _make_chunk_with_payload()

@@ -1,136 +1,25 @@
 from __future__ import annotations
 
 import contextlib
-import re
 from uuid import UUID
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.document import Document
+from src.schemas.query_router import CompanyCandidate
 
-_CORP_SUFFIXES = (
-    # English
-    "limited",
-    "ltd",
-    "llc",
-    "inc",
-    "incorporated",
-    "corp",
-    "corporation",
-    "company",
-    "plc",
-    "lp",
-    "llp",
-    "pllc",
-    "pc",
-    "holdings",
-    "holding",
-    "group",
-    "trust",
-    "reit",
-    # Australian/UK/SG/MY
-    "pty",
-    "pte",
-    "sdn",
-    "bhd",
-    # German/Austrian/Swiss
-    "gmbh",
-    "ag",
-    "kg",
-    "kgaa",
-    "se",
-    # Dutch
-    "bv",
-    "nv",
-    "cv",
-    # French/Belgian
-    "sa",
-    "sas",
-    "sarl",
-    "sca",
-    # Italian/Spanish/Portuguese
-    "srl",
-    "spa",
-    "sl",
-    # Nordic
-    "ab",
-    "oy",
-    "oyj",
-    "as",
-    "asa",
-    "aps",
-    # Japanese romanized
-    "kk",
-    "gk",
-)
-
-# Generic industry/sector words that appear in many company names and reduce
-# discriminative power when doing trigram similarity matching.
-_INDUSTRY_WORDS = (
-    "pharmaceuticals",
-    "pharmaceutical",
-    "pharma",
-    "biosciences",
-    "bioscience",
-    "biotechnology",
-    "biotech",
-    "therapeutics",
-    "therapies",
-    "sciences",
-    "science",
-    "laboratories",
-    "laboratory",
-    "labs",
-    "technologies",
-    "technology",
-    "solutions",
-    "services",
-    "systems",
-    "industries",
-    "international",
-    "global",
-    "national",
-    "enterprises",
-    "partners",
-    "capital",
-    "ventures",
-    "financial",
-    "investments",
-    "management",
-    "resources",
-)
-
-_CORP_SUFFIX_RE = re.compile(
-    r"\b(" + "|".join(_CORP_SUFFIXES) + r")\b\.?\s*$",
-    re.IGNORECASE,
-)
-_INDUSTRY_RE = re.compile(
-    r"\b(" + "|".join(_INDUSTRY_WORDS) + r")\b",
-    re.IGNORECASE,
-)
-# \m is PostgreSQL's start-of-word anchor; pattern interpolated into SQL literals.
-_CORP_SUFFIX_SQL_RE = r"\m(" + "|".join(_CORP_SUFFIXES) + r")\.?\s*$"
-_INDUSTRY_SQL_RE = r"\m(" + "|".join(_INDUSTRY_WORDS) + r")\M"
-_MIN_NORMALIZED_LEN = 3
-
-
-def _normalize_company(name: str) -> str:
-    """Strip trailing corp suffixes, punctuation, and generic industry words.
-
-    Falls back to the original (lowercased) string when stripping would leave
-    fewer than _MIN_NORMALIZED_LEN characters (e.g. "The Limited" → "the").
-    """
-    lowered = name.lower().strip()
-    # Strip trailing corp suffix first
-    stripped = _CORP_SUFFIX_RE.sub("", lowered).strip()
-    # Strip trailing punctuation (commas, periods left behind by "Ltd., Inc." etc.)
-    stripped = stripped.rstrip(".,;").strip()
-    # Remove generic industry words that inflate cross-company similarity
-    stripped = _INDUSTRY_RE.sub("", stripped).strip()
-    # Collapse multiple spaces
-    stripped = re.sub(r"\s+", " ", stripped).strip()
-    return stripped if len(stripped) >= _MIN_NORMALIZED_LEN else lowered
+# One candidate per company_norm, aggregated over its documents. Shared by the candidate
+# query and the catalogue listing so both return the same shape.
+_CANDIDATE_COLUMNS = """
+    company_norm,
+    min(metadata->>'company') AS display_name,
+    array_agg(id) AS doc_ids,
+    coalesce(array_agg(DISTINCT (metadata->>'year')::int)
+             FILTER (WHERE metadata->>'year' ~ '^[0-9]+$'), '{}') AS years,
+    coalesce(array_agg(DISTINCT extracted_title)
+             FILTER (WHERE extracted_title IS NOT NULL), '{}') AS titles
+"""
 
 
 class DocumentRepository:
@@ -150,6 +39,7 @@ class DocumentRepository:
         content_type: str = "application/pdf",
         file_size_bytes: int | None = None,
         metadata: dict | None = None,
+        company_norm: str | None = None,
     ) -> Document:
         """Create a new document record."""
         doc = Document(
@@ -160,6 +50,7 @@ class DocumentRepository:
             content_type=content_type,
             file_size_bytes=file_size_bytes,
             document_metadata=metadata or {},
+            company_norm=company_norm,
         )
         if id is not None:
             doc.id = id
@@ -350,95 +241,101 @@ class DocumentRepository:
             "years": sorted(years, reverse=True),
         }
 
-    async def get_scope_doc_summaries(
-        self, user_id: UUID, doc_ids: list[UUID], *, limit: int
-    ) -> list[tuple[UUID, str | None, int | None]]:
-        """Return (id, company, year) for ready docs in scope."""
-        if not doc_ids:
-            return []
+    async def get_scope_docs(
+        self, user_id: UUID, doc_ids: list[UUID] | None = None
+    ) -> list[tuple[UUID, str | None, str | None, int | None]]:
+        """(id, company_norm, company, year) for the user's ready docs among ``doc_ids``,
+        or all of them when ``doc_ids`` is None."""
         rows = (
             await self.session.execute(
                 text("""
                     SELECT
                         id,
+                        company_norm,
                         metadata->>'company',
                         CASE WHEN metadata->>'year' ~ '^[0-9]+$'
                              THEN (metadata->>'year')::int
                         END
                     FROM documents
                     WHERE user_id = CAST(:user_id AS uuid)
-                      AND id = ANY(CAST(:doc_ids AS uuid[]))
                       AND status = 'ready'
-                    LIMIT :limit
+                      AND (CAST(:doc_ids AS uuid[]) IS NULL
+                           OR id = ANY(CAST(:doc_ids AS uuid[])))
+                    ORDER BY created_at
                 """),
-                {"user_id": str(user_id), "doc_ids": [str(d) for d in doc_ids], "limit": limit},
+                {
+                    "user_id": str(user_id),
+                    "doc_ids": [str(d) for d in doc_ids] if doc_ids is not None else None,
+                },
             )
         ).fetchall()
-        return [
-            (UUID(str(row[0])), row[1] or None, int(row[2]) if row[2] is not None else None)
-            for row in rows
-        ]
+        return [(UUID(str(r[0])), r[1], r[2] or None, r[3]) for r in rows]
 
-    async def find_by_company_similarity(
+    async def find_company_candidates(
         self,
         user_id: UUID,
-        name: str,
+        keys: list[str],
         *,
-        threshold: float = 0.5,
-        constrain_to: list[UUID] | None = None,
-        limit: int = 10,
-    ) -> list[UUID]:
-        """Find document IDs by fuzzy-matching metadata company name (pg_trgm).
+        limit: int,
+        sim_threshold: float,
+        word_threshold: float,
+    ) -> dict[str, list[CompanyCandidate]]:
+        """Companies matching each normalized lookup key: exact, `%` (similarity) or `<<%`
+        (strict_word_similarity), best first, up to ``limit`` per key. Every key is in the
+        result, unmatched ones with an empty list."""
+        keys = list(dict.fromkeys(keys))
+        result: dict[str, list[CompanyCandidate]] = {k: [] for k in keys}
+        if not keys:
+            return result
+        # Transaction-local, so safe under pgbouncer transaction pooling.
+        await self.session.execute(
+            text(
+                "SELECT set_config('pg_trgm.similarity_threshold', :sim, true),"
+                " set_config('pg_trgm.strict_word_similarity_threshold', :word, true)"
+            ),
+            {"sim": str(sim_threshold), "word": str(word_threshold)},
+        )
+        rows = await self.session.execute(
+            text(f"""
+                SELECT k.key, c.*
+                FROM unnest(CAST(:keys AS text[])) AS k(key)
+                CROSS JOIN LATERAL (
+                    SELECT {_CANDIDATE_COLUMNS},
+                           greatest(max(similarity(company_norm, k.key)),
+                                    max(strict_word_similarity(k.key, company_norm))) AS score
+                    FROM documents
+                    WHERE user_id = CAST(:user_id AS uuid)
+                      AND status = 'ready'
+                      AND (company_norm = k.key
+                           OR k.key <<% company_norm
+                           OR k.key % company_norm)
+                    GROUP BY company_norm
+                    ORDER BY score DESC
+                    LIMIT :limit
+                ) c
+            """),  # nosemgrep
+            {"user_id": str(user_id), "keys": keys, "limit": limit},
+        )
+        for row in rows.mappings():
+            result[row["key"]].append(CompanyCandidate.model_validate(dict(row)))
+        return result
 
-        Returns doc IDs ordered by similarity descending, up to ``limit``.
-        """
-        params: dict = {
-            "user_id": str(user_id),
-            "name": _normalize_company(name),
-            "threshold": threshold,
-            "limit": limit,
-        }
-
-        constrain_clause = ""
-        if constrain_to:
-            params["constrain_to"] = [str(d) for d in constrain_to]
-            constrain_clause = "AND id = ANY(CAST(:constrain_to AS uuid[]))"
-
-        # Only hardcoded regex constants and a fixed clause literal are interpolated;
-        # all filter values (:name, :threshold, :user_id, :constrain_to) are bind params.
-        sql = f"""
-            SELECT id FROM documents
-            WHERE user_id = CAST(:user_id AS uuid)
-              AND status = 'ready'
-              AND metadata->>'company' IS NOT NULL
-              AND similarity(
-                    trim(regexp_replace(
-                        regexp_replace(
-                            lower(metadata->>'company'),
-                            '{_CORP_SUFFIX_SQL_RE}',
-                            '', 'i'
-                        ),
-                        '{_INDUSTRY_SQL_RE}',
-                        '', 'gi'
-                    )),
-                    :name
-                  ) > :threshold
-              {constrain_clause}
-            ORDER BY similarity(
-                trim(regexp_replace(
-                    regexp_replace(
-                        lower(metadata->>'company'),
-                        '{_CORP_SUFFIX_SQL_RE}',
-                        '', 'i'
-                    ),
-                    '{_INDUSTRY_SQL_RE}',
-                    '', 'gi'
-                )),
-                :name
-            ) DESC
-            LIMIT :limit
-        """
-        stmt = text(sql)  # nosemgrep
-
-        rows = (await self.session.execute(stmt, params)).fetchall()
-        return [row[0] for row in rows]
+    async def list_companies(
+        self, user_id: UUID, *, limit: int | None = None
+    ) -> list[CompanyCandidate]:
+        """Every company among the user's ready documents, in the candidate shape, up to
+        ``limit`` (None for all)."""
+        rows = await self.session.execute(
+            text(f"""
+                SELECT {_CANDIDATE_COLUMNS}
+                FROM documents
+                WHERE user_id = CAST(:user_id AS uuid)
+                  AND status = 'ready'
+                  AND company_norm IS NOT NULL
+                GROUP BY company_norm
+                ORDER BY company_norm
+                LIMIT :limit
+            """),  # nosemgrep
+            {"user_id": str(user_id), "limit": limit},
+        )
+        return [CompanyCandidate.model_validate(dict(row)) for row in rows.mappings()]

@@ -45,6 +45,7 @@ from src.services.ingestion import opensearch_ingest, qdrant_ingest
 from src.services.ingestion.recovery import reap_abandoned
 from src.services.ingestion.s3_client import build_raw_storage_key, upload_pdf
 from src.services.ingestion.tasks import ingest_document
+from src.services.router.company_name import normalize_company
 from src.utils.config import (
     get_ingest_stream_abandoned_after_seconds,
     get_s3_access_key,
@@ -160,6 +161,7 @@ async def upload_document(
         content_type=ALLOWED_CONTENT_TYPE,
         file_size_bytes=file_size,
         metadata=metadata if metadata else None,
+        company_norm=normalize_company(company) if company else None,
     )
     await session.commit()
 

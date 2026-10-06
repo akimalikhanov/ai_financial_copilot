@@ -64,10 +64,13 @@ from src.services.chat.events import (
     build_activity_event,
     build_all_references,
     build_references_list,
+    build_scope_clarification_event,
     build_usage_event,
+    clarification_text,
     error_event,
     out_of_scope_response,
     span_to_dict,
+    too_broad_response,
 )
 from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
@@ -82,6 +85,7 @@ from src.services.llm_router import (
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
+from src.services.router.scope_resolver import scope_outcome
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
     get_chat_max_request_age_seconds,
@@ -91,6 +95,7 @@ from src.utils.config import (
     get_injection_scan_user_input_enabled,
     get_query_router_prompt_version,
     get_redis_app_url,
+    get_scope_max_companies,
 )
 
 logger = logging.getLogger(__name__)
@@ -584,6 +589,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             assistant_msg = await message_repo.get_by_id(state.assistant_message_id)
             state.assistant_seq = assistant_msg.seq if assistant_msg else 0
+            # Set by the API from the request's `allow_clarification`.
+            allow_clarification = bool(
+                (assistant_msg.message_metadata if assistant_msg else {}).get(
+                    "allow_clarification", True
+                )
+            )
             await llm_request_repo.update_status(UUID(request_id), "streaming")
 
             if lf:
@@ -739,6 +750,23 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             ROUTER_DECISIONS.labels(state.router_output.route).inc()
             # Flushed by the commits below; expire_on_commit=False keeps the object usable.
             llm_request.query_shape = state.router_output.query_shape
+            # The clarification card, when the client can show one: the question covers too
+            # many companies, or names one that is ambiguous, unknown or outside the UI scope.
+            card: dict | None = None
+            if state.scope_result is not None:
+                llm_request.scope_outcome = scope_outcome(state.router_output, state.scope_result)
+                if allow_clarification and (
+                    state.scope_result.too_broad_count is not None
+                    or state.scope_result.clarifications
+                ):
+                    card = build_scope_clarification_event(
+                        state.assistant_message_id,
+                        state.scope_result,
+                        named_companies=bool(state.router_output.entities),
+                        max_companies=get_scope_max_companies(),
+                    )
+                    if state.scope_result.too_broad_count is None:
+                        llm_request.scope_outcome = "clarification"
             _scope_doc_ids = (
                 [str(d) for d in state.scope_result.doc_ids]
                 if state.scope_result and state.scope_result.doc_ids is not None
@@ -790,6 +818,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "prior_findings_present": prior_findings_present,
                         "prior_findings_hops": prior_findings.hops,
                         "scope_source": state.scope_result.source if state.scope_result else None,
+                        "unresolved_entities": state.scope_result.unresolved_entities
+                        if state.scope_result
+                        else [],
                         "scope_doc_ids": cap_list(_scope_doc_ids or []),
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
                         "scope_per_entity_doc_ids": {
@@ -805,16 +836,42 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     with contextlib.suppress(Exception):
                         _root_span.update(metadata={"scope": scope_summary})  # type: ignore[attr-defined]
 
-            # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
-            if state.router_output.route == "out_of_scope":
-                redirect_text = out_of_scope_response()
-                _trace_io(output={"answer": redirect_text, "route": "out_of_scope"})
+            # Early-exit: out_of_scope, the clarification card, or (with clarification off) a
+            # question covering more companies than one run can analyse — skip RAG + LLM,
+            # emit a fixed reply and persist
+            too_broad = state.scope_result.too_broad_count if state.scope_result else None
+            if (
+                state.router_output.route == "out_of_scope"
+                or card is not None
+                or too_broad is not None
+            ):
+                if card is not None:
+                    exit_reason = "clarification"
+                    redirect_text = clarification_text(card)
+                elif too_broad is not None:
+                    exit_reason = "too_broad"
+                    redirect_text = too_broad_response(too_broad, get_scope_max_companies())
+                else:
+                    exit_reason = "out_of_scope"
+                    redirect_text = out_of_scope_response()
+                _trace_io(output={"answer": redirect_text, "route": exit_reason})
+                if card is not None:
+                    await add_event(redis_app, request_id, "scope_clarification", card)
                 await add_event(redis_app, request_id, "delta", {"text": redirect_text})
                 await message_repo.update_on_final(
                     message_id=state.assistant_message_id,
                     content=redirect_text,
                     raw_content=redirect_text,
                     request_id=UUID(request_id),
+                    # The card re-renders from here after a reload, and a reply re-runs
+                    # this user message.
+                    metadata_updates={
+                        "kind": "clarification",
+                        "clarification": card,
+                        "user_message_id": str(llm_request.user_message_id),
+                    }
+                    if card is not None
+                    else None,
                 )
                 await llm_request_repo.update_status(UUID(request_id), "completed")
                 await conversation_repo.update_on_message(
@@ -829,15 +886,18 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
                 await add_event(redis_app, request_id, "usage", usage_data)
                 await session.commit()
-                try:
-                    await state.history.append_assistant(
-                        state.conversation_id,
-                        redirect_text,
-                        state.assistant_seq,
-                    )
-                except Exception:
-                    logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
-                logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
+                # A card stays out of the history: its re-run answers the same question, and
+                # later turns should see question and answer as one pair.
+                if card is None:
+                    try:
+                        await state.history.append_assistant(
+                            state.conversation_id,
+                            redirect_text,
+                            state.assistant_seq,
+                        )
+                    except Exception:
+                        logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
+                logger.info("pipeline.%s", exit_reason, extra={"request_id": request_id})
                 return
 
             # Release the pgbouncer slot before the agent loop / carryover branch, which can
@@ -1427,11 +1487,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     except Exception:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
 
-                    # Auto-name conversation on the first exchange (seq 2 = first assistant reply)
+                    # Auto-name conversation on its first real answer: no earlier assistant
+                    # message in history, which already leaves out clarification cards. A card
+                    # can push that answer past seq 2, after a reply or a re-sent question.
                     # Must emit conversation_title BEFORE the usage event, since the frontend
                     # stops reading the stream as soon as it receives usage (the final sentinel).
                     naming_cfg = get_conversation_naming_config()
-                    if naming_cfg["enabled"] and state.assistant_seq == 2 and state.user_query_raw:
+                    if (
+                        naming_cfg["enabled"]
+                        and state.user_query_raw
+                        and not any(
+                            m.role == schemas.Role.assistant for m in state.context_messages
+                        )
+                    ):
                         try:
                             # Use a fresh session so the naming sub-request + title update
                             # commit together, independent of the main pipeline session.

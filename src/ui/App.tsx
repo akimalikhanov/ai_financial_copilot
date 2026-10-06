@@ -8,7 +8,7 @@ import {
   ChevronDown, ChevronLeft, ChevronRight, Sun, Moon, Monitor, SlidersHorizontal,
   Pencil, Loader2, PanelLeft, Sparkles,
 } from 'lucide-react';
-import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem, BoundingBox } from './types';
+import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem, BoundingBox, ClarificationPick, ScopeClarification } from './types';
 import { CitedText } from './components/CitedText';
 import {
   chatEnqueue,
@@ -42,6 +42,7 @@ import { UploadModal } from './components/UploadModal';
 import { DocPickerModal } from './components/DocPickerModal';
 import { ControlPane, ModelParams, RequestStats, ModelCapabilities } from './components/ControlPane';
 import { MessageActions } from './components/MessageActions';
+import { ClarificationCard } from './components/ClarificationCard';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -146,6 +147,10 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       route: meta.route as string | null | undefined,
       degraded_retrieval: meta.degraded_retrieval as string[] | null | undefined,
     },
+    ...(meta.kind === 'clarification' && {
+      clarification: meta.clarification as ScopeClarification,
+      clarificationAnswered: Boolean(meta.answered),
+    }),
   };
 };
 
@@ -1134,10 +1139,15 @@ export default function App() {
     setIsTyping(false);
   }, []);
 
-  const handleSendMessage = async (text: string = inputMessage) => {
+  // `reply` answers a clarification card (the backend re-runs `text`, no new user message).
+  const handleSendMessage = async (
+    text: string = inputMessage,
+    reply?: { cardId: string; picks: ClarificationPick[] },
+  ) => {
     if (!text.trim() || !activeChatId || !activeChat?.conversationId) return;
     const conversationId = activeChat.conversationId;
-    setInputMessage('');
+    if (text === inputMessage) setInputMessage('');
+    if (reply) updateMessage(conversationId, reply.cardId, m => ({ ...m, clarificationAnswered: true }));
     setIsTyping(true);
     setIsAwaitingResponse(true);
     const clientMsgId = crypto.randomUUID();
@@ -1157,8 +1167,9 @@ export default function App() {
         model: activeModel,
         params: { temperature: modelParams.temperature, max_tokens: modelParams.maxTokens, ...extraParams },
         metadata: { scope: { mode: scope.mode, docIds: scope.docIds, filters: scope.filters } },
+        ...(reply && { clarification_reply: { clarification_id: reply.cardId, picks: reply.picks } }),
       });
-      appendMessage(conversationId, { id: enqueueRes.user_message_id, role: 'user', content: text, timestamp: Date.now() });
+      if (!reply) appendMessage(conversationId, { id: enqueueRes.user_message_id, role: 'user', content: text, timestamp: Date.now() });
       const placeholderId = enqueueRes.assistant_message_id;
       appendMessage(conversationId, { id: placeholderId, role: 'assistant', content: '', timestamp: Date.now() });
       await chatStreamSubscribe(
@@ -1246,6 +1257,9 @@ export default function App() {
             c.conversationId === ev.conversation_id ? { ...c, title: ev.title } : c
           ));
         },
+        (card) => {
+          updateMessage(conversationId, placeholderId, m => ({ ...m, clarification: card }));
+        },
       );
     } catch (err) {
       const error = err as ApiError;
@@ -1254,7 +1268,7 @@ export default function App() {
       const content = error.statusCode === 503
         ? `The assistant is at capacity right now. Please resend your question${error.retryAfterSeconds ? ` in about ${error.retryAfterSeconds} seconds` : ' shortly'}.`
         : `Error: ${error.message}`;
-      appendMessage(conversationId, { id: `temp-${clientMsgId}`, role: 'user', content: text, timestamp: Date.now() });
+      if (!reply) appendMessage(conversationId, { id: `temp-${clientMsgId}`, role: 'user', content: text, timestamp: Date.now() });
       appendMessage(conversationId, { id: `error-${Date.now()}`, role: 'assistant', content, timestamp: Date.now() });
       setIsTyping(false);
       setIsAwaitingResponse(false);
@@ -1638,6 +1652,21 @@ export default function App() {
                               )}
                             </>
                           )}
+                          {msg.clarification && (() => {
+                            const question = activeMessages.slice(0, msgIdx).reverse().find(m => m.role === 'user')?.content ?? '';
+                            return (
+                              <ClarificationCard
+                                card={msg.clarification}
+                                companies={filterOptions.companies}
+                                disabled={Boolean(msg.clarificationAnswered) || !isLastMsg || isAwaitingResponse}
+                                filteredCompanies={scope.mode === 'filteredByMetadata' ? scope.filters.company?.length ?? 0 : 0}
+                                onReply={picks => handleSendMessage(question, { cardId: msg.id, picks })}
+                                onNarrowScope={() => setScope(s => ({ ...s, mode: 'filteredByMetadata' }))}
+                                onAskAgain={() => handleSendMessage(question)}
+                                onUpload={() => setIsUploadOpen(true)}
+                              />
+                            );
+                          })()}
                         </div>
                       ) : (
                         /* User bubble */
@@ -1659,7 +1688,7 @@ export default function App() {
                       )}
 
                       {/* Action row (Copy + Thumbs Up/Down) for completed assistant messages */}
-                      {msg.role === 'assistant' && !isStreaming && msg.content && activeChat?.conversationId && (
+                      {msg.role === 'assistant' && !isStreaming && msg.content && !msg.clarification && activeChat?.conversationId && (
                         <MessageActions
                           messageId={msg.id}
                           content={msg.content}

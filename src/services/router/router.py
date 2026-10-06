@@ -10,14 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.observability.langfuse import describe_error
 from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.metrics import observe_llm_latency
-from src.repository.document_repository import DocumentRepository
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.query_router import (
-    DocumentScopeResult,
-    EntityManifestItem,
-    RouterInput,
-    RouterOutput,
-)
+from src.schemas.query_router import DocumentScopeResult, RouterInput, RouterOutput
 from src.services.context.turns import cap_turns, router_history, session_index
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
 from src.services.llm_router import LLMRouter, get_router
@@ -151,18 +145,23 @@ async def route_query(
         session is not None and parent_request_id is not None and conversation_id is not None
     )
 
+    async def scoped(output: RouterOutput) -> tuple[RouterOutput, DocumentScopeResult | None]:
+        return await _with_scope(
+            output, inp, session, user_id, router, parent_request_id, conversation_id
+        )
+
     try:
         llm = router.get(model_id)
     except Exception:
         logger.warning("route_query_model_unavailable", extra={"model": model_id})
-        return _FALLBACK, None
+        return await scoped(_FALLBACK)
 
     try:
         prompt = get_prompt_loader().load("query_router", get_query_router_prompt_version())
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("route_query_prompt_missing", extra={"model": model_id})
-        return _FALLBACK, None
+        return await scoped(_FALLBACK)
 
     response_format = _router_response_format()
     messages = _build_messages(inp, system)
@@ -190,7 +189,7 @@ async def route_query(
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})
             lf_mark_current("WARNING", f"router call failed ({describe_error(e)}); fallback route")
-            return _FALLBACK, None
+            return await scoped(_FALLBACK)
 
         observe_llm_latency(model_id, "router", resp.stats)
 
@@ -233,7 +232,7 @@ async def route_query(
 
     if output is None:
         lf_mark_current("WARNING", "router output unparseable after retry; fallback route")
-        return _FALLBACK, None
+        return await scoped(_FALLBACK)
 
     # if output.route == "retrieval" and not output.entities and not _has_active_scope:
     #     # Retrieval with no entities and no scope — ask user to be more specific
@@ -254,37 +253,30 @@ async def route_query(
         extra={"model": model_id, "provider": llm.provider},
     )
 
-    if session is not None and user_id is not None and output.route == "retrieval":
-        scope_result = await resolve_scope(session, user_id, inp.scope, output)
-        scope_result = await _attach_entity_manifest(session, user_id, scope_result)
-        return output, scope_result
-
-    return output, None
+    return await scoped(output)
 
 
-async def _attach_entity_manifest(
-    session: AsyncSession,
-    user_id: UUID,
-    scope_result: DocumentScopeResult,
-) -> DocumentScopeResult:
-    """Fetch doc summaries for each entity and attach as entity_manifest.
-
-    One batched DB query regardless of entity count.
-    No-op when per_entity_doc_ids is absent.
-    """
-    if not scope_result.per_entity_doc_ids:
-        return scope_result
-
-    all_ids = list({d for ids in scope_result.per_entity_doc_ids.values() for d in ids})
-    rows = await DocumentRepository(session).get_scope_doc_summaries(user_id, all_ids, limit=50)
-    id_to_summary = {
-        row[0]: {"doc_id": str(row[0]), "name": row[1], "year": row[2]} for row in rows
-    }
-    manifest = [
-        EntityManifestItem(
-            entity_name=entity,
-            doc_summaries=[id_to_summary[d] for d in ids if d in id_to_summary],
-        )
-        for entity, ids in scope_result.per_entity_doc_ids.items()
-    ]
-    return scope_result.model_copy(update={"entity_manifest": manifest})
+async def _with_scope(
+    output: RouterOutput,
+    inp: RouterInput,
+    session: AsyncSession | None,
+    user_id: UUID | None,
+    llm_router: LLMRouter,
+    parent_request_id: UUID | None,
+    conversation_id: UUID | None,
+) -> tuple[RouterOutput, DocumentScopeResult | None]:
+    """Attach the resolved scope to a retrieval route. Runs on the fallback route too, so
+    a router failure still honours the UI scope and loses only entity narrowing."""
+    if session is None or user_id is None or output.route != "retrieval":
+        return output, None
+    scope_result = await resolve_scope(
+        session,
+        user_id,
+        inp.scope,
+        output,
+        query=inp.query,
+        llm_router=llm_router,
+        parent_request_id=parent_request_id,
+        conversation_id=conversation_id,
+    )
+    return output, scope_result

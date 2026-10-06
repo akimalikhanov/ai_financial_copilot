@@ -957,14 +957,24 @@ def get_embedding_dim() -> int | None:
 
 # --- RAG retrieval ---
 def get_query_router_prompt_version() -> str:
-    """Router prompt version (QUERY_ROUTER_PROMPT_VERSION, default v4). v3 has no
-    follow-up carry-over guidance — set it to roll back routing behavior."""
-    return os.getenv("QUERY_ROUTER_PROMPT_VERSION", "v4")
+    """Router prompt version (QUERY_ROUTER_PROMPT_VERSION, default v5). v4 asks for the
+    legal name instead of the span's expansion — set it to roll back entity extraction."""
+    return os.getenv("QUERY_ROUTER_PROMPT_VERSION", "v5")
 
 
 def get_query_router_model() -> str:
     """Model ID for query routing (QUERY_ROUTER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
+
+
+def get_entity_disambiguator_model() -> str:
+    """Model ID for the entity disambiguator (ENTITY_DISAMBIGUATOR_MODEL, default: gpt-4o-mini)."""
+    return os.getenv("ENTITY_DISAMBIGUATOR_MODEL", "gpt-4o-mini")
+
+
+def get_entity_disambiguator_prompt_version() -> str:
+    """Entity disambiguator prompt version (ENTITY_DISAMBIGUATOR_PROMPT_VERSION, default v1)."""
+    return os.getenv("ENTITY_DISAMBIGUATOR_PROMPT_VERSION", "v1")
 
 
 # Agent config lives in src.services.chat.agent.state.get_agent_settings() (validated,
@@ -1222,17 +1232,43 @@ def get_router_config() -> dict[str, float | int]:
     """Query router configuration from environment variables.
 
     Returns:
-        Dict with keys: temperature, max_tokens, timeout, entity_similarity_threshold,
-        entity_max_candidates, filtered_md_thresh.
+        Dict with keys: temperature, max_tokens, timeout, entity_max_candidates,
+        entity_candidate_sim_threshold, entity_candidate_word_threshold,
+        entity_catalogue_inline_max, disambiguator_timeout, disambiguator_max_tokens,
+        disambiguator_max_titles.
     """
     return {
         "temperature": float(os.getenv("ROUTER_TEMPERATURE", "0.0")),
         "max_tokens": int(os.getenv("ROUTER_MAX_TOKENS", "800")),
         "timeout": float(os.getenv("ROUTER_TIMEOUT", "10.0")),
-        "entity_similarity_threshold": float(os.getenv("ENTITY_SIMILARITY_THRESHOLD", "0.3")),
         "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
-        "filtered_md_thresh": int(os.getenv("FILTERED_MD_THRESH", "5")),
+        # Candidate generation is deliberately loose: pg_trgm `%` (similarity) and `<<%`
+        # (strict_word_similarity) thresholds. Precision is the disambiguator's job.
+        "entity_candidate_sim_threshold": float(os.getenv("ENTITY_CANDIDATE_SIM_THRESHOLD", "0.2")),
+        "entity_candidate_word_threshold": float(
+            os.getenv("ENTITY_CANDIDATE_WORD_THRESHOLD", "0.25")
+        ),
+        # Up to this many distinct companies, every company is a candidate (no trigrams).
+        "entity_catalogue_inline_max": int(os.getenv("ENTITY_CATALOGUE_INLINE_MAX", "50")),
+        "disambiguator_timeout": float(os.getenv("ENTITY_DISAMBIGUATOR_TIMEOUT", "8.0")),
+        "disambiguator_max_tokens": int(os.getenv("ENTITY_DISAMBIGUATOR_MAX_TOKENS", "400")),
+        # Document titles shown per candidate company.
+        "disambiguator_max_titles": int(os.getenv("ENTITY_DISAMBIGUATOR_MAX_TITLES", "3")),
     }
+
+
+def get_scope_max_companies() -> int:
+    """Most companies one retrieval question may cover (SCOPE_MAX_COMPANIES, default 5).
+    Each covered company is an agent plan item, so it may not exceed AGENT_MAX_PLAN_ITEMS."""
+    from src.services.chat.agent.state import get_agent_settings
+
+    value = int(os.getenv("SCOPE_MAX_COMPANIES", "5"))
+    max_plan_items = get_agent_settings().max_plan_items
+    if value > max_plan_items:
+        raise ValueError(
+            f"SCOPE_MAX_COMPANIES={value} exceeds AGENT_MAX_PLAN_ITEMS={max_plan_items}"
+        )
+    return value
 
 
 def get_multi_pass_chunks_per_sub() -> int:

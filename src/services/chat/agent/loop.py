@@ -42,7 +42,7 @@ from src.observability.metrics import (
 from src.observability.trace_payload import cap_list
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.agent_findings import AgentFindings, FindingsReport
+from src.schemas.agent_findings import AgentFindings, Finding, FindingsReport
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.state import (
@@ -96,6 +96,8 @@ class _SearchResult:
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
     backend_failed: bool = False
     args_invalid: bool = False
+    # The entity matched no document in the library, so no retrieval ran.
+    not_found: bool = False
     # Capabilities this search ran without ("dense", "keyword", "rerank"). Partial
     # degradation, as opposed to backend_failed's total outage: the search still returned
     # usable chunks, just from fewer sources than it should have.
@@ -241,18 +243,27 @@ async def _execute_search(
         )
     raw_query = search_args.query
 
-    # Resolve doc_ids for this entity. The analytical agent passes entity="" — resolve it
-    # to the primary entity's name here so the ledger, the SSE events and the trace span
-    # all carry the entity actually searched rather than an empty string.
     per_entity = (state.scope_result.per_entity_doc_ids or {}) if state.scope_result else {}
     entity = search_args.entity
+    if entity in per_entity and not per_entity[entity]:
+        # An entity the resolver could not match. Searching would mean searching nothing,
+        # or worse, everything under its name — say so instead.
+        AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
+        return _SearchResult(
+            entity=entity,
+            chunks=[],
+            payloads={},
+            error_str=f"{entity!r} did not match any document in your library.",
+            not_found=True,
+        )
     if entity and entity in per_entity:
         doc_ids = per_entity[entity]
-    elif not entity and per_entity:
-        # Scope to the first (primary) entity's docs rather than leaking to the full corpus.
-        entity, doc_ids = next(iter(per_entity.items()))
     else:
+        # entity="" (the analytical agent) searches every resolved entity's documents.
+        # The SSE events and trace span carry the entity name only when there is one.
         doc_ids = state.scope_result.doc_ids if state.scope_result else None
+        if not entity and len(per_entity) == 1:
+            entity = next(iter(per_entity))
 
     _tool_started = perf_counter()
     activity_id, start_data = build_activity_event(
@@ -279,8 +290,8 @@ async def _execute_search(
             "keywords": keyword_query,
             # Show the resolved scope this search was constrained to, so the
             # trace makes clear which docs the agent could actually see.
-            "scope_doc_ids": cap_list([str(d) for d in doc_ids]) if doc_ids else "all",
-            "scope_doc_count": len(doc_ids) if doc_ids else "all",
+            "scope_doc_ids": cap_list([str(d) for d in doc_ids]) if doc_ids is not None else "all",
+            "scope_doc_count": len(doc_ids) if doc_ids is not None else "all",
             "scoped_via_entity": entity in per_entity,
         },
     ) as obs:
@@ -534,6 +545,21 @@ def fold_searches(
             stats.new_chunks += entity_new
             if result.backend_failed:
                 stats.errored += 1
+
+        # A seeded entity with no documents can't produce evidence, so its search settles
+        # the key as a stated negative; otherwise the key stays open until the budget runs out.
+        if result.not_found and aspect is not None and aspect == result.entity:
+            state.findings.record(
+                aspect,
+                Finding(
+                    key=aspect,
+                    claim=f"No document for {aspect} was found in the user's library.",
+                    supported=False,
+                    evidence=[],
+                    confidence="high",
+                ),
+                state.evidence,
+            )
 
         if result.error_str is not None:
             texts[tc.id] = traces[tc.id] = result.error_str
@@ -848,9 +874,11 @@ async def _run_turn(
             results = list(
                 await asyncio.gather(*[_guarded_search(tc, state, deps) for tc in searches])
             )
+            before_searches = state.addressed
             search_texts, new_per_search, search_traces = fold_searches(
                 state, searches, results, keys
             )
+            closed |= state.addressed - before_searches
             results_by_id |= search_texts
             new_labels = sum(new_per_search)
             for tc, result, search_new in zip(searches, results, new_per_search, strict=True):
@@ -1066,8 +1094,11 @@ async def run_loop(
                 _entity_years[item.entity_name] = years
 
     expected_entities: set[str] = set()
+    not_found: set[str] = set()
     if chat_state.scope_result and chat_state.scope_result.per_entity_doc_ids:
-        expected_entities = set(chat_state.scope_result.per_entity_doc_ids.keys())
+        per_entity = chat_state.scope_result.per_entity_doc_ids
+        expected_entities = set(per_entity)
+        not_found = {name for name, ids in per_entity.items() if not ids}
 
     # The task is one user message: the scope (entities and years) above the question.
     scope_block: str | None = None
@@ -1075,7 +1106,12 @@ async def run_loop(
         lines: list[str] = []
         for name in sorted(expected_entities):
             years = _entity_years.get(name)
-            suffix = f" (available years: {', '.join(str(y) for y in years)})" if years else ""
+            if name in not_found:
+                suffix = " (not found in your documents)"
+            elif years:
+                suffix = f" (available years: {', '.join(str(y) for y in years)})"
+            else:
+                suffix = ""
             lines.append(f"- {name}{suffix}")
         scope_block = (
             "Entities to search (you MUST call search_documents for each before report_findings).\n"
@@ -1090,6 +1126,10 @@ async def run_loop(
         scope_block = (
             "Available document years (use ONLY these in search queries — do not invent fiscal years):\n"
             + "\n".join(year_lines)
+        )
+    if not shape.seed_plan_from_entities and not_found:
+        scope_block = (f"{scope_block}\n" if scope_block else "") + (
+            f"Not found in your documents: {', '.join(sorted(not_found))}"
         )
 
     task = chat_state.user_query_raw

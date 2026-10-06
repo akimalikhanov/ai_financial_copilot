@@ -138,6 +138,11 @@ class ConversationHistory:
             self._max_messages,
             before_seq=before_seq,
         )
-        messages = [_db_message_to_chat_message(msg) for msg in db_messages]
+        # Clarification cards are never history: the Redis tail skips them too.
+        messages = [
+            _db_message_to_chat_message(msg)
+            for msg in db_messages
+            if (msg.message_metadata or {}).get("kind") != "clarification"
+        ]
         latest_seq = db_messages[-1].seq if db_messages else 0
         return messages, latest_seq

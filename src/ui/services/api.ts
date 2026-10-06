@@ -1,3 +1,5 @@
+import type { ClarificationPick, ScopeClarification } from '../types';
+
 export type Role = 'system' | 'developer' | 'user' | 'assistant' | 'tool';
 
 // --- Auth token wiring (in-memory only; set by AuthContext) ---
@@ -806,6 +808,9 @@ export interface ChatEnqueueRequest {
   model: string;
   params: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  allow_clarification?: boolean;
+  // Answers a card: the backend re-runs the original question instead of adding a message.
+  clarification_reply?: { clarification_id: string; picks: ClarificationPick[] };
 }
 
 export interface ChatEnqueueResponse {
@@ -851,11 +856,13 @@ export const chatStreamSubscribe = async (
   onMetadata?: (meta: MetadataEvent) => void,
   onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
+  onClarification?: (event: ScopeClarification) => void,
 ): Promise<void> => {
   let cursor = afterEventId;
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, cursor, onMetadata, onActivity, onConversationTitle
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, cursor, onMetadata, onActivity, onConversationTitle,
+      onClarification
     );
     // Resume from the last event actually consumed, not the original cursor, so a
     // reconnect doesn't re-stream (and re-render) everything already processed.
@@ -888,6 +895,7 @@ async function _doStreamAttempt(
   onMetadata?: (meta: MetadataEvent) => void,
   onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
+  onClarification?: (event: ScopeClarification) => void,
 ): Promise<{ status: 'done' | 'server-error' | 'connection-error'; lastEventId?: string }> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
@@ -974,6 +982,10 @@ async function _doStreamAttempt(
         }
         if (parsed.event === 'conversation_title') {
           try { onConversationTitle?.(JSON.parse(parsed.data) as ConversationTitleEvent); } catch { /* ignore */ }
+          continue;
+        }
+        if (parsed.event === 'scope_clarification') {
+          try { onClarification?.(JSON.parse(parsed.data) as ScopeClarification); } catch { /* ignore */ }
           continue;
         }
         // Skip other non-content server events

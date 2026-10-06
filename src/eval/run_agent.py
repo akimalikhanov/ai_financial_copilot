@@ -247,6 +247,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
 
                 result.route = pr.route
                 result.query_shape = pr.query_shape
+                result.scope_outcome = pr.scope_outcome
                 result.latency_s = round(time.monotonic() - t0, 3)
 
                 if pr.usage:
@@ -532,6 +533,12 @@ def _compute_aggregate(
             )
             agent_agg["query_shape_misclassified_qids"] = [r.qid for r in misclassified]
 
+    # How often scope resolution took each path; eval runs with clarification off, so
+    # "unresolved" and "too_broad" are the cases a user would have been asked about.
+    scope_outcomes = Counter(r.scope_outcome for r in results if r.scope_outcome)
+    if scope_outcomes:
+        agent_agg["scope_outcomes"] = dict(scope_outcomes)
+
     return AggregateMetrics(
         retrieval=ret,
         correctness=correct_agg,
@@ -589,6 +596,10 @@ def _print_summary(output: RunOutput, out_path: Path) -> None:
         print(
             f"    questions w/ any    {agg.hallucination.get('questions_with_any_unsupported', 0)}"
         )
+
+    if agg.agent.get("scope_outcomes"):
+        outcomes = ", ".join(f"{k}={v}" for k, v in agg.agent["scope_outcomes"].items())
+        print(f"  SCOPE OUTCOMES   {outcomes}")
 
     if agg.agent:
         print("  AGENT LOOP (by query_shape)")

@@ -216,6 +216,31 @@ class ChatEnqueueRequest(BaseModel):
     model: str
     params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # False for API clients that can't show the clarification card: the run goes ahead with
+    # the best candidate, or the "not found" label.
+    allow_clarification: bool = True
+    # Set when answering a clarification card: the original question is re-run, and no new
+    # user message is created.
+    clarification_reply: ClarificationReply | None = None
+
+
+class ClarificationPick(BaseModel):
+    """The user's answer for one entity on a clarification card."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_span: str
+    # A company display name, from the card's candidates or the user's company list.
+    company: str | None = None
+    # For an entity outside the UI scope: search that company anyway, or leave it out.
+    include_outside_scope: bool | None = None
+
+
+class ClarificationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clarification_id: UUID  # the clarification card's assistant message
+    picks: list[ClarificationPick]
 
 
 class ChatEnqueueResponse(BaseModel):

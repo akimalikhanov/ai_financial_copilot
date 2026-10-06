@@ -1,108 +1,164 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.langfuse import span as lf_span
+from src.observability.trace_payload import cap_list
+from src.repository.conversation_repository import ConversationRepository
 from src.repository.document_repository import DocumentRepository
-from src.schemas.query_router import ExtractedEntity
+from src.schemas.query_router import CompanyCandidate, ExtractedEntity
+from src.services.llm_router import LLMRouter
+from src.services.router.company_name import normalize_company
+from src.services.router.disambiguator import Disambiguation, disambiguate
 from src.utils.config import get_router_config
 
 
-async def _resolve_all_entities(
+class EntityResolution(Disambiguation):
+    """How an entity resolved. Unless the decision is "none", the first candidate is the pick."""
+
+    method: Literal["binding", "fast_path", "llm", "fallback", "no_candidates"]
+    # From a binding: the user's answer when the company was outside the UI scope.
+    outside_scope: Literal["include", "exclude"] | None = None
+
+
+def _keys(entity: ExtractedEntity) -> list[str]:
+    """Normalized lookup strings: the verbatim span and the router's expansion."""
+    return [k for k in dict.fromkeys(map(normalize_company, (entity.raw_span, entity.name))) if k]
+
+
+def _merge(lists: Iterable[list[CompanyCandidate]]) -> list[CompanyCandidate]:
+    """One candidate per company, at its best score, best first."""
+    best: dict[str, CompanyCandidate] = {}
+    for c in (c for cs in lists for c in cs):
+        if c.company_norm not in best or c.score > best[c.company_norm].score:
+            best[c.company_norm] = c
+    return sorted(best.values(), key=lambda c: c.score, reverse=True)
+
+
+def _fallback(trigram: list[CompanyCandidate]) -> EntityResolution:
+    """No usable LLM answer: the trigram candidates, best first, as an ambiguous result."""
+    if not trigram:
+        return EntityResolution(decision="none", candidates=[], method="fallback")
+    return EntityResolution(decision="ambiguous", candidates=trigram, method="fallback")
+
+
+async def resolve_entities(
     session: AsyncSession,
     user_id: UUID,
+    query: str,
     entities: list[ExtractedEntity],
     *,
-    constrain_to: list[UUID] | None = None,
-    threshold: float,
-    max_candidates: int,
-) -> dict[str, list[UUID]]:
-    """Resolve entity lookups sequentially on a shared session.
+    llm_router: LLMRouter | None = None,
+    parent_request_id: UUID | None = None,
+    conversation_id: UUID | None = None,
+) -> list[EntityResolution]:
+    """Resolve each entity against all of the user's companies, in input order.
 
-    AsyncSession does not support concurrent operations, so lookups run
-    in sequence. Returns {entity.name: [doc_ids]}.
+    Order: the conversation's binding from an earlier clarification, then a single exact
+    match on a lookup string, then one LLM disambiguator call for the rest. Candidates are
+    the user's whole catalogue when it is small, else the pg_trgm matches. A failed call
+    falls back to the trigram candidates.
     """
+    if not entities:
+        return []
+    cfg = get_router_config()
     repo = DocumentRepository(session)
-    result: dict[str, list[UUID]] = {}
-    for entity in entities:
-        result[entity.name] = await repo.find_by_company_similarity(
+    keys = [_keys(e) for e in entities]
+    bindings = (
+        await ConversationRepository(session).get_entity_bindings(conversation_id)
+        if conversation_id is not None
+        else {}
+    )
+    bound = [next((bindings[k] for k in ks if k in bindings), None) for ks in keys]
+    results: list[EntityResolution | None] = [None] * len(entities)
+
+    with lf_span(
+        "entity_candidates",
+        as_type="retriever",
+        input={e.name: ks for e, ks in zip(entities, keys, strict=True)},
+    ) as obs:
+        # A bound company is looked up by its own company_norm, which matches exactly.
+        found = await repo.find_company_candidates(
             user_id,
-            entity.name,
-            threshold=threshold,
-            constrain_to=constrain_to,
-            limit=max_candidates,
+            [k for ks in keys for k in ks] + [b["company_norm"] for b in bound if b],
+            limit=int(cfg["entity_max_candidates"]),
+            sim_threshold=float(cfg["entity_candidate_sim_threshold"]),
+            word_threshold=float(cfg["entity_candidate_word_threshold"]),
         )
-    return result
+        trigram = [_merge(found[k] for k in ks) for ks in keys]
 
+        pending: list[int] = []
+        for i, ks in enumerate(keys):
+            b = bound[i]
+            company = (
+                next(
+                    (c for c in found[b["company_norm"]] if c.company_norm == b["company_norm"]),
+                    None,
+                )
+                if b
+                else None
+            )
+            exact = [c for c in trigram[i] if c.company_norm in ks]
+            if b and company:
+                results[i] = EntityResolution(
+                    decision="resolved",
+                    candidates=[company],
+                    method="binding",
+                    outside_scope=b.get("outside_scope"),
+                )
+            elif len(exact) == 1:
+                results[i] = EntityResolution(
+                    decision="resolved", candidates=exact, method="fast_path"
+                )
+            else:
+                pending.append(i)
 
-async def resolve_entities_to_doc_ids(
-    session: AsyncSession,
-    user_id: UUID,
-    entities: list[ExtractedEntity],
-    *,
-    constrain_to: list[UUID] | None = None,
-    threshold: float | None = None,
-    max_candidates: int | None = None,
-) -> tuple[list[UUID], list[ExtractedEntity]]:
-    """Map extracted entities to document IDs via pg_trgm fuzzy matching.
+        pool: list[CompanyCandidate] = []
+        use_catalogue = False
+        if pending:
+            inline_max = int(cfg["entity_catalogue_inline_max"])
+            catalogue = await repo.list_companies(user_id, limit=inline_max + 1)
+            use_catalogue = len(catalogue) <= inline_max
+            pool = catalogue if use_catalogue else _merge(trigram[i] for i in pending)
 
-    Returns (matched_doc_ids, unresolved_entities).
-    """
-    if not entities:
-        return [], []
+        if obs:
+            obs.update(
+                output={
+                    "candidates": {
+                        e.name: cap_list([f"{c.display_name} ({c.score:.2f})" for c in cs])
+                        for e, cs in zip(entities, trigram, strict=True)
+                    },
+                    "decided": {entities[i].name: r.method for i, r in enumerate(results) if r},
+                    "catalogue_shortcut": use_catalogue,
+                    "llm_pool_size": len(pool),
+                }
+            )
 
-    cfg = get_router_config()
-    if threshold is None:
-        threshold = float(cfg["entity_similarity_threshold"])
-    if max_candidates is None:
-        max_candidates = int(cfg["entity_max_candidates"])
+    if pending and not pool:
+        for i in pending:
+            results[i] = EntityResolution(decision="none", candidates=[], method="no_candidates")
+    elif pending:
+        decisions = await disambiguate(
+            query,
+            [entities[i] for i in pending],
+            pool,
+            llm_router=llm_router,
+            session=session,
+            user_id=user_id,
+            parent_request_id=parent_request_id,
+            conversation_id=conversation_id,
+        )
+        for n, i in enumerate(pending):
+            if decisions is None:
+                results[i] = _fallback(trigram[i])
+            else:
+                d = decisions[n]
+                results[i] = EntityResolution(
+                    decision=d.decision, candidates=d.candidates, method="llm"
+                )
 
-    per_entity = await _resolve_all_entities(
-        session,
-        user_id,
-        entities,
-        constrain_to=constrain_to,
-        threshold=threshold,
-        max_candidates=max_candidates,
-    )
-
-    matched: set[UUID] = set()
-    unresolved: list[ExtractedEntity] = []
-    for entity in entities:
-        doc_ids = per_entity[entity.name]
-        if doc_ids:
-            matched.update(doc_ids)
-        else:
-            unresolved.append(entity)
-
-    return list(matched), unresolved
-
-
-async def resolve_entities_per_entity(
-    session: AsyncSession,
-    user_id: UUID,
-    entities: list[ExtractedEntity],
-    *,
-    constrain_to: list[UUID] | None = None,
-    threshold: float | None = None,
-    max_candidates: int | None = None,
-) -> dict[str, list[UUID]]:
-    """Returns {entity.name: [doc_ids]}, including empty lists for unresolved."""
-    if not entities:
-        return {}
-
-    cfg = get_router_config()
-    if threshold is None:
-        threshold = float(cfg["entity_similarity_threshold"])
-    if max_candidates is None:
-        max_candidates = int(cfg["entity_max_candidates"])
-
-    return await _resolve_all_entities(
-        session,
-        user_id,
-        entities,
-        constrain_to=constrain_to,
-        threshold=threshold,
-        max_candidates=max_candidates,
-    )
+    return [r for r in results if r is not None]

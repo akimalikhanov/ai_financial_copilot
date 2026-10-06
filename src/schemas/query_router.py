@@ -52,8 +52,45 @@ class EntityManifestItem(BaseModel):
     doc_summaries: list[dict]  # [{doc_id, name, year}]
 
 
+class CompanyCandidate(BaseModel):
+    """One company (a distinct `company_norm`) with its ready documents."""
+
+    company_norm: str
+    display_name: str
+    doc_ids: list[UUID]
+    years: list[int]
+    titles: list[str]
+    # Best of similarity / strict_word_similarity against the lookup key; 0 when listed
+    # from the catalogue rather than matched.
+    score: float = 0.0
+
+
+class EntityClarification(BaseModel):
+    """An entity the clarification card asks about. With clarification off, the run goes
+    ahead: an ambiguous entity uses its first candidate, the others count as not found."""
+
+    entity: str  # ExtractedEntity.name
+    raw_span: str
+    outcome: Literal["ambiguous", "none", "outside_scope"]
+    candidates: list[CompanyCandidate] = []
+
+
+ScopeSource = Literal["explicit", "filtered", "entity_resolved", "unresolved", "all"]
+
+
 class DocumentScopeResult(BaseModel):
-    doc_ids: list[UUID] | None  # None = no pre-filter (search all user docs)
-    source: Literal["explicit", "filtered", "entity_resolved", "all"]
-    per_entity_doc_ids: dict[str, list[UUID]] | None = None  # keyed by ExtractedEntity.name
+    # None = no pre-filter. resolve_scope always returns a list; None stays the retrievers'
+    # contract for callers that build a result themselves.
+    doc_ids: list[UUID] | None
+    # Without entities, the UI scope the documents came from (explicit selection, metadata
+    # filter or all). With entities, whether any of them resolved.
+    source: ScopeSource
+    # Covered company display name → its documents in the UI scope; an unresolved entity
+    # is listed under its router name with [].
+    per_entity_doc_ids: dict[str, list[UUID]] | None = None
+    # Entity names that matched no document in the UI scope.
+    unresolved_entities: list[str] = []
     entity_manifest: list[EntityManifestItem] | None = None
+    clarifications: list[EntityClarification] = []
+    # Companies covered, set only when above SCOPE_MAX_COMPANIES: the run stops before the agent.
+    too_broad_count: int | None = None

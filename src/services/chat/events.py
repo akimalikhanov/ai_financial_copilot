@@ -11,6 +11,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repository.chunk_repository import ChunkRepository
+from src.schemas.query_router import DocumentScopeResult
 from src.schemas.retrieval import AnswerCitationSpan, ChunkProvenance, Citation, RAGContext
 from src.services.llm_adapters.base_adapter import LLMResponseStats
 from src.services.retrieval.payload_hydrator import _parse_provenance
@@ -62,6 +63,81 @@ def out_of_scope_response() -> str:
         "I'm focused on financial document analysis and can't help with that. "
         "Feel free to ask about financial reports, filings, or documents you've uploaded."
     )
+
+
+def too_broad_response(covered: int, max_companies: int) -> str:
+    """Fixed reply when a question covers more companies than one run can analyse."""
+    return (
+        f"This question covers {covered} companies, and I can analyse up to {max_companies} "
+        "at once. Name the companies you want compared, or narrow the scope to fewer "
+        "companies, and ask again."
+    )
+
+
+def build_scope_clarification_event(
+    clarification_id: UUID,
+    scope: DocumentScopeResult,
+    named_companies: bool,
+    max_companies: int,
+) -> dict:
+    """Payload of the `scope_clarification` event, also stored on the card's message so a
+    reload renders the same card. ``outcome`` is "too_broad" or "entities"."""
+    # An ambiguous entity provisionally covers its top candidate; that's a guess, not a match.
+    guesses = {
+        c.candidates[0].display_name
+        for c in scope.clarifications
+        if c.outcome == "ambiguous" and c.candidates
+    }
+    return {
+        "clarification_id": str(clarification_id),
+        "outcome": "too_broad" if scope.too_broad_count is not None else "entities",
+        "named_companies": named_companies,
+        "unresolved": [
+            {
+                "raw_span": c.raw_span,
+                "outcome": c.outcome,
+                "candidates": [
+                    {
+                        "company": k.display_name,
+                        "years": sorted(k.years),
+                        "doc_count": len(k.doc_ids),
+                    }
+                    for k in c.candidates
+                ],
+            }
+            for c in scope.clarifications
+        ],
+        "resolved": [
+            n for n, ids in (scope.per_entity_doc_ids or {}).items() if ids and n not in guesses
+        ],
+        "covered_count": scope.too_broad_count,
+        "max_companies": max_companies,
+    }
+
+
+def clarification_text(payload: dict) -> str:
+    """The card as plain text: the message content, for history, copy and API clients."""
+    if payload["outcome"] == "too_broad":
+        if payload["named_companies"]:
+            return (
+                f"I can compare up to {payload['max_companies']} companies per question. "
+                "Split it into smaller questions."
+            )
+        return (
+            f"This covers {payload['covered_count']} companies. I can analyse up to "
+            f"{payload['max_companies']} at once — pick which ones."
+        )
+    lines = []
+    for u in payload["unresolved"]:
+        span = u["raw_span"]
+        if u["outcome"] == "ambiguous":
+            lines.append(f'I couldn\'t tell which company you mean by "{span}".')
+        elif u["outcome"] == "none":
+            lines.append(f'I found no document for "{span}".')
+        else:
+            company = u["candidates"][0]["company"] if u["candidates"] else span
+            lines.append(f"{company} isn't in your current selection.")
+    return "\n\n".join(lines)
 
 
 _GENERIC_USER_ERROR = "Something went wrong. Please try again."

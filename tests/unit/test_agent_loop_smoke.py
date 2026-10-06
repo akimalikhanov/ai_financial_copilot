@@ -342,6 +342,74 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_unresolved_entity_returns_not_found_without_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compare Aurora and RWE, with Aurora unresolved: an empty list must not become an
+    unfiltered search that files RWE's chunks under Aurora."""
+    from src.services.chat.agent import loop as loop_module
+
+    state = _make_state()
+    state.scope_result = DocumentScopeResult(
+        doc_ids=[uuid4()],
+        source="entity_resolved",
+        per_entity_doc_ids={"Aurora": [], "RWE AG": [uuid4()]},
+    )
+    pipeline = AsyncMock()
+    monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", pipeline)
+
+    tc = ToolCallRef(
+        id="call_1",
+        name="search_documents",
+        arguments=json.dumps({"entity": "Aurora", "query": "revenue", "keywords": "revenue"}),
+    )
+    result = await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
+    )
+
+    assert result.not_found is True
+    assert result.chunks == []
+    assert result.error_str is not None and "Aurora" in result.error_str
+    pipeline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_empty_entity_searches_every_resolved_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.chat.agent import loop as loop_module
+
+    union = [uuid4(), uuid4()]
+    state = _make_state()
+    state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
+    state.scope_result = DocumentScopeResult(
+        doc_ids=union,
+        source="entity_resolved",
+        per_entity_doc_ids={"Acme": [union[0]], "Globex": [union[1]]},
+    )
+    seen: list[Any] = []
+
+    async def _fake_pipeline(*_a: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["doc_ids"])
+        return None, RetrievalTrace(), []
+
+    monkeypatch.setattr(loop_module, "run_chat_rag_pipeline", _fake_pipeline)
+    monkeypatch.setattr(loop_module, "get_chunk_prompt_payloads", AsyncMock(return_value={}))
+    monkeypatch.setattr(loop_module, "add_event", AsyncMock())
+
+    tc = ToolCallRef(
+        id="call_1",
+        name="search_documents",
+        arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
+    )
+    await loop_module._execute_search(
+        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
+    )
+
+    assert seen == [union]
+
+
+@pytest.mark.asyncio
 async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     """P1-F: the pipeline fails open on a dead index — zero chunks, no exception. Without
     reading the trace the loop cannot tell that from "the corpus has nothing on this"."""

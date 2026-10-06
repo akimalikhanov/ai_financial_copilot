@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 from typing import cast
+from uuid import uuid4
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.schemas.query_router import RouterInput
+from src.schemas.query_router import ChatScope, RouterInput
 from src.services.llm_adapters.base_adapter import LLMResponse
 from src.services.llm_router import LLMRouter
+from src.services.router import scope_resolver
 from src.services.router.router import _FALLBACK, route_query
 
 
@@ -86,6 +89,26 @@ class TestFallbackSites:
         output, scope = await route_query(RouterInput(query="hello"), llm_router=router)
         assert output == _FALLBACK
         assert len(llm.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_timeout_keeps_selected_docs_scope(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        doc_id = uuid4()
+
+        class FakeRepo:
+            async def get_scope_docs(self, _user_id, doc_ids=None):
+                return [(d, "acme", "Acme", 2023) for d in doc_ids or []]
+
+        monkeypatch.setattr(scope_resolver, "DocumentRepository", lambda _s: FakeRepo())
+        router = FakeRouter(FakeLLM(raises=TimeoutError()))
+        inp = RouterInput(query="revenue?", scope=ChatScope(mode="selectedDocs", doc_ids=[doc_id]))
+
+        output, scope = await route_query(
+            inp, llm_router=router, session=cast(AsyncSession, object()), user_id=uuid4()
+        )
+
+        assert output == _FALLBACK
+        assert scope is not None
+        assert scope.doc_ids == [doc_id]
 
     @pytest.mark.asyncio
     async def test_empty_query_raises_value_error(self) -> None:
