@@ -25,6 +25,9 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.observability import langfuse as lf_client
+from src.observability.langfuse import describe_error
+from src.observability.langfuse import mark as lf_mark
+from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     AGENT_LAST_TURN_INPUT_TOKENS,
@@ -36,6 +39,7 @@ from src.observability.metrics import (
     LLM_TOKENS,
     observe_llm_latency,
 )
+from src.observability.trace_payload import cap_list
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.agent_findings import AgentFindings, FindingsReport
@@ -275,7 +279,7 @@ async def _execute_search(
             "keywords": keyword_query,
             # Show the resolved scope this search was constrained to, so the
             # trace makes clear which docs the agent could actually see.
-            "scope_doc_ids": [str(d) for d in doc_ids] if doc_ids else "all",
+            "scope_doc_ids": cap_list([str(d) for d in doc_ids]) if doc_ids else "all",
             "scope_doc_count": len(doc_ids) if doc_ids else "all",
             "scoped_via_entity": entity in per_entity,
         },
@@ -299,6 +303,7 @@ async def _execute_search(
                 logger.warning("agent_search_backends_down", extra={"entity": entity})
                 if obs:
                     obs.update(output={"chunks_returned": 0, "error": True})
+                    lf_mark(obs, "ERROR", "all retrieval backends failed")
                 AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
                 AGENT_TOOL_DURATION.labels("search_documents").observe(
                     perf_counter() - _tool_started
@@ -311,10 +316,11 @@ async def _execute_search(
                     backend_failed=True,
                     activity_id=activity_id,
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning("agent_search_failed", extra={"entity": entity})
             if obs:
                 obs.update(output={"chunks_returned": 0, "error": True})
+                lf_mark(obs, "ERROR", describe_error(exc))
             AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
             AGENT_TOOL_DURATION.labels("search_documents").observe(perf_counter() - _tool_started)
             return _SearchResult(
@@ -500,8 +506,8 @@ def fold_searches(
     """Fold one turn's search results into the state, in call order.
 
     Returns the tool-result text per call id, the count of new labels each search
-    showed the model, and a trace view per call id (chunk ids with trimmed text — the
-    full text already lands in the next turn's GENERATION input). No awaits and no I/O:
+    showed the model, and a trace view per call id (chunk ids with trimmed text; the next
+    turn's GENERATION input carries a longer, still capped, cut). No awaits and no I/O:
     labels are assigned here, sequentially, so S-labels continue across searches instead
     of restarting at S1, and stay deterministic however the concurrent searches finished.
     """
@@ -617,16 +623,28 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
 
 
 async def _call_tool_model(
-    state: AgentRunState, deps: RunDeps, messages: list[ChatMessage], tools: list[dict]
+    state: AgentRunState,
+    deps: RunDeps,
+    messages: list[ChatMessage],
+    tools: list[dict],
+    allowed: list[str] | None = None,
 ) -> tuple[RoutedLLM, AssistantTurnResult]:
     """The first model in the chain that answers, and its turn. The last model's provider
-    error propagates; a timeout does not fall back."""
+    error propagates; a timeout does not fall back. `allowed` restricts the callable tools:
+    via `allowed_tools` where the model supports it (keeps the cached prefix), otherwise by
+    dropping the other tools from the request."""
 
     async def complete(llm: RoutedLLM) -> AssistantTurnResult:
-        return await asyncio.wait_for(
-            llm.complete_with_tools(messages, tools=tools, temperature=0.0),
-            timeout=state.settings.turn_timeout_seconds,
-        )
+        if allowed is None:
+            call = llm.complete_with_tools(messages, tools=tools, temperature=0.0)
+        elif llm.capabilities.get("allowed_tools", False):
+            call = llm.complete_with_tools(
+                messages, tools=tools, allowed_tools=allowed, temperature=0.0
+            )
+        else:
+            subset = [t for t in tools if t["function"]["name"] in allowed]
+            call = llm.complete_with_tools(messages, tools=subset, temperature=0.0)
+        return await asyncio.wait_for(call, timeout=state.settings.turn_timeout_seconds)
 
     *fallible, last = deps.llms
     for llm in fallible:
@@ -642,6 +660,7 @@ async def _call_tool_model(
                     "error": type(e).__name__,
                 },
             )
+            lf_mark_current("WARNING", f"tool model {llm.model_id} failed ({type(e).__name__})")
     return last, await complete(last)
 
 
@@ -738,7 +757,9 @@ async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) 
         )
 
 
-async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> TurnOutcome:
+async def _run_turn(
+    state: AgentRunState, deps: RunDeps, tools: list[dict], allowed: list[str] | None = None
+) -> TurnOutcome:
     """One turn: call the tool model, dispatch its calls, fold the results, decide."""
     iteration = state.iteration
     request_id = deps.request_id
@@ -776,7 +797,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                 *state.transcript.messages,
                 *([ChatMessage(role=Role.user, content=status)] if status else []),
             ]
-            served, turn = await _call_tool_model(state, deps, prompt_messages, tools)
+            served, turn = await _call_tool_model(state, deps, prompt_messages, tools, allowed)
             await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn))
 
             if not turn.tool_calls:
@@ -787,7 +808,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
 
             # A call to a tool outside this turn's pool is answered and never parsed: a
             # final-turn search does not run.
-            offered = {t["function"]["name"] for t in tools}
+            offered = set(allowed) if allowed else {t["function"]["name"] for t in tools}
             reports = [tc for tc in turn.tool_calls if tc.name == REPORT_TOOL_NAME]
             searches = [tc for tc in turn.tool_calls if tc.name in offered - {REPORT_TOOL_NAME}]
             for tc in turn.tool_calls:
@@ -884,8 +905,7 @@ async def _run_turn(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> T
                         ],
                         # The `role: tool` results this turn appended, keyed by
                         # tool_call_id. Report results verbatim; a search as chunk ids with
-                        # trimmed text — its full excerpts are in the next turn's
-                        # GENERATION input.
+                        # trimmed text — the next turn's GENERATION input logs it once.
                         "tool_results": {**results_by_id, **search_traces},
                         # State *after* this turn's effects landed — the structured
                         # counterpart to the prose `status` this span took as input (state
@@ -944,15 +964,13 @@ async def _iterate(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> No
         # An aspect whose evidence is already admitted but never written up dies as
         # "Not resolved" at the iteration cap. Withholding search on the last turn — the
         # turn that was going to run anyway — gives the model one pass to convert what it
-        # already holds, at no extra cost. `tool_choice` stays "auto": if the model emits
+        # already holds, at no extra cost. The tool mode stays "auto": if the model emits
         # prose instead, the turn returns Stop("natural") and accumulated findings still
         # serve, so this fails safe.
         final_turn = iteration == state.max_iterations - 1
-        turn_tools = (
-            [t for t in tools if t["function"]["name"] == REPORT_TOOL_NAME] if final_turn else tools
-        )
+        allowed = [REPORT_TOOL_NAME] if final_turn else None
         try:
-            outcome = await _run_turn(state, deps, turn_tools)
+            outcome = await _run_turn(state, deps, tools, allowed)
         except TimeoutError:
             logger.warning(
                 "agent_turn_timeout",

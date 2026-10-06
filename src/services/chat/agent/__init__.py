@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from src.services.chat.agent.loop import run_loop
 from src.services.chat.agent.state import AgentLoopMeta, AgentSettings, get_agent_settings
 from src.services.chat.agent.synthesis import AgentRunResult, run_synthesis
+from src.utils.config import get_agent_fallback_max_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -46,5 +47,5 @@ async def run_agent(
         findings,
         meta,
         requested_currency,
-        max_chunks_per_entity=get_agent_settings().max_chunks_per_entity,
+        fallback_max_chunks=get_agent_fallback_max_chunks(),
     )

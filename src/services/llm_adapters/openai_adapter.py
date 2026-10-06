@@ -291,13 +291,26 @@ class OpenAIAdapter(LLMAdapter):
         self,
         messages: Sequence[ChatMessage],
         tools: list[dict[str, Any]],
+        allowed_tools: list[str] | None = None,
         **kwargs: Any,
     ) -> AssistantTurnResult:
         reject_images(messages, f"{self.__class__.__name__}.complete_with_tools")
         req = self._build_request(messages, **kwargs)
         kw = self._build_kwargs(req)
         kw["tools"] = tools
-        kw["tool_choice"] = "auto"
+        # `allowed_tools` restricts the callable subset while `tools` stays byte-identical,
+        # so the cached prompt prefix survives the restriction.
+        kw["tool_choice"] = (
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "auto",
+                    "tools": [{"type": "function", "function": {"name": n}} for n in allowed_tools],
+                },
+            }
+            if allowed_tools
+            else "auto"
+        )
         start_ms = now_ms()
         try:
             resp = await self._client.chat.completions.create(**cast(Any, kw))

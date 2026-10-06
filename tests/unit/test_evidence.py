@@ -24,11 +24,6 @@ def _chunk(score: float = 1.0) -> RetrievedChunk:
     )
 
 
-def _chunk_like(chunk: RetrievedChunk, score: float) -> RetrievedChunk:
-    """Same chunk_id, different score — a re-surfaced chunk from a later search."""
-    return replace(chunk, score=score)
-
-
 def _payload(chunk: RetrievedChunk) -> ChunkPromptPayload:
     return ChunkPromptPayload(
         chunk_id=chunk.chunk_id,
@@ -47,14 +42,6 @@ class TestAdmit:
         assert ledger.admit([chunk]) == 1
         assert ledger.admit([chunk]) == 0  # already known — not newly admitted
         assert len(ledger) == 1
-
-    def test_best_score_is_kept_across_searches(self) -> None:
-        ledger = EvidenceLedger()
-        chunk = _chunk(score=0.3)
-        ledger.admit([chunk])
-        ledger.admit([_chunk_like(chunk, score=0.8)])
-
-        assert ledger._records[chunk.chunk_id].best_score == 0.8
 
 
 class TestAssignLabels:
@@ -114,6 +101,37 @@ class TestLabelledChunks:
         ledger.assign_labels([shown], {shown.chunk_id: _payload(shown)})
 
         assert [c.chunk_id for c in ledger.labelled_chunks()] == [shown.chunk_id]
+
+
+class TestFallbackChunks:
+    def test_round_robin_across_searches_in_run_order(self) -> None:
+        ledger = EvidenceLedger()
+        a1, a2, a3 = _chunk(0.9), _chunk(0.8), _chunk(0.7)
+        b1, b2 = _chunk(0.2), _chunk(0.1)
+        ledger.assign_labels([a1, a2, a3], {c.chunk_id: _payload(c) for c in (a1, a2, a3)})
+        ledger.assign_labels([b1, b2], {c.chunk_id: _payload(c) for c in (b1, b2)})
+
+        got = [c.chunk_id for c in ledger.fallback_chunks(4)]
+
+        assert got == [a1.chunk_id, b1.chunk_id, a2.chunk_id, b2.chunk_id]
+
+    def test_rank_counts_only_chunks_the_search_rendered(self) -> None:
+        """A chunk an earlier search already labelled is not re-rendered, so the second
+        search's first *fresh* chunk is its rank 0."""
+        ledger = EvidenceLedger()
+        shared, fresh = _chunk(0.9), _chunk(0.5)
+        ledger.assign_labels([shared], {shared.chunk_id: _payload(shared)})
+        ledger.assign_labels([shared, fresh], {c.chunk_id: _payload(c) for c in (shared, fresh)})
+
+        assert [c.chunk_id for c in ledger.fallback_chunks(2)] == [shared.chunk_id, fresh.chunk_id]
+
+    def test_unshown_chunks_are_never_selected(self) -> None:
+        ledger = EvidenceLedger()
+        shown, unshown = _chunk(), _chunk()
+        ledger.admit([shown, unshown])
+        ledger.assign_labels([shown], {shown.chunk_id: _payload(shown)})
+
+        assert [c.chunk_id for c in ledger.fallback_chunks(10)] == [shown.chunk_id]
 
 
 class TestShownBefore:

@@ -35,13 +35,13 @@ template: |
 
   ## Reading the [FINDINGS] block
 
-  The block lists one numbered finding per entity or aspect: `N. <key> [<confidence> confidence] <claim> | evidence: <excerpt ids>`, followed by the finding's figures, one per line: `- <metric> (<period>): <value>`.
+  The block lists one numbered finding per entity or aspect: `N. <entity> [<confidence> confidence] <claim> | evidence: [S1] [S4]` (the entity is omitted for aspect findings), followed by the finding's figures, one per line: `- <metric> (<period>): <value>`.
 
   ### Claims
 
   - **Use the findings as your structural starting point.** For a narrative question, synthesize them into a coherent answer — do not just list them. For a lookup, answer with the figures directly.
   - **Expand on the `Conclusion`** (if present) — it is a draft, not your final answer.
-  - **Cite the underlying excerpts** for each claim you make, using the finding's `evidence` IDs.
+  - **Cite the underlying excerpts** for each claim you make, copying the finding's `evidence` refs (`[S1] [S4]`). Only `[Sn]` refs are citations — never cite a finding's number or entity.
   - **Flag contested findings**: if a claim says the excerpts disagree, acknowledge the contradiction — do not silently adopt either side.
   - **Confidence levels**: treat `high` as established fact from the documents; `medium` as probable but single-sourced; `low` as possible but weakly supported — qualify accordingly.
   - **A finding marked `[not disclosed]`** is a settled negative, not missing data — the agent searched for it and confirmed the documents do not address it. State that plainly using the finding's own claim text (no citation needed, since it points to an absence). Treat it as answering its part of the question. When the question asks for a value, output exactly `N/A` on its own line before that one-sentence explanation.

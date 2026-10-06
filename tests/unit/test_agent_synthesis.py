@@ -39,25 +39,23 @@ def _meta(convergence_reason: str = "natural") -> AgentLoopMeta:
     )
 
 
+def _payload_for(c: RetrievedChunk) -> ChunkPromptPayload:
+    return ChunkPromptPayload(
+        chunk_id=c.chunk_id,
+        document_id=c.document_id,
+        document_name="Doc.pdf",
+        page_numbers=(1,),
+        heading_trail=("Section",),
+        prompt_text="[__REF__]\nSome chunk text.",
+    )
+
+
 def _ledger(*chunks: RetrievedChunk) -> EvidenceLedger:
-    """A ledger with every chunk admitted and rendered — i.e. its payloads cached, which
-    is what synthesis reads instead of re-hydrating."""
+    """A ledger with every chunk admitted and rendered by one search — i.e. its payloads
+    cached, which is what synthesis reads instead of re-hydrating."""
     ledger = EvidenceLedger()
     ledger.admit(chunks)
-    ledger.assign_labels(
-        chunks,
-        {
-            c.chunk_id: ChunkPromptPayload(
-                chunk_id=c.chunk_id,
-                document_id=c.document_id,
-                document_name="Doc.pdf",
-                page_numbers=(1,),
-                heading_trail=("Section",),
-                prompt_text="[__REF__]\nSome chunk text.",
-            )
-            for c in chunks
-        },
-    )
+    ledger.assign_labels(chunks, {c.chunk_id: _payload_for(c) for c in chunks})
     return ledger
 
 
@@ -65,7 +63,7 @@ async def _run(
     ledger: EvidenceLedger, findings: AgentFindings | None, meta: AgentLoopMeta | None = None
 ) -> synthesis.AgentRunResult:
     return await synthesis.run_synthesis(
-        ledger, findings, meta or _meta(), None, max_chunks_per_entity=100
+        ledger, findings, meta or _meta(), None, fallback_max_chunks=100
     )
 
 
@@ -80,7 +78,7 @@ class TestChunkOrdering:
         early_mid = _chunk(score=0.5)
         early_mid.turn_index = 0
 
-        ordered = _ledger(early_weak, late_strong, early_mid).ordered_chunks()
+        ordered = _ledger(early_weak, late_strong, early_mid).labelled_chunks()
 
         assert [c.chunk_id for c in ordered] == [
             late_strong.chunk_id,
@@ -95,7 +93,7 @@ class TestChunkOrdering:
         late_strong = _chunk(score=0.9)
         late_strong.turn_index = 3
 
-        ordered = _ledger(early_weak, late_strong).ordered_chunks()
+        ordered = _ledger(early_weak, late_strong).labelled_chunks()
         assert ordered[0].chunk_id == late_strong.chunk_id
 
 
@@ -147,6 +145,48 @@ class TestCitedChunkNarrowing:
         assert {item.chunk_id for item in result.rag_context.items} == {c1.chunk_id, c2.chunk_id}
 
 
+class TestUncitedExcerptsNotice:
+    async def test_notice_precedes_fallback_excerpts(self) -> None:
+        findings = AgentFindings(findings=(_neg("Acme"),))
+
+        result = await _run(_ledger(_chunk()), findings)
+
+        assert result.findings_block is not None
+        assert result.synthesis_context.startswith(result.findings_block + "\n\n")
+        excerpts = result.synthesis_context[len(result.findings_block) + 2 :]
+        assert excerpts.startswith(synthesis.UNCITED_EXCERPTS_NOTICE + "\n\n")
+
+    async def test_notice_leads_when_there_are_no_findings(self) -> None:
+        result = await _run(_ledger(_chunk()), None)
+        assert result.synthesis_context.startswith(synthesis.UNCITED_EXCERPTS_NOTICE)
+
+    async def test_no_notice_when_findings_cite_excerpts(self) -> None:
+        c1 = _chunk()
+        findings = AgentFindings(findings=(_f("Acme", evidence=[str(c1.chunk_id)]),))
+
+        result = await _run(_ledger(c1), findings)
+
+        assert synthesis.UNCITED_EXCERPTS_NOTICE not in result.synthesis_context
+
+    async def test_no_notice_without_excerpts(self) -> None:
+        result = await _run(EvidenceLedger(), None)
+        assert result.synthesis_context == "(No document context.)"
+
+
+class TestFallbackSelection:
+    async def test_cap_takes_each_search_before_any_second_chunk(self) -> None:
+        """Two searches, cap 2: one chunk from each, even though the first search's
+        second chunk outscores the second search's best."""
+        a1, a2 = _chunk(score=0.9), _chunk(score=0.8)
+        b1 = _chunk(score=0.05)  # fusion-scale score from a search whose reranker fell open
+        ledger = _ledger(a1, a2)
+        ledger.assign_labels([b1], {b1.chunk_id: _payload_for(b1)})
+
+        result = await synthesis.run_synthesis(ledger, None, _meta(), None, fallback_max_chunks=2)
+
+        assert [item.chunk_id for item in result.rag_context.items] == [a1.chunk_id, b1.chunk_id]
+
+
 class TestOneBlock:
     async def test_unresolved_keys_reach_the_block(self) -> None:
         """A seeded entity nobody reported must not vanish — that turns a 2-entity
@@ -180,7 +220,7 @@ class TestOneBlock:
         assert result.findings_block is not None
         lines = result.findings_block.splitlines()
         i = next(n for n, line in enumerate(lines) if line.startswith("1. Acme "))
-        assert lines[i].endswith("| evidence: S1")
+        assert lines[i].endswith("| evidence: [S1]")
         # The fixture excerpt states neither number, so both carry the grounding marker.
         assert lines[i + 1].startswith("   - revenue (2023-12-31): USD 10.0M | ⚠ UNVERIFIED")
         assert lines[i + 2].startswith("   - revenue (2022-12-31): USD 8.0M | ⚠ UNVERIFIED")

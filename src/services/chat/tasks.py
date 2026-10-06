@@ -23,6 +23,9 @@ from src.api.logging import configure_worker_logging, worker_request_context
 from src.celery_app import celery_app
 from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
+from src.observability.langfuse import describe_error
+from src.observability.langfuse import mark as lf_mark
+from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.metrics import (
     AGENT_ITERATIONS,
     AGENT_STOP_REASONS,
@@ -42,6 +45,8 @@ from src.observability.metrics import (
     ROUTER_DECISIONS,
     observe_llm_latency,
 )
+from src.observability.trace_payload import cap_list, trace_params
+from src.observability.trace_payload import dedup_scope as trace_dedup_scope
 from src.redis_client import add_event, events_stream_key, expire_event_stream, get_activity_log
 from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
 from src.repository.llm_request_repository import stats_to_request_kwargs
@@ -67,7 +72,13 @@ from src.services.chat.events import (
 from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
 from src.services.context.turns import prior_turns
-from src.services.llm_router import FallbackStream, LLMRouter, get_router
+from src.services.llm_router import (
+    FallbackStream,
+    LLMRouter,
+    get_router,
+    trace_input,
+    trace_usage,
+)
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
@@ -123,6 +134,12 @@ def _init_metric_series() -> None:
     for tool in ("search_documents", agent_tools.REPORT_TOOL_NAME):
         AGENT_TOOL_ARG_ERRORS.labels(tool)
 
+
+# Agent stops caused by a fault or a limit rather than the model finishing — marked WARNING
+# on the agent_loop span so they can be filtered in Langfuse.
+_AGENT_FAILED_STOPS: frozenset[ConvergenceReason] = frozenset(
+    {"timeout", "deadline", "llm_error", "search_unavailable"}
+)
 
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
@@ -430,6 +447,30 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 input={"request_id": request_id},
             )
         )
+        # Every generation in this trace logs a repeated message once (the agent resends
+        # its whole transcript each turn).
+        _lf_stack.enter_context(trace_dedup_scope())
+
+    def _trace_io(**io: Any) -> None:
+        """Trace-level input/output — what the Langfuse trace list shows per row."""
+        if _root_span is not None:
+            with contextlib.suppress(Exception):
+                _root_span.set_trace_io(**io)  # type: ignore[attr-defined]
+
+    def _score(name: str, value: float | str, data_type: str) -> None:
+        if not lf:
+            return
+        trace_id = UUID(request_id).hex
+        with contextlib.suppress(Exception):
+            if isinstance(value, str):
+                lf.create_score(name=name, value=value, data_type="CATEGORICAL", trace_id=trace_id)
+            else:
+                lf.create_score(
+                    name=name,
+                    value=value,
+                    data_type=data_type,  # type: ignore[arg-type]
+                    trace_id=trace_id,
+                )
 
     try:
         async with sf() as session:
@@ -575,10 +616,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 None,
             )
             state.user_query_raw = last_user.content if last_user else ""
-            if lf:
-                lf.update_current_span(
-                    input={"request_id": request_id, "query": state.user_query_raw}
-                )
+            _trace_io(input={"query": state.user_query_raw})
 
             injection_signal: InjectionSignal | None = None
             # 2.5 scan_user_input (skipped when INJECTION_SCAN_USER_INPUT=false)
@@ -598,24 +636,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     },
                 )
 
-                if lf:
-                    lf_trace_id = UUID(request_id).hex
-                    lf.create_score(
-                        name="injection_score",
-                        value=float(injection_signal.score),
-                        trace_id=lf_trace_id,
-                    )
-                    lf.create_score(
-                        name="injection_severity",
-                        value=injection_signal.severity,
-                        trace_id=lf_trace_id,
-                    )
+                _score("injection_score", float(injection_signal.score), "NUMERIC")
+                _score("injection_severity", injection_signal.severity, "CATEGORICAL")
 
                 if injection_signal.severity == "block":
                     GUARDRAIL_BLOCKS.labels("injection").inc()
                     refusal_text = (
                         "I'm sorry, but I can't process that request. "
                         "Please ask a financial question about your documents."
+                    )
+                    _trace_io(output={"answer": refusal_text, "route": "blocked"})
+                    lf_mark(
+                        _root_span,
+                        "WARNING",
+                        f"blocked by injection guardrail: {injection_signal.matched_rules}",
                     )
                     await add_event(redis_app, request_id, "delta", {"text": refusal_text})
                     await message_repo.update_on_final(
@@ -756,24 +790,25 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "prior_findings_present": prior_findings_present,
                         "prior_findings_hops": prior_findings.hops,
                         "scope_source": state.scope_result.source if state.scope_result else None,
-                        "scope_doc_ids": _scope_doc_ids,
+                        "scope_doc_ids": cap_list(_scope_doc_ids or []),
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
-                        "scope_per_entity_doc_ids": _scope_per_entity,
-                        "scope_entity_manifest": _scope_entity_manifest,
+                        "scope_per_entity_doc_ids": {
+                            entity: {"count": len(ids), "doc_ids": cap_list(ids)}
+                            for entity, ids in (_scope_per_entity or {}).items()
+                        },
+                        "scope_entity_manifest": cap_list(_scope_entity_manifest or []),
                     },
                 )
                 # Surface scope at the trace root so it's visible without drilling into
-                # the route stage. The root span owns trace-level IO in langfuse v3.
+                # the route stage.
                 if _root_span is not None:
                     with contextlib.suppress(Exception):
-                        _root_span.set_trace_io(  # type: ignore[attr-defined]
-                            output={"scope": scope_summary["headline"]}
-                        )
                         _root_span.update(metadata={"scope": scope_summary})  # type: ignore[attr-defined]
 
             # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
             if state.router_output.route == "out_of_scope":
                 redirect_text = out_of_scope_response()
+                _trace_io(output={"answer": redirect_text, "route": "out_of_scope"})
                 await add_event(redis_app, request_id, "delta", {"text": redirect_text})
                 await message_repo.update_on_final(
                     message_id=state.assistant_message_id,
@@ -839,16 +874,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             }
                         )
                     )
-                    _agent_lf_stack.enter_context(
-                        lf.start_as_current_observation(
-                            as_type="chain",
-                            name="agent_loop",
-                            input={
-                                "query": state.user_query_raw,
-                                "query_shape": getattr(state.router_output, "query_shape", None),
-                                "tool_model": _tool_model_id,
-                            },
-                        )
+                    # The `agent_loop` stage span opened by _log_stage is the agent's span;
+                    # a second one nested inside it would only repeat it.
+                    lf.update_current_span(
+                        input={
+                            "query": state.user_query_raw,
+                            "query_shape": _query_shape,
+                            "tool_model": _tool_model_id,
+                        }
                     )
                 try:
                     agent_result = await run_agent(
@@ -889,18 +922,25 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "last_turn_input_tokens": agent_meta.last_turn_input_tokens,
                             },
                         )
-                        lf_trace_id = UUID(request_id).hex
-                        if agent_meta.plan_seeded:
-                            lf.create_score(
-                                name="agent_plan_coverage",
-                                value=agent_meta.plan_covered / agent_meta.plan_seeded,
-                                trace_id=lf_trace_id,
+                        if agent_meta.convergence_reason in _AGENT_FAILED_STOPS:
+                            lf_mark_current(
+                                "WARNING",
+                                f"agent stopped early: {agent_meta.convergence_reason}"
+                                f" (sealed={agent_meta.sealed})",
                             )
-                        lf.create_score(
-                            name="agent_uncited_claim_rate",
-                            value=agent_meta.uncited_claim_rate,
-                            trace_id=lf_trace_id,
+                        if agent_meta.plan_seeded:
+                            _score(
+                                "agent_plan_coverage",
+                                agent_meta.plan_covered / agent_meta.plan_seeded,
+                                "NUMERIC",
+                            )
+                        _score("agent_uncited_claim_rate", agent_meta.uncited_claim_rate, "NUMERIC")
+                        _score(
+                            "agent_convergence_reason",
+                            agent_meta.convergence_reason or "none",
+                            "CATEGORICAL",
                         )
+                        _score("agent_sealed", float(agent_meta.sealed), "BOOLEAN")
                 finally:
                     _agent_lf_stack.close()
 
@@ -986,6 +1026,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 llm_chain = router.get_with_fallback(llm_request.model)
             except Exception as e:
                 logger.exception("llm_router_error", extra={"request_id": request_id})
+                lf_mark_current("ERROR", describe_error(e))
+                lf_mark(_root_span, "ERROR", f"render_prompt: {describe_error(e)}")
+                _trace_io(output={"error": describe_error(e)})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
@@ -1029,23 +1072,22 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             # 6. stream_llm_response
             await _log_stage("stream_llm_response", model=llm.model_id, provider=llm.provider)
-            if lf:
-                _gen = _gen_stack.enter_context(
-                    lf.start_as_current_observation(
-                        as_type="generation",
-                        name="chat_model",
-                        model=llm_request.model,
-                        input=[
-                            {"role": m.role.value, "content": m.content}
-                            for m in state.adapter_messages
-                        ],
-                    )
-                )
             temperature = state.params.get("temperature")
             max_tokens = state.params.get("max_tokens")
             extra = {
                 k: v for k, v in state.params.items() if k not in ("temperature", "max_tokens")
             }
+            if lf:
+                _gen = _gen_stack.enter_context(
+                    lf.start_as_current_observation(
+                        as_type="generation",
+                        name="chat_model",
+                        model=llm.model_id,
+                        model_parameters=trace_params({**llm.default_params, **state.params}),
+                        input=trace_input(state.adapter_messages, "chat_model"),
+                    )
+                )
+            first_chunk_seen = False
 
             stream = FallbackStream(
                 llm_chain,
@@ -1061,6 +1103,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             try:
                 chunk = None
                 async for chunk in stream:
+                    if not first_chunk_seen and chunk.text:
+                        first_chunk_seen = True
+                        # Langfuse derives time-to-first-token from this.
+                        if _gen is not None:
+                            with contextlib.suppress(Exception):
+                                _gen.update(completion_start_time=datetime.now(UTC))  # type: ignore[attr-defined]
                     state.accumulated_content += chunk.text  # raw for DB
                     # Strip [S1] markers, track spans. Emitted for every chunk, including
                     # the final one — a final chunk can carry text, and skipping it would
@@ -1086,6 +1134,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "llm_fallback_served",
                         extra={"request_id": request_id, "served_model": llm.model_id},
                     )
+                    if _gen is not None:
+                        with contextlib.suppress(Exception):
+                            _gen.update(model=llm.model_id)  # type: ignore[attr-defined]
+                        lf_mark(_gen, "WARNING", f"fallback model {llm.model_id} answered")
 
                 if chunk is not None:
                     final_result = parser.finalize()
@@ -1298,24 +1350,25 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             **stats_to_request_kwargs(chunk.stats),
                             trace_id=lf_trace_id,
                         )
-                        if _gen is not None:
-                            s = chunk.stats
+                    if _gen is not None:
+                        with contextlib.suppress(Exception):
                             _gen.update(  # type: ignore[union-attr]
-                                output=state.accumulated_content,
-                                usage_details={
-                                    k: v
-                                    for k, v in {
-                                        "input": s.input_tokens,
-                                        "output": s.output_tokens,
-                                        "cache_read_input_tokens": s.cached_input_tokens,
-                                        "total": s.total_tokens,
-                                    }.items()
-                                    if v is not None
-                                },
-                                cost_details={"total": s.cost_usd}
-                                if s.cost_usd is not None
-                                else None,
+                                output=state.accumulated_content, **trace_usage(chunk.stats)
                             )
+                    _trace_io(
+                        output={
+                            "answer": state.clean_content,
+                            "route": state.router_output.route,
+                            "confidence": confidence,
+                            "ungrounded_claims": ungrounded,
+                            "references": len(ref_items),
+                        }
+                    )
+                    _score("confidence", confidence, "CATEGORICAL")
+                    _score("ungrounded_claims", float(ungrounded), "BOOLEAN")
+                    _score("retrieval_degraded", float(bool(degraded)), "BOOLEAN")
+                    if degraded:
+                        lf_mark(_root_span, "WARNING", f"degraded retrieval: {degraded}")
                     # Close chat_model generation while still inside stream_llm_response's
                     # contextvar scope — prevents contextvar corruption when persist_and_emit
                     # stage span was opened by _log_stage (which reset stream's token).
@@ -1422,6 +1475,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             except Exception as e:
                 logger.exception("llm_stream_error", extra={"request_id": request_id})
+                lf_mark(_gen, "ERROR", describe_error(e))
+                lf_mark_current("ERROR", describe_error(e))
+                lf_mark(_root_span, "ERROR", f"{current_stage}: {describe_error(e)}")
+                _trace_io(output={"error": describe_error(e)})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await llm_request_repo.update_on_final(
                     request_id=UUID(request_id),
@@ -1452,6 +1509,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             "pipeline.failed_at_stage",
             extra={"request_id": request_id, "stage": current_stage},
         )
+        # The stage span is still the current one; it closes in the finally below.
+        lf_mark_current("ERROR", describe_error(exc))
+        lf_mark(_root_span, "ERROR", f"{current_stage}: {describe_error(exc)}")
+        _trace_io(output={"error": describe_error(exc)})
         try:
             async with sf() as session:
                 llm_repo = LLMRequestRepository(session)

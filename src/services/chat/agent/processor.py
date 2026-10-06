@@ -26,6 +26,8 @@ _FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 _FX_TIMEOUT = httpx.Timeout(3.0)
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Matches the aspect ids minted by `loop._mint` (`A{n}`).
+_ASPECT_KEY_RE = re.compile(r"^A\d+$")
 
 
 def _normalize_date(date: str | None) -> str | None:
@@ -315,7 +317,8 @@ def _map_refs(raw_refs: list[str], rag_context: RAGContext) -> str:
             mapped.append(ref)
         else:
             CITATION_REFS_DROPPED.inc()
-    return ", ".join(mapped) or "—"
+    # Rendered in the exact `[Sn]` form the answer must cite, so the model copies these.
+    return " ".join(f"[{ref}]" for ref in mapped) or "—"
 
 
 def _amount(currency: str | None, amount: float, unit: str | None) -> str:
@@ -377,16 +380,19 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
     lines.append("")
 
     for i, f in enumerate(findings.findings, 1):
+        # Aspect ids (A1, A2…) are opaque and get cited as `[A1]` in place of the
+        # excerpt refs; entity keys stay, since the figure lines below rely on them.
+        head = f"{i}." if _ASPECT_KEY_RE.match(f.key) else f"{i}. {f.key}"
         # A stated negative has no evidence to cite and no confidence worth reporting —
         # rendering it as a low-confidence claim would invite the synthesis model to
         # hedge it into a weak positive instead of reporting the absence.
         if not f.supported:
-            lines.append(f"{i}. {f.key} [not disclosed] {f.claim}")
+            lines.append(f"{head} [not disclosed] {f.claim}")
             continue
         # Drop refs with no excerpt in the synthesis context — leaking a raw ref here
         # would let the model cite an ID the citation pipeline can't resolve.
         refs = _map_refs(f.evidence, rag_context)
-        lines.append(f"{i}. {f.key} [{f.confidence} confidence] {f.claim} | evidence: {refs}")
+        lines.append(f"{head} [{f.confidence} confidence] {f.claim} | evidence: {refs}")
         lines.extend(
             _render_figure(n, processed.target_currency) for n in processed.figures_for(f.key)
         )

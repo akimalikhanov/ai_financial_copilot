@@ -706,6 +706,7 @@ services:
       <<: *app-env
       # Container logs go to stdout only; Fluent Bit collects via fluentd driver.
       LOG_FILE: ""
+      OTEL_SERVICE_NAME: api
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -746,6 +747,7 @@ services:
       <<: *app-env
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom_chat
       LOG_FILE: ""
+      OTEL_SERVICE_NAME: worker-chat
     command: ["python", "-m", "src.workers.chat_worker"]
     depends_on:
       pgbouncer:
@@ -789,6 +791,7 @@ services:
       <<: *app-env
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom_ingestion
       LOG_FILE: ""
+      OTEL_SERVICE_NAME: worker-ingestion
       HF_HOME: /home/appuser/.cache/huggingface
     volumes:
       - hf-model-cache:/home/appuser/.cache/huggingface

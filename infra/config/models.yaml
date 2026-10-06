@@ -50,6 +50,8 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      # Accepts tool_choice={"type": "allowed_tools"} on chat/completions.
+      allowed_tools: true
       vision: true
     # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
@@ -86,6 +88,7 @@ models:
     capabilities:
       streaming: true
       tool_calling: true
+      allowed_tools: true
       vision: true
     params_override: {}
     # Cross-provider fallback: mutual pair with gemini-3.7-flash's fallback below,

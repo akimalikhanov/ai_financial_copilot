@@ -138,6 +138,8 @@ spec:
               value: /tmp/prom_ingestion
             - name: LOG_FILE
               value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: worker-ingestion
             # /home/appuser, NOT /root — Dockerfile.worker runs as the non-root `appuser`
             # (uid 1001) and pre-creates this path. Pointing at /root would be unwritable.
             - name: HF_HOME

@@ -11,8 +11,10 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.langfuse import mark as lf_mark
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
+from src.observability.trace_payload import cap_list
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
 from src.services.ingestion.embedder import embed_query
 from src.services.retrieval.context_assembler import assemble_rag_context
@@ -174,6 +176,8 @@ async def run_chat_rag_pipeline(
                     "ok": semantic_vector is not None,
                 }
             )
+            if semantic_vector is None:
+                lf_mark(obs, "WARNING", "embedding failed; dense search skipped")
     embed_ok = semantic_vector is not None
 
     with lf_span(
@@ -206,14 +210,20 @@ async def run_chat_rag_pipeline(
         RAG_CHUNKS.labels("keyword").observe(len(kw_r))
         RAG_CHUNKS.labels("fused").observe(len(fused))
         if obs:
+            # Fused hits carry both legs' scores, so the per-leg lists would only repeat them.
             obs.update(
                 output={
                     "counts": {"vector": len(vec_r), "keyword": len(kw_r), "fused": len(fused)},
-                    "vector": [_to_hit(c).model_dump(exclude_none=True) for c in vec_r],
-                    "keyword": [_to_hit(c).model_dump(exclude_none=True) for c in kw_r],
-                    "fused": [_to_hit(c).model_dump(exclude_none=True) for c in fused],
+                    "fused_top": [
+                        _to_hit(c).model_dump(exclude_none=True) for c in cap_list(fused)
+                    ],
                 }
             )
+            if all_backends_failed:
+                lf_mark(obs, "ERROR", "all retrieval backends failed")
+            elif not (vector_ok and keyword_ok):
+                failed = [n for n, ok in (("dense", vector_ok), ("keyword", keyword_ok)) if not ok]
+                lf_mark(obs, "WARNING", f"degraded: {', '.join(failed)} unavailable")
     capped = fused[:reranker_max_input]
     if not capped:
         trace = RetrievalTrace(
@@ -229,14 +239,11 @@ async def run_chat_rag_pipeline(
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
     texts_map = {cid: payloads[cid].prompt_text for cid in chunk_ids if cid in payloads}
+    # The candidates are the head of `hybrid_retrieve`'s fused list, logged there.
     with lf_span(
         "rerank",
         as_type="retriever",
-        input={
-            "query": semantic_query,
-            "input_count": len(capped),
-            "chunks": [{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in capped],
-        },
+        input={"query": semantic_query, "input_count": len(capped)},
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
@@ -250,10 +257,13 @@ async def run_chat_rag_pipeline(
                     "output_count": len(reranked),
                     "scored": outcome.scored,
                     "chunks": [
-                        {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked
+                        {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)}
+                        for c in cap_list(reranked)
                     ],
                 }
             )
+            if outcome.degraded:
+                lf_mark(obs, "WARNING", "reranker unavailable; fusion order kept")
 
     trace = RetrievalTrace(
         qdrant=[_to_hit(c) for c in vec_r],
@@ -267,18 +277,7 @@ async def run_chat_rag_pipeline(
         rerank_ok=not outcome.degraded,
         scores_are_rerank=outcome.scored,
     )
-    with lf_span(
-        "assemble_context",
-        input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked],
-    ) as obs:
-        ctx, guardrails = assemble_rag_context(reranked, payloads)
-        if obs:
-            obs.update(
-                output={
-                    "chunk_count": ctx.chunk_count,
-                    "context_chars": len(ctx.formatted_context or ""),
-                }
-            )
+    ctx, guardrails = assemble_rag_context(reranked, payloads)
     trace.dropped_chunks = guardrails.dropped
     trace.flagged_chunks = guardrails.flagged
     return ctx, trace, reranked

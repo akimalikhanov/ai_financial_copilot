@@ -25,6 +25,8 @@ from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     INGESTION_CHUNKS,
     INGESTION_DOCUMENTS,
@@ -127,6 +129,8 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     reset_qdrant_client()
     reset_opensearch_client()
     reset_s3_client()
+    lf_client.reset()
+    lf_client.initialize()
     if get_picture_enricher_enabled():
         validate_picture_enricher_config()
     if _worker_loop is None or _worker_loop.is_closed():
@@ -1011,8 +1015,12 @@ def ingest_document(self, document_id: str) -> None:
     _child_tasks += 1
     mem = _record_task_start(_child_tasks)
     try:
-        _ingest_document(self, document_id, mem)
+        # One trace per document: the enrichment and summarization generations nest under
+        # it instead of each landing as a parentless trace.
+        with lf_span("ingest_document", as_type="chain", input={"document_id": document_id}):
+            _ingest_document(self, document_id, mem)
     finally:
+        lf_client.flush()
         # After _run_pipeline returned, so its locals (the parsed document) are gone and
         # task_end reads the floor the next task inherits.
         _record_task_end(mem, document_id)

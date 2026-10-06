@@ -18,6 +18,9 @@ def worker_loop(monkeypatch: pytest.MonkeyPatch):
     loop = asyncio.new_event_loop()
     monkeypatch.setattr(tasks, "_worker_loop", loop)
     monkeypatch.setattr(tasks, "_child_tasks", 0)
+    # ingest_document opens a Langfuse span; another test may have left a live client.
+    monkeypatch.setattr(tasks.lf_client, "get_client", lambda: None)
+    monkeypatch.setattr(tasks.lf_client, "flush", lambda: None)
     yield loop
     loop.close()
 

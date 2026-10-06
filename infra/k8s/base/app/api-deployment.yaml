@@ -119,6 +119,8 @@ spec:
           env:
             - name: LOG_FILE
               value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: api
           # Liveness must be strictly laxer than readiness. Failing readiness is safe and
           # reversible (leave the endpoint list, come back); failing liveness is destructive
           # (SIGKILL, every in-flight SSE stream dropped). Sharing one endpoint and one

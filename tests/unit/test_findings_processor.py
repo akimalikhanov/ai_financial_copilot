@@ -319,7 +319,8 @@ class TestRenderedBlock:
         assert "1. Acme [high confidence] Acme reported revenue. | evidence: —" in block
         assert "   - revenue (FY2023 / 2023-12-31): USD 120.0M" in block
         assert "   - revenue (FY2022 / 2022-12-31): USD 100.0M" in block
-        assert "2. A2 [not disclosed] A2 does not report it." in block
+        # Aspect ids are not rendered — the model would cite them as `[A2]`.
+        assert "2. [not disclosed] A2 does not report it." in block
         assert "Conclusion: Revenue grew." in block
         assert "Unresolved: Not resolved: Globex" in block
 

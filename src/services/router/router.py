@@ -7,6 +7,8 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.langfuse import describe_error
+from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.metrics import observe_llm_latency
 from src.repository.document_repository import DocumentRepository
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
@@ -187,6 +189,7 @@ async def route_query(
             )
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})
+            lf_mark_current("WARNING", f"router call failed ({describe_error(e)}); fallback route")
             return _FALLBACK, None
 
         observe_llm_latency(model_id, "router", resp.stats)
@@ -229,6 +232,7 @@ async def route_query(
             ]
 
     if output is None:
+        lf_mark_current("WARNING", "router output unparseable after retry; fallback route")
         return _FALLBACK, None
 
     # if output.route == "retrieval" and not output.entities and not _has_active_scope:

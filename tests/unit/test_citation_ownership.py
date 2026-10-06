@@ -60,7 +60,7 @@ class TestMapRefs:
 
         result = _map_refs([str(present.chunk_id), str(absent.chunk_id)], ctx)
 
-        assert result == "S1"
+        assert result == "[S1]"
         assert CITATION_REFS_DROPPED._value.get() == dropped_before + 1
 
     def test_all_dropped_renders_em_dash(self) -> None:

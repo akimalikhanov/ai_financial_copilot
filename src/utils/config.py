@@ -407,9 +407,16 @@ def get_agent_shown_heading_chars() -> int:
     return int(os.getenv("AGENT_SHOWN_HEADING_CHARS", "40"))
 
 
+def get_agent_fallback_max_chunks() -> int:
+    """Most excerpts synthesis serves when the findings cite none, taken round-robin across
+    the run's searches (AGENT_FALLBACK_MAX_CHUNKS, default 25)."""
+    return int(os.getenv("AGENT_FALLBACK_MAX_CHUNKS", "25"))
+
+
 def get_agent_trace_chunk_chars() -> int:
-    """Chunk text kept per search hit on the agent turn's trace span; the full text is in
-    the next turn's GENERATION input (AGENT_TRACE_CHUNK_CHARS, default 200)."""
+    """Chunk text kept per search hit on the agent turn's trace span; the next turn's
+    GENERATION input carries LANGFUSE_TRACE_EXCERPT_CHARS of it (AGENT_TRACE_CHUNK_CHARS,
+    default 200)."""
     return int(os.getenv("AGENT_TRACE_CHUNK_CHARS", "200"))
 
 
@@ -1249,6 +1256,36 @@ def get_langfuse_config() -> dict[str, str | float | bool]:
         "sample_rate": float(os.getenv("LANGFUSE_SAMPLE_RATE", "1.0")),
         "environment": os.getenv("LANGFUSE_ENVIRONMENT", "development"),
     }
+
+
+def get_langfuse_trace_system_prompt_chars() -> int:
+    """System prompt text kept on a GENERATION input; the prompt version is in the trace
+    metadata (LANGFUSE_TRACE_SYSTEM_PROMPT_CHARS, default 300)."""
+    return int(os.getenv("LANGFUSE_TRACE_SYSTEM_PROMPT_CHARS", "300"))
+
+
+def get_langfuse_trace_excerpt_chars() -> int:
+    """Body text kept per `<retrieved_excerpt>` on a GENERATION input
+    (LANGFUSE_TRACE_EXCERPT_CHARS, default 400)."""
+    return int(os.getenv("LANGFUSE_TRACE_EXCERPT_CHARS", "400"))
+
+
+def get_langfuse_trace_message_chars() -> int:
+    """Upper bound on any one message's text on a GENERATION input, after excerpt capping
+    (LANGFUSE_TRACE_MESSAGE_CHARS, default 4000)."""
+    return int(os.getenv("LANGFUSE_TRACE_MESSAGE_CHARS", "4000"))
+
+
+def get_langfuse_trace_dedup_min_chars() -> int:
+    """A message at least this long that an earlier GENERATION in the same trace already
+    logged is replaced by a pointer to it (LANGFUSE_TRACE_DEDUP_MIN_CHARS, default 200)."""
+    return int(os.getenv("LANGFUSE_TRACE_DEDUP_MIN_CHARS", "200"))
+
+
+def get_langfuse_trace_max_hits() -> int:
+    """Entries kept in a traced list of retrieval hits or doc ids; the total count is
+    logged beside it (LANGFUSE_TRACE_MAX_HITS, default 20)."""
+    return int(os.getenv("LANGFUSE_TRACE_MAX_HITS", "20"))
 
 
 # --- Eval ---

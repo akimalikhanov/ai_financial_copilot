@@ -138,6 +138,8 @@ spec:
               value: /tmp/prom_chat
             - name: LOG_FILE
               value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: worker-chat
           volumeMounts:
             - name: prom-multiproc
               mountPath: /tmp/prom_chat

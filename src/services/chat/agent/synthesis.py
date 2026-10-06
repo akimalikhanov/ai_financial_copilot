@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from src.observability.langfuse import get_client as lf_get_client
+from src.observability.langfuse import mark_current as lf_mark_current
 from src.schemas.agent_findings import AgentFindings
 from src.schemas.retrieval import RAGContext
 from src.services.chat.agent.evidence import EvidenceLedger
@@ -51,6 +52,15 @@ RETRIEVAL_UNAVAILABLE_BANNER = (
     "`N/A` not-found marker."
 )
 
+# Placed right before the excerpts when no finding cites any, so the fallback excerpts are
+# not mistaken for the vetted evidence a finding would have pointed to.
+UNCITED_EXCERPTS_NOTICE = (
+    "[EXCERPTS NOT BACKED BY FINDINGS]\n"
+    "No finding cites the excerpts below. They are what the search agent read, not "
+    "conclusions it reached. Use only what an excerpt states explicitly, cite it, and do not "
+    "present it as a confirmed finding. A finding marked [not disclosed] still stands."
+)
+
 
 def _cited_chunk_ids(findings: AgentFindings) -> set[UUID]:
     cited_ids: set[UUID] = set()
@@ -66,16 +76,20 @@ async def run_synthesis(
     findings: AgentFindings | None,
     agent_meta: AgentLoopMeta,
     requested_currency: str | None,
-    max_chunks_per_entity: int,
+    fallback_max_chunks: int,
 ) -> AgentRunResult:
-    ordered = evidence.ordered_chunks()
-    # The fallback pool is what the model could actually read: falling back to excerpts
+    # Both pools are what the model could actually read: citing or falling back to excerpts
     # it never saw would let synthesis cite text no reasoning was ever grounded in.
-    fallback = evidence.labelled_chunks()[:max_chunks_per_entity]
+    labelled = evidence.labelled_chunks()
+    # Selected round-robin across searches, then score-ordered like the cited pool, so S1
+    # is still the strongest excerpt (the confidence badge reads items[0].score).
+    fallback = sorted(evidence.fallback_chunks(fallback_max_chunks), key=lambda c: -(c.score or 0))
 
     processed: ProcessedFindings | None = None
+    cited_ids: set[UUID] = set()
 
     if findings is not None:
+        cited_ids = _cited_chunk_ids(findings)
         # No dedicated span: this wraps a single `process_findings` call with no
         # sub-structure of its own (the interesting nested work is `fx_conversion`, inside
         # `process_findings`), so its output lands on the enclosing `agent_loop` span
@@ -83,7 +97,10 @@ async def run_synthesis(
         processed = await process_findings(
             findings,
             requested_currency=requested_currency,
-            chunk_texts=evidence.texts_for({c for f in findings.findings for c in f.evidence}),
+            # Keyed by `str(UUID)`, the form `resolve_refs` gives finding evidence.
+            chunk_texts={
+                str(cid): p.prompt_text for cid, p in evidence.payloads_for(cited_ids).items()
+            },
         )
         lf = lf_get_client()
         if lf:
@@ -109,31 +126,43 @@ async def run_synthesis(
                     }
                 )
 
-        # Narrow the synthesis context to the chunks the agent actually cited in its
-        # findings — those are the evidence it reasoned over. When findings cite nothing
-        # (e.g. a weak tool model that omits evidence), fall back to the chunks the model
-        # was actually shown rather than starving synthesis.
-        cited_ids = _cited_chunk_ids(findings)
-        synthesis_chunks = (
-            [c for c in ordered if c.chunk_id in cited_ids] if cited_ids else fallback
-        )
-    else:
-        synthesis_chunks = fallback
+    # Narrow the synthesis context to the chunks the agent actually cited in its findings —
+    # those are the evidence it reasoned over. When findings cite nothing (no report, only
+    # stated negatives, or only unresolved lines), fall back to the chunks the model was
+    # actually shown rather than starving synthesis.
+    synthesis_chunks = [c for c in labelled if c.chunk_id in cited_ids] if cited_ids else fallback
 
     # Payloads were cached (already sanitized) when the loop rendered these chunks — no
     # second hydration, and the re-scan below is a no-op over sanitized text.
     payloads = evidence.payloads_for(c.chunk_id for c in synthesis_chunks)
-    synthesis_chunks = [c for c in synthesis_chunks if c.chunk_id in payloads]
     rag_context, _ = assemble_rag_context(synthesis_chunks, payloads, assume_unique=True)
 
     findings_block = (
         _render_findings_block(processed, rag_context) if processed is not None else None
     )
 
+    excerpts = rag_context.formatted_context or ""
+    if not cited_ids and rag_context.items:
+        excerpts = UNCITED_EXCERPTS_NOTICE + "\n\n" + excerpts
+        reason = "no_findings" if findings is None else "no_citations"
+        lf_mark_current("WARNING", f"synthesis fell back to uncited excerpts ({reason})")
+        lf = lf_get_client()
+        if lf:
+            with contextlib.suppress(Exception):
+                lf.update_current_span(
+                    metadata={
+                        "synthesis_fallback": {
+                            "reason": reason,
+                            "excerpts": len(rag_context.items),
+                            "shown": len(labelled),
+                        }
+                    }
+                )
+
     synthesis_context = (
-        findings_block + "\n\n" + (rag_context.formatted_context or "")
+        findings_block + "\n\n" + excerpts
         if findings_block is not None
-        else rag_context.formatted_context or "(No document context.)"
+        else excerpts or "(No document context.)"
     )
 
     # Leads the context so the instruction is read before any (possibly empty) evidence.
