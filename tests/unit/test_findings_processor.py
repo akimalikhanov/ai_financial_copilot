@@ -329,3 +329,87 @@ class TestRenderedBlock:
         findings = _findings(_finding("A", _figure(41.2, None, unit=None, period_end=None)))
         block = _render_findings_block(await process_findings(findings), _NO_EXCERPTS)
         assert "   - revenue (FY2023): 41.2 (scale not stated)" in block
+
+
+def _year(amount: float, year: int, **overrides: Any) -> Figure:
+    fields: dict[str, Any] = {
+        "currency": "USD",
+        "period_end": f"{year}-12-31",
+        "fiscal_label": f"FY{year}",
+    }
+    fields.update(overrides)
+    return _figure(amount, **fields)
+
+
+async def _change_lines(
+    *figures: Figure, evidence: list[str] | None = None, **kw: Any
+) -> list[str]:
+    findings = _findings(_finding("Aurora", *figures, evidence=evidence))
+    block = _render_findings_block(await process_findings(findings, **kw), _NO_EXCERPTS)
+    return [line for line in block.splitlines() if line.startswith("   - change")]
+
+
+class TestChangeLines:
+    @pytest.mark.asyncio
+    async def test_up_then_down_from_a_nil_base(self) -> None:
+        # Trace c67763e8: nil → 82 → 68 was answered as "a decline over three years".
+        lines = await _change_lines(_year(68, 2022), _year(0, 2020), _year(82, 2021))
+        assert lines == [
+            "   - change 2020-12-31 → 2021-12-31: up USD 82.0M (% change n/m)",
+            "   - change 2021-12-31 → 2022-12-31: down USD 14.0M (-17.1%)",
+            "   - change 2020-12-31 → 2022-12-31: up USD 68.0M (% change n/m)",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mixed_units_compare_in_the_finer_unit(self) -> None:
+        lines = await _change_lines(_year(82, 2021), _year(0.068, 2022, unit="B"))
+        assert lines == ["   - change 2021-12-31 → 2022-12-31: down USD 14.0M (-17.1%)"]
+
+    @pytest.mark.asyncio
+    async def test_unchanged(self) -> None:
+        lines = await _change_lines(_year(82, 2021), _year(82, 2022))
+        assert lines == ["   - change 2021-12-31 → 2022-12-31: unchanged (+0.0%)"]
+
+    @pytest.mark.asyncio
+    async def test_non_monetary_change_has_no_percentage(self) -> None:
+        # A margin's relative change would read as a percentage-point change.
+        lines = await _change_lines(
+            _year(5.5, 2021, currency=None, unit="", metric="operating margin"),
+            _year(6.4, 2022, currency=None, unit="", metric="operating margin"),
+        )
+        assert lines == ["   - change 2021-12-31 → 2022-12-31: up 0.9"]
+
+    @pytest.mark.asyncio
+    async def test_metrics_and_currencies_are_kept_apart(self) -> None:
+        lines = await _change_lines(
+            _year(82, 2021), _year(5, 2022, metric="net loss"), _year(70, 2022, currency="EUR")
+        )
+        assert lines == []
+
+    @pytest.mark.asyncio
+    async def test_shared_period_end_gives_no_change(self) -> None:
+        # A 10-Q's three and nine months both end on the quarter's last day.
+        lines = await _change_lines(
+            _year(30, 2021), _year(40, 2022, fiscal_label="Q3"), _year(90, 2022, fiscal_label="9M")
+        )
+        assert lines == []
+
+    @pytest.mark.asyncio
+    async def test_figures_without_date_or_scale_are_left_out(self) -> None:
+        lines = await _change_lines(
+            _year(82, 2021), _year(68, 2022, unit=None), _figure(70, "USD", period_end=None)
+        )
+        assert lines == []
+
+    @pytest.mark.asyncio
+    async def test_unverified_figure_marks_its_change(self) -> None:
+        lines = await _change_lines(
+            _year(82, 2021),
+            _year(68, 2022),
+            evidence=["c1"],
+            chunk_texts={"c1": "(in millions) | Revenue | $ 82 |"},
+        )
+        assert lines == [
+            "   - change 2021-12-31 → 2022-12-31: down USD 14.0M (-17.1%)"
+            " | ⚠ UNVERIFIED: computed from an unverified figure"
+        ]

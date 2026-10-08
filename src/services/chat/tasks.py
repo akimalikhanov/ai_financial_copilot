@@ -58,7 +58,7 @@ from src.services.chat.agent import tools as agent_tools
 from src.services.chat.agent.loop import tool_model_chain
 from src.services.chat.agent.state import ConvergenceReason, get_agent_settings, shape_config
 from src.services.chat.citation_parser import BracketCitationParser
-from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
+from src.services.chat.confidence import compute_confidence, uncited_fact_share
 from src.services.chat.events import (
     ThinkingStripper,
     build_activity_event,
@@ -1288,7 +1288,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     confidence = compute_confidence(
                         top_score, num_chunks, scores_are_rerank=scores_are_rerank
                     )
-                    ungrounded = has_ungrounded_claims(state.clean_content, parser.all_spans)
+                    # Citations are asked for only when excerpts were shown; a carried-over
+                    # findings block is answered without them.
+                    uncited_share = (
+                        uncited_fact_share(state.clean_content, parser.all_spans)
+                        if num_chunks
+                        else None
+                    )
+                    ungrounded = bool(uncited_share)
 
                     # Build pipeline trace
                     trace_payload: dict = {
@@ -1351,6 +1358,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         "num_chunks": num_chunks,
                         "degraded_retrieval": degraded,
                         "ungrounded_claims": ungrounded,
+                        "uncited_fact_share": uncited_share,
                         **(
                             {
                                 "injection": {
@@ -1426,6 +1434,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     )
                     _score("confidence", confidence, "CATEGORICAL")
                     _score("ungrounded_claims", float(ungrounded), "BOOLEAN")
+                    if uncited_share is not None:
+                        _score("uncited_fact_share", uncited_share, "NUMERIC")
                     _score("retrieval_degraded", float(bool(degraded)), "BOOLEAN")
                     if degraded:
                         lf_mark(_root_span, "WARNING", f"degraded retrieval: {degraded}")

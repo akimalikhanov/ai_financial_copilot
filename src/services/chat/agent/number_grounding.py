@@ -52,6 +52,12 @@ _SCALE_WORDS: dict[str, float] = {
     "k": 0.001,
 }
 _TRAILING_WINDOW = 20  # chars scanned after a number for an adjacent scale word
+# A table's stated scale, e.g. "(in millions, except per share data)".
+_STATED_SCALE_RE = re.compile(r"\bin (thousands|millions|billions)\b", re.IGNORECASE)
+_STATED_UNIT = {"thousands": "K", "millions": "M", "billions": "B"}
+# Nil, i.e. zero: a table cell holding only a dash (optionally after a currency sign), or a
+# currency sign and a dash with no digit after it in prose ("$68 million and $-").
+_NIL_RE = re.compile(r"\|\s*[$€£]?\s*[-–—]\s*(?=\|)|[$€£][ \t]*[-–—](?![ \t]*[\d.])")
 
 _REL_TOL = 0.005
 _ABS_TOL = 1e-9
@@ -67,7 +73,7 @@ def _parse_number(token: str) -> float | None:
     return -value if negative else value
 
 
-def _candidates(raw: float, trailing: str, finding_unit: str) -> list[float]:
+def _candidates(raw: float, trailing: str, text_unit: str) -> list[float]:
     """Magnitudes (in millions) a bare number token could plausibly denote."""
     out = [raw * UNIT_TO_MILLIONS[""]]  # literal, treated as an absolute value
     word_match = re.match(r"\s*([a-zA-Z]+)", trailing)
@@ -75,9 +81,8 @@ def _candidates(raw: float, trailing: str, finding_unit: str) -> list[float]:
         scale = _SCALE_WORDS.get(word_match.group(1).lower())
         if scale is not None:
             out.append(raw * scale)
-    # The finding's own declared unit — covers a table whose scale sits in a header far
-    # from the cell (e.g. "$ in millions" at the top of the table).
-    out.append(to_millions(raw, finding_unit))
+    # The text's scale — covers a table whose scale sits in a header far from the cell.
+    out.append(to_millions(raw, text_unit))
     return out
 
 
@@ -91,18 +96,25 @@ def verify_value(
     texts: Sequence[str],
 ) -> NumberGrounding:
     """Scan `texts` for a number matching `value` (scaled by `unit`) within tolerance.
-    With no stated unit, the value must appear as printed."""
+
+    Bare numbers are read at the text's stated scale ("in millions"); only a text that
+    states none falls back to `unit`, so a wrong unit cannot confirm itself. A zero
+    grounds on a nil dash. With no unit at all, the value must appear as printed."""
     if value is None or not texts:
         return NumberGrounding.UNVERIFIABLE
 
     unit = "" if unit is None else unit
     target = to_millions(value, unit)
     for text in texts:
+        if value == 0 and _NIL_RE.search(text):
+            return NumberGrounding.GROUNDED
+        stated = _STATED_SCALE_RE.search(text)
+        text_unit = _STATED_UNIT[stated.group(1).lower()] if stated else unit
         for m in _NUMBER_RE.finditer(text):
             raw = _parse_number(m.group())
             if raw is None:
                 continue
             trailing = text[m.end() : m.end() + _TRAILING_WINDOW]
-            if any(_matches(target, c) for c in _candidates(raw, trailing, unit)):
+            if any(_matches(target, c) for c in _candidates(raw, trailing, text_unit)):
                 return NumberGrounding.GROUNDED
     return NumberGrounding.NOT_FOUND

@@ -35,7 +35,7 @@ template: |
 
   ## Reading the [FINDINGS] block
 
-  The block lists one numbered finding per entity or aspect: `N. <entity> [<confidence> confidence] <claim> | evidence: [S1] [S4]` (the entity is omitted for aspect findings), followed by the finding's figures, one per line: `- <metric> (<period>): <value>`.
+  The block lists one numbered finding per entity or aspect: `N. <entity> [<confidence> confidence] <claim> | evidence: [S1] [S4]` (the entity is omitted for aspect findings), followed by the finding's figures, one per line: `- <metric> (<period>): <value>`. When a metric has figures for two or more periods, `- change <from> → <to>: …` lines follow them.
 
   ### Claims
 
@@ -50,6 +50,7 @@ template: |
   ### Figures
 
   - **Use the pre-computed values directly.** Do not re-derive figures from raw chunk text. The agent has already extracted them in the document's own scale.
+  - **For any change, growth rate or trend, use the `change` lines; never compute one yourself.** Take the direction from the line's own word (`up`, `down`, `unchanged`), not from reading the figures. A trend over several periods is the sequence of its change lines: say so when it went up and then down. `% change n/m` means the base was zero or negative, so give the amount and no percentage. A change line marked `UNVERIFIED` was computed from an unverified figure: apply the rule for unverified figures below to the figures it was computed from. If the question asks for a change no line covers, compute it from the listed figures and state both figures you used.
   - **A figure marked `(scale not stated)`** has no known scale: report the number as printed and do not add "million" or "billion".
   - **FX conversions are pre-applied.** A converted figure shows the converted value, the native value after `from`, and the rate. Report this transparently: e.g., "EUR 198M (converted from USD 215M at 0.9221 USD/EUR, FY2023 close)." A rate marked `approx — date unavailable` used the latest rate; say so.
   - **For comparisons**, use the `Answer` line as the authoritative result. Cite the supporting excerpts.

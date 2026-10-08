@@ -41,3 +41,30 @@ class TestVerifyValue:
         assert (
             verify_value(1234.5, "M", ["Revenue 1,234.5 987.6 1,102.3"]) == NumberGrounding.GROUNDED
         )
+
+    def test_stated_scale_overrides_finding_unit(self) -> None:
+        text = "(in millions, except per share data) | Revenue | $ 68 |"
+        assert verify_value(68, "M", [text]) == NumberGrounding.GROUNDED
+        assert verify_value(68, "B", [text]) == NumberGrounding.NOT_FOUND
+
+    def test_stated_thousands_scale_matches_millions_finding(self) -> None:
+        assert (
+            verify_value(68, "M", ["(in thousands) | Revenue | 68,000 |"])
+            == NumberGrounding.GROUNDED
+        )
+
+    def test_nil_dash_cell_grounds_zero(self) -> None:
+        text = "(in millions) | Revenue | $ 68 | $ 82 | $ - |"
+        assert verify_value(0, "M", [text]) == NumberGrounding.GROUNDED
+
+    def test_markdown_separator_is_not_a_nil_cell(self) -> None:
+        assert verify_value(0, "M", ["| Revenue | 2022 |\n|---|---|"]) == NumberGrounding.NOT_FOUND
+
+    def test_nil_dash_in_prose_grounds_zero(self) -> None:
+        text = "recognized collaboration revenue of $ 68 million, $82 million and $-, respectively."
+        assert verify_value(0, "M", [text]) == NumberGrounding.GROUNDED
+
+    def test_negative_amount_is_not_a_nil_dash(self) -> None:
+        assert verify_value(0, "M", ["a loss of $-5 million and $ -0.4 million"]) == (
+            NumberGrounding.NOT_FOUND
+        )

@@ -18,7 +18,12 @@ from src.observability.langfuse import span as lf_span
 from src.observability.metrics import CITATION_REFS_DROPPED
 from src.schemas.agent_findings import AgentFindings, Figure
 from src.schemas.retrieval import RAGContext
-from src.services.chat.agent.number_grounding import NumberGrounding, to_millions, verify_value
+from src.services.chat.agent.number_grounding import (
+    UNIT_TO_MILLIONS,
+    NumberGrounding,
+    to_millions,
+    verify_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +33,8 @@ _FX_TIMEOUT = httpx.Timeout(3.0)
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Matches the aspect ids minted by `loop._mint` (`A{n}`).
 _ASPECT_KEY_RE = re.compile(r"^A\d+$")
+_UNVERIFIED_FLAG = " | ⚠ UNVERIFIED: value not located in cited excerpt"
+_UNVERIFIED_CHANGE_FLAG = " | ⚠ UNVERIFIED: computed from an unverified figure"
 
 
 def _normalize_date(date: str | None) -> str | None:
@@ -341,12 +348,55 @@ def _render_figure(n: NormalizedFigure, target_currency: str | None) -> str:
         value = native
     # Only the anomaly is worth a marker — flagging every row trains the synthesis model
     # to skip it. Advisory rather than a filter: see `number_grounding.py`.
-    flag = (
-        " | ⚠ UNVERIFIED: value not located in cited excerpt"
-        if n.number_grounding is NumberGrounding.NOT_FOUND
-        else ""
-    )
+    flag = _UNVERIFIED_FLAG if n.number_grounding is NumberGrounding.NOT_FOUND else ""
     return f"   - {fig.metric} ({period}): {value}{flag}"
+
+
+def _render_change(a: NormalizedFigure, b: NormalizedFigure) -> str:
+    """The change from `a` to `b`, in native amounts so FX rates don't move it, shown in
+    the finer of the two units. A percentage is given only for money: for a ratio or a
+    margin it would read as a percentage-point change."""
+    old, new = a.figure, b.figure
+    old_unit = old.unit if old.unit is not None else ""
+    new_unit = new.unit if new.unit is not None else ""
+    unit = min(old_unit, new_unit, key=UNIT_TO_MILLIONS.__getitem__)
+    base = to_millions(old.amount, old_unit)
+    delta = to_millions(new.amount, new_unit) - base
+    shown = delta / UNIT_TO_MILLIONS[unit]
+    if round(shown, 1) == 0:
+        text = "unchanged"
+    else:
+        text = f"{'up' if delta > 0 else 'down'} {_amount(new.currency, abs(shown), unit)}"
+    if new.currency is not None:
+        text += f" ({delta / base * 100:+.1f}%)" if base > 0 else " (% change n/m)"
+    unverified = NumberGrounding.NOT_FOUND in (a.number_grounding, b.number_grounding)
+    flag = _UNVERIFIED_CHANGE_FLAG if unverified else ""
+    return f"   - change {old.period_end} → {new.period_end}: {text}{flag}"
+
+
+def _change_lines(figures: list[NormalizedFigure]) -> list[str]:
+    """One change line per consecutive pair of periods of a metric, plus first to last
+    when there are three or more, so the answering model copies a change instead of
+    working one out. Figures without an ISO period end or a stated scale are left out."""
+    groups: dict[tuple[str, str | None], list[NormalizedFigure]] = {}
+    for n in figures:
+        fig = n.figure
+        if fig.unit is None or not _ISO_DATE_RE.match(fig.period_end or ""):
+            continue
+        groups.setdefault((fig.metric.strip().casefold(), fig.currency), []).append(n)
+    lines: list[str] = []
+    for group in groups.values():
+        ends = [n.figure.period_end for n in group]
+        # Two figures for one date are different durations (a 10-Q's three and nine
+        # months), and without the duration there is no safe pairing.
+        if len(group) < 2 or len(set(ends)) < len(ends):
+            continue
+        group.sort(key=lambda n: n.figure.period_end or "")
+        pairs = list(zip(group, group[1:], strict=False))
+        if len(group) > 2:
+            pairs.append((group[0], group[-1]))
+        lines.extend(_render_change(a, b) for a, b in pairs)
+    return lines
 
 
 def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext) -> str:
@@ -393,9 +443,9 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
         # would let the model cite an ID the citation pipeline can't resolve.
         refs = _map_refs(f.evidence, rag_context)
         lines.append(f"{head} [{f.confidence} confidence] {f.claim} | evidence: {refs}")
-        lines.extend(
-            _render_figure(n, processed.target_currency) for n in processed.figures_for(f.key)
-        )
+        figures = processed.figures_for(f.key)
+        lines.extend(_render_figure(n, processed.target_currency) for n in figures)
+        lines.extend(_change_lines(figures))
 
     if findings.conclusion:
         lines.append(f"\nConclusion: {findings.conclusion}")
