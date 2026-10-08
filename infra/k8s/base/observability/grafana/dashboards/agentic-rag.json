@@ -404,7 +404,7 @@
       "id": 27,
       "title": "Agent Stop Reasons",
       "type": "timeseries",
-      "description": "Why agent runs ended. covered is the healthy case; iteration_cap, budget_cap, deadline and timeout mean the run was cut off and served partial findings.",
+      "description": "Why agent runs ended. covered is the healthy case; iteration_cap, budget_cap, deadline, timeout and truncated (the tool model hit its token cap) mean the run was cut off and served partial findings.",
       "gridPos": { "x": 8, "y": 53, "w": 8, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
@@ -477,10 +477,64 @@
       "options": { "sortBy": [{ "displayName": "runs", "desc": true }] }
     },
     {
+      "id": 31,
+      "title": "Tool-Model Latency p95 by Turn Kind (s)",
+      "type": "timeseries",
+      "description": "p95 of tool-model calls, split by what the turn did: search, report, mixed, final (report-only last turn) or none (prose). Includes calls that timed out or were cancelled; those count as unknown unless they were the final turn. Each call's budget is what is left of the run deadline less a reserve, so a rising report or final line means late turns start running out of time.",
+      "gridPos": { "x": 0, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_tool_model_duration_seconds_bucket[5m])) by (le, turn_kind))",
+          "legendFormat": "{{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 32,
+      "title": "Failed Tool-Model Calls",
+      "type": "timeseries",
+      "description": "Tool-model calls that failed, by outcome. timeout: the call used up its budget (the cap, or what was left of the run). cancelled: a worker shutdown cut it off. error: provider error (the fallback model may still have answered). length: answered, but hit the completion-token cap. Each also has a row in llm_requests (status timeout, cancelled, failed or truncated).",
+      "gridPos": { "x": 8, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_tool_model_duration_seconds_count{outcome!=\"ok\"}[1h])) by (outcome, turn_kind)",
+          "legendFormat": "{{outcome}} {{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" }, "fillOpacity": 70 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 33,
+      "title": "Reasoning Tokens per Tool-Model Call",
+      "type": "timeseries",
+      "description": "Mean hidden reasoning tokens per answered call, by turn kind. Reasoning is most of a call's output and the main driver of its latency, at roughly 8.5 ms per output token. A rise here with flat throughput means the model is thinking longer, not that the provider got slower.",
+      "gridPos": { "x": 16, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_tool_model_output_tokens_total{part=\"reasoning\"}[1h])) by (turn_kind) / sum(increase(agent_tool_model_duration_seconds_count{outcome=\"ok\"}[1h])) by (turn_kind)",
+          "legendFormat": "{{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 14,
       "type": "row",
       "title": "Quality Drill-Down (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 69, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 77, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -488,7 +542,7 @@
       "title": "Per-Request Stage Breakdown (slowest in range)",
       "type": "table",
       "description": "Outlier drill-down: the slowest requests in the dashboard time range. Not possible from aggregate histograms — find the specific requests where a stage blew up.",
-      "gridPos": { "x": 0, "y": 70, "w": 12, "h": 10 },
+      "gridPos": { "x": 0, "y": 78, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -511,7 +565,7 @@
       "title": "Response Quality — Thumbs Down Rate (hourly)",
       "type": "timeseries",
       "description": "Only user-perceived quality signal — catches fast-but-wrong regressions.",
-      "gridPos": { "x": 12, "y": 70, "w": 12, "h": 10 },
+      "gridPos": { "x": 12, "y": 78, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {

@@ -27,6 +27,9 @@ class AssistantTurnResult:
     text: str
     tool_calls: list[ToolCallRef]
     stats: LLMResponseStats | None = None
+    # The provider's stop reason, normalised to OpenAI's names: "stop", "tool_calls",
+    # "length" (hit the completion-token cap), ... None when the adapter does not report it.
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

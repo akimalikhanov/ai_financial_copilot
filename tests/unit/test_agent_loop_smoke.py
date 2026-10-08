@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import replace as dc_replace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -29,7 +29,12 @@ from src.services.chat.agent.loop import (
     run_loop,
     tool_model_chain,
 )
-from src.services.llm_adapters.base_adapter import AssistantTurnResult, Role, ToolCallRef
+from src.services.llm_adapters.base_adapter import (
+    AssistantTurnResult,
+    LLMResponseStats,
+    Role,
+    ToolCallRef,
+)
 from src.services.llm_router import RoutedLLM
 from src.services.llm_runtime.exceptions import LLMRateLimitError, LLMServerError
 
@@ -236,7 +241,7 @@ async def test_concurrent_searches_each_open_a_distinct_session(
     """P0-1: fanned-out searches must not share the loop's session — each opens its own.
 
     Fire N searches in one turn and assert N distinct sessions were opened from the
-    factory (and that none of them is the loop's own serial `session`).
+    factory (and that none of them is the pipeline's `session`).
     """
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")
     state = _make_state()
@@ -594,7 +599,11 @@ def _report_tc(call_id: str, key: str, chunk_id: str | None) -> ToolCallRef:
     return ToolCallRef(id=call_id, name="report_findings", arguments=_report_args(key, chunk_id))
 
 
-async def _run(state: ChatPipelineState, turns: list, search) -> tuple:
+async def _run(
+    state: ChatPipelineState,
+    turns: list | Callable[..., Awaitable[AssistantTurnResult]],
+    search,
+) -> tuple:
     adapter = AsyncMock()
     adapter.complete_with_tools = AsyncMock(side_effect=turns)
     return await run_loop(
@@ -1263,56 +1272,88 @@ async def test_final_turn_search_is_not_executed(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.asyncio
 async def test_run_stops_at_the_wall_clock_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """turn_timeout_seconds bounds one turn; without a run-level deadline a sequence of
-    slow-but-not-timing-out turns has no bound at all."""
-    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.001")
+    """Without a run-level deadline a sequence of slow-but-not-timing-out turns has no
+    bound at all. A search still running when it fires is cancelled mid-flight."""
+    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.05")
+    monkeypatch.setenv("AGENT_DEADLINE_RESERVE_SECONDS", "0")
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
     turns = [AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "q?")])] * 5
 
     async def _search(*_a: Any, **_k: Any) -> _SearchResult:
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(10)
         return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
 
-    _ev, _f, meta = await _run(state, turns, _search)
+    async with asyncio.timeout(2):
+        _ev, _f, meta = await _run(state, turns, _search)
 
     assert meta.convergence_reason == "deadline"
     assert meta.iterations == 1  # cancelled inside the first turn, not at the cap
 
 
 @pytest.mark.asyncio
-async def test_deadline_cancels_a_turn_mid_flight(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The deadline is not checked between turns: a tool-model call still inside its own
-    turn timeout is cut off when the run's wall-clock bound expires."""
-    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.05")
-    monkeypatch.setenv("AGENT_TURN_TIMEOUT_SECONDS", "30")
-    adapter = AsyncMock()
+async def test_call_budget_comes_from_the_time_left_in_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A call gets what is left of the deadline less the reserve, not the full cap. A stall
+    therefore times out on its own budget (a clean "timeout" with a row) before the run
+    deadline can cancel it."""
+    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.4")
+    monkeypatch.setenv("AGENT_DEADLINE_RESERVE_SECONDS", "0.2")
+    monkeypatch.setenv("AGENT_TURN_TIMEOUT_CAP_SECONDS", "30")
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
 
     async def _hang(*_a: Any, **_k: Any) -> AssistantTurnResult:
         await asyncio.sleep(10)
         raise AssertionError("unreachable")
 
-    adapter.complete_with_tools = AsyncMock(side_effect=_hang)
-    state = _analytical_state()
-
     async def _search(*_a: Any, **_k: Any) -> _SearchResult:
         raise AssertionError("no search should run")
 
+    started = asyncio.get_running_loop().time()
     async with asyncio.timeout(2):
-        _ev, _f, meta = await run_loop(
-            state,
-            _routed_llm(adapter),
-            state.session,
-            state.redis_app,
-            state.request_id,
-            reranker=None,
-            session_factory=_fake_session_factory(),
-            execute_search=_search,
-        )
+        _ev, _f, meta = await _run(state, _hang, _search)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert meta.convergence_reason == "timeout"
+    assert elapsed < 0.4
+    [row] = rows
+    assert row["status"] == "timeout"
+    assert 0 < row["request_params"]["budget_s"] <= 0.2
+
+
+@pytest.mark.asyncio
+async def test_no_call_starts_without_a_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the time left is inside the reserve, the loop stops instead of starting a call
+    the deadline would only cut off."""
+    monkeypatch.setenv("AGENT_DEADLINE_SECONDS", "0.3")
+    monkeypatch.setenv("AGENT_DEADLINE_RESERVE_SECONDS", "0.2")
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        return_value=AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "q?")])
+    )
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        await asyncio.sleep(0.15)  # turn 0 ends with ~0.15s left, inside the 0.2s reserve
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, _f, meta = await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_search,
+    )
 
     assert meta.convergence_reason == "deadline"
-    assert meta.iterations == 1
+    assert adapter.complete_with_tools.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1405,3 +1446,215 @@ def test_tool_model_chain_drops_fallbacks_that_cannot_call_tools() -> None:
     router.get_with_fallback.return_value = [no_tools, tool_capable]
     with pytest.raises(RuntimeError, match="tool_calling"):
         tool_model_chain(router, "plain")
+
+
+def _capture_subrequests(monkeypatch: pytest.MonkeyPatch, state: ChatPipelineState) -> list[dict]:
+    """Give the run a parent request and collect every sub-request row it writes."""
+    from src.services.chat.agent import loop as loop_module
+
+    state.llm_request = cast("Any", MagicMock(id=uuid4(), conversation_id=uuid4(), user_id=None))
+    rows: list[dict] = []
+
+    class _Repo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def create_subrequest(self, **kwargs: Any) -> None:
+            rows.append(kwargs)
+
+    monkeypatch.setattr(loop_module, "LLMRequestRepository", _Repo)
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_turn_timeout_writes_a_timeout_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call cut off by its budget has no stats, but must still leave a row."""
+    monkeypatch.setenv("AGENT_TURN_TIMEOUT_CAP_SECONDS", "0.05")
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+
+    async def _hang(*_a: Any, **_k: Any) -> AssistantTurnResult:
+        await asyncio.sleep(10)
+        raise AssertionError("unreachable")
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        raise AssertionError("no search should run")
+
+    _ev, _f, meta = await _run(state, _hang, _search)
+
+    assert meta.convergence_reason == "timeout"
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "timeout"
+    assert row["request_type"] == "agent_tool_call"
+    params = row["request_params"]
+    assert (params["iteration"], params["turn_kind"]) == (0, "unknown")
+    assert "budget_s" in params
+    assert row["latency_ms"] >= 50
+    assert row.get("prompt_tokens") is None
+
+
+@pytest.mark.asyncio
+async def test_outside_cancel_writes_a_cancelled_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancel from outside the loop (a worker shutdown) is recorded apart from a call
+    timing out on its own budget, and still propagates."""
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+    started = asyncio.Event()
+
+    async def _hang(*_a: Any, **_k: Any) -> AssistantTurnResult:
+        started.set()
+        await asyncio.sleep(10)
+        raise AssertionError("unreachable")
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        raise AssertionError("no search should run")
+
+    task = asyncio.ensure_future(_run(state, _hang, _search))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [r["status"] for r in rows] == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_tool_model_rows_carry_outcome_and_turn_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider error on the primary leaves a failed row; the fallback's answers leave
+    completed rows labelled by what each turn did."""
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+    chunk, payloads = _make_chunk_with_payload()
+    primary = AsyncMock()
+    primary.complete_with_tools = AsyncMock(side_effect=LLMServerError("500"))
+    fallback = AsyncMock()
+    fallback.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(
+                text="",
+                tool_calls=[_search_tc("s1", "Did costs rise?")],
+                stats=LLMResponseStats(output_tokens=100, reasoning_tokens=80, latency_ms=900),
+            ),
+            AssistantTurnResult(
+                text="",
+                tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))],
+                stats=LLMResponseStats(output_tokens=300, reasoning_tokens=250, latency_ms=4000),
+            ),
+        ]
+    )
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await run_loop(
+        state,
+        _routed_llm(primary),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        fallbacks=[_routed_llm(fallback)],
+        execute_search=_search,
+    )
+
+    summary = [(r["status"], r["request_params"]["turn_kind"]) for r in rows]
+    assert summary == [
+        ("failed", "unknown"),
+        ("completed", "search"),
+        ("failed", "unknown"),
+        ("completed", "report"),
+    ]
+    assert rows[0]["error_code"] == "LLMServerError"
+    assert rows[3]["reasoning_tokens"] == 250
+
+
+@pytest.mark.asyncio
+async def test_failed_row_write_leaves_the_pipeline_session_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row write that fails must stay in its own session. Rolling back the pipeline's
+    session would expire `llm_request` and drop its pending changes."""
+    from src.services.chat.agent import loop as loop_module
+
+    state = _analytical_state()
+    state.llm_request = cast("Any", MagicMock(id=uuid4(), conversation_id=uuid4(), user_id=None))
+    session = cast("AsyncMock", state.session)
+
+    class _Repo:
+        def __init__(self, _session: Any) -> None:
+            pass
+
+        async def create_subrequest(self, **_kwargs: Any) -> None:
+            raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(loop_module, "LLMRequestRepository", _Repo)
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(
+            text="",
+            tool_calls=[_search_tc("s1", "Did costs rise?")],
+            stats=LLMResponseStats(output_tokens=10),
+        ),
+        AssistantTurnResult(
+            text="",
+            tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))],
+            stats=LLMResponseStats(output_tokens=10),
+        ),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    _ev, _f, meta = await _run(state, turns, _search)
+
+    assert meta.convergence_reason == "covered"
+    session.rollback.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    session.flush.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_token_cap_without_a_call_stops_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning that spends the whole completion cap leaves no tool call. That is a
+    failure, not the model choosing to answer in prose."""
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+    turns = [
+        AssistantTurnResult(
+            text="",
+            tool_calls=[],
+            stats=LLMResponseStats(output_tokens=6000, reasoning_tokens=6000, latency_ms=90_000),
+            finish_reason="length",
+        )
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        raise AssertionError("no search should run")
+
+    _ev, _f, meta = await _run(state, turns, _search)
+
+    assert meta.convergence_reason == "truncated"
+    assert [r["status"] for r in rows] == ["truncated"]
+
+
+def test_turn_kind_classifies_by_the_calls_made() -> None:
+    from src.services.chat.agent.loop import _turn_kind
+
+    def turn(*names: str) -> AssistantTurnResult:
+        return AssistantTurnResult(
+            text="", tool_calls=[ToolCallRef(id=n, name=n, arguments="{}") for n in names]
+        )
+
+    assert _turn_kind(None, turn("search_documents", "search_documents")) == "search"
+    assert _turn_kind(None, turn("report_findings")) == "report"
+    assert _turn_kind(None, turn("search_documents", "report_findings")) == "mixed"
+    assert _turn_kind(None, turn()) == "none"
+    assert _turn_kind(None, None) == "unknown"
+    # The final turn is known before the call, so even a failed one is labelled.
+    assert _turn_kind(["report_findings"], None) == "final"

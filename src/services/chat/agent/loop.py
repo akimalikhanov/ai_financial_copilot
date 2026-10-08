@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -34,9 +34,12 @@ from src.observability.metrics import (
     AGENT_TOOL_ARG_ERRORS,
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
+    AGENT_TOOL_MODEL_DURATION,
+    AGENT_TOOL_MODEL_OUTPUT_TOKENS,
     LLM_CACHE_HIT_TOKENS,
     LLM_COST,
     LLM_TOKENS,
+    observe_llm_failure,
     observe_llm_latency,
 )
 from src.observability.trace_payload import cap_list
@@ -125,8 +128,8 @@ class RunDeps:
     # The tool model first, then its fallbacks. A provider error moves a turn to the next.
     llms: tuple[RoutedLLM, ...]
     chat_state: ChatPipelineState
-    # The loop's own serial DB work (sub-request logging). Concurrent searches each open
-    # their own session from `session_factory` instead.
+    # The pipeline's session. The loop does not write on it: sub-request rows and
+    # concurrent searches each open their own session from `session_factory`.
     session: AsyncSession
     session_factory: async_sessionmaker[AsyncSession]
     reranker: Reranker | None
@@ -648,6 +651,17 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
     return Continue()
 
 
+def _call_budget(state: AgentRunState) -> float:
+    """Seconds the next tool-model call may take: what is left of the run deadline less
+    the reserve, capped. The deadline belongs to the request, so each call inherits what
+    remains of it instead of a fixed timeout picked when calls were shorter."""
+    settings = state.settings
+    if state.deadline_at is None:
+        return settings.turn_timeout_cap_seconds
+    remaining = state.deadline_at - asyncio.get_running_loop().time()
+    return min(settings.turn_timeout_cap_seconds, remaining - settings.deadline_reserve_seconds)
+
+
 async def _call_tool_model(
     state: AgentRunState,
     deps: RunDeps,
@@ -670,7 +684,30 @@ async def _call_tool_model(
         else:
             subset = [t for t in tools if t["function"]["name"] in allowed]
             call = llm.complete_with_tools(messages, tools=subset, temperature=0.0)
-        return await asyncio.wait_for(call, timeout=state.settings.turn_timeout_seconds)
+        # Recomputed per call: a fallback gets only what the failed attempt left.
+        budget = _call_budget(state)
+        started = perf_counter()
+        # A call that never answers has no stats, so without these it leaves no row and no
+        # latency sample: the slowest calls would be missing from every percentile.
+        # "timeout" is this call's own budget; "cancelled" is a cancel from outside (a
+        # worker shutdown — the reserve keeps the run deadline from landing mid-call).
+        try:
+            return await asyncio.wait_for(call, timeout=max(budget, 0.0))
+        except TimeoutError:
+            await _finish_despite_cancel(
+                _record_failed_call(state, deps, llm, allowed, "timeout", started, budget)
+            )
+            raise
+        except asyncio.CancelledError:
+            await _finish_despite_cancel(
+                _record_failed_call(state, deps, llm, allowed, "cancelled", started, budget)
+            )
+            raise
+        except LLMError as e:
+            await _finish_despite_cancel(
+                _record_failed_call(state, deps, llm, allowed, "error", started, budget, e)
+            )
+            raise
 
     *fallible, last = deps.llms
     for llm in fallible:
@@ -692,8 +729,7 @@ async def _call_tool_model(
 
 async def _finish_despite_cancel(aw: Awaitable[None]) -> None:
     """Run `aw` to completion even if the run deadline cancels this task meanwhile, then
-    let the cancellation through. A commit interrupted on the shared session would leave it
-    unusable for the pipeline's own writes after the loop."""
+    let the cancellation through. A row write interrupted mid-commit would lose the row."""
     task = asyncio.ensure_future(aw)
     try:
         await asyncio.shield(task)
@@ -702,13 +738,112 @@ async def _finish_despite_cancel(aw: Awaitable[None]) -> None:
         raise
 
 
+def _turn_kind(allowed: list[str] | None, turn: AssistantTurnResult | None) -> str:
+    """What a tool-model call did, for splitting its latency. `turn` is None when the call
+    failed before answering: only the final turn's kind is known in advance."""
+    if allowed is not None:
+        return "final"
+    if turn is None:
+        return "unknown"
+    names = {tc.name for tc in turn.tool_calls or []}
+    if not names:
+        return "none"
+    if REPORT_TOOL_NAME not in names:
+        return "search"
+    return "report" if names == {REPORT_TOOL_NAME} else "mixed"
+
+
+async def _write_tool_call_row(
+    state: AgentRunState,
+    deps: RunDeps,
+    llm: RoutedLLM,
+    request_params: dict,
+    **row: Any,
+) -> None:
+    """The `llm_requests` sub-request row for one tool-model call. Best effort: a failed
+    write never fails the turn.
+
+    Written on its own short-lived session, committed at once, so the connection is back
+    in the pool before the next LLM call. A failure stays in that session: rolling back
+    the shared `deps.session` instead would expire every object the pipeline holds
+    (`llm_request` included — a later attribute read then raises MissingGreenlet) and
+    discard its pending changes."""
+    llm_request = deps.chat_state.llm_request
+    if llm_request is None or llm_request.conversation_id is None:
+        return
+    try:
+        async with deps.session_factory() as session:
+            await LLMRequestRepository(session).create_subrequest(
+                parent_request_id=llm_request.id,
+                conversation_id=llm_request.conversation_id,
+                user_id=llm_request.user_id,
+                provider=llm.provider,
+                model=llm.model_id,
+                request_type="agent_tool_call",
+                request_params={"iteration": state.iteration, **request_params},
+                **row,
+            )
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "agent_tool_call_row_failed",
+            extra={"request_id": deps.request_id, "iteration": state.iteration},
+            exc_info=True,
+        )
+
+
+async def _record_failed_call(
+    state: AgentRunState,
+    deps: RunDeps,
+    llm: RoutedLLM,
+    allowed: list[str] | None,
+    outcome: str,
+    started: float,
+    budget: float,
+    error: LLMError | None = None,
+) -> None:
+    """Metrics and the `llm_requests` row for a tool-model call that never answered.
+    The tokens a timed-out call was billed for are unknown, so the row has none."""
+    elapsed = perf_counter() - started
+    turn_kind = _turn_kind(allowed, None)
+    observe_llm_failure(llm.model_id, "agent_tool_call", outcome, elapsed)
+    AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(elapsed)
+    if outcome == "timeout":
+        logger.warning(
+            "agent_tool_model_timeout",
+            extra={
+                "request_id": deps.request_id,
+                "iteration": state.iteration,
+                "model": llm.model_id,
+                "budget_s": round(budget, 1),
+                # Below the cap means the run deadline, not the cap, set this budget.
+                "cap_s": state.settings.turn_timeout_cap_seconds,
+            },
+        )
+    await _write_tool_call_row(
+        state,
+        deps,
+        llm,
+        {"turn_kind": turn_kind, "budget_s": round(budget, 1)},
+        status="failed" if outcome == "error" else outcome,
+        latency_ms=int(elapsed * 1000),
+        error_code=type(error).__name__ if error else None,
+        error_message=describe_error(error) if error else None,
+    )
+
+
 async def _record_turn_spend(
-    state: AgentRunState, deps: RunDeps, llm: RoutedLLM, turn: AssistantTurnResult
+    state: AgentRunState,
+    deps: RunDeps,
+    llm: RoutedLLM,
+    turn: AssistantTurnResult,
+    allowed: list[str] | None,
 ) -> None:
     """Spend, metrics and the `llm_requests` sub-request row for one tool-model call."""
     stats = turn.stats
     if stats is None:
         return
+    turn_kind = _turn_kind(allowed, turn)
     state.record_spend(llm.model_id, stats)
     state.last_turn_input_tokens = stats.input_tokens or 0
     if stats.input_tokens:
@@ -719,39 +854,49 @@ async def _record_turn_spend(
         LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(stats.cached_input_tokens)
     if stats.cost_usd:
         LLM_COST.labels(llm.model_id).inc(stats.cost_usd)
-    observe_llm_latency(llm.model_id, "agent_tool_call", stats)
-
-    llm_request = deps.chat_state.llm_request
-    if llm_request is None or llm_request.conversation_id is None:
-        return
-    with contextlib.suppress(Exception):
-        await LLMRequestRepository(deps.session).create_subrequest(
-            parent_request_id=llm_request.id,
-            conversation_id=llm_request.conversation_id,
-            user_id=llm_request.user_id,
-            provider=llm.provider,
-            model=llm.model_id,
-            request_type="agent_tool_call",
-            request_params={
+    # Hitting the completion-token cap is its own failure: reasoning can spend the whole
+    # cap before any tool call is written, and the turn then looks like a prose answer.
+    truncated = turn.finish_reason == "length"
+    outcome = "length" if truncated else "ok"
+    if truncated:
+        logger.warning(
+            "agent_tool_model_truncated",
+            extra={
+                "request_id": deps.request_id,
                 "iteration": state.iteration,
-                "tool_calls_issued": len(turn.tool_calls or []),
+                "model": llm.model_id,
+                "output_tokens": stats.output_tokens,
+                "reasoning_tokens": stats.reasoning_tokens,
+                "tool_calls": len(turn.tool_calls or []),
             },
-            status="completed",
-            **stats_to_request_kwargs(stats),
         )
-        # Release the pgbouncer server connection between turns. create_subrequest only
-        # flushes, so without this the transaction it opens stays open across the next
-        # turn's LLM call — converting transaction pooling into session pooling for the
-        # whole loop. Committed here and not inside create_subrequest because naming.py's
-        # caller depends on NOT committing: its sub-request and the title update have to
-        # land together.
-        await deps.session.commit()
+        lf_mark_current("WARNING", f"tool model hit its token cap ({stats.output_tokens} out)")
+    observe_llm_latency(llm.model_id, "agent_tool_call", stats, outcome)
+    if stats.latency_ms is not None:
+        AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(
+            stats.latency_ms / 1000.0
+        )
+    if stats.output_tokens:
+        reasoning = stats.reasoning_tokens or 0
+        AGENT_TOOL_MODEL_OUTPUT_TOKENS.labels(llm.model_id, turn_kind, "reasoning").inc(reasoning)
+        AGENT_TOOL_MODEL_OUTPUT_TOKENS.labels(llm.model_id, turn_kind, "visible").inc(
+            max(stats.output_tokens - reasoning, 0)
+        )
+
+    await _write_tool_call_row(
+        state,
+        deps,
+        llm,
+        {"tool_calls_issued": len(turn.tool_calls or []), "turn_kind": turn_kind},
+        status="truncated" if truncated else "completed",
+        **stats_to_request_kwargs(stats),
+    )
 
 
 async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) -> _SearchResult:
-    """One search, bounded by the turn timeout; a timeout becomes a backend failure."""
+    """One search, bounded by the search timeout; a timeout becomes a backend failure."""
     try:
-        async with asyncio.timeout(state.settings.turn_timeout_seconds):
+        async with asyncio.timeout(state.settings.search_timeout_seconds):
             # A fresh session per concurrent search — the shared `deps.session` is not
             # safe for concurrent use under asyncio.gather.
             async with deps.search_sem, deps.session_factory() as task_session:
@@ -770,7 +915,7 @@ async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) 
             extra={
                 "request_id": deps.request_id,
                 "iteration": state.iteration,
-                "timeout_s": state.settings.turn_timeout_seconds,
+                "timeout_s": state.settings.search_timeout_seconds,
             },
         )
         AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
@@ -824,13 +969,14 @@ async def _run_turn(
                 *([ChatMessage(role=Role.user, content=status)] if status else []),
             ]
             served, turn = await _call_tool_model(state, deps, prompt_messages, tools, allowed)
-            await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn))
+            await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn, allowed))
 
             if not turn.tool_calls:
                 # With no terminal tool this is a normal exit, not a rare one: the model
                 # emitted prose instead of a call. projection() still serves whatever the
-                # ledger accumulated (None only if nothing was ever reported).
-                return Stop("natural")
+                # ledger accumulated (None only if nothing was ever reported). A turn cut
+                # off by the token cap looks the same and is told apart here.
+                return Stop("truncated" if turn.finish_reason == "length" else "natural")
 
             # A call to a tool outside this turn's pool is answered and never parsed: a
             # final-turn search does not run.
@@ -997,16 +1143,20 @@ async def _iterate(state: AgentRunState, deps: RunDeps, tools: list[dict]) -> No
         # serve, so this fails safe.
         final_turn = iteration == state.max_iterations - 1
         allowed = [REPORT_TOOL_NAME] if final_turn else None
+        # A call with no budget left would only be cut off by the deadline mid-flight.
+        if _call_budget(state) <= 0:
+            logger.warning(
+                "agent_run_out_of_time",
+                extra={"request_id": request_id, "iteration": iteration},
+            )
+            state.convergence_reason = "deadline"
+            return
         try:
             outcome = await _run_turn(state, deps, tools, allowed)
         except TimeoutError:
+            # The call's budget and the cap are on the agent_tool_model_timeout line.
             logger.warning(
-                "agent_turn_timeout",
-                extra={
-                    "request_id": request_id,
-                    "iteration": iteration,
-                    "timeout": state.settings.turn_timeout_seconds,
-                },
+                "agent_turn_timeout", extra={"request_id": request_id, "iteration": iteration}
             )
             state.convergence_reason = "timeout"
             return
@@ -1060,10 +1210,10 @@ async def run_loop(
     chain fails, the run stops as ``llm_error`` and serves what it gathered; with nothing
     gathered the error propagates and the request fails.
 
-    ``session`` is used for the loop's own serial DB work (subrequest logging).
-    Concurrent searches each open their own session from ``session_factory``:
-    SQLAlchemy's AsyncSession is not safe for concurrent use, so the fan-out under
-    asyncio.gather must never share one.
+    The loop never writes on the caller's ``session``. Each sub-request row and each
+    concurrent search opens its own session from ``session_factory``: a failed row write
+    then cannot abort the pipeline's transaction, and SQLAlchemy's AsyncSession is not
+    safe for concurrent use, so the fan-out under asyncio.gather must never share one.
     """
     settings = get_agent_settings()
 
@@ -1163,10 +1313,12 @@ async def run_loop(
         search_sem=asyncio.Semaphore(settings.max_concurrent_searches),
         execute_search=execute_search,
     )
-    # One wall-clock bound for the whole run. It cancels a turn mid-flight: that turn's
-    # in-flight results are lost, while earlier turns are already in the ledgers.
+    # One wall-clock bound for the whole run. Tool-model calls are budgeted to end before
+    # it; a search still running when it fires is cancelled, and its results are lost,
+    # while earlier turns are already in the ledgers.
     try:
-        async with asyncio.timeout(settings.deadline_seconds):
+        async with asyncio.timeout(settings.deadline_seconds) as deadline:
+            state.deadline_at = deadline.when()
             await _iterate(state, deps, shape.tools)
     except TimeoutError:
         logger.warning(

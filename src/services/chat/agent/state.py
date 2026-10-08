@@ -11,11 +11,16 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.findings import FindingsLedger
-from src.services.chat.agent.tools import REPORT_FINDINGS_TOOL, SEARCH_ANALYTICAL_TOOL, SEARCH_TOOL
+from src.services.chat.agent.tools import (
+    REPORT_ANALYTICAL_TOOL,
+    REPORT_FINDINGS_TOOL,
+    SEARCH_ANALYTICAL_TOOL,
+    SEARCH_TOOL,
+)
 from src.services.chat.agent.transcript import Transcript
 
 if TYPE_CHECKING:
@@ -29,8 +34,9 @@ ConvergenceReason = Literal[
     "timeout",
     "covered",  # every planned aspect/entity was reported on
     "search_unavailable",  # every search this turn errored — a dead backend, not an empty corpus
-    "deadline",  # wall-clock bound for the whole run (turn_timeout_seconds bounds only one turn)
+    "deadline",  # wall-clock bound for the whole run
     "llm_error",  # every model in the tool-model chain raised a provider error
+    "truncated",  # the tool model hit its completion-token cap without calling a tool
 ]
 
 
@@ -51,15 +57,30 @@ class AgentSettings(BaseModel):
     # At 0 a run stops on the first such turn, before the model has read the grounding
     # feedback from its last report.
     max_empty_rounds: int = Field(ge=0)
-    turn_timeout_seconds: float = Field(gt=0)
-    # Wall-clock bound on the whole run. `turn_timeout_seconds` bounds a single turn, so
-    # without this a run of slow-but-not-timing-out turns has no bound at all.
+    # Wall-clock bound on the whole run. Every tool-model call is budgeted from what is
+    # left of it, so a slow call can use the time a fast run would not have needed.
     deadline_seconds: float = Field(gt=0)
+    # Ceiling on one tool-model call, so one stalled call cannot use the whole run.
+    turn_timeout_cap_seconds: float = Field(gt=0)
+    # Run time a tool-model call is never given: its own timeout then fires before the
+    # deadline cancels it, and the loop keeps time to act on the failure.
+    deadline_reserve_seconds: float = Field(ge=0)
+    # Bound on one search (retrieve + rerank).
+    search_timeout_seconds: float = Field(gt=0)
     # Analytical runs open several aspects and corroborate each, so they get more turns.
     max_iterations_analytical: int = Field(ge=1, le=20)
     # Ceiling on loop-minted plan entries. Near-duplicate sub_questions each mint their
     # own id (no fuzzy matching), so this is what bounds the cost of that choice.
     max_plan_items: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _reserve_leaves_run_time(self) -> AgentSettings:
+        if self.deadline_reserve_seconds >= self.deadline_seconds:
+            raise ValueError(
+                "AGENT_DEADLINE_RESERVE_SECONDS must be below AGENT_DEADLINE_SECONDS, "
+                "or no tool-model call ever gets a budget"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -71,13 +92,17 @@ class ShapeConfig:
     # Analytical searches carry a `sub_question` that mints an aspect key; extraction
     # searches are keyed by the entity they name.
     search_takes_sub_question: bool
+    # Analytical findings state their numbers in `claim`; offering `figures` as well gets
+    # every number written twice.
+    report_takes_figures: bool
     seed_plan_from_entities: bool
     max_iterations: int
 
     @property
     def tools(self) -> list[dict]:
         search = SEARCH_ANALYTICAL_TOOL if self.search_takes_sub_question else SEARCH_TOOL
-        return [search, REPORT_FINDINGS_TOOL]
+        report = REPORT_FINDINGS_TOOL if self.report_takes_figures else REPORT_ANALYTICAL_TOOL
+        return [search, report]
 
 
 def shape_config(query_shape: str | None, settings: AgentSettings) -> ShapeConfig:
@@ -85,12 +110,14 @@ def shape_config(query_shape: str | None, settings: AgentSettings) -> ShapeConfi
         return ShapeConfig(
             prompt="v6_agent_analytical",
             search_takes_sub_question=True,
+            report_takes_figures=False,
             seed_plan_from_entities=False,
             max_iterations=settings.max_iterations_analytical,
         )
     return ShapeConfig(
         prompt="v4_agent",
         search_takes_sub_question=False,
+        report_takes_figures=True,
         seed_plan_from_entities=True,
         max_iterations=settings.max_iterations,
     )
@@ -107,8 +134,10 @@ def get_agent_settings() -> AgentSettings:
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
         max_chunks_per_entity=int(os.getenv("AGENT_MAX_CHUNKS_PER_ENTITY", "5")),
         max_empty_rounds=int(os.getenv("AGENT_MAX_EMPTY_ROUNDS", "1")),
-        turn_timeout_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_SECONDS", "60")),
         deadline_seconds=float(os.getenv("AGENT_DEADLINE_SECONDS", "180")),
+        turn_timeout_cap_seconds=float(os.getenv("AGENT_TURN_TIMEOUT_CAP_SECONDS", "120")),
+        deadline_reserve_seconds=float(os.getenv("AGENT_DEADLINE_RESERVE_SECONDS", "15")),
+        search_timeout_seconds=float(os.getenv("AGENT_SEARCH_TIMEOUT_SECONDS", "60")),
         max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "7")),
         max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "6")),
     )
@@ -174,6 +203,8 @@ class AgentRunState:
     empty_rounds: int = 0
     tool_calls_total: int = 0
     convergence_reason: ConvergenceReason = "iteration_cap"
+    # Event-loop time at which the run deadline fires; set when the run starts.
+    deadline_at: float | None = None
 
     # --- instrumentation: is reporting incremental, and how often do calls fail? ---
     report_calls_total: int = 0

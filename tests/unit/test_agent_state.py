@@ -36,8 +36,10 @@ def _settings(**overrides: object) -> AgentSettings:
         "max_concurrent_searches": 3,
         "max_chunks_per_entity": 5,
         "max_empty_rounds": 1,
-        "turn_timeout_seconds": 60.0,
         "deadline_seconds": 180.0,
+        "turn_timeout_cap_seconds": 120.0,
+        "deadline_reserve_seconds": 15.0,
+        "search_timeout_seconds": 60.0,
         "max_iterations_analytical": 7,
         "max_plan_items": 8,
     }
@@ -145,9 +147,18 @@ class TestAgentSettingsValidation:
         with pytest.raises(ValidationError):
             _settings(cost_budget_usd=0)
 
-    def test_turn_timeout_must_be_positive(self) -> None:
+    def test_turn_timeout_cap_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
-            _settings(turn_timeout_seconds=0)
+            _settings(turn_timeout_cap_seconds=0)
+
+    def test_search_timeout_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings(search_timeout_seconds=0)
+
+    def test_reserve_must_leave_run_time(self) -> None:
+        """A reserve at or above the deadline would leave every call a budget <= 0."""
+        with pytest.raises(ValidationError, match="AGENT_DEADLINE_RESERVE_SECONDS"):
+            _settings(deadline_seconds=30.0, deadline_reserve_seconds=30.0)
 
 
 _MAX_PLAN_ITEMS = 8  # AGENT_MAX_PLAN_ITEMS default; these tests are about minting, not config

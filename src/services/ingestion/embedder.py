@@ -195,8 +195,8 @@ def embed_query(text: str) -> list[float]:
 
     Separate entry point from `embed_chunks` because the two callers have opposite
     latency budgets: ingestion batches may wait EMBEDDER_TIMEOUT_SECONDS, while this
-    runs inside the agent's search fan-out, which sits outside the per-turn timeout —
-    so total wall clock, not attempt count, is what has to be bounded here.
+    runs inside an agent search, which shares AGENT_SEARCH_TIMEOUT_SECONDS with retrieval
+    and rerank, so total wall clock, not attempt count, is what has to be bounded here.
 
     Raises the last exception if every attempt fails; callers fail open (see
     `run_chat_rag_pipeline`, which degrades to keyword-only).

@@ -45,7 +45,7 @@ class Finding(BaseModel):
     supported: bool = Field(
         description=(
             "False when you searched this key and the documents do not say — state the "
-            "absence in claim and leave evidence and figures empty."
+            "absence in claim and leave evidence empty."
         ),
     )
     evidence: list[str] = Field(
@@ -54,7 +54,10 @@ class Finding(BaseModel):
     confidence: Literal["high", "medium", "low"]
     figures: list[Figure] = Field(
         default=[],
-        description="Numeric values behind the claim, one per metric and period. Empty if none.",
+        description=(
+            "Numeric values behind the claim, one per metric and period. Empty if none, "
+            "or if supported is false."
+        ),
     )
 
 

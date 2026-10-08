@@ -186,6 +186,23 @@ AGENT_TOOL_DURATION = Histogram(
     # search_documents wraps full RAG retrieve+rerank and can exceed 10s.
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
+# Tool-model calls split by what the turn did. Search and report turns differ 3-5x in
+# latency, so they need separate percentiles. turn_kind: search | report | mixed | final |
+# none (prose, no call), or unknown for a non-final call that failed before it answered.
+# outcome: as on llm_request_duration_seconds.
+AGENT_TOOL_MODEL_DURATION = Histogram(
+    "agent_tool_model_duration_seconds",
+    "Tool-model call latency by turn kind",
+    ["model", "turn_kind", "outcome"],
+    buckets=(1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120),
+)
+# part: reasoning | visible. The two sum to the call's output tokens; reasoning is most of
+# a report turn's latency.
+AGENT_TOOL_MODEL_OUTPUT_TOKENS = Counter(
+    "agent_tool_model_output_tokens_total",
+    "Tool-model output tokens by turn kind",
+    ["model", "turn_kind", "part"],
+)
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
 # outcome: carried | none | dropped_hop_cap | dropped_scope
 FOLLOWUP_FINDINGS_CARRIED = Counter(
@@ -216,12 +233,13 @@ LLM_TOKENS = Counter("llm_tokens_total", "Tokens", ["direction", "model"])
 LLM_COST = Counter("llm_cost_usd_total", "Cost USD", ["model"])
 LLM_CACHE_HIT_TOKENS = Counter("llm_cache_hit_tokens_total", "Cached input tokens", ["model"])
 # request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
-# router | conversation_naming.
+# router | conversation_naming. outcome: ok | length (answered, but hit its token cap) |
+# timeout | cancelled | error — only agent_tool_call observes the non-ok outcomes so far.
 LLM_DURATION = Histogram(
     "llm_request_duration_seconds",
     "LLM call latency, first byte to last",
-    ["model", "request_type"],
-    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120),
+    ["model", "request_type", "outcome"],
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120),
 )
 LLM_TTFT = Histogram(
     "llm_time_to_first_token_seconds",
@@ -231,14 +249,22 @@ LLM_TTFT = Histogram(
 )
 
 
-def observe_llm_latency(model: str, request_type: str, stats: LLMResponseStats | None) -> None:
+def observe_llm_latency(
+    model: str, request_type: str, stats: LLMResponseStats | None, outcome: str = "ok"
+) -> None:
     """Record one LLM call's latency histograms."""
     if stats is None:
         return
     if stats.latency_ms is not None:
-        LLM_DURATION.labels(model, request_type).observe(stats.latency_ms / 1000.0)
+        LLM_DURATION.labels(model, request_type, outcome).observe(stats.latency_ms / 1000.0)
     if stats.ttft_ms is not None:
         LLM_TTFT.labels(model, request_type).observe(stats.ttft_ms / 1000.0)
+
+
+def observe_llm_failure(model: str, request_type: str, outcome: str, seconds: float) -> None:
+    """Record how long a call that never answered ran before it timed out, was cancelled or
+    errored. Without it the latency histogram only ever sees the calls that finished."""
+    LLM_DURATION.labels(model, request_type, outcome).observe(seconds)
 
 
 # --- Ingestion ---

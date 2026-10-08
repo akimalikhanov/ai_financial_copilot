@@ -276,8 +276,8 @@ def get_llm_timeout_seconds() -> float:
     """Per-request LLM timeout (LLM_TIMEOUT_SECONDS, default 120.0).
 
     Not passing a timeout does not mean "no limit" — it means the SDK default, which is 600s
-    for openai-python. Must fit inside the agent turn timeout (60s) for tool calls and inside
-    the Celery soft limit (900s) for synthesis.
+    for openai-python. Must not exceed AGENT_TURN_TIMEOUT_CAP_SECONDS (120s) for tool calls,
+    and must fit inside the Celery soft limit (900s) for synthesis.
     """
     return float(os.getenv("LLM_TIMEOUT_SECONDS", "120.0"))
 
@@ -892,7 +892,8 @@ def get_embedder_query_timeout_seconds() -> float:
 
     Per-attempt budget for the chat path only. Deliberately far below
     EMBEDDER_TIMEOUT_SECONDS: an ingestion batch can afford to wait, but a query embed
-    sits inside the agent's search fan-out, which runs outside the per-turn timeout.
+    sits inside an agent search and shares AGENT_SEARCH_TIMEOUT_SECONDS with retrieval and
+    rerank.
     """
     try:
         return float(os.getenv("EMBEDDER_QUERY_TIMEOUT_SECONDS", "5.0"))

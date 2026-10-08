@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -16,19 +17,30 @@ from src.services.llm_router import LLMRouter
 from src.services.router import disambiguator
 from src.services.router.disambiguator import _response_format, disambiguate
 
-_FAKE_SESSION = cast(AsyncSession, object())
+
+def _fake_session() -> AsyncMock:
+    """An AsyncSession double whose begin_nested() works as `async with`."""
+    session = AsyncMock()
+    session.begin_nested = MagicMock(return_value=AsyncMock())
+    return session
+
+
+_FAKE_SESSION = cast(AsyncSession, _fake_session())
 
 
 class FakeLLM:
     provider = "fake"
 
-    def __init__(self, text: str = "", delay: float = 0.0) -> None:
+    def __init__(self, text: str = "", delay: float = 0.0, events: list[str] | None = None) -> None:
         self._text = text
         self._delay = delay
+        self._events = events
         self.calls: list[dict] = []
 
     async def complete(self, **kwargs):
         self.calls.append(kwargs)
+        if self._events is not None:
+            self._events.append("llm")
         await asyncio.sleep(self._delay)
         return LLMResponse(
             text=self._text, stats=LLMResponseStats(input_tokens=120, output_tokens=20)
@@ -119,6 +131,52 @@ async def test_success_logs_one_completed_subrequest(_repo: list[dict]) -> None:
     assert row["status"] == "completed"
     assert row["prompt_tokens"] == 120 and row["completion_tokens"] == 20
     assert llm.calls[0]["_lf_name"] == "entity_disambiguator"
+
+
+@pytest.mark.asyncio
+async def test_commits_before_the_llm_call() -> None:
+    """The candidate reads leave a transaction open; it must not be held across the call."""
+    events: list[str] = []
+    session = _fake_session()
+    session.commit.side_effect = lambda: events.append("commit")
+    llm = FakeLLM(
+        json.dumps({"entities": [{"entity": "E1", "decision": "resolved", "candidates": ["C1"]}]}),
+        events=events,
+    )
+    await _run(llm, session=cast(AsyncSession, session))
+    assert events == ["commit", "llm"]
+
+
+@pytest.mark.asyncio
+async def test_failed_log_write_does_not_fail_the_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed sub-request INSERT rolls back its savepoint only; the caller's session is
+    never rolled back and the decision still comes through."""
+
+    class BrokenRepo:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def create_subrequest(self, **_kwargs) -> None:
+            raise RuntimeError("insert failed")
+
+    monkeypatch.setattr(disambiguator, "LLMRequestRepository", BrokenRepo)
+    session = _fake_session()
+    llm = FakeLLM(
+        json.dumps({"entities": [{"entity": "E1", "decision": "resolved", "candidates": ["C1"]}]})
+    )
+    [result] = (
+        await _run(
+            llm,
+            session=cast(AsyncSession, session),
+            parent_request_id=uuid4(),
+            conversation_id=uuid4(),
+        )
+        or []
+    )
+    assert result.decision == "resolved"
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -194,17 +194,26 @@ async def route_query(
         observe_llm_latency(model_id, "router", resp.stats)
 
         if should_log_subrequest:
-            await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
-                parent_request_id=parent_request_id,  # type: ignore[arg-type]
-                conversation_id=conversation_id,  # type: ignore[arg-type]
-                user_id=user_id,
-                provider=llm.provider,
-                model=model_id,
-                request_type="router",
-                request_params=request_params,
-                status="completed",
-                **stats_to_request_kwargs(resp.stats),
-            )
+            # Best effort, in a SAVEPOINT: a failed INSERT rolls back only the savepoint.
+            # Rolling back the caller's session instead would expire its objects.
+            try:
+                async with session.begin_nested():  # type: ignore[union-attr]
+                    await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
+                        parent_request_id=parent_request_id,  # type: ignore[arg-type]
+                        conversation_id=conversation_id,  # type: ignore[arg-type]
+                        user_id=user_id,
+                        provider=llm.provider,
+                        model=model_id,
+                        request_type="router",
+                        request_params=request_params,
+                        status="completed",
+                        **stats_to_request_kwargs(resp.stats),
+                    )
+            except Exception:
+                logger.warning("route_query_subrequest_failed", exc_info=True)
+            # Release the connection before the parse retry's LLM call and the
+            # disambiguator's; holding it converts transaction pooling into session pooling.
+            await session.commit()  # type: ignore[union-attr]
 
         raw = resp.text or ""
         result, error = parse_router_response(raw)

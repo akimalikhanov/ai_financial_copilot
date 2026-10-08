@@ -147,16 +147,22 @@ async def disambiguate(
     async def log(**kwargs: Any) -> None:
         if session is None or parent_request_id is None or conversation_id is None:
             return
-        await LLMRequestRepository(session).create_subrequest(
-            parent_request_id=parent_request_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            provider=llm.provider,
-            model=model_id,
-            request_type="entity_disambiguator",
-            request_params={"temperature": cfg["temperature"], "max_tokens": max_tokens},
-            **kwargs,
-        )
+        # Best effort, in a SAVEPOINT: a failed INSERT rolls back only the savepoint.
+        # Rolling back the caller's session instead would expire its objects.
+        try:
+            async with session.begin_nested():
+                await LLMRequestRepository(session).create_subrequest(
+                    parent_request_id=parent_request_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    provider=llm.provider,
+                    model=model_id,
+                    request_type="entity_disambiguator",
+                    request_params={"temperature": cfg["temperature"], "max_tokens": max_tokens},
+                    **kwargs,
+                )
+        except Exception:
+            logger.warning("entity_disambiguator_subrequest_failed", exc_info=True)
 
     messages = [
         ChatMessage(role=Role.system, content=system),
@@ -167,6 +173,10 @@ async def disambiguate(
             ),
         ),
     ]
+    if session is not None:
+        # The candidate reads above opened a transaction. Release the connection before
+        # the LLM call rather than hold it idle for up to the disambiguator timeout.
+        await session.commit()
     try:
         resp = await asyncio.wait_for(
             llm.complete(

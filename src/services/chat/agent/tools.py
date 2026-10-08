@@ -7,12 +7,14 @@ definitions handed to the LLM, and the same models parse the tool-call arguments
 There is no registry: no tool is terminal and no tool has gates, so the only thing a
 caller ever needs is the schema list.
 
-Every shape offers `report_findings`; only the search schema differs, picked by
-`ShapeConfig.tools`. The pool is also the dispatch rule: a call to a tool outside the
-turn's pool gets "tool not available" and is never parsed.
+Every shape offers `search_documents` and `report_findings`; the schemas differ by shape,
+picked by `ShapeConfig.tools`. The pool is also the dispatch rule: a call to a tool
+outside the turn's pool gets "tool not available" and is never parsed.
 """
 
 from __future__ import annotations
+
+import copy
 
 from pydantic import BaseModel, Field
 
@@ -94,6 +96,7 @@ SEARCH_ANALYTICAL_TOOL = tool_schema(
     _AnalyticalSearchArgs,
 )
 
+
 REPORT_TOOL_NAME = "report_findings"
 
 REPORT_FINDINGS_TOOL = tool_schema(
@@ -103,3 +106,19 @@ REPORT_FINDINGS_TOOL = tool_schema(
     "report each key as soon as its evidence settles.",
     FindingsReport,
 )
+
+
+def _without_figures(tool: dict) -> dict:
+    """The same tool with `figures` dropped from each finding. `FindingsReport` still
+    parses the calls, with `figures` left empty."""
+    tool = copy.deepcopy(tool)
+    params = tool["function"]["parameters"]
+    finding = params["$defs"]["Finding"]
+    del finding["properties"]["figures"]
+    finding["required"].remove("figures")
+    del params["$defs"]["Figure"]
+    return tool
+
+
+# Analytical findings state their numbers in `claim`.
+REPORT_ANALYTICAL_TOOL = _without_figures(REPORT_FINDINGS_TOOL)

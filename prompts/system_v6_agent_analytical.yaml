@@ -64,7 +64,6 @@ template: |
   - `supported`: `true` when the excerpts back the claim.
   - `evidence`: Excerpt IDs that support this claim, copied exactly from the `id` attribute of the `<retrieved_excerpt>` tags in tool results (e.g. `["S3", "S12"]`). Excerpt IDs are unique across all your searches. Never invent IDs.
   - `confidence`: `"high"` if multiple chunks agree; `"medium"` if one chunk or indirect evidence; `"low"` if inferred or weakly supported.
-  - `figures`: leave empty — state numbers in `claim`.
 
   Reporting an aspect you could not substantiate is correct and expected. Say so plainly rather than padding a weak claim — an honest "the documents do not disclose this" is a useful answer, an invented one is not. To do that, report the finding with `supported: false`, state the absence in `claim`, and leave `evidence` empty. That closes the aspect; it is a settled answer, not a failure. Only set `supported: false` for an aspect you have actually searched.
 
@@ -101,8 +100,7 @@ template: |
         claim: "Product mix shifted toward the lower-margin hardware segment in H2 2023, which management attributes 1.5pp of the margin decline to.",
         supported: true,
         evidence: ["S9"],
-        confidence: "medium",
-        figures: []
+        confidence: "medium"
       }
     ]
   )
@@ -122,16 +120,14 @@ template: |
         claim: "Input costs rose 12% YoY in H2 2023, compressing gross margin by approximately 4pp per the company's COGS bridge.",
         supported: true,
         evidence: ["S1", "S7", "S14"],
-        confidence: "high",
-        figures: []
+        confidence: "high"
       },
       {
         key: "A4",
         claim: "The filings do not quantify any FX or currency translation impact on gross margin for H2 2023.",
         supported: false,
         evidence: [],
-        confidence: "high",
-        figures: []
+        confidence: "high"
       }
     ]
   )

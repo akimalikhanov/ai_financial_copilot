@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from src.schemas.agent_findings import FindingsReport
 from src.services.chat.agent.state import AgentSettings, shape_config
 from src.services.chat.agent.tools import (
+    REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
     REPORT_TOOL_NAME,
     SEARCH_ANALYTICAL_TOOL,
@@ -37,8 +38,10 @@ def _settings() -> AgentSettings:
         max_concurrent_searches=3,
         max_chunks_per_entity=5,
         max_empty_rounds=1,
-        turn_timeout_seconds=60,
         deadline_seconds=180,
+        turn_timeout_cap_seconds=120,
+        deadline_reserve_seconds=15,
+        search_timeout_seconds=60,
         max_iterations_analytical=7,
         max_plan_items=6,
     )
@@ -195,13 +198,26 @@ class TestFieldDescriptionsPreserved:
         assert schema["function"]["description"] == "does x"
 
 
+class TestAnalyticalReport:
+    def test_findings_carry_no_figures(self) -> None:
+        params = _params(REPORT_ANALYTICAL_TOOL)
+        assert "Figure" not in params["$defs"]
+        finding = params["$defs"]["Finding"]
+        assert "figures" not in finding["properties"]
+        assert set(finding["required"]) == set(finding["properties"])
+
+    def test_extraction_report_keeps_its_figures(self) -> None:
+        # The analytical tool is a copy; dropping figures must not reach the original.
+        assert "figures" in _params(REPORT_FINDINGS_TOOL)["$defs"]["Finding"]["properties"]
+
+
 class TestShapePools:
-    """Every shape reports through one tool; only the search schema differs."""
+    """Every shape offers one search and one report tool; their schemas differ by shape."""
 
     def test_analytical_pool(self) -> None:
         assert shape_config("analytical", _settings()).tools == [
             SEARCH_ANALYTICAL_TOOL,
-            REPORT_FINDINGS_TOOL,
+            REPORT_ANALYTICAL_TOOL,
         ]
 
     @pytest.mark.parametrize("shape", ["extraction", "comparison", None])

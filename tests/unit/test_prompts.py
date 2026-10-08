@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from src.schemas.prompt import PromptTemplate
+from src.services.chat.agent.state import get_agent_settings, shape_config
 from src.services.prompts.prompt_loader import PromptLoader, PromptLoaderError
 from src.services.prompts.prompt_renderer import (
     PromptRenderer,
@@ -370,14 +371,20 @@ def test_agent_prompt_names_only_the_offered_tools(version: str):
     assert "report_analytical_findings" not in prompt
 
 
-@pytest.mark.parametrize("version", ["v4_agent", "v6_agent_analytical"])
-def test_agent_prompt_names_only_current_finding_fields(version: str):
-    prompt = get_system_prompt(version=version)
+@pytest.mark.parametrize("shape", ["extraction", "analytical"])
+def test_agent_prompt_names_only_current_finding_fields(shape: str):
+    """A prompt describes exactly the finding fields its shape's report tool advertises —
+    telling the model to leave out a field the schema still asks for gets it filled anyway."""
+    config = shape_config(shape, get_agent_settings())
+    prompt = get_system_prompt(version=config.prompt)
+    finding = config.tools[1]["function"]["parameters"]["$defs"]["Finding"]
 
     for retired in ("metric_requested", "source_chunks", "evidence_chunks", "substantiated"):
         assert retired not in prompt
-    for field in ("key", "claim", "supported", "evidence", "figures"):
+    for field in finding["properties"]:
         assert f"`{field}`" in prompt
+    if "figures" not in finding["properties"]:
+        assert "figures" not in prompt
 
 
 def test_analytical_prompt_drops_the_one_shot_finalizer_framing():

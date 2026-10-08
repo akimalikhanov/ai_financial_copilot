@@ -186,6 +186,39 @@ groups:
             ingestion_documents_total to see whether any are reaching ready, and check
             whether one oversized document is killing every worker that picks it up.
 
+  # A cut-off run still answers, from partial findings or raw excerpts, so nothing errors.
+  - name: agent-latency
+    interval: 30s
+    rules:
+      - alert: AgentRunsCutOff
+        expr: |
+          100 * sum(increase(agent_stop_reasons_total{reason=~"timeout|deadline|truncated"}[6h]))
+            / sum(increase(agent_stop_reasons_total[6h])) > 2
+          and sum(increase(agent_stop_reasons_total[6h])) >= 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.1f\" }} of every 100 agent runs cut off by a timeout, the deadline or the token cap (6h)"
+          description: >-
+            Check the "Failed Tool-Model Calls" panel for which turn kind is failing, and
+            llm_requests rows with status timeout or truncated for the runs.
+
+      # A call gets what is left of the 180s run less a 15s reserve, so a 45s report turn
+      # late in a run can run out of budget.
+      - alert: AgentReportTurnSlow
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(agent_tool_model_duration_seconds_bucket{turn_kind=~"report|final"}[30m])
+          )) > 45
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Report-turn p95 at {{ $value | printf \"%.0f\" }}s"
+          description: >-
+            Compare "Reasoning Tokens per Tool-Model Call" for the same window: a rise there
+            means longer reasoning; flat reasoning means provider throughput dropped.
+
   - name: scrape-health
     interval: 30s
     rules:

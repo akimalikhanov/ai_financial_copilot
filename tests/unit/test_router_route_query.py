@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -43,6 +44,13 @@ class _FakeRouterImpl:
 def FakeRouter(llm: FakeLLM | Exception) -> LLMRouter:  # noqa: N802
     """Build a duck-typed router double, cast to LLMRouter to satisfy route_query's signature."""
     return cast(LLMRouter, _FakeRouterImpl(llm))
+
+
+def _fake_session() -> AsyncMock:
+    """An AsyncSession double whose begin_nested() works as `async with`."""
+    session = AsyncMock()
+    session.begin_nested = MagicMock(return_value=AsyncMock())
+    return session
 
 
 def _valid_json(route: str = "retrieval") -> str:
@@ -127,6 +135,71 @@ class TestHappyPath:
         assert output.user_intent == "asking about revenue"
         assert scope is None  # no session provided
         assert len(llm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_logged_row_is_committed_before_the_retry_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sub-request flush opens a transaction; it must not be held across the
+        parse retry's LLM call."""
+        from src.services.router import router as router_module
+
+        events: list[str] = []
+
+        class FakeRepo:
+            def __init__(self, _session) -> None:
+                pass
+
+            async def create_subrequest(self, **_kwargs) -> None:
+                events.append("row")
+
+        monkeypatch.setattr(router_module, "LLMRequestRepository", FakeRepo)
+        session = _fake_session()
+        session.commit.side_effect = lambda: events.append("commit")
+
+        class RecordingLLM(FakeLLM):
+            async def complete(self, **kwargs):
+                events.append("llm")
+                return await super().complete(**kwargs)
+
+        llm = RecordingLLM(
+            responses=[LLMResponse(text="garbage"), LLMResponse(text=_valid_json("direct_answer"))]
+        )
+        await route_query(
+            RouterInput(query="What was revenue?"),
+            llm_router=FakeRouter(llm),
+            session=cast(AsyncSession, session),
+            parent_request_id=uuid4(),
+            conversation_id=uuid4(),
+        )
+        assert events == ["llm", "row", "commit", "llm", "row", "commit"]
+
+    @pytest.mark.asyncio
+    async def test_failed_log_write_still_routes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed sub-request INSERT rolls back its savepoint only: routing goes on, the
+        caller's session is never rolled back, and the connection is still released."""
+        from src.services.router import router as router_module
+
+        class BrokenRepo:
+            def __init__(self, _session) -> None:
+                pass
+
+            async def create_subrequest(self, **_kwargs) -> None:
+                raise RuntimeError("insert failed")
+
+        monkeypatch.setattr(router_module, "LLMRequestRepository", BrokenRepo)
+        session = _fake_session()
+        llm = FakeLLM(responses=[LLMResponse(text=_valid_json("direct_answer"))])
+        output, _scope = await route_query(
+            RouterInput(query="What was revenue?"),
+            llm_router=FakeRouter(llm),
+            session=cast(AsyncSession, session),
+            parent_request_id=uuid4(),
+            conversation_id=uuid4(),
+        )
+        assert output.route == "direct_answer"
+        session.rollback.assert_not_awaited()
+        session.commit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_recovers_on_retry_after_bad_first_attempt(self) -> None:

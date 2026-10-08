@@ -317,7 +317,8 @@ class OpenAIAdapter(LLMAdapter):
         except Exception as e:
             raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
         latency_ms = elapsed_ms(start_ms)
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         tool_calls = [
             ToolCallRef(id=tc.id, name=tc.function.name, arguments=tc.function.arguments)
             for tc in (msg.tool_calls or [])
@@ -325,7 +326,12 @@ class OpenAIAdapter(LLMAdapter):
         stats = self._build_stats_from_usage(
             getattr(resp, "usage", None), model=req.model, latency_ms=latency_ms
         )
-        return AssistantTurnResult(text=msg.content or "", tool_calls=tool_calls, stats=stats)
+        return AssistantTurnResult(
+            text=msg.content or "",
+            tool_calls=tool_calls,
+            stats=stats,
+            finish_reason=choice.finish_reason,
+        )
 
     async def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         kwargs = self._build_kwargs(req)

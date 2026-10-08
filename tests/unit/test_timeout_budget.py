@@ -2,7 +2,7 @@
 
 The pathologies covered here are the ones that are invisible when everything is healthy:
 a config key that is loaded but never applied, and a fan-out that sits outside the
-per-turn timeout so nothing bounds it but the Celery hard limit.
+tool-model call's timeout so nothing bounds it but the Celery hard limit.
 """
 
 from __future__ import annotations
@@ -95,15 +95,15 @@ def _make_state() -> ChatPipelineState:
 
 
 @pytest.mark.asyncio
-async def test_hung_search_does_not_run_past_the_turn_timeout(
+async def test_hung_search_does_not_run_past_the_search_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The fan-out sits outside the per-turn wait_for, so before this only the Celery hard
-    limit bounded it — one hung backend held a worker slot for 20 minutes."""
+    """The fan-out sits outside the tool-model call's wait_for, so before this only the
+    Celery hard limit bounded it — one hung backend held a worker slot for 20 minutes."""
     monkeypatch.setenv("AGENT_MAX_ITERATIONS", "1")
     monkeypatch.setenv("AGENT_COST_BUDGET_USD", "100")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT_SEARCHES", "2")
-    monkeypatch.setenv("AGENT_TURN_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setenv("AGENT_SEARCH_TIMEOUT_SECONDS", "0.2")
 
     from src.services.chat.agent.loop import run_loop
     from src.services.llm_router import RoutedLLM

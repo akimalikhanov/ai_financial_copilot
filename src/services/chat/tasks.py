@@ -143,7 +143,7 @@ def _init_metric_series() -> None:
 # Agent stops caused by a fault or a limit rather than the model finishing — marked WARNING
 # on the agent_loop span so they can be filtered in Langfuse.
 _AGENT_FAILED_STOPS: frozenset[ConvergenceReason] = frozenset(
-    {"timeout", "deadline", "llm_error", "search_unavailable"}
+    {"timeout", "deadline", "llm_error", "search_unavailable", "truncated"}
 )
 
 _STAGE_OBS_TYPES: dict[str, str] = {
@@ -735,9 +735,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             )
             # Release before the router's LLM call. update_status above only flushes, and the
             # message reads reopen a transaction anyway, so without this the connection is
-            # held across route_query — the same pattern as the agent loop
-            # (agent/loop.py:689), one stage earlier. Measured as the residual
-            # `idle in transaction` after that fix: readiness audit §4.1.
+            # held across the router's LLM call. route_query commits again after its own
+            # writes and reads, before each later LLM call. Measured as the residual
+            # `idle in transaction` after the agent-loop fix: readiness audit §4.1.
             await session.commit()
             state.router_output, state.scope_result = await route_query(
                 router_input,
@@ -916,8 +916,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 # Step 25: mark this request as agentic for DB queries/dashboards.
                 # Left pending deliberately: flushing here would reopen the transaction the
                 # commit above just closed, right before an LLM call. The dirty attribute
-                # holds no connection, and the loop's first create_subrequest flushes it
-                # along with its own INSERT (agent/loop.py:689).
+                # holds no connection, and the commit after the loop writes it.
                 llm_request.request_type = "chat_agent"
 
                 await _log_stage(
