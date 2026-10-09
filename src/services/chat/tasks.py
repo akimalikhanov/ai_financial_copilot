@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import json as _json
 import logging
+import os
+from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, NamedTuple, get_args
 from uuid import UUID
 
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -21,8 +23,18 @@ from src.api.logging import configure_worker_logging, worker_request_context
 from src.celery_app import celery_app
 from src.models.message import Message, MessageStatus
 from src.observability import langfuse as lf_client
+from src.observability.langfuse import describe_error
+from src.observability.langfuse import mark as lf_mark
+from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.metrics import (
     AGENT_ITERATIONS,
+    AGENT_STOP_REASONS,
+    AGENT_TOOL_ARG_ERRORS,
+    CHAT_QUEUE_WAIT,
+    CHAT_STAGE_DURATION,
+    CHAT_TTFT,
+    FOLLOWUP_DIRECT_ANSWER,
+    FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
     LLM_CACHE_HIT_TOKENS,
     LLM_COST,
@@ -31,62 +43,123 @@ from src.observability.metrics import (
     RAG_CITATIONS,
     RAG_CONTEXT_TOKENS,
     ROUTER_DECISIONS,
+    observe_llm_latency,
 )
-from src.redis_client import add_event
-from src.repository import (
-    ConversationRepository,
-    DocumentRepository,
-    LLMRequestRepository,
-    MessageRepository,
-)
+from src.observability.trace_payload import cap_list, trace_params
+from src.observability.trace_payload import dedup_scope as trace_dedup_scope
+from src.redis_client import add_event, events_stream_key, expire_event_stream, get_activity_log
+from src.repository import ConversationRepository, LLMRequestRepository, MessageRepository
 from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
-from src.schemas.query_router import ChatScope, RouterInput
-from src.schemas.query_transform import (  # noqa: F401 (TransformerInput kept for kill-switch path)
-    ScopeDocSummary,
-    TransformedQuery,
-    TransformerInput,
-)
-from src.schemas.retrieval import ProcessedQuery, RetrievalTrace
+from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput, RouterOutput
 from src.services.chat.agent import run_agent
-from src.services.chat.agent.state import get_agent_settings
+from src.services.chat.agent import tools as agent_tools
+from src.services.chat.agent.loop import tool_model_chain
+from src.services.chat.agent.state import ConvergenceReason, get_agent_settings, shape_config
 from src.services.chat.citation_parser import BracketCitationParser
-from src.services.chat.confidence import compute_confidence, has_ungrounded_claims
+from src.services.chat.confidence import compute_confidence, uncited_fact_share
 from src.services.chat.events import (
     ThinkingStripper,
+    build_activity_event,
     build_all_references,
     build_references_list,
+    build_scope_clarification_event,
     build_usage_event,
+    clarification_text,
     error_event,
     out_of_scope_response,
     span_to_dict,
+    too_broad_response,
 )
+from src.services.chat.naming import generate_conversation_title
 from src.services.context import ConversationHistory, assemble_prompt
-from src.services.llm_router import LLMRouter, get_router
+from src.services.context.turns import prior_turns
+from src.services.llm_router import (
+    FallbackStream,
+    LLMRouter,
+    get_router,
+    trace_input,
+    trace_usage,
+)
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
-from src.services.retrieval.chat_rag import run_chat_rag_pipeline
-
-# from src.services.retrieval.query_processor import process_query
-from src.services.retrieval.query_transformer import rewrite_query
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
+from src.services.router.scope_resolver import scope_outcome
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
+    get_chat_max_request_age_seconds,
     get_conversation_naming_config,
     get_db_url,
+    get_followup_max_inherit_hops,
     get_injection_scan_user_input_enabled,
-    get_query_transformer_config,
+    get_query_router_prompt_version,
     get_redis_app_url,
+    get_scope_max_companies,
 )
 
 logger = logging.getLogger(__name__)
 
+FINDINGS_BLOCK_MAX_CHARS = 20_000
+
+SYNTHESIS_PROMPT_VERSION = "v5_agent_synthesis"
+
+# Ceiling on acks_late redeliveries of one chat task, mirroring INGEST_MAX_ATTEMPTS. Past it
+# the request is failed rather than retried, so a task that reliably kills its worker cannot
+# loop forever re-billing the provider.
+CHAT_MAX_ATTEMPTS = int(os.getenv("CHAT_MAX_ATTEMPTS", "2"))
+
+# Ceiling on how stale a redelivered chat task may be and still be worth running. Bounds the
+# hour that the broker's visibility timeout otherwise allows; see the guard in `process_chat`.
+CHAT_MAX_REQUEST_AGE_SECONDS = get_chat_max_request_age_seconds()
+
+
+def _observe_ttft(enqueued_at: datetime, query_shape: str) -> float:
+    """Record the user-perceived time to first token and return it in seconds."""
+    ttft = (datetime.now(UTC) - enqueued_at).total_seconds()
+    CHAT_TTFT.labels(query_shape).observe(ttft)
+    return ttft
+
+
+_QUERY_SHAPES = ("extraction", "comparison", "analytical")
+
+
+def _init_metric_series() -> None:
+    """Create the labelled series at zero in this worker process.
+
+    rate() never counts a series' first sample as an increase, so a series born at 1
+    reads as zero rate and low-traffic quantiles come out NaN. Must run after fork:
+    multiprocess values are per-PID.
+    """
+    for shape in (*_QUERY_SHAPES, "direct"):
+        CHAT_TTFT.labels(shape)
+    for reason in get_args(ConvergenceReason):
+        for shape in (*_QUERY_SHAPES, "none"):
+            AGENT_STOP_REASONS.labels(reason, shape)
+    for tool in ("search_documents", agent_tools.REPORT_TOOL_NAME):
+        AGENT_TOOL_ARG_ERRORS.labels(tool)
+
+
+# Agent stops caused by a fault or a limit rather than the model finishing — marked WARNING
+# on the agent_loop span so they can be filtered in Langfuse.
+_AGENT_FAILED_STOPS: frozenset[ConvergenceReason] = frozenset(
+    {"timeout", "deadline", "llm_error", "search_unavailable", "truncated"}
+)
+
 _STAGE_OBS_TYPES: dict[str, str] = {
     "route_query": "chain",
     "agent_loop": "chain",
-    "transform_query": "chain",
-    "build_rag_context": "retriever",
+}
+
+_STAGE_LABELS: dict[str, str] = {
+    "load_and_validate_request": "Loading request",
+    "build_conversation_context": "Building context",
+    "scan_user_input": "Scanning input",
+    "route_query": "Routing query",
+    "agent_loop": "Searching documents",
+    "render_prompt": "Rendering prompt",
+    "stream_llm_response": "Generating answer",
+    "persist_and_emit": "Finalizing",
 }
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
@@ -95,6 +168,67 @@ _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _router: LLMRouter | None = None
 _reranker: Reranker | None = None
+
+
+class _CarriedFindings(NamedTuple):
+    block: str | None
+    hops: int
+    doc_ids: list[str] | None
+    outcome: str  # carried | none | dropped_hop_cap | dropped_scope
+
+
+def _latest_findings_block(
+    messages: list[schemas.ChatMessage] | None,
+    current_doc_ids: list[str] | None = None,
+    *,
+    check_scope: bool = False,
+) -> _CarriedFindings:
+    """Carried findings block, the hop count it would have if inherited now, and why.
+
+    The block is dropped past `FOLLOWUP_MAX_INHERIT_HOPS`, or when the resolved document
+    scope has moved since it was produced — findings describing documents the user is no
+    longer asking about are worse than a re-retrieval. A drop leaves the router with no
+    carried data, so the follow-up re-retrieves.
+
+    `check_scope` is off for the router call, which runs before scope is resolved.
+    """
+    for m in reversed(messages or []):
+        if m.role == schemas.Role.assistant and m.findings_block:
+            next_hops = m.findings_block_hops + 1
+            if next_hops > get_followup_max_inherit_hops():
+                return _CarriedFindings(None, 0, None, "dropped_hop_cap")
+            if check_scope and _scope_moved(m.findings_block_doc_ids, current_doc_ids):
+                return _CarriedFindings(None, 0, None, "dropped_scope")
+            return _CarriedFindings(
+                m.findings_block, next_hops, m.findings_block_doc_ids, "carried"
+            )
+    return _CarriedFindings(None, 0, None, "none")
+
+
+def _turn_summary(
+    router_output: RouterOutput | None, scope: DocumentScopeResult | None
+) -> schemas.TurnSummary | None:
+    """This turn's line in later turns' session index: what the router resolved."""
+    if router_output is None:
+        return None
+    if scope is not None and scope.per_entity_doc_ids:
+        entities = sorted(scope.per_entity_doc_ids)
+    else:
+        entities = [e.name for e in router_output.entities]
+    return schemas.TurnSummary(
+        route=router_output.route,
+        query_shape=router_output.query_shape,
+        entities=entities,
+        doc_count=len(scope.doc_ids) if scope is not None and scope.doc_ids is not None else None,
+    )
+
+
+def _scope_moved(before: list[str] | None, now: list[str] | None) -> bool:
+    """Whether the resolved document scope changed. None means "all documents", so it
+    compares equal only to itself — a narrowing from all-docs is a real change."""
+    if before is None or now is None:
+        return not (before is None and now is None)
+    return set(before) != set(now)
 
 
 def _parse_scope(raw: object) -> ChatScope | None:
@@ -130,8 +264,6 @@ def _scope_summary(
     Combines what the user selected (mode + filters) with how it resolved
     (source, doc count, per-entity companies) into a flat, glanceable dict.
     """
-    from src.schemas.query_router import DocumentScopeResult
-
     requested_mode = chat_scope.mode if chat_scope else "allDocs"
     summary: dict[str, object] = {
         "requested_mode": requested_mode,
@@ -235,6 +367,7 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     global _worker_loop, _redis_app, _engine, _session_factory, _router, _reranker
     configure_worker_logging()
     _initialize_worker_resources()
+    _init_metric_series()
 
 
 @worker_process_shutdown.connect
@@ -272,33 +405,29 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
-    retrieval_trace: RetrievalTrace | None = None
     agent_findings_json: str | None = None  # set by agent branch; used in persist
-    _agent_answer_entity: str | None = None
-    _agent_fx_rates: dict = {}
-    _agent_currency_converted: bool = False
-    stage_total = 8
-    stage_index = 0
     current_stage = "initializing"
+    current_stage_event_id: str | None = None
 
     async def _log_stage(stage_name: str, **extra_fields: Any) -> None:
-        nonlocal stage_index, current_stage, stage_start, _stage_stack
+        nonlocal current_stage, current_stage_event_id, stage_start, _stage_stack
         if current_stage != "initializing":
-            stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+            elapsed = perf_counter() - stage_start
+            stage_times[current_stage] = round(elapsed, 3)
+            CHAT_STAGE_DURATION.labels(current_stage).observe(elapsed)
             _stage_stack.close()
-        stage_index += 1
-        current_stage = f"{stage_index:02d}_{stage_name}"
+            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            await add_event(redis_app, request_id, "activity", end_data)
+        current_stage = stage_name
         stage_start = perf_counter()
         logger.info(
-            f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
+            f"pipeline.stage {stage_name}",
             extra={"request_id": request_id, "stage": stage_name, **extra_fields},
         )
-        await add_event(
-            redis_app,
-            request_id,
-            "stage",
-            {"stage": stage_name, "index": stage_index, "total": stage_total},
+        current_stage_event_id, start_data = build_activity_event(
+            "stage_started", label=_STAGE_LABELS.get(stage_name, stage_name.replace("_", " "))
         )
+        await add_event(redis_app, request_id, "activity", start_data)
         _stage_stack = contextlib.ExitStack()
         if lf:
             _stage_stack.enter_context(
@@ -323,6 +452,30 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 input={"request_id": request_id},
             )
         )
+        # Every generation in this trace logs a repeated message once (the agent resends
+        # its whole transcript each turn).
+        _lf_stack.enter_context(trace_dedup_scope())
+
+    def _trace_io(**io: Any) -> None:
+        """Trace-level input/output — what the Langfuse trace list shows per row."""
+        if _root_span is not None:
+            with contextlib.suppress(Exception):
+                _root_span.set_trace_io(**io)  # type: ignore[attr-defined]
+
+    def _score(name: str, value: float | str, data_type: str) -> None:
+        if not lf:
+            return
+        trace_id = UUID(request_id).hex
+        with contextlib.suppress(Exception):
+            if isinstance(value, str):
+                lf.create_score(name=name, value=value, data_type="CATEGORICAL", trace_id=trace_id)
+            else:
+                lf.create_score(
+                    name=name,
+                    value=value,
+                    data_type=data_type,  # type: ignore[arg-type]
+                    trace_id=trace_id,
+                )
 
     try:
         async with sf() as session:
@@ -345,6 +498,81 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
                 return
 
+            # acks_late + reject_on_worker_lost means a SIGKILLed task is redelivered. Without
+            # this guard the redelivery re-runs the whole agent loop and synthesis, re-billing
+            # the provider and appending a second answer to the same SSE stream. Must stay the
+            # first thing after the load, ahead of any write or metric.
+            if llm_request.status == "completed":
+                logger.info("pipeline.already_completed", extra={"request_id": request_id})
+                return
+
+            # The companion to the guard above, for the case it cannot see. acks_late
+            # redelivery is gated on the broker's visibility timeout, which is sized for
+            # ingestion's 2700s parses and so runs an hour on the chat queue too (both queues
+            # share one transport, and kombu restores from a single global unacked index). By
+            # the time a redelivery of that age lands, the subscriber has already reported the
+            # worker gone, so re-running the agent loop bills the provider for an answer
+            # nobody is waiting for. Attempt count alone cannot catch this: a task killed on
+            # its FIRST delivery arrives here at attempt 1, looking new.
+            age_s = (datetime.now(UTC) - llm_request.created_at).total_seconds()
+            if age_s > CHAT_MAX_REQUEST_AGE_SECONDS:
+                await llm_request_repo.update_status(UUID(request_id), "failed")
+                # Same reason as the max-attempts path below: commit before returning, or the
+                # next redelivery reads the old state and takes this branch again.
+                await session.commit()
+                logger.warning(
+                    "pipeline.request_too_stale",
+                    extra={
+                        "request_id": request_id,
+                        "age_seconds": round(age_s, 1),
+                        "max_age_seconds": CHAT_MAX_REQUEST_AGE_SECONDS,
+                    },
+                )
+                await add_event(
+                    redis_app,
+                    request_id,
+                    "error",
+                    error_event(RuntimeError("Request expired before it could be processed")),
+                )
+                return
+
+            attempt = await llm_request_repo.increment_attempt_count(UUID(request_id))
+            if attempt > CHAT_MAX_ATTEMPTS:
+                await llm_request_repo.update_status(UUID(request_id), "failed")
+                # Committed before returning: an uncommitted status leaves the next
+                # redelivery seeing the same state and looping forever.
+                await session.commit()
+                logger.warning(
+                    "pipeline.max_attempts_exceeded",
+                    extra={
+                        "request_id": request_id,
+                        "attempt": attempt,
+                        "max_attempts": CHAT_MAX_ATTEMPTS,
+                    },
+                )
+                await add_event(
+                    redis_app,
+                    request_id,
+                    "error",
+                    error_event(
+                        RuntimeError(f"Exceeded max processing attempts ({CHAT_MAX_ATTEMPTS})")
+                    ),
+                )
+                return
+
+            if attempt > 1:
+                # A redelivery must not append to the previous attempt's partial output —
+                # a client reconnecting with Last-Event-ID would read two answers spliced
+                # together. Start the stream clean.
+                logger.info(
+                    "pipeline.retry_attempt",
+                    extra={"request_id": request_id, "attempt": attempt},
+                )
+                with contextlib.suppress(Exception):
+                    await redis_app.delete(events_stream_key(request_id))
+
+            CHAT_QUEUE_WAIT.observe((datetime.now(UTC) - llm_request.created_at).total_seconds())
+
             state.llm_request = llm_request
             state.conversation_id = llm_request.conversation_id
             state.assistant_message_id = llm_request.assistant_message_id
@@ -361,6 +589,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             assistant_msg = await message_repo.get_by_id(state.assistant_message_id)
             state.assistant_seq = assistant_msg.seq if assistant_msg else 0
+            # Set by the API from the request's `allow_clarification`.
+            allow_clarification = bool(
+                (assistant_msg.message_metadata if assistant_msg else {}).get(
+                    "allow_clarification", True
+                )
+            )
             await llm_request_repo.update_status(UUID(request_id), "streaming")
 
             if lf:
@@ -368,7 +602,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     propagate_attributes(
                         user_id=str(llm_request.user_id) if llm_request.user_id else None,
                         session_id=str(state.conversation_id),
-                        metadata={"request_id": request_id, "model": llm_request.model},
+                        metadata={
+                            "request_id": request_id,
+                            "model": llm_request.model,
+                            "tool_model": get_agent_settings().tool_model,
+                            "router_prompt": get_query_router_prompt_version(),
+                            "synthesis_prompt": SYNTHESIS_PROMPT_VERSION,
+                        },
                     )
                 )
 
@@ -387,10 +627,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 None,
             )
             state.user_query_raw = last_user.content if last_user else ""
-            if lf:
-                lf.update_current_span(
-                    input={"request_id": request_id, "query": state.user_query_raw}
-                )
+            _trace_io(input={"query": state.user_query_raw})
 
             injection_signal: InjectionSignal | None = None
             # 2.5 scan_user_input (skipped when INJECTION_SCAN_USER_INPUT=false)
@@ -410,24 +647,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     },
                 )
 
-                if lf:
-                    lf_trace_id = UUID(request_id).hex
-                    lf.create_score(
-                        name="injection_score",
-                        value=float(injection_signal.score),
-                        trace_id=lf_trace_id,
-                    )
-                    lf.create_score(
-                        name="injection_severity",
-                        value=injection_signal.severity,
-                        trace_id=lf_trace_id,
-                    )
+                _score("injection_score", float(injection_signal.score), "NUMERIC")
+                _score("injection_severity", injection_signal.severity, "CATEGORICAL")
 
                 if injection_signal.severity == "block":
                     GUARDRAIL_BLOCKS.labels("injection").inc()
                     refusal_text = (
                         "I'm sorry, but I can't process that request. "
                         "Please ask a financial question about your documents."
+                    )
+                    _trace_io(output={"answer": refusal_text, "route": "blocked"})
+                    lf_mark(
+                        _root_span,
+                        "WARNING",
+                        f"blocked by injection guardrail: {injection_signal.matched_rules}",
                     )
                     await add_event(redis_app, request_id, "delta", {"text": refusal_text})
                     await message_repo.update_on_final(
@@ -453,8 +686,6 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         new_seq=state.assistant_seq,
                     )
                     usage_data = build_usage_event(
-                        refusal_text,
-                        None,
                         state.assistant_message_id,
                         state.assistant_seq,
                         None,
@@ -472,6 +703,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     logger.info("pipeline.injection_blocked", extra={"request_id": request_id})
                     return
 
+            # Prior questions were written to the tail raw at the API layer; the scan above
+            # covered only the current one, so `prior_turns` scans each of them.
+            state.prior_turns = prior_turns(
+                state.context_messages,
+                scan=get_injection_scan_user_input_enabled(),
+                request_id=request_id,
+            )
+
             # 3. route_query
             await _log_stage("route_query")
             router = _get_router()
@@ -484,14 +723,22 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             raw_scope = (user_db_msg.message_metadata or {}).get("scope") if user_db_msg else None
             chat_scope = _parse_scope(raw_scope)
 
+            # Scope isn't resolved yet, so the staleness check runs later, on the
+            # synthesis path — the router only needs to know the data exists.
+            prior_findings = _latest_findings_block(state.context_messages)
+            prior_findings_present = prior_findings.block is not None
             router_input = RouterInput(
                 query=state.user_query_raw,
                 scope=chat_scope,
-                conversation_history=[
-                    {"role": m.role.value, "content": m.content}
-                    for m in (state.context_messages or [])
-                ],
+                prior_turns=state.prior_turns,
+                prior_findings_block=prior_findings.block,
             )
+            # Release before the router's LLM call. update_status above only flushes, and the
+            # message reads reopen a transaction anyway, so without this the connection is
+            # held across the router's LLM call. route_query commits again after its own
+            # writes and reads, before each later LLM call. Measured as the residual
+            # `idle in transaction` after the agent-loop fix: readiness audit §4.1.
+            await session.commit()
             state.router_output, state.scope_result = await route_query(
                 router_input,
                 user_id=llm_request.user_id,
@@ -501,15 +748,25 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 conversation_id=state.conversation_id,
             )
             ROUTER_DECISIONS.labels(state.router_output.route).inc()
-            # Shim for downstream stages that still read processed_query.route
-            state.processed_query = ProcessedQuery(
-                normalized_text=state.user_query_raw.strip(),
-                route="retrieve"
-                if state.router_output.route == "retrieval"
-                else state.router_output.route,
-                user_intent=state.router_output.user_intent,
-                reason=state.router_output.reasoning,
-            )
+            # Flushed by the commits below; expire_on_commit=False keeps the object usable.
+            llm_request.query_shape = state.router_output.query_shape
+            # The clarification card, when the client can show one: the question covers too
+            # many companies, or names one that is ambiguous, unknown or outside the UI scope.
+            card: dict | None = None
+            if state.scope_result is not None:
+                llm_request.scope_outcome = scope_outcome(state.router_output, state.scope_result)
+                if allow_clarification and (
+                    state.scope_result.too_broad_count is not None
+                    or state.scope_result.clarifications
+                ):
+                    card = build_scope_clarification_event(
+                        state.assistant_message_id,
+                        state.scope_result,
+                        named_companies=bool(state.router_output.entities),
+                        max_companies=get_scope_max_companies(),
+                    )
+                    if state.scope_result.too_broad_count is None:
+                        llm_request.scope_outcome = "clarification"
             _scope_doc_ids = (
                 [str(d) for d in state.scope_result.doc_ids]
                 if state.scope_result and state.scope_result.doc_ids is not None
@@ -543,7 +800,12 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             if lf:
                 scope_summary = _scope_summary(chat_scope, state.scope_result)
                 lf.update_current_span(
-                    input={"query": state.user_query_raw},
+                    # The carried digest is the input a misroute has to be read against —
+                    # without it a bad follow-up decision is undiagnosable from the trace.
+                    input={
+                        "query": state.user_query_raw,
+                        "prior_findings_block": prior_findings.block,
+                    },
                     output={
                         "route": state.router_output.route,
                         "query_shape": getattr(state.router_output, "query_shape", None),
@@ -553,31 +815,63 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     },
                     metadata={
                         "scope": scope_summary,
+                        "prior_findings_present": prior_findings_present,
+                        "prior_findings_hops": prior_findings.hops,
                         "scope_source": state.scope_result.source if state.scope_result else None,
-                        "scope_doc_ids": _scope_doc_ids,
+                        "unresolved_entities": state.scope_result.unresolved_entities
+                        if state.scope_result
+                        else [],
+                        "scope_doc_ids": cap_list(_scope_doc_ids or []),
                         "scope_doc_count": len(_scope_doc_ids) if _scope_doc_ids is not None else 0,
-                        "scope_per_entity_doc_ids": _scope_per_entity,
-                        "scope_entity_manifest": _scope_entity_manifest,
+                        "scope_per_entity_doc_ids": {
+                            entity: {"count": len(ids), "doc_ids": cap_list(ids)}
+                            for entity, ids in (_scope_per_entity or {}).items()
+                        },
+                        "scope_entity_manifest": cap_list(_scope_entity_manifest or []),
                     },
                 )
                 # Surface scope at the trace root so it's visible without drilling into
-                # the route stage. The root span owns trace-level IO in langfuse v3.
+                # the route stage.
                 if _root_span is not None:
                     with contextlib.suppress(Exception):
-                        _root_span.set_trace_io(  # type: ignore[attr-defined]
-                            output={"scope": scope_summary["headline"]}
-                        )
                         _root_span.update(metadata={"scope": scope_summary})  # type: ignore[attr-defined]
 
-            # Early-exit: out_of_scope — skip RAG + LLM, emit redirect and persist
-            if state.processed_query.route == "out_of_scope":
-                redirect_text = out_of_scope_response()
+            # Early-exit: out_of_scope, the clarification card, or (with clarification off) a
+            # question covering more companies than one run can analyse — skip RAG + LLM,
+            # emit a fixed reply and persist
+            too_broad = state.scope_result.too_broad_count if state.scope_result else None
+            if (
+                state.router_output.route == "out_of_scope"
+                or card is not None
+                or too_broad is not None
+            ):
+                if card is not None:
+                    exit_reason = "clarification"
+                    redirect_text = clarification_text(card)
+                elif too_broad is not None:
+                    exit_reason = "too_broad"
+                    redirect_text = too_broad_response(too_broad, get_scope_max_companies())
+                else:
+                    exit_reason = "out_of_scope"
+                    redirect_text = out_of_scope_response()
+                _trace_io(output={"answer": redirect_text, "route": exit_reason})
+                if card is not None:
+                    await add_event(redis_app, request_id, "scope_clarification", card)
                 await add_event(redis_app, request_id, "delta", {"text": redirect_text})
                 await message_repo.update_on_final(
                     message_id=state.assistant_message_id,
                     content=redirect_text,
                     raw_content=redirect_text,
                     request_id=UUID(request_id),
+                    # The card re-renders from here after a reload, and a reply re-runs
+                    # this user message.
+                    metadata_updates={
+                        "kind": "clarification",
+                        "clarification": card,
+                        "user_message_id": str(llm_request.user_message_id),
+                    }
+                    if card is not None
+                    else None,
                 )
                 await llm_request_repo.update_status(UUID(request_id), "completed")
                 await conversation_repo.update_on_message(
@@ -586,44 +880,44 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     new_seq=state.assistant_seq,
                 )
                 usage_data = build_usage_event(
-                    redirect_text,
-                    None,
                     state.assistant_message_id,
                     state.assistant_seq,
                     None,
                 )
                 await add_event(redis_app, request_id, "usage", usage_data)
                 await session.commit()
-                try:
-                    await state.history.append_assistant(
-                        state.conversation_id,
-                        redirect_text,
-                        state.assistant_seq,
-                    )
-                except Exception:
-                    logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
-                logger.info("pipeline.out_of_scope", extra={"request_id": request_id})
+                # A card stays out of the history: its re-run answers the same question, and
+                # later turns should see question and answer as one pair.
+                if card is None:
+                    try:
+                        await state.history.append_assistant(
+                            state.conversation_id,
+                            redirect_text,
+                            state.assistant_seq,
+                        )
+                    except Exception:
+                        logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
+                logger.info("pipeline.%s", exit_reason, extra={"request_id": request_id})
                 return
 
+            # Release the pgbouncer slot before the agent loop / carryover branch, which can
+            # run for minutes — holding a transaction that long converts transaction pooling
+            # into session pooling. `expire_on_commit=False` keeps llm_request/assistant_msg
+            # usable after this.
+            await session.commit()
+
             agent_settings = get_agent_settings()
-            _use_agent = (
-                agent_settings.enabled
-                and state.processed_query.route == "retrieve"
-                and llm_request.user_id is not None
-            )
-
-            # 3.5 / 4 — agent branch or classic single-pass
-            if _use_agent:
+            # `user_id` is nullable on LLMRequest, and the agent loop cannot search
+            # without one — route that case to the no-context path explicitly.
+            if state.router_output.route == "retrieval" and llm_request.user_id is not None:
                 _tool_model_id: str = agent_settings.tool_model
-                _tool_llm = router.get(_tool_model_id)
-                if not _tool_llm.capabilities.get("tool_calling", False):
-                    raise RuntimeError(
-                        f"AGENT_TOOL_MODEL={_tool_model_id!r} does not have tool_calling: true in models.yaml"
-                    )
+                _tool_llm, *_tool_fallbacks = tool_model_chain(router, _tool_model_id)
 
-                # Step 25: mark this request as agentic for DB queries/dashboards
+                # Step 25: mark this request as agentic for DB queries/dashboards.
+                # Left pending deliberately: flushing here would reopen the transaction the
+                # commit above just closed, right before an LLM call. The dirty attribute
+                # holds no connection, and the commit after the loop writes it.
                 llm_request.request_type = "chat_agent"
-                await session.flush()
 
                 await _log_stage(
                     "agent_loop", model=_tool_llm.model_id, provider=_tool_llm.provider
@@ -631,16 +925,22 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
                 _agent_lf_stack = contextlib.ExitStack()
                 if lf:
+                    _query_shape = getattr(state.router_output, "query_shape", None)
                     _agent_lf_stack.enter_context(
-                        lf.start_as_current_observation(
-                            as_type="chain",
-                            name="agent_loop",
-                            input={
-                                "query": state.user_query_raw,
-                                "query_shape": getattr(state.router_output, "query_shape", None),
-                                "tool_model": _tool_model_id,
-                            },
+                        propagate_attributes(
+                            metadata={
+                                "agent_prompt": shape_config(_query_shape, agent_settings).prompt
+                            }
                         )
+                    )
+                    # The `agent_loop` stage span opened by _log_stage is the agent's span;
+                    # a second one nested inside it would only repeat it.
+                    lf.update_current_span(
+                        input={
+                            "query": state.user_query_raw,
+                            "query_shape": _query_shape,
+                            "tool_model": _tool_model_id,
+                        }
                     )
                 try:
                     agent_result = await run_agent(
@@ -651,6 +951,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         request_id,
                         _get_reranker(),
                         _get_session_factory(),
+                        fallbacks=_tool_fallbacks,
                     )
                     agent_meta = agent_result.meta
                     if lf:
@@ -661,29 +962,70 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                 "convergence_reason": agent_meta.convergence_reason,
                                 "sealed": agent_meta.sealed,
                                 "chunks_collected": len(agent_result.rag_context.items),
+                                # Is reporting incremental, or is the model one-shotting?
+                                "plan_seeded": agent_meta.plan_seeded,
+                                "plan_covered": agent_meta.plan_covered,
+                                "report_calls_total": agent_meta.report_calls_total,
+                                "turns_to_first_report": agent_meta.turns_to_first_report,
+                                "unknown_aspect_keys": agent_meta.unknown_aspect_keys,
+                                "unsearched_negatives": agent_meta.unsearched_negatives,
+                                "uncited_claim_rate": agent_meta.uncited_claim_rate,
+                                "search_arg_errors": agent_meta.search_arg_errors,
+                                "report_parse_failures": agent_meta.report_parse_failures,
                             },
                             metadata={
+                                "prompt_version": agent_meta.prompt_version,
                                 "input_tokens_total": agent_meta.input_tokens_total,
                                 "output_tokens_total": agent_meta.output_tokens_total,
                                 "cost_usd_total": agent_meta.cost_usd_total,
+                                "last_turn_input_tokens": agent_meta.last_turn_input_tokens,
                             },
                         )
+                        if agent_meta.convergence_reason in _AGENT_FAILED_STOPS:
+                            lf_mark_current(
+                                "WARNING",
+                                f"agent stopped early: {agent_meta.convergence_reason}"
+                                f" (sealed={agent_meta.sealed})",
+                            )
+                        if agent_meta.plan_seeded:
+                            _score(
+                                "agent_plan_coverage",
+                                agent_meta.plan_covered / agent_meta.plan_seeded,
+                                "NUMERIC",
+                            )
+                        _score("agent_uncited_claim_rate", agent_meta.uncited_claim_rate, "NUMERIC")
+                        _score(
+                            "agent_convergence_reason",
+                            agent_meta.convergence_reason or "none",
+                            "CATEGORICAL",
+                        )
+                        _score("agent_sealed", float(agent_meta.sealed), "BOOLEAN")
                 finally:
                     _agent_lf_stack.close()
 
                 AGENT_ITERATIONS.observe(agent_meta.iterations)
+                AGENT_STOP_REASONS.labels(
+                    agent_meta.convergence_reason,
+                    getattr(state.router_output, "query_shape", None) or "none",
+                ).inc()
                 state.agent_meta = agent_meta
-                state.used_agent_loop = True
 
                 state.rag_context = agent_result.rag_context
                 state.rag_context_str = agent_result.synthesis_context
 
                 if agent_result.findings is not None:
                     agent_findings_json = agent_result.findings.model_dump_json()
+                # Runaway guard only: real blocks are ~2-4k (rows are bounded by scope,
+                # observations by max_plan_items). Clips at a line so a pathological
+                # model output can't blow up the router prompt on every later turn.
+                block = agent_result.findings_block
+                if block is not None and len(block) > FINDINGS_BLOCK_MAX_CHARS:
+                    block = block[:FINDINGS_BLOCK_MAX_CHARS].rsplit("\n", 1)[0] + "\n… (truncated)"
+                state.findings_block = block
                 if agent_result.processed is not None:
-                    _agent_answer_entity = agent_result.processed.answer_entity
-                    _agent_fx_rates = agent_result.processed.fx_rates_used
-                    _agent_currency_converted = agent_result.processed.currency_converted
+                    state.agent_answer_entity = agent_result.processed.answer_entity
+                    state.agent_fx_rates = agent_result.processed.fx_rates_used
+                    state.agent_currency_converted = agent_result.processed.currency_converted
 
                 logger.info(
                     "agent_loop_complete",
@@ -699,79 +1041,34 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 )
 
             else:
-                # 3.5 rewrite_query — retrieval route only
-                if state.processed_query.route == "retrieve" and llm_request.user_id:
-                    await _log_stage("transform_query")
-                    doc_ids_scope = state.scope_result.doc_ids if state.scope_result else None
-
-                    scope_docs: list[ScopeDocSummary] = []
-                    if doc_ids_scope:
-                        cfg = get_query_transformer_config()
-                        doc_repo = DocumentRepository(session)
-                        rows = await doc_repo.get_scope_doc_summaries(
-                            llm_request.user_id, doc_ids_scope, limit=cfg["max_scope_docs"]
-                        )
-                        scope_docs = [
-                            ScopeDocSummary(document_id=r[0], company=r[1], year=r[2]) for r in rows
-                        ]
-
-                    try:
-                        state.transformed_query, _ = await rewrite_query(
-                            state.user_query_raw,
-                            conversation_history=[
-                                {"role": m.role.value, "content": m.content}
-                                for m in (state.context_messages or [])
-                            ],
-                            user_intent=state.router_output.user_intent,
-                            scope_docs=scope_docs,
-                            llm_router=router,
-                            session=session,
-                            parent_request_id=llm_request.id,
-                            conversation_id=state.conversation_id,
-                            user_id=llm_request.user_id,
-                        )
-                    except Exception:
-                        logger.exception("query_rewrite_failed", extra={"request_id": request_id})
-                        state.transformed_query = TransformedQuery(
-                            semantic_query=state.user_query_raw,
-                            keyword_query=state.user_query_raw,
-                            fallback=True,
-                        )
-
-                    tq = state.transformed_query
-                    logger.info(
-                        "query_rewrite_result",
-                        extra={
-                            "request_id": request_id,
-                            "semantic_query": tq.semantic_query,
-                            "keyword_query": tq.keyword_query,
-                            "fallback": tq.fallback,
-                        },
-                    )
-
-                # 4. build_rag_context
-                await _log_stage("build_rag_context")
-                if state.processed_query.route == "direct_answer" or not llm_request.user_id:
-                    state.rag_context_str = "(No document context - general question.)"
+                # Answerable from what an earlier turn already retrieved — reformat,
+                # restate, or arithmetic on a rate the user supplied. No excerpts here,
+                # so the block is the only grounding the synthesis model gets.
+                carried = _latest_findings_block(
+                    state.context_messages, _scope_doc_ids, check_scope=True
+                )
+                FOLLOWUP_FINDINGS_CARRIED.labels(carried.outcome).inc()
+                if carried.block:
+                    state.rag_context_str = carried.block
+                    state.findings_block = carried.block
+                    state.findings_block_hops = carried.hops
+                    state.findings_block_doc_ids = carried.doc_ids
+                    state.answer_derived_from_carryover = True
                 else:
-                    doc_ids = state.scope_result.doc_ids if state.scope_result is not None else None
-                    transformed = state.transformed_query or TransformedQuery(
-                        semantic_query=state.user_query_raw,
-                        keyword_query=state.user_query_raw,
-                        fallback=True,
-                    )
+                    state.rag_context_str = "(No document context - general question.)"
+                FOLLOWUP_DIRECT_ANSWER.labels("true" if carried.block else "false").inc()
+                logger.info(
+                    "followup_findings_carryover",
+                    extra={
+                        "request_id": request_id,
+                        "route": state.router_output.route,
+                        "outcome": carried.outcome,
+                        "hops": carried.hops,
+                    },
+                )
 
-                    state.rag_context, retrieval_trace, _ = await run_chat_rag_pipeline(
-                        session,
-                        transformed=transformed,
-                        user_id=llm_request.user_id,
-                        doc_ids=doc_ids,
-                        reranker=_get_reranker(),
-                    )
-                    state.rag_context_str = (
-                        state.rag_context.formatted_context
-                        or "(No document context - general question.)"
-                    )
+            # Release again before the synthesis stream.
+            await session.commit()
 
             top_score = (
                 state.rag_context.items[0].score
@@ -784,26 +1081,33 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             await _log_stage("render_prompt")
             # ~4 chars/token heuristic — a cheap, bounded proxy for synthesis context size.
             RAG_CONTEXT_TOKENS.observe(len(state.rag_context_str or "") / 4)
-            # Resolve model + citation_mode before rendering so prompt version is model-aware
             try:
-                llm = router.get(llm_request.model)
+                llm_chain = router.get_with_fallback(llm_request.model)
             except Exception as e:
                 logger.exception("llm_router_error", extra={"request_id": request_id})
+                lf_mark_current("ERROR", describe_error(e))
+                lf_mark(_root_span, "ERROR", f"render_prompt: {describe_error(e)}")
+                _trace_io(output={"error": describe_error(e)})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
                 return
+            llm = llm_chain[0]
 
-            citation_mode = llm.capabilities.get("citation_mode", "none")
-            if citation_mode == "bracket":
-                prompt_version = "v3_agent_synthesis" if state.used_agent_loop else "v3_bracket"
-            else:
-                prompt_version = "v3_none"
+            prompt_version = SYNTHESIS_PROMPT_VERSION
+            # Agent runs label by the router's shape; everything else answered without
+            # retrieval, whatever shape the router guessed.
+            ttft_shape = (
+                (getattr(state.router_output, "query_shape", None) or "none")
+                if state.agent_meta is not None
+                else "direct"
+            )
+            ttft_s: float | None = None
 
             renderer = get_prompt_renderer()
             state.params = dict(llm_request.request_params or {})
             state.adapter_messages = assemble_prompt(
-                history=state.context_messages,
+                prior=state.prior_turns,
                 system_prompt=get_system_prompt(version=prompt_version),
                 rag_context=state.rag_context_str,
                 user_query=state.user_query_raw,
@@ -813,10 +1117,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 lf.update_current_span(
                     input={
                         "prompt_version": prompt_version,
-                        "citation_mode": citation_mode,
                         "num_chunks": num_chunks,
-                        "context_messages": len(state.context_messages),
-                        "used_agent_loop": state.used_agent_loop,
+                        "prior_turns": len(state.prior_turns),
                     },
                     output={
                         "num_messages": len(state.adapter_messages),
@@ -829,138 +1131,138 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             # 6. stream_llm_response
             await _log_stage("stream_llm_response", model=llm.model_id, provider=llm.provider)
-            if lf:
-                _gen = _gen_stack.enter_context(
-                    lf.start_as_current_observation(
-                        as_type="generation",
-                        name="chat_model",
-                        model=llm_request.model,
-                        input=[
-                            {"role": m.role.value, "content": m.content}
-                            for m in state.adapter_messages
-                        ],
-                    )
-                )
             temperature = state.params.get("temperature")
             max_tokens = state.params.get("max_tokens")
             extra = {
                 k: v for k, v in state.params.items() if k not in ("temperature", "max_tokens")
             }
+            if lf:
+                _gen = _gen_stack.enter_context(
+                    lf.start_as_current_observation(
+                        as_type="generation",
+                        name="chat_model",
+                        model=llm.model_id,
+                        model_parameters=trace_params({**llm.default_params, **state.params}),
+                        input=trace_input(state.adapter_messages, "chat_model"),
+                    )
+                )
+            first_chunk_seen = False
 
-            stream = llm.stream(
-                messages=state.adapter_messages,
+            stream = FallbackStream(
+                llm_chain,
+                state.adapter_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 **extra,
             )
 
-            parser = BracketCitationParser() if citation_mode == "bracket" else None
+            parser = BracketCitationParser()
             think_stripper = ThinkingStripper()
 
             try:
+                chunk = None
                 async for chunk in stream:
+                    if not first_chunk_seen and chunk.text:
+                        first_chunk_seen = True
+                        # Langfuse derives time-to-first-token from this.
+                        if _gen is not None:
+                            with contextlib.suppress(Exception):
+                                _gen.update(completion_start_time=datetime.now(UTC))  # type: ignore[attr-defined]
                     state.accumulated_content += chunk.text  # raw for DB
-                    visible_chunk = think_stripper.feed(chunk.text)
+                    # Strip [S1] markers, track spans. Emitted for every chunk, including
+                    # the final one — a final chunk can carry text, and skipping it would
+                    # drop that text and any spans it completed from the SSE stream.
+                    result = parser.feed(think_stripper.feed(chunk.text))
+                    state.clean_content += result.visible_text
+                    if result.visible_text:
+                        if ttft_s is None:
+                            ttft_s = _observe_ttft(llm_request.created_at, ttft_shape)
+                        await add_event(
+                            redis_app, request_id, "delta", {"text": result.visible_text}
+                        )
+                    for span in result.completed_spans:
+                        await add_event(redis_app, request_id, "citation_span", span_to_dict(span))
 
-                    if parser is not None:
-                        # Bracket-citation mode: strip [S1] markers, track spans.
-                        # Emitted for every chunk, including the final one — a final
-                        # chunk can carry text, and skipping it would drop that text
-                        # and any spans it completed from the SSE stream.
-                        result = parser.feed(visible_chunk)
-                        state.clean_content += result.visible_text
-                        if result.visible_text:
-                            await add_event(
-                                redis_app, request_id, "delta", {"text": result.visible_text}
-                            )
-                        for span in result.completed_spans:
-                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
-                            await add_event(
-                                redis_app,
-                                request_id,
-                                "citation_span",
-                                span_to_dict(span, labels),
-                            )
+                if stream.served is not llm:
+                    # Fallback fired: record the model that actually answered, not the
+                    # one originally requested, so cost/token metrics and the persisted
+                    # request row aren't attributed to a model that never responded.
+                    llm = stream.served
+                    llm_request.model = llm.model_id
+                    logger.warning(
+                        "llm_fallback_served",
+                        extra={"request_id": request_id, "served_model": llm.model_id},
+                    )
+                    if _gen is not None:
+                        with contextlib.suppress(Exception):
+                            _gen.update(model=llm.model_id)  # type: ignore[attr-defined]
+                        lf_mark(_gen, "WARNING", f"fallback model {llm.model_id} answered")
 
-                        if not chunk.is_final:
-                            continue
+                if chunk is not None:
+                    final_result = parser.finalize()
+                    state.clean_content += final_result.visible_text
+                    if final_result.visible_text:
+                        if ttft_s is None:
+                            ttft_s = _observe_ttft(llm_request.created_at, ttft_shape)
+                        await add_event(
+                            redis_app, request_id, "delta", {"text": final_result.visible_text}
+                        )
+                    for span in final_result.completed_spans:
+                        await add_event(redis_app, request_id, "citation_span", span_to_dict(span))
 
-                        # ── Final chunk (bracket mode) ──
-                        final_result = parser.finalize()
-                        state.clean_content += final_result.visible_text
-                        if final_result.visible_text:
-                            await add_event(
-                                redis_app, request_id, "delta", {"text": final_result.visible_text}
-                            )
-                        for span in final_result.completed_spans:
-                            labels = parser.label_map.get_labels_for_refs(span.ref_ids)
-                            await add_event(
-                                redis_app,
-                                request_id,
-                                "citation_span",
-                                span_to_dict(span, labels),
-                            )
-
-                        # Emit references: cited sources only, or all sources as fallback
-                        if state.rag_context:
-                            if parser.label_map.mapping:
-                                ref_items = build_references_list(
-                                    state.rag_context, parser.label_map
-                                )
-                            else:
-                                # Model produced no bracket citations (e.g. bare number answer) —
-                                # fall back to emitting all retrieved sources so the evidence panel
-                                # still populates.
-                                ref_items = build_all_references(state.rag_context)
-                            await add_event(
-                                redis_app, request_id, "references", {"items": ref_items}
-                            )
-
-                    else:
-                        # No-citation mode: raw text = clean text, no span parsing.
-                        # Delta emitted for the final chunk too — it can carry text.
-                        state.clean_content += visible_chunk
-                        if visible_chunk:
-                            await add_event(redis_app, request_id, "delta", {"text": visible_chunk})
-
-                        if not chunk.is_final:
-                            continue
-
-                        # ── Final chunk (no-citation mode) ──
-                        # Emit ALL retrieved sources as evidence panel references
-                        if state.rag_context and state.rag_context.items:
-                            ref_items = build_all_references(state.rag_context)
-                            await add_event(
-                                redis_app, request_id, "references", {"items": ref_items}
-                            )
+                    # Cited sources, in order of first appearance; all retrieved sources
+                    # as a fallback when the model emitted no citations at all (e.g. a
+                    # bare-number answer) so the evidence panel still populates. Built
+                    # once here and shared by the SSE event, persistence, and usage.
+                    ref_items: list[dict] = []
+                    if state.rag_context:
+                        cited_ref_ids: list[str] = []
+                        for span in parser.all_spans:
+                            for ref_id in span.ref_ids:
+                                if ref_id not in cited_ref_ids:
+                                    cited_ref_ids.append(ref_id)
+                        ref_items = (
+                            build_references_list(state.rag_context, cited_ref_ids)
+                            if cited_ref_ids
+                            else build_all_references(state.rag_context)
+                        )
+                    if ref_items:
+                        await add_event(redis_app, request_id, "references", {"items": ref_items})
 
                     # 7. persist_and_emit
                     await _log_stage("persist_and_emit")
                     # Build citation metadata for persistence
                     citation_meta: dict = {}
-                    if parser is not None:
-                        if parser.all_spans:
-                            citation_meta["citation_spans"] = [
-                                span_to_dict(s, parser.label_map.get_labels_for_refs(s.ref_ids))
-                                for s in parser.all_spans
-                            ]
-                        if state.rag_context:
-                            if parser.label_map.mapping:
-                                citation_meta["references"] = build_references_list(
-                                    state.rag_context, parser.label_map
-                                )
-                            elif state.rag_context.items:
-                                citation_meta["references"] = build_all_references(
-                                    state.rag_context
-                                )
-                    elif state.rag_context and state.rag_context.items:
-                        citation_meta["references"] = build_all_references(state.rag_context)
+                    if parser.all_spans:
+                        citation_meta["citation_spans"] = [
+                            span_to_dict(sp) for sp in parser.all_spans
+                        ]
+                    if ref_items:
+                        citation_meta["references"] = ref_items
 
                     if state.rag_context and state.rag_context.items:
                         citation_meta["retrieved_chunks"] = [
                             {"chunk_id": str(item.chunk_id), "score": item.score}
                             for item in state.rag_context.items
                         ]
+
+                    # Carried to the next turn so a follow-up can be answered without
+                    # re-retrieving. Unsealed findings are not carried — a partial result
+                    # restated a turn later reads as settled fact.
+                    if state.findings_block and (
+                        state.agent_meta is None or state.agent_meta.sealed
+                    ):
+                        citation_meta["findings_block"] = state.findings_block
+                        citation_meta["findings_block_hops"] = state.findings_block_hops
+                        # A fresh run's block belongs to this turn's scope; a carried one
+                        # keeps the scope it was originally retrieved under.
+                        citation_meta["findings_block_doc_ids"] = (
+                            state.findings_block_doc_ids
+                            if state.answer_derived_from_carryover
+                            else _scope_doc_ids
+                        )
+                    if state.answer_derived_from_carryover:
+                        citation_meta["answer_derived_from_carryover"] = True
 
                     if agent_findings_json is not None:
                         citation_meta["agent_findings"] = agent_findings_json
@@ -971,21 +1273,43 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             citation_meta["agent_findings_sealed"] = state.agent_meta.sealed
 
                     # Finalize stage times (stream_llm_response ends here)
-                    stage_times[current_stage] = round(perf_counter() - stage_start, 3)
+                    _elapsed = perf_counter() - stage_start
+                    stage_times[current_stage] = round(_elapsed, 3)
+                    CHAT_STAGE_DURATION.labels(current_stage).observe(_elapsed)
                     total_time = round(perf_counter() - pipeline_started_at, 3)
 
-                    confidence = compute_confidence(top_score, num_chunks)
-                    ungrounded = (
-                        has_ungrounded_claims(state.clean_content)
-                        if citation_mode == "bracket"
+                    scores_are_rerank = (
+                        state.agent_meta.scores_are_rerank if state.agent_meta else True
+                    )
+                    degraded = sorted(
+                        state.agent_meta.degraded_capabilities if state.agent_meta else ()
+                    )
+                    confidence = compute_confidence(
+                        top_score, num_chunks, scores_are_rerank=scores_are_rerank
+                    )
+                    # Citations are asked for only when excerpts were shown; a carried-over
+                    # findings block is answered without them.
+                    uncited_share = (
+                        uncited_fact_share(state.clean_content, parser.all_spans)
+                        if num_chunks
                         else None
                     )
+                    ungrounded = bool(uncited_share)
 
                     # Build pipeline trace
                     trace_payload: dict = {
                         "v": 1,
                         "stage_times": stage_times,
+                        "activity": await get_activity_log(redis_app, request_id),
                         "total_time": total_time,
+                        "ttft_s": round(ttft_s, 3) if ttft_s is not None else None,
+                        "config": {
+                            "answer_model": llm.model_id,
+                            "prompts": {
+                                "router": get_query_router_prompt_version(),
+                                "synthesis": prompt_version,
+                            },
+                        },
                         "router": {
                             "decision": state.router_output.route,
                             "reasoning": state.router_output.reasoning[:500]
@@ -996,32 +1320,44 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "scope_source": state.scope_result.source
                             if state.scope_result
                             else None,
+                            "prior_findings_present": prior_findings_present,
+                            "prior_findings_carried": state.answer_derived_from_carryover,
+                            "prior_findings_hops": state.findings_block_hops,
                         },
                     }
-                    if state.transformed_query is not None:
-                        tq = state.transformed_query
-                        trace_payload["query_transform"] = {
-                            "semantic_query": tq.semantic_query,
-                            "keyword_query": tq.keyword_query,
-                            "fallback": tq.fallback,
-                        }
-                    if retrieval_trace is not None:
-                        trace_payload["retrieval"] = retrieval_trace.model_dump(exclude_none=True)
                     if state.agent_meta is not None:
                         m = state.agent_meta
+                        trace_payload["config"]["tool_model"] = agent_settings.tool_model
+                        trace_payload["config"]["prompts"]["agent"] = m.prompt_version
                         trace_payload["agent"] = {
                             "iterations": m.iterations,
                             "tool_calls_total": m.tool_calls_total,
                             "convergence_reason": m.convergence_reason,
-                            "currency_normalized": _agent_currency_converted,
-                            "answer_entity": _agent_answer_entity,
-                            "fx_rates_used": _agent_fx_rates,
+                            "sealed": m.sealed,
+                            "currency_normalized": state.agent_currency_converted,
+                            "answer_entity": state.agent_answer_entity,
+                            "fx_rates_used": state.agent_fx_rates,
+                            # Decomposition/coverage instrumentation, persisted so DB and
+                            # Grafana queries over Message.trace can see it.
+                            "plan_seeded": m.plan_seeded,
+                            "plan_covered": m.plan_covered,
+                            "report_calls_total": m.report_calls_total,
+                            "turns_to_first_report": m.turns_to_first_report,
+                            "unknown_aspect_keys": m.unknown_aspect_keys,
+                            "unsearched_negatives": m.unsearched_negatives,
+                            "uncited_claim_rate": m.uncited_claim_rate,
+                            "search_arg_errors": m.search_arg_errors,
+                            "report_parse_failures": m.report_parse_failures,
+                            "last_turn_input_tokens": m.last_turn_input_tokens,
                         }
                     trace_payload["guardrails"] = {
                         "confidence": confidence,
                         "top_reranker_score": top_score,
+                        "scores_are_rerank": scores_are_rerank,
                         "num_chunks": num_chunks,
+                        "degraded_retrieval": degraded,
                         "ungrounded_claims": ungrounded,
+                        "uncited_fact_share": uncited_share,
                         **(
                             {
                                 "injection": {
@@ -1036,6 +1372,20 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         ),
                     }
 
+                    # Persist the answer-quality signals onto the message itself, not just
+                    # the trace: the SSE `metadata` event only reaches the client that was
+                    # streaming, so without this every badge vanishes on reload.
+                    citation_meta["confidence"] = confidence
+                    citation_meta["ungrounded_claims"] = ungrounded
+                    citation_meta["route"] = (
+                        state.router_output.route if state.router_output else None
+                    )
+                    turn_summary = _turn_summary(state.router_output, state.scope_result)
+                    if turn_summary is not None:
+                        citation_meta["turn_summary"] = turn_summary.model_dump()
+                    if degraded:
+                        citation_meta["degraded_retrieval"] = degraded
+
                     lf_trace_id = UUID(request_id).hex if lf else None
                     await message_repo.update_on_final(
                         message_id=state.assistant_message_id,
@@ -1049,8 +1399,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         if agent_findings_json
                         else None,
                     )
-                    if parser is not None:
-                        RAG_CITATIONS.observe(len(parser.all_spans))
+                    RAG_CITATIONS.observe(len(parser.all_spans))
 
                     if chunk.stats:
                         _model = llm_request.model
@@ -1062,29 +1411,33 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             LLM_CACHE_HIT_TOKENS.labels(_model).inc(chunk.stats.cached_input_tokens)
                         if chunk.stats.cost_usd:
                             LLM_COST.labels(_model).inc(chunk.stats.cost_usd)
+                        observe_llm_latency(_model, llm_request.request_type, chunk.stats)
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),
                             trace_id=lf_trace_id,
                         )
-                        if _gen is not None:
-                            s = chunk.stats
+                    if _gen is not None:
+                        with contextlib.suppress(Exception):
                             _gen.update(  # type: ignore[union-attr]
-                                output=state.accumulated_content,
-                                usage_details={
-                                    k: v
-                                    for k, v in {
-                                        "input": s.input_tokens,
-                                        "output": s.output_tokens,
-                                        "cache_read_input_tokens": s.cached_input_tokens,
-                                        "total": s.total_tokens,
-                                    }.items()
-                                    if v is not None
-                                },
-                                cost_details={"total": s.cost_usd}
-                                if s.cost_usd is not None
-                                else None,
+                                output=state.accumulated_content, **trace_usage(chunk.stats)
                             )
+                    _trace_io(
+                        output={
+                            "answer": state.clean_content,
+                            "route": state.router_output.route,
+                            "confidence": confidence,
+                            "ungrounded_claims": ungrounded,
+                            "references": len(ref_items),
+                        }
+                    )
+                    _score("confidence", confidence, "CATEGORICAL")
+                    _score("ungrounded_claims", float(ungrounded), "BOOLEAN")
+                    if uncited_share is not None:
+                        _score("uncited_fact_share", uncited_share, "NUMERIC")
+                    _score("retrieval_degraded", float(bool(degraded)), "BOOLEAN")
+                    if degraded:
+                        lf_mark(_root_span, "WARNING", f"degraded retrieval: {degraded}")
                     # Close chat_model generation while still inside stream_llm_response's
                     # contextvar scope — prevents contextvar corruption when persist_and_emit
                     # stage span was opened by _log_stage (which reset stream's token).
@@ -1104,6 +1457,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "confidence": confidence,
                             "ungrounded_claims": ungrounded,
                             "route": state.router_output.route if state.router_output else None,
+                            "degraded_retrieval": degraded,
                         },
                     )
                     logger.info(
@@ -1112,19 +1466,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             "request_id": request_id,
                             "confidence": confidence,
                             "top_score": top_score,
+                            "scores_are_rerank": scores_are_rerank,
                             "num_chunks": num_chunks,
+                            "degraded_retrieval": degraded,
                             "ungrounded_claims": ungrounded,
                         },
                     )
 
                     usage_data = build_usage_event(
-                        state.accumulated_content,
-                        state.rag_context,
                         state.assistant_message_id,
                         state.assistant_seq,
                         chunk.stats,
-                        citation_spans=parser.all_spans if parser is not None else None,
-                        label_map=parser.label_map if parser is not None else None,
+                        citation_spans=parser.all_spans,
+                        references=ref_items,
                     )
                     await session.commit()
 
@@ -1133,18 +1487,29 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             state.conversation_id,
                             state.clean_content,
                             state.assistant_seq,
+                            findings_block=citation_meta.get("findings_block"),
+                            answer_derived_from_carryover=state.answer_derived_from_carryover,
+                            findings_block_hops=state.findings_block_hops,
+                            findings_block_doc_ids=citation_meta.get("findings_block_doc_ids"),
+                            turn_summary=turn_summary,
                         )
                     except Exception:
                         logger.warning("chat_tail_append_failed", extra={"request_id": request_id})
 
-                    # Auto-name conversation on the first exchange (seq 2 = first assistant reply)
+                    # Auto-name conversation on its first real answer: no earlier assistant
+                    # message in history, which already leaves out clarification cards. A card
+                    # can push that answer past seq 2, after a reply or a re-sent question.
                     # Must emit conversation_title BEFORE the usage event, since the frontend
                     # stops reading the stream as soon as it receives usage (the final sentinel).
                     naming_cfg = get_conversation_naming_config()
-                    if naming_cfg["enabled"] and state.assistant_seq == 2 and state.user_query_raw:
+                    if (
+                        naming_cfg["enabled"]
+                        and state.user_query_raw
+                        and not any(
+                            m.role == schemas.Role.assistant for m in state.context_messages
+                        )
+                    ):
                         try:
-                            from src.services.chat.naming import generate_conversation_title
-
                             # Use a fresh session so the naming sub-request + title update
                             # commit together, independent of the main pipeline session.
                             async with sf() as naming_session:
@@ -1187,6 +1552,10 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             except Exception as e:
                 logger.exception("llm_stream_error", extra={"request_id": request_id})
+                lf_mark(_gen, "ERROR", describe_error(e))
+                lf_mark_current("ERROR", describe_error(e))
+                lf_mark(_root_span, "ERROR", f"{current_stage}: {describe_error(e)}")
+                _trace_io(output={"error": describe_error(e)})
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await llm_request_repo.update_on_final(
                     request_id=UUID(request_id),
@@ -1212,13 +1581,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         )
 
     except Exception as exc:
-        # current_stage is "NN_stage_name" (or "initializing") — strip the ordinal
-        # prefix so the label stays stable across stage reordering.
-        PIPELINE_ERRORS.labels(current_stage.split("_", 1)[-1]).inc()
+        PIPELINE_ERRORS.labels(current_stage).inc()
         logger.exception(
             "pipeline.failed_at_stage",
             extra={"request_id": request_id, "stage": current_stage},
         )
+        # The stage span is still the current one; it closes in the finally below.
+        lf_mark_current("ERROR", describe_error(exc))
+        lf_mark(_root_span, "ERROR", f"{current_stage}: {describe_error(exc)}")
+        _trace_io(output={"error": describe_error(exc)})
         try:
             async with sf() as session:
                 llm_repo = LLMRequestRepository(session)
@@ -1229,6 +1600,13 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         await add_event(redis_app, request_id, "error", error_event(exc))
         raise
     finally:
+        if current_stage != "initializing" and current_stage_event_id is not None:
+            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            await add_event(redis_app, request_id, "activity", end_data)
+        # After the last add_event above — an XADD on an expired/expiring key recreates it
+        # without a TTL, so this must be the final write to the stream.
+        with contextlib.suppress(Exception):
+            await expire_event_stream(redis_app, request_id)
         _stage_stack.close()
         _gen_stack.close()
         _lf_stack.close()

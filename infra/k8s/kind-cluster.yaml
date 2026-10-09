@@ -1,0 +1,41 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: copilot
+nodes:
+  - role: control-plane
+    # Built by `make k8s-node-image` from infra/k8s/node-image/Dockerfile — the NVIDIA toolkit
+    # baked in and registered as containerd's default runtime
+    image: copilot/kind-node:v1.36.1-nvidia1.18.1
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            # gpu.present: normally set by NVIDIA's gpu-feature-discovery, which we don't
+            # run on kind; worker-ingestion nodeSelects on it.
+            node-labels: "ingress-ready=true,nvidia.com/gpu.present=true"
+    extraPortMappings:
+      - { containerPort: 80,  hostPort: 80,  protocol: TCP }
+      - { containerPort: 443, hostPort: 443, protocol: TCP }
+    extraMounts:
+      # GPU injection: kind has no `--gpus` flag, so this uses the toolkit's volume-mount
+      # device protocol — a mount *destination* under /var/run/nvidia-container-devices/
+      # is read as a device request, like NVIDIA_VISIBLE_DEVICES=all. hostPath is unused.
+      # Requires accept-nvidia-visible-devices-as-volume-mounts=true + nvidia as docker's
+      # default runtime (both checked by `make k8s-gpu-preflight`). Going through the
+      # toolkit is what injects the driver libs; without them the device plugin dies with
+      # "Failed to initialize NVML: ERROR_LIBRARY_NOT_FOUND".
+      - hostPath: /dev/null
+        containerPath: /var/run/nvidia-container-devices/all
+      # Backs the loadtest overlay's hostPath PV (infra/k8s/loadtest/results-pv.yaml) — without
+      # this the node's hostPath is just a directory inside the kind node's own container
+      # filesystem, invisible from the actual host. Relative hostPaths resolve against this
+      # file's directory (infra/k8s/), so this lands at infra/k8s/loadtest/results/ on the
+      # host — gitignored, created on demand by Docker's bind mount if it doesn't exist yet.
+      - hostPath: ./loadtest/results
+        containerPath: /mnt/loadtest-results
+      # Same mechanism for the ingestion fixture PDFs, inbound (loadtest/fixtures-pv.yaml).
+      # Populated on the host by `make loadtest-fixtures`; gitignored, since it holds real
+      # filings and multi-MB generated PDFs.
+      - hostPath: ./loadtest/fixtures
+        containerPath: /mnt/loadtest-fixtures

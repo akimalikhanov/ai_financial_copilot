@@ -9,15 +9,21 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Literal
+from dataclasses import replace as dc_replace
 from uuid import UUID
 
 import httpx
 
-from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import CITATION_REFS_DROPPED
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings, EntityFinding
+from src.schemas.agent_findings import AgentFindings, Figure
 from src.schemas.retrieval import RAGContext
+from src.services.chat.agent.number_grounding import (
+    UNIT_TO_MILLIONS,
+    NumberGrounding,
+    to_millions,
+    verify_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,55 +31,45 @@ _FRANKFURTER_BASE = "https://api.frankfurter.dev/v1"
 _FX_TIMEOUT = httpx.Timeout(3.0)
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_YEAR_RE = re.compile(r"^\d{4}$")
+# Matches the aspect ids minted by `loop._mint` (`A{n}`).
+_ASPECT_KEY_RE = re.compile(r"^A\d+$")
+_UNVERIFIED_FLAG = " | ⚠ UNVERIFIED: value not located in cited excerpt"
+_UNVERIFIED_CHANGE_FLAG = " | ⚠ UNVERIFIED: computed from an unverified figure"
 
 
 def _normalize_date(date: str | None) -> str | None:
+    """`date` if it is ISO, else None (the latest rate). A bare year is not turned into
+    Dec 31: that guess is wrong for every non-calendar fiscal year."""
     if not date:
         return None
     if _ISO_DATE_RE.match(date):
         return date
-    if _YEAR_RE.match(date):
-        return f"{date}-12-31"
     logger.warning("period_end_not_iso: %s — falling back to latest rate", date)
     return None  # frankfurter interprets None as "latest"
 
 
 @dataclass(frozen=True, slots=True)
-class NormalizedFinding:
-    finding: EntityFinding
-    normalized_value: (
-        float | None
-    )  # in target_currency; equals finding.value if no conversion needed
+class NormalizedFigure:
+    key: str
+    figure: Figure
+    normalized_amount: float | None  # in target_currency; the amount if not converted
     fx_rate: float | None  # rate applied; None if same currency or no conversion
+    number_grounding: NumberGrounding = NumberGrounding.UNVERIFIABLE
 
 
 @dataclass(frozen=True, slots=True)
 class ProcessedFindings:
-    findings: tuple[NormalizedFinding, ...]
+    findings: AgentFindings
+    # One row per figure of a supported finding, in finding order.
+    figures: tuple[NormalizedFigure, ...]
     answer_entity: str | None
     fx_rates_used: dict[str, float]  # key: "USD->EUR@2023-12-31"
     currency_converted: bool
     answer_note: str | None
-    # Metadata carried for the renderer
-    metric_requested: str | None = None
     target_currency: str | None = None
-    comparison_op: Literal["argmin", "argmax", "list", "none"] | None = None
-    analytical_findings: AnalyticalFindings | None = None
 
-
-_UNIT_TO_MILLIONS: dict[str | None, float] = {
-    "B": 1_000.0,
-    "M": 1.0,
-    "K": 0.001,
-    "": 0.000_001,  # absolute / units
-    None: 1.0,  # assume millions when unspecified
-}
-
-
-def _to_millions(value: float, unit: str | None) -> float:
-    """Scale value to millions for unit-safe comparison."""
-    return value * _UNIT_TO_MILLIONS.get(unit, 1.0)
+    def figures_for(self, key: str) -> list[NormalizedFigure]:
+        return [n for n in self.figures if n.key == key]
 
 
 def _normalizer_enabled() -> bool:
@@ -114,20 +110,20 @@ _DEFAULT_COMPARISON_CURRENCY = "USD"
 
 
 async def process_findings(
-    findings: AgentFindings | AnalyticalFindings,
+    findings: AgentFindings,
     requested_currency: str | None = None,
+    chunk_texts: dict[str, str] | None = None,
 ) -> ProcessedFindings:
-    if isinstance(findings, AnalyticalFindings):
-        return ProcessedFindings(
-            findings=(),
-            answer_entity=None,
-            fx_rates_used={},
-            currency_converted=False,
-            answer_note=None,
-            analytical_findings=findings,
-        )
+    """FX-normalize and rank the figures of a run's supported findings. A run without
+    figures passes through unchanged, with no FX call.
 
-    available = [f for f in findings.findings if f.available and f.value is not None]
+    `chunk_texts` (chunk-UUID string -> sanitized rendered text) enables the
+    number-grounding check: does the cited excerpt actually contain the asserted value?
+    Omitted (the default), every figure's `number_grounding` stays `UNVERIFIABLE` — this
+    is purely additive instrumentation, never a filter (see `number_grounding.py`).
+    """
+    rows = [(f.key, fig) for f in findings.findings if f.supported for fig in f.figures]
+    available = [fig for _, fig in rows]
     op = findings.comparison_op
     is_comparison = op in ("argmin", "argmax")
 
@@ -161,7 +157,8 @@ async def process_findings(
     currency_converted = False
 
     if needs_fx:
-        assert resolved_target is not None  # narrowed above
+        if resolved_target is None:  # narrowed above; keep the invariant under -O
+            raise RuntimeError("needs_fx implies a resolved target currency")
         # Unique (from_currency, date) pairs requiring conversion
         pairs: list[tuple[str, str | None]] = list(
             {
@@ -171,17 +168,9 @@ async def process_findings(
             }
         )
 
-        lf = lf_client.get_client()
-        _fx_lf_stack = contextlib.ExitStack()
-        if lf:
-            _fx_lf_stack.enter_context(
-                lf.start_as_current_observation(
-                    as_type="span",
-                    name="fx_conversion",
-                    input={"pairs": list(pairs), "target_currency": resolved_target},
-                )
-            )
-        try:
+        with lf_span(
+            "fx_conversion", input={"pairs": list(pairs), "target_currency": resolved_target}
+        ) as obs:
             async with httpx.AsyncClient(timeout=_FX_TIMEOUT) as client:
                 results = await asyncio.gather(
                     *[_fetch_rate(client, cur, resolved_target, date) for cur, date in pairs]
@@ -196,9 +185,9 @@ async def process_findings(
                 else:
                     failed.append(key)
 
-            if lf:
+            if obs:
                 if failed:
-                    lf.update_current_span(
+                    obs.update(
                         level="ERROR",
                         status_message=f"FX fetch failed for: {', '.join(failed)}",
                         output={
@@ -208,102 +197,119 @@ async def process_findings(
                         },
                     )
                 else:
-                    lf.update_current_span(
+                    obs.update(
                         output={
                             "pairs_fetched": len(results),
                             "rates_ok": fx_rates_used,
                         }
                     )
-        finally:
-            _fx_lf_stack.close()
 
         if failed:
             # For argmin/argmax we can't rank with a hole — abort the whole result.
-            # For list/none, render what converted successfully; mark failed entities N/A.
+            # For list/none, keep what converted; failed pairs stay in native currency.
             if is_comparison:
                 return ProcessedFindings(
-                    findings=tuple(
-                        NormalizedFinding(finding=f, normalized_value=None, fx_rate=None)
-                        for f in findings.findings
+                    findings=findings,
+                    figures=tuple(
+                        NormalizedFigure(key=k, figure=fig, normalized_amount=None, fx_rate=None)
+                        for k, fig in rows
                     ),
                     answer_entity=None,
                     fx_rates_used=fx_rates_used,
                     currency_converted=False,
                     answer_note=f"comparison not possible — FX conversion failed for: {', '.join(failed)}",
-                    metric_requested=findings.metric_requested,
                     target_currency=resolved_target,
-                    comparison_op=findings.comparison_op,
                 )
-            # list/none: proceed with partial conversion; failed pairs produce
-            # normalized_value=None (handled in the loop below) and render as N/A.
-            answer_note = f"FX conversion failed for: {', '.join(failed)} — shown as N/A"
+            answer_note = f"FX conversion failed for: {', '.join(failed)} — shown unconverted"
 
-        normalized: list[NormalizedFinding] = []
-        for f in findings.findings:
-            if not f.available or f.value is None:
-                normalized.append(NormalizedFinding(finding=f, normalized_value=None, fx_rate=None))
-            elif f.currency and f.currency != resolved_target:
-                rate = rate_map[(f.currency, _normalize_date(f.period_end))]
-                norm_val = f.value * rate if rate is not None else None
+        normalized: list[NormalizedFigure] = []
+        for k, fig in rows:
+            if fig.currency and fig.currency != resolved_target:
+                rate = rate_map[(fig.currency, _normalize_date(fig.period_end))]
+                amount = fig.amount * rate if rate is not None else None
                 normalized.append(
-                    NormalizedFinding(finding=f, normalized_value=norm_val, fx_rate=rate)
+                    NormalizedFigure(key=k, figure=fig, normalized_amount=amount, fx_rate=rate)
                 )
             else:
                 normalized.append(
-                    NormalizedFinding(finding=f, normalized_value=f.value, fx_rate=None)
+                    NormalizedFigure(key=k, figure=fig, normalized_amount=fig.amount, fx_rate=None)
                 )
 
         currency_converted = True
 
     else:
         normalized = [
-            NormalizedFinding(
-                finding=f,
-                normalized_value=f.value if (f.available and f.value is not None) else None,
-                fx_rate=None,
-            )
-            for f in findings.findings
+            NormalizedFigure(key=k, figure=fig, normalized_amount=fig.amount, fx_rate=None)
+            for k, fig in rows
         ]
 
-    # Apply comparison op over available normalized values.
-    # Null-currency candidates are excluded from ranking — they can't be safely compared
-    # against converted values (unknown denomination) and are flagged in answer_note.
+    # Apply the comparison op. A figure with no currency or no stated scale can't be
+    # compared safely, so it is left out of the ranking and named in answer_note. A key
+    # with several figures (metrics or periods) has no single value to rank on.
     answer_entity: str | None = None
+    keys_with_figures = {k for k, _ in rows}
     if is_comparison:
-        assert resolved_target is not None or not multi_ccy, (
-            "argmin/argmax reached comparator with multi-currency findings and no resolved_target"
-        )
-        rankable = [
-            n
-            for n in normalized
-            if n.normalized_value is not None and n.finding.currency is not None
-        ]
-        null_ccy_excluded = [
-            n for n in normalized if n.normalized_value is not None and n.finding.currency is None
-        ]
-        if null_ccy_excluded and answer_note is None:
-            excluded_names = ", ".join(n.finding.entity for n in null_ccy_excluded)
-            answer_note = f"excluded from ranking (unknown currency): {excluded_names}"
-        if rankable:
+        if resolved_target is None and multi_ccy:
+            raise RuntimeError(
+                "argmin/argmax reached comparator with multi-currency findings "
+                "and no resolved_target"
+            )
+        if len(rows) > len(keys_with_figures):
+            answer_note = answer_note or "not ranked — several figures per entity"
+        else:
+            rankable = [
+                n
+                for n in normalized
+                if n.normalized_amount is not None
+                and n.figure.currency is not None
+                and n.figure.unit is not None
+            ]
+            excluded = [n.key for n in normalized if n not in rankable]
+            if excluded and answer_note is None:
+                answer_note = (
+                    f"excluded from ranking (unknown currency or scale): {', '.join(excluded)}"
+                )
+            if rankable:
 
-            def key_fn(n: NormalizedFinding) -> float:
-                return _to_millions(n.normalized_value, n.finding.unit)  # type: ignore[arg-type]
+                def rank_key(n: NormalizedFigure) -> float:
+                    return to_millions(n.normalized_amount, n.figure.unit)  # type: ignore[arg-type]
 
-            best = min(rankable, key=key_fn) if op == "argmin" else max(rankable, key=key_fn)
-            answer_entity = best.finding.entity
+                pick = min if op == "argmin" else max
+                answer_entity = pick(rankable, key=rank_key).key
 
-    if len(available) == 1 and len(findings.findings) > 1 and answer_note is None:
+    if (
+        op in ("argmin", "argmax", "list")
+        and len(keys_with_figures) == 1
+        and len(findings.findings) > 1
+        and answer_note is None
+    ):
         answer_note = "only one entity had available data"
 
+    if chunk_texts is not None:
+        # Verify the native amount — the chunk states what the filing states, never our FX
+        # arithmetic. Checking the converted amount would make every converted figure
+        # read as a false "not_found".
+        evidence = {f.key: f.evidence for f in findings.findings if f.supported}
+        normalized = [
+            dc_replace(
+                n,
+                number_grounding=verify_value(
+                    n.figure.amount,
+                    n.figure.unit,
+                    [chunk_texts[c] for c in evidence[n.key] if c in chunk_texts],
+                ),
+            )
+            for n in normalized
+        ]
+
     return ProcessedFindings(
-        findings=tuple(normalized),
+        findings=findings,
+        figures=tuple(normalized),
         answer_entity=answer_entity,
         fx_rates_used=fx_rates_used,
         currency_converted=currency_converted,
         answer_note=answer_note,
-        metric_requested=findings.metric_requested,
         target_currency=resolved_target,
-        comparison_op=findings.comparison_op,
     )
 
 
@@ -318,35 +324,106 @@ def _map_refs(raw_refs: list[str], rag_context: RAGContext) -> str:
             mapped.append(ref)
         else:
             CITATION_REFS_DROPPED.inc()
-    return ", ".join(mapped) or "—"
+    # Rendered in the exact `[Sn]` form the answer must cite, so the model copies these.
+    return " ".join(f"[{ref}]" for ref in mapped) or "—"
+
+
+def _amount(currency: str | None, amount: float, unit: str | None) -> str:
+    """`amount` with its currency and scale; an unstated scale is said, never assumed."""
+    text = f"{currency + ' ' if currency else ''}{amount:,.1f}{unit or ''}"
+    return text if unit is not None else f"{text} (scale not stated)"
+
+
+def _render_figure(n: NormalizedFigure, target_currency: str | None) -> str:
+    fig = n.figure
+    period = " / ".join(p for p in (fig.fiscal_label, fig.period_end) if p) or "period not stated"
+    native = _amount(fig.currency, fig.amount, fig.unit)
+    if n.fx_rate is not None and n.normalized_amount is not None:
+        approx = "" if _normalize_date(fig.period_end) else " (approx — date unavailable)"
+        value = (
+            f"{_amount(target_currency, n.normalized_amount, fig.unit)} | from {native}"
+            f" | rate: {n.fx_rate:.4f}{approx}"
+        )
+    else:
+        value = native
+    # Only the anomaly is worth a marker — flagging every row trains the synthesis model
+    # to skip it. Advisory rather than a filter: see `number_grounding.py`.
+    flag = _UNVERIFIED_FLAG if n.number_grounding is NumberGrounding.NOT_FOUND else ""
+    return f"   - {fig.metric} ({period}): {value}{flag}"
+
+
+def _render_change(a: NormalizedFigure, b: NormalizedFigure) -> str:
+    """The change from `a` to `b`, in native amounts so FX rates don't move it, shown in
+    the finer of the two units. A percentage is given only for money: for a ratio or a
+    margin it would read as a percentage-point change."""
+    old, new = a.figure, b.figure
+    old_unit = old.unit if old.unit is not None else ""
+    new_unit = new.unit if new.unit is not None else ""
+    unit = min(old_unit, new_unit, key=UNIT_TO_MILLIONS.__getitem__)
+    base = to_millions(old.amount, old_unit)
+    delta = to_millions(new.amount, new_unit) - base
+    shown = delta / UNIT_TO_MILLIONS[unit]
+    if round(shown, 1) == 0:
+        text = "unchanged"
+    else:
+        text = f"{'up' if delta > 0 else 'down'} {_amount(new.currency, abs(shown), unit)}"
+    if new.currency is not None:
+        text += f" ({delta / base * 100:+.1f}%)" if base > 0 else " (% change n/m)"
+    unverified = NumberGrounding.NOT_FOUND in (a.number_grounding, b.number_grounding)
+    flag = _UNVERIFIED_CHANGE_FLAG if unverified else ""
+    return f"   - change {old.period_end} → {new.period_end}: {text}{flag}"
+
+
+def _change_lines(figures: list[NormalizedFigure]) -> list[str]:
+    """One change line per consecutive pair of periods of a metric, plus first to last
+    when there are three or more, so the answering model copies a change instead of
+    working one out. Figures without an ISO period end or a stated scale are left out."""
+    groups: dict[tuple[str, str | None], list[NormalizedFigure]] = {}
+    for n in figures:
+        fig = n.figure
+        if fig.unit is None or not _ISO_DATE_RE.match(fig.period_end or ""):
+            continue
+        groups.setdefault((fig.metric.strip().casefold(), fig.currency), []).append(n)
+    lines: list[str] = []
+    for group in groups.values():
+        ends = [n.figure.period_end for n in group]
+        # Two figures for one date are different durations (a 10-Q's three and nine
+        # months), and without the duration there is no safe pairing.
+        if len(group) < 2 or len(set(ends)) < len(ends):
+            continue
+        group.sort(key=lambda n: n.figure.period_end or "")
+        pairs = list(zip(group, group[1:], strict=False))
+        if len(group) > 2:
+            pairs.append((group[0], group[-1]))
+        lines.extend(_render_change(a, b) for a, b in pairs)
+    return lines
 
 
 def _render_findings_block(
     processed: ProcessedFindings,
-    rag_context: RAGContext | None = None,
+    rag_context: RAGContext,
+    mentions: dict[str, str] | None = None,
 ) -> str:
-    lines = ["[STRUCTURED FINDINGS]"]
+    """`mentions` maps an entity key to the question's name for it (`DocumentScopeResult.
+    mentions`), so synthesis can tell "PFH" was answered under the company the user picked."""
+    findings = processed.findings
+    mentions = mentions or {}
+    lines = ["[FINDINGS]"]
 
     header_parts = []
-    if processed.metric_requested:
-        header_parts.append(f"Metric: {processed.metric_requested}")
     if processed.target_currency:
         header_parts.append(f"Target currency: {processed.target_currency}")
-    if processed.comparison_op and processed.comparison_op != "none":
-        header_parts.append(f"Operation: {processed.comparison_op}")
+    if findings.comparison_op and findings.comparison_op != "none":
+        header_parts.append(f"Operation: {findings.comparison_op}")
     if header_parts:
         lines.append(" | ".join(header_parts))
 
     if processed.answer_entity:
-        ans_nf = next(
-            (n for n in processed.findings if n.finding.entity == processed.answer_entity), None
-        )
-        if ans_nf and ans_nf.normalized_value is not None:
-            cur = processed.target_currency or ans_nf.finding.currency or ""
-            unit_str = ans_nf.finding.unit if ans_nf.finding.unit is not None else "M"
-            lines.append(
-                f"Answer: {processed.answer_entity} ({cur} {ans_nf.normalized_value:,.1f}{unit_str})"
-            )
+        best = processed.figures_for(processed.answer_entity)
+        if best and best[0].normalized_amount is not None:
+            cur = processed.target_currency or best[0].figure.currency
+            amount = _amount(cur, best[0].normalized_amount, best[0].figure.unit)
+            lines.append(f"Answer: {processed.answer_entity} ({amount})")
         else:
             lines.append(f"Answer: {processed.answer_entity}")
 
@@ -359,64 +436,31 @@ def _render_findings_block(
 
     lines.append("")
 
-    for nf in processed.findings:
-        f = nf.finding
-        unit_str = f.unit if f.unit is not None else "M"
-        raw_chunks = f.source_chunks or []
-        if rag_context is not None:
-            # Drop refs with no excerpt in the synthesis context — leaking a raw ref
-            # here would let the model cite an ID the citation pipeline can't resolve.
-            chunks_str = _map_refs(raw_chunks, rag_context)
-        else:
-            chunks_str = ", ".join(raw_chunks) or "—"
-        if not f.available or f.value is None:
-            reason = f.reason or "not found in retrieved context"
-            lines.append(f"{f.entity:<22} | N/A | not available: {reason}")
-        elif nf.fx_rate is not None and nf.normalized_value is not None:
-            to_cur = processed.target_currency or ""
-            native = f"{f.currency} {f.value:,.1f}{unit_str}"
-            converted = f"{to_cur} {nf.normalized_value:,.1f}{unit_str}"
-            date_used = _normalize_date(f.period_end) or "latest"
-            rate_note = " (approx — date unavailable)" if date_used == "latest" else ""
-            lines.append(
-                f"{f.entity:<22} | {converted:<14} | from {native:<16} | rate: {nf.fx_rate:.4f}{rate_note}"
-                f" | period: {f.period_end or '—'} | chunks: {chunks_str}"
-            )
-        else:
-            cur = f.currency or ""
-            val_str = f"{cur} {f.value:,.1f}{unit_str}" if cur else f"{f.value:,.1f}{unit_str}"
-            lines.append(
-                f"{f.entity:<22} | {val_str:<14} | native"
-                f" | period: {f.period_end or '—'} | chunks: {chunks_str}"
-            )
-
-    lines.append("[END STRUCTURED FINDINGS]")
-    return "\n".join(lines)
-
-
-def _render_observations_block(
-    findings: AnalyticalFindings,
-    rag_context: RAGContext | None = None,
-) -> str:
-    lines = ["[AGENT OBSERVATIONS]", f"Question: {findings.question}", ""]
-
-    for i, obs in enumerate(findings.observations, 1):
-        if rag_context is not None:
-            chunks_str = _map_refs(obs.evidence_chunks, rag_context)
-            refuted_str = _map_refs(obs.refuted_by or [], rag_context)
-        else:
-            chunks_str = ", ".join(obs.evidence_chunks) if obs.evidence_chunks else "—"
-            refuted_str = ", ".join(obs.refuted_by) if obs.refuted_by else "—"
-        lines.append(
-            f"{i}. [{obs.confidence} confidence] {obs.claim}"
-            f" | evidence: {chunks_str} | refuted_by: {refuted_str}"
-        )
+    for i, f in enumerate(findings.findings, 1):
+        # Aspect ids (A1, A2…) are opaque and get cited as `[A1]` in place of the
+        # excerpt refs; entity keys stay, since the figure lines below rely on them.
+        head = f"{i}." if _ASPECT_KEY_RE.match(f.key) else f"{i}. {f.key}"
+        if f.key in mentions:
+            head += f" (asked as {mentions[f.key]})"
+        # A stated negative has no evidence to cite and no confidence worth reporting —
+        # rendering it as a low-confidence claim would invite the synthesis model to
+        # hedge it into a weak positive instead of reporting the absence.
+        if not f.supported:
+            lines.append(f"{head} [not disclosed] {f.claim}")
+            continue
+        # Drop refs with no excerpt in the synthesis context — leaking a raw ref here
+        # would let the model cite an ID the citation pipeline can't resolve.
+        refs = _map_refs(f.evidence, rag_context)
+        lines.append(f"{head} [{f.confidence} confidence] {f.claim} | evidence: {refs}")
+        figures = processed.figures_for(f.key)
+        lines.extend(_render_figure(n, processed.target_currency) for n in figures)
+        lines.extend(_change_lines(figures))
 
     if findings.conclusion:
         lines.append(f"\nConclusion: {findings.conclusion}")
 
-    if findings.gaps:
-        lines.append("Unresolved (do not assert as fact): " + "; ".join(findings.gaps))
+    if findings.unresolved:
+        lines.append(f"Unresolved: {'; '.join(findings.unresolved)}")
 
-    lines.append("[END AGENT OBSERVATIONS]")
+    lines.append("[END FINDINGS]")
     return "\n".join(lines)

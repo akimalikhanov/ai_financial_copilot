@@ -83,12 +83,19 @@ def bulk_index(
         for item in chunks
     ]
 
-    bulk(get_client(), actions, refresh=True)
+    # One refresh at the end rather than one per 500-action request the helper sends.
+    client = get_client()
+    bulk(client, actions, refresh=False)
+    client.indices.refresh(index=index)
 
 
 def delete_by_document(index: str, doc_id: UUID | str) -> None:
-    """Delete all indexed chunks for a document."""
-    get_client().delete_by_query(
+    """Delete all indexed chunks for a document. No-op if the index doesn't exist."""
+    client = get_client()
+    if not client.indices.exists(index=index):
+        return
+
+    client.delete_by_query(
         index=index,
         body={"query": {"term": {"document_id": str(doc_id)}}},
         params={"conflicts": "proceed"},

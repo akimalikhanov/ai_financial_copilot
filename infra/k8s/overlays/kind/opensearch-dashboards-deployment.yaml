@@ -1,0 +1,50 @@
+# Dashboards is stateless (no volumeClaimTemplate needed) and dev-only, so it lives in the
+# kind overlay rather than base/search — production stacks may not want it deployed at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch-dashboards
+  namespace: copilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opensearch-dashboards
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opensearch-dashboards
+    spec:
+      initContainers:
+        # Replaces compose's `depends_on: {opensearch: {condition: service_healthy}}`.
+        - name: wait-for-opensearch
+          image: curlimages/curl:8.11.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://opensearch:9200/_cluster/health | grep -q '"status"'; do
+                echo "waiting for opensearch:9200"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: opensearch-dashboards
+          image: opensearchproject/opensearch-dashboards:2.19.0
+          env:
+            - name: OPENSEARCH_HOSTS
+              value: http://opensearch:9200
+            - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN     # DEV ONLY
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 5601
+          readinessProbe:
+            httpGet: { path: /api/status, port: 5601 }
+            initialDelaySeconds: 60      # compose: start_period 60s
+            periodSeconds: 20            # compose: interval 20s
+            timeoutSeconds: 10           # compose: timeout 10s
+            failureThreshold: 10         # compose: retries 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }   # compose: cpus 0.50 / mem_limit 512m

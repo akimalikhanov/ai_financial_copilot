@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from src.schemas.retrieval import AnswerCitationSpan, DisplayLabelMap, ParserOutput
+from src.schemas.retrieval import AnswerCitationSpan, ParserOutput
 
 
 class _State(Enum):
@@ -50,7 +50,6 @@ class BracketCitationParser:
     _pending_refs: list[str] = field(default_factory=list)
     _pending_pos: int = field(default=0)
     _spans: list[AnswerCitationSpan] = field(default_factory=list)
-    label_map: DisplayLabelMap = field(default_factory=DisplayLabelMap)
     _finalized: bool = field(default=False)
 
     def feed(self, chunk: str) -> ParserOutput:
@@ -65,8 +64,6 @@ class BracketCitationParser:
 
         visible_text = "".join(visible_parts)
         self._clean_offset += len(visible_text)
-        for span in completed:
-            self.label_map.get_labels_for_refs(span.ref_ids)
         self._spans.extend(completed)
         return ParserOutput(visible_text=visible_text, completed_spans=completed)
 
@@ -89,8 +86,6 @@ class BracketCitationParser:
 
         visible_text = "".join(visible_parts)
         self._clean_offset += len(visible_text)
-        for span in completed:
-            self.label_map.get_labels_for_refs(span.ref_ids)
         self._spans.extend(completed)
         self._state = _State.TEXT
         self._bracket_buffer = ""

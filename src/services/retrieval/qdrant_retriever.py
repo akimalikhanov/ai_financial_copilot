@@ -18,7 +18,7 @@ def _build_filter(user_id: UUID, doc_ids: list[UUID] | None):
     from qdrant_client.http.models import Condition, FieldCondition, Filter, MatchAny, MatchValue
 
     must: list[Condition] = [FieldCondition(key="user_id", match=MatchValue(value=str(user_id)))]
-    if doc_ids:
+    if doc_ids is not None:
         must.append(
             FieldCondition(
                 key="document_id",
@@ -95,8 +95,11 @@ async def retrieve(
     doc_ids: list[UUID] | None = None,
     top_k: int = get_vector_search_top_k(),
 ) -> list[RetrievedChunk]:
-    """Search Qdrant for a user's most relevant chunks."""
-    if top_k <= 0 or not query_vector:
+    """Search Qdrant for a user's most relevant chunks.
+
+    `doc_ids=None` searches all of the user's documents; `[]` matches nothing.
+    """
+    if top_k <= 0 or not query_vector or doc_ids == []:
         return []
 
     return await asyncio.to_thread(

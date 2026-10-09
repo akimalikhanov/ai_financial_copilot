@@ -48,10 +48,11 @@ class PerQuestionResult(BaseModel):
     # Agentic-path-only fields (populated by run_agent.py; Stage 0.5 baseline signal)
     query_shape: str | None = None
     expected_query_shape: str | None = None  # gold label, from EvalQuestion.query_shape
+    scope_outcome: str | None = None  # resolved | unresolved | too_broad | no_entities
     agent_meta: dict[str, Any] | None = None
-    observations_count: int | None = None
+    findings_count: int | None = None
     confidence_counts: dict[str, int] | None = None
-    gaps_count: int | None = None
+    unresolved_count: int | None = None
     ref_id_to_chunk_id: dict[str, str] = {}
 
 

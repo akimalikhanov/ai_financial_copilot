@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import json
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
+import pytest
+from pydantic import ValidationError
+
+from src.schemas.agent_findings import FindingsReport
+from src.services.chat.agent.state import AgentSettings, shape_config
 from src.services.chat.agent.tools import (
-    ALL_TOOLS,
     REPORT_ANALYTICAL_TOOL,
     REPORT_FINDINGS_TOOL,
+    REPORT_TOOL_NAME,
+    SEARCH_ANALYTICAL_TOOL,
     SEARCH_TOOL,
     SearchDocumentsArgs,
-    gates_for,
-    is_terminal,
     tool_schema,
 )
 
@@ -27,25 +30,69 @@ def _params(tool: dict) -> dict:
     return tool["function"]["parameters"]
 
 
+def _settings() -> AgentSettings:
+    return AgentSettings(
+        tool_model="m",
+        max_iterations=5,
+        cost_budget_usd=0.1,
+        max_concurrent_searches=3,
+        max_chunks_per_entity=5,
+        max_empty_rounds=1,
+        deadline_seconds=180,
+        turn_timeout_cap_seconds=120,
+        deadline_reserve_seconds=15,
+        search_timeout_seconds=60,
+        max_iterations_analytical=7,
+        max_plan_items=6,
+    )
+
+
 class TestSchemaShape:
     def test_search_tool_names_and_params(self) -> None:
         assert SEARCH_TOOL["function"]["name"] == "search_documents"
-        props = _params(SEARCH_TOOL)["properties"]
-        assert set(props) == {"entity", "query"}
+        params = _params(SEARCH_TOOL)
+        # No sub_question on extraction: make_strict forces every property into
+        # `required`, so offering it here would oblige a null for a concept its prompt
+        # never explains.
+        assert set(params["properties"]) == {"entity", "query", "keywords"}
+        assert set(params["required"]) == {"entity", "query", "keywords"}
+
+    def test_analytical_search_tool_carries_sub_question(self) -> None:
+        assert SEARCH_ANALYTICAL_TOOL["function"]["name"] == "search_documents"
+        params = _params(SEARCH_ANALYTICAL_TOOL)
+        assert set(params["properties"]) == {"entity", "query", "keywords", "sub_question"}
+        # Required, so the plan seeds from every analytical search rather than whichever
+        # ones the model remembered to decompose.
+        assert set(params["required"]) == {"entity", "query", "keywords", "sub_question"}
+
+    def test_keywords_is_a_non_nullable_string_in_both_schemas(self) -> None:
+        # Nullable would let the model skip it; the BM25 query then falls back to `query`.
+        for tool in (SEARCH_TOOL, SEARCH_ANALYTICAL_TOOL):
+            assert _params(tool)["properties"]["keywords"]["type"] == "string"
+
+    def test_parser_accepts_a_call_without_keywords(self) -> None:
+        args = SearchDocumentsArgs.model_validate_json('{"entity": "Acme", "query": "revenue"}')
+        assert args.keywords is None
 
     def test_report_findings_tool_name(self) -> None:
-        assert REPORT_FINDINGS_TOOL["function"]["name"] == "report_findings"
-        assert "findings" in _params(REPORT_FINDINGS_TOOL)["properties"]
-
-    def test_report_analytical_tool_name(self) -> None:
-        assert REPORT_ANALYTICAL_TOOL["function"]["name"] == "report_analytical_findings"
-        assert "observations" in _params(REPORT_ANALYTICAL_TOOL)["properties"]
+        assert REPORT_FINDINGS_TOOL["function"]["name"] == REPORT_TOOL_NAME == "report_findings"
+        props = _params(REPORT_FINDINGS_TOOL)["properties"]
+        assert set(props) == {"findings", "comparison_op", "conclusion"}
 
     def test_make_strict_applied(self) -> None:
         # Every object node is additionalProperties:false with an exhaustive required list.
         params = _params(REPORT_FINDINGS_TOOL)
         assert params["additionalProperties"] is False
         assert set(params["required"]) == set(params["properties"].keys())
+        for name in ("Finding", "Figure"):
+            node = params["$defs"][name]
+            assert node["additionalProperties"] is False
+            assert set(node["required"]) == set(node["properties"])
+
+    def test_served_fields_are_not_advertised(self) -> None:
+        # `unresolved` is loop-written: advertising it would let the model author lines
+        # that close nothing.
+        assert "unresolved" not in _params(REPORT_FINDINGS_TOOL)["properties"]
 
 
 class TestRoundTrip:
@@ -57,66 +104,93 @@ class TestRoundTrip:
         assert args.entity == "Acme Corp"
         assert args.query == "revenue 2023"
 
-    def test_report_findings_round_trip(self) -> None:
+    def test_report_with_figures_round_trip(self) -> None:
         payload = json.dumps(
             {
-                "metric_requested": "revenue",
                 "comparison_op": "argmax",
+                "conclusion": None,
                 "findings": [
                     {
-                        "entity": "Acme",
-                        "available": True,
-                        "value": 1234.5,
-                        "currency": "USD",
-                        "period_end": "2023-12-31",
-                        "source_chunks": ["S1", "S3"],
-                        "reason": None,
-                        "unit": "M",
+                        "key": "Acme",
+                        "claim": "Acme's revenue rose.",
+                        "supported": True,
+                        "evidence": ["S1", "S3"],
+                        "confidence": "high",
+                        "figures": [
+                            {
+                                "metric": "revenue",
+                                "amount": 1234.5,
+                                "unit": "M",
+                                "currency": "USD",
+                                "period_end": "2023-12-31",
+                                "fiscal_label": "FY2023",
+                            },
+                            {
+                                "metric": "revenue",
+                                "amount": 1100.0,
+                                "unit": "M",
+                                "currency": "USD",
+                                "period_end": "2022-12-31",
+                                "fiscal_label": "FY2022",
+                            },
+                        ],
                     }
                 ],
             }
         )
-        parsed = AgentFindings.model_validate(json.loads(payload))
-        assert parsed.metric_requested == "revenue"
+        parsed = FindingsReport.model_validate_json(payload)
         assert parsed.comparison_op == "argmax"
-        assert len(parsed.findings) == 1
-        assert parsed.findings[0].source_chunks == ["S1", "S3"]
+        assert [f.period_end for f in parsed.findings[0].figures] == ["2023-12-31", "2022-12-31"]
+        assert parsed.findings[0].evidence == ["S1", "S3"]
 
-    def test_report_findings_minimal_defaults(self) -> None:
-        # source_chunks omitted -> defaults to [] (schema marks it non-nullable).
-        parsed = AgentFindings.model_validate(
-            {"metric_requested": "revenue", "findings": [{"entity": "Acme", "available": False}]}
+    def test_non_numeric_finding_needs_no_figures(self) -> None:
+        parsed = FindingsReport.model_validate(
+            {
+                "findings": [
+                    {
+                        "key": "A1",
+                        "claim": "Acme introduced a special dividend.",
+                        "supported": True,
+                        "evidence": ["S2"],
+                        "confidence": "medium",
+                    }
+                ]
+            }
         )
-        assert parsed.findings[0].source_chunks == []
+        assert parsed.findings[0].figures == []
         assert parsed.comparison_op is None
 
-    def test_report_analytical_round_trip(self) -> None:
-        payload = json.dumps(
-            {
-                "question": "Why did margins fall?",
-                "conclusion": "Input costs rose.",
-                "gaps": None,
-                "observations": [
-                    {
-                        "aspect": "cogs",
-                        "claim": "COGS rose 12%",
-                        "evidence_chunks": ["S2"],
-                        "confidence": "high",
-                        "refuted_by": None,
-                    }
-                ],
-            }
-        )
-        parsed = AnalyticalFindings.model_validate(json.loads(payload))
-        assert parsed.question == "Why did margins fall?"
-        assert len(parsed.observations) == 1
-        assert parsed.observations[0].confidence == "high"
+    def test_unknown_unit_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            FindingsReport.model_validate(
+                {
+                    "findings": [
+                        {
+                            "key": "Acme",
+                            "claim": "c",
+                            "supported": True,
+                            "evidence": [],
+                            "confidence": "high",
+                            "figures": [
+                                {
+                                    "metric": "revenue",
+                                    "amount": 1.0,
+                                    "unit": "millions",
+                                    "currency": None,
+                                    "period_end": None,
+                                    "fiscal_label": None,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
 
 
 class TestFieldDescriptionsPreserved:
-    def test_source_chunks_description_carried_into_schema(self) -> None:
-        defs = _params(REPORT_FINDINGS_TOOL)["$defs"]["EntityFinding"]["properties"]
-        assert "Excerpt IDs" in defs["source_chunks"]["description"]
+    def test_evidence_description_carried_into_schema(self) -> None:
+        props = _params(REPORT_FINDINGS_TOOL)["$defs"]["Finding"]["properties"]
+        assert "Excerpt IDs" in props["evidence"]["description"]
 
     def test_tool_schema_helper_wraps_model(self) -> None:
         schema = tool_schema("x", "does x", SearchDocumentsArgs)
@@ -124,23 +198,42 @@ class TestFieldDescriptionsPreserved:
         assert schema["function"]["description"] == "does x"
 
 
-class TestUnifiedToolPool:
-    """Stage 1.5: one tool pool for every query_shape, not two hardcoded lists."""
+class TestAnalyticalReport:
+    def test_findings_carry_no_figures(self) -> None:
+        params = _params(REPORT_ANALYTICAL_TOOL)
+        assert "Figure" not in params["$defs"]
+        finding = params["$defs"]["Finding"]
+        assert "figures" not in finding["properties"]
+        assert set(finding["required"]) == set(finding["properties"])
 
-    def test_all_tools_contains_both_finalizers(self) -> None:
-        names = {t["function"]["name"] for t in ALL_TOOLS}
-        assert names == {"search_documents", "report_findings", "report_analytical_findings"}
+    def test_extraction_report_keeps_its_figures(self) -> None:
+        # The analytical tool is a copy; dropping figures must not reach the original.
+        assert "figures" in _params(REPORT_FINDINGS_TOOL)["$defs"]["Finding"]["properties"]
 
-    def test_both_finalizers_are_terminal(self) -> None:
-        assert is_terminal("report_findings")
-        assert is_terminal("report_analytical_findings")
-        assert not is_terminal("search_documents")
 
-    def test_gates_scoped_to_their_own_finalizer(self) -> None:
-        # missing_entity_gate only guards report_findings; analytical_insufficiency_gate
-        # only guards report_analytical_findings — unifying the pool must not cross-wire
-        # a gate onto the wrong finalizer.
-        report_findings_gates = {g.__name__ for g in gates_for("report_findings")}
-        report_analytical_gates = {g.__name__ for g in gates_for("report_analytical_findings")}
-        assert report_findings_gates == {"missing_entity_gate"}
-        assert report_analytical_gates == {"analytical_insufficiency_gate"}
+class TestShapePools:
+    """Every shape offers one search and one report tool; their schemas differ by shape."""
+
+    def test_analytical_pool(self) -> None:
+        assert shape_config("analytical", _settings()).tools == [
+            SEARCH_ANALYTICAL_TOOL,
+            REPORT_ANALYTICAL_TOOL,
+        ]
+
+    @pytest.mark.parametrize("shape", ["extraction", "comparison", None])
+    def test_extraction_pool(self, shape: str | None) -> None:
+        assert shape_config(shape, _settings()).tools == [SEARCH_TOOL, REPORT_FINDINGS_TOOL]
+
+    def test_no_terminal_or_gate_machinery_remains(self) -> None:
+        # Nothing ends the run but the loop's own coverage check, so a re-introduced
+        # `terminal` flag would silently restore the one-shot finalizer.
+        import src.services.chat.agent.tools as tools_module
+
+        for attr in ("TOOL_REGISTRY", "is_terminal", "gates_for", "ToolRegistration"):
+            assert not hasattr(tools_module, attr)
+
+    def test_report_description_invites_incremental_calls(self) -> None:
+        # The schema description is the only place the model is told it may report more
+        # than once.
+        desc = REPORT_FINDINGS_TOOL["function"]["description"].lower()
+        assert "more than once" in desc

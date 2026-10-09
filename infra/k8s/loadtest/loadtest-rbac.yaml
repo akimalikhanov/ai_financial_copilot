@@ -1,0 +1,31 @@
+# Minimal RBAC for the Job's await-fake-llm-rollout init container: `kubectl rollout status`
+# reads the Deployment and the ReplicaSets it owns, nothing more.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loadtest
+  namespace: copilot
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: loadtest-rollout-reader
+  namespace: copilot
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: loadtest-rollout-reader
+  namespace: copilot
+subjects:
+  - kind: ServiceAccount
+    name: loadtest
+    namespace: copilot
+roleRef:
+  kind: Role
+  name: loadtest-rollout-reader
+  apiGroup: rbac.authorization.k8s.io

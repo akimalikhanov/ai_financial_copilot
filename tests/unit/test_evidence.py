@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import UUID, uuid4
+
+import pytest
 
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
 from src.services.chat.agent.evidence import EvidenceLedger
@@ -33,25 +36,12 @@ def _payload(chunk: RetrievedChunk) -> ChunkPromptPayload:
 
 
 class TestAdmit:
-    def test_dedups_across_lookups(self) -> None:
+    def test_dedups_across_searches(self) -> None:
         ledger = EvidenceLedger()
         chunk = _chunk()
-        lookup1 = ledger.start_lookup()
-        assert ledger.admit(lookup1, 0, [chunk]) == 1
-        lookup2 = ledger.start_lookup()
-        assert ledger.admit(lookup2, 1, [chunk]) == 0  # already known — not newly admitted
+        assert ledger.admit([chunk]) == 1
+        assert ledger.admit([chunk]) == 0  # already known — not newly admitted
         assert len(ledger) == 1
-
-    def test_multi_lookup_provenance_tracked(self) -> None:
-        ledger = EvidenceLedger()
-        chunk = _chunk()
-        lookup1 = ledger.start_lookup()
-        ledger.admit(lookup1, 0, [chunk])
-        lookup2 = ledger.start_lookup()
-        ledger.admit(lookup2, 1, [chunk])
-
-        record = ledger._records[chunk.chunk_id]
-        assert record.seen_in_lookups == {lookup1, lookup2}
 
 
 class TestAssignLabels:
@@ -101,80 +91,77 @@ class TestAssignLabels:
         assert unresolved == []
 
 
-class TestProtect:
-    def test_protect_is_additive(self) -> None:
+class TestLabelledChunks:
+    def test_only_labelled_chunks_are_returned(self) -> None:
+        """Admitted-but-never-rendered chunks are not a legitimate synthesis fallback —
+        the model never saw them."""
         ledger = EvidenceLedger()
-        c1, c2 = _chunk(), _chunk()
-        ledger.protect([str(c1.chunk_id)])
-        ledger.protect([str(c2.chunk_id)])
-        assert ledger._protected == {c1.chunk_id, c2.chunk_id}
+        shown, unshown = _chunk(), _chunk()
+        ledger.admit([shown, unshown])
+        ledger.assign_labels([shown], {shown.chunk_id: _payload(shown)})
 
-    def test_protect_ignores_malformed_ids(self) -> None:
+        assert [c.chunk_id for c in ledger.labelled_chunks()] == [shown.chunk_id]
+
+
+class TestFallbackChunks:
+    def test_round_robin_across_searches_in_run_order(self) -> None:
         ledger = EvidenceLedger()
-        ledger.protect(["not-a-uuid"])
-        assert ledger._protected == set()
+        a1, a2, a3 = _chunk(0.9), _chunk(0.8), _chunk(0.7)
+        b1, b2 = _chunk(0.2), _chunk(0.1)
+        ledger.assign_labels([a1, a2, a3], {c.chunk_id: _payload(c) for c in (a1, a2, a3)})
+        ledger.assign_labels([b1, b2], {c.chunk_id: _payload(c) for c in (b1, b2)})
 
+        got = [c.chunk_id for c in ledger.fallback_chunks(4)]
 
-class TestApplyCap:
-    def test_single_lookup_never_capped(self) -> None:
+        assert got == [a1.chunk_id, b1.chunk_id, a2.chunk_id, b2.chunk_id]
+
+    def test_rank_counts_only_chunks_the_search_rendered(self) -> None:
+        """A chunk an earlier search already labelled is not re-rendered, so the second
+        search's first *fresh* chunk is its rank 0."""
         ledger = EvidenceLedger()
-        chunks = [_chunk() for _ in range(10)]
-        lookup = ledger.start_lookup()
-        ledger.admit(lookup, 0, chunks)
-        ledger.apply_cap(max_per_lookup=2)
-        assert len(ledger) == 10
+        shared, fresh = _chunk(0.9), _chunk(0.5)
+        ledger.assign_labels([shared], {shared.chunk_id: _payload(shared)})
+        ledger.assign_labels([shared, fresh], {c.chunk_id: _payload(c) for c in (shared, fresh)})
 
-    def test_keeps_any_lookup_top_n(self) -> None:
-        """P1-5: a chunk ranked top-N by *any* lookup survives, not only its first lookup."""
+        assert [c.chunk_id for c in ledger.fallback_chunks(2)] == [shared.chunk_id, fresh.chunk_id]
+
+    def test_unshown_chunks_are_never_selected(self) -> None:
         ledger = EvidenceLedger()
-        shared, other_a, other_b = _chunk(), _chunk(), _chunk()
+        shown, unshown = _chunk(), _chunk()
+        ledger.admit([shown, unshown])
+        ledger.assign_labels([shown], {shown.chunk_id: _payload(shown)})
 
-        lookup1 = ledger.start_lookup()
-        # `shared` ranks low (3rd) in lookup1 — would be capped if only lookup1 mattered.
-        ledger.admit(lookup1, 0, [other_a, other_b, shared])
+        assert [c.chunk_id for c in ledger.fallback_chunks(10)] == [shown.chunk_id]
 
-        lookup2 = ledger.start_lookup()
-        # `shared` ranks 1st in lookup2, along with a fresh chunk.
-        fresh = _chunk()
-        ledger.admit(lookup2, 1, [shared, fresh])
 
-        ledger.apply_cap(max_per_lookup=1)
-
-        # lookup1 top-1 = other_a, lookup2 top-1 = shared: both survive; other_b/fresh don't.
-        assert set(ledger.registry.keys()) == {other_a.chunk_id, shared.chunk_id}
-
-    def test_protected_chunk_survives_cap_regardless_of_rank(self) -> None:
+class TestShownBefore:
+    def test_names_earlier_labels_with_their_heading(self) -> None:
         ledger = EvidenceLedger()
-        top, protected_low_rank, evict = _chunk(), _chunk(), _chunk()
-        lookup1 = ledger.start_lookup()
-        # Without protection, max_per_lookup=1 keeps only `top`.
-        ledger.admit(lookup1, 0, [top, protected_low_rank, evict])
-        lookup2 = ledger.start_lookup()
-        ledger.admit(lookup2, 1, [_chunk()])  # a second lookup, so capping actually runs
+        old = replace(_chunk(), heading_trail=["Annual Report", "Consolidated Statements"])
+        new = _chunk()
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
 
-        ledger.protect([str(protected_low_rank.chunk_id)])
-        ledger.apply_cap(max_per_lookup=1)
+        assert ledger.shown_before([new, old]) == ["S1 Consolidated Statements"]
 
-        assert top.chunk_id in ledger.registry
-        assert protected_low_rank.chunk_id in ledger.registry
-        assert evict.chunk_id not in ledger.registry
-
-
-class TestOrdered:
-    def test_orders_by_turn_index_then_score_desc(self) -> None:
+    def test_long_headings_are_cut_to_the_configured_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_SHOWN_HEADING_CHARS", "12")
         ledger = EvidenceLedger()
-        early_low = _chunk(score=0.1)
-        early_low.turn_index = 0
-        early_high = _chunk(score=0.9)
-        early_high.turn_index = 0
-        late = _chunk(score=0.5)
-        late.turn_index = 1
+        old = replace(_chunk(), heading_trail=["x" * 60])
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
 
-        lookup = ledger.start_lookup()
-        ledger.admit(lookup, 0, [early_low, early_high, late])
+        assert ledger.shown_before([old]) == ["S1 " + "x" * 12 + "…"]
 
-        ordered_ids = [c.chunk_id for c in ledger.ordered()]
-        assert ordered_ids == [early_high.chunk_id, early_low.chunk_id, late.chunk_id]
+    def test_a_chunk_without_a_heading_is_named_by_label(self) -> None:
+        ledger = EvidenceLedger()
+        old = _chunk()
+        ledger.admit([old])
+        ledger.assign_labels([old], {old.chunk_id: _payload(old)})
+
+        assert ledger.shown_before([old]) == ["S1"]
 
 
 class TestContractC2:

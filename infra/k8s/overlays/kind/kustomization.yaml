@@ -1,0 +1,79 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: copilot
+
+resources:
+  - ../../base
+  - opensearch-dashboards-deployment.yaml
+  - opensearch-dashboards-service.yaml
+  - ingress.yaml
+  - gpu/dcgm-exporter.yaml
+  # NOT listed here: gpu/device-plugin.yaml. It lives in kube-system and is applied
+  # separately by `make k8s-gpu-plugin`, because this overlay's `commonLabels` and
+  # `namespace: copilot` would rewrite the DaemonSet's namespace and inject a label into
+  # its immutable selector.
+
+# Replaces the deprecated `commonLabels:`, which forced includeSelectors:true.
+#
+# includeSelectors:false is deliberate: every Deployment/StatefulSet/Service in base already
+# declares a complete selector on app.kubernetes.io/name, so nothing is gained by also
+# injecting part-of into selectors. includeTemplates:true still puts the label on pod
+# metadata, so it remains available for querying and for Prometheus SD.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: copilot
+    includeSelectors: false
+    includeTemplates: true
+
+secretGenerator:
+  - name: postgres-secret
+    envs: [secrets/postgres.env]        # gitignored
+  - name: redis-secret
+    envs: [secrets/redis.env]           # gitignored; shared by redis-app and redis-broker
+  - name: garage-secret
+    envs: [secrets/garage.env]          # gitignored
+  - name: app-secret
+    envs: [secrets/app.env]             # gitignored
+  - name: grafana-secret
+    envs: [secrets/grafana.env]         # gitignored
+  - name: clickhouse-secret
+    envs: [secrets/clickhouse.env]      # gitignored; read by both ClickHouse and Langfuse
+  - name: langfuse-secret
+    envs: [secrets/langfuse.env]        # gitignored
+
+generatorOptions:
+  disableNameSuffixHash: false          # keep hashing ON (that's the point)
+
+patches:
+  # Scoped by name (not blanket kind) because Kustomize's strategic-merge on
+  # volumeClaimTemplates has no recognized merge key for this field — a patch's list *replaces*
+  # the whole array on any object it targets, rather than merging by name. That's fine for every
+  # StatefulSet here with exactly one "data" claim, but would silently drop garage's second
+  # ("meta") claim if this patch also matched it — see patches/garage-small-pvcs.yaml.
+  - path: patches/small-pvcs.yaml
+    target:
+      kind: StatefulSet
+      name: "^(postgres|redis-app|redis-broker|qdrant|opensearch|elasticsearch|clickhouse)$"
+  - path: patches/garage-small-pvcs.yaml
+    target:
+      kind: StatefulSet
+      name: garage
+  # Adds nvidia.com/gpu:1 + the GPU nodeSelector to worker-ingestion, tei, and tei-embedder —
+  # the three consumers sharing the device plugin's time-sliced GPU (replicas: 3 in
+  # gpu/device-plugin.yaml). Overlay-only so base stays schedulable on a GPU-less cluster.
+  - path: patches/worker-ingestion-gpu.yaml
+    target:
+      kind: Deployment
+      name: worker-ingestion
+  - path: patches/tei-gpu.yaml
+    target:
+      kind: Deployment
+      name: tei
+  - path: patches/tei-embedder-gpu.yaml
+    target:
+      kind: Deployment
+      name: tei-embedder
+  # NOTE: hf-model-cache is deliberately NOT shrunk by a small-PVC patch like the
+  # StatefulSet volumes above. The real cache on this machine is ~6.2 GiB (Docling layout +
+  # EasyOCR + the bge tokenizer), so the 15 GiB request in base is already right-sized;
+  # cutting it to 2 GiB would fail ingestion partway through a model download.

@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import io
 import json
 import logging
 import os
 import shutil
 import tempfile
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
+from uuid import UUID, uuid4
 
 from celery.exceptions import Retry, SoftTimeLimitExceeded
 from celery.signals import setup_logging, worker_process_init, worker_process_shutdown
@@ -20,17 +25,34 @@ from sqlalchemy.pool import NullPool
 
 from src.api.logging import configure_worker_logging
 from src.celery_app import celery_app
+from src.observability import langfuse as lf_client
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     INGESTION_CHUNKS,
     INGESTION_DOCUMENTS,
     INGESTION_DURATION,
+    INGESTION_QUEUE_WAIT,
+    INGESTION_WORKER_CHILD_TASKS,
+    INGESTION_WORKER_MALLOC_FREE,
+    INGESTION_WORKER_PEAK_RSS,
+    INGESTION_WORKER_RECYCLES,
+    INGESTION_WORKER_RSS,
+    INGESTION_WORKER_STAGE_GROWTH,
 )
-from src.redis_client import ingestion_stream_key
+from src.observability.process_memory import TaskMemory, malloc_trim
+from src.redis_client import add_ingestion_event, ingestion_lease_key, ingestion_reap_key
 from src.services.ingestion.chunker import reset_tokenizer
-from src.services.ingestion.docling_parser import reset_converter
+from src.services.ingestion.docling_parser import empty_cuda_cache, reset_converter
 from src.services.ingestion.embedder import reset_clients as reset_embedding_clients
 from src.services.ingestion.opensearch_ingest import reset_client as reset_opensearch_client
+from src.services.ingestion.picture_enricher import enrich_pictures as _enrich_pictures
+from src.services.ingestion.picture_enricher import reset as reset_picture_enricher
+from src.services.ingestion.picture_enricher import (
+    validate_config as validate_picture_enricher_config,
+)
 from src.services.ingestion.qdrant_ingest import reset_client as reset_qdrant_client
+from src.services.ingestion.s3_client import close_client as close_s3_client
+from src.services.ingestion.s3_client import reset_client as reset_s3_client
 from src.services.ingestion.table_summarizer import reset as reset_table_summarizer
 from src.services.ingestion.table_summarizer import (
     summarize_table_chunks as _summarize_table_chunks,
@@ -39,8 +61,16 @@ from src.services.llm_router import get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
 from src.utils.config import (
     get_db_url,
+    get_docling_parse_timeout,
     get_embedding_dim,
     get_embedding_model,
+    get_ingest_cuda_empty_cache_enabled,
+    get_ingest_heartbeat_interval_seconds,
+    get_ingest_lease_ttl_seconds,
+    get_ingest_malloc_trim_enabled,
+    get_ingest_max_pages,
+    get_ingest_worker_max_memory_per_child_kb,
+    get_picture_enricher_enabled,
     get_redis_app_url,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
@@ -48,11 +78,16 @@ from src.utils.config import (
     get_table_summarizer_enabled,
 )
 
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DoclingDocument
+
 logger = logging.getLogger(__name__)
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _redis_ingestion: Redis | None = None
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+# Tasks started by this process. Only prefork children run tasks, so it counts since fork.
+_child_tasks = 0
 
 
 def _get_int_env(name: str) -> int | None:
@@ -62,7 +97,16 @@ def _get_int_env(name: str) -> int | None:
     return int(raw)
 
 
-_task_soft_time_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
+# Ingestion gets its own limits rather than the app-wide CELERY_TASK_*_SECONDS pair, which is
+# sized for chat (360/450). A 1000-page parse alone outlives that, so the global limits made
+# every inner stage timeout unreachable: Celery reaped the child first and every large-document
+# failure surfaced as a generic SoftTimeLimitExceeded instead of the stage that actually blew.
+# Must stay strictly above the sum of the stage budgets — see docs/stages/
+# ingestion-pipeline-findings.md P1-2 for the ladder.
+_task_soft_time_limit = _get_int_env("INGEST_TASK_SOFT_TIME_LIMIT_SECONDS") or 2400
+# Held back from the enrichment budget for everything after it (~60s on a 1043-page filing).
+_POST_ENRICH_RESERVE_SECONDS = 300
+_task_time_limit = _get_int_env("INGEST_TASK_TIME_LIMIT_SECONDS") or 2700
 INGEST_MAX_ATTEMPTS = int(os.getenv("INGEST_MAX_ATTEMPTS", "3"))
 
 
@@ -79,10 +123,16 @@ def _on_worker_process_init(**_kwargs: object) -> None:
     reset_tokenizer()
     reset_embedding_clients()
     reset_table_summarizer()
+    reset_picture_enricher()
     get_router.cache_clear()
     get_prompt_loader.cache_clear()
     reset_qdrant_client()
     reset_opensearch_client()
+    reset_s3_client()
+    lf_client.reset()
+    lf_client.initialize()
+    if get_picture_enricher_enabled():
+        validate_picture_enricher_config()
     if _worker_loop is None or _worker_loop.is_closed():
         _worker_loop = asyncio.new_event_loop()
     if _redis_ingestion is None:
@@ -104,6 +154,7 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
         _worker_loop.run_until_complete(_redis_ingestion.aclose())
     if _engine is not None:
         _worker_loop.run_until_complete(_engine.dispose())
+    _worker_loop.run_until_complete(close_s3_client())
     _redis_ingestion = None
     _engine = None
     _session_factory = None
@@ -111,22 +162,311 @@ def _on_worker_process_shutdown(**_kwargs: object) -> None:
     _worker_loop = None
 
 
-def _export_artifacts(document) -> tuple[bytes, bytes]:
-    """Serialize DoclingDocument to JSON and Markdown bytes without embedded images."""
+class _DocumentLease:
+    """One task's claim on one document: mutual exclusion and liveness in a single Redis key.
+
+    Claimed with SET NX before the attempt count is spent, refreshed while the task runs, and
+    deleted on the way out. A worker killed without warning runs none of its handlers, so the
+    key just expires — which is what lets a reader tell a document that is still being worked
+    on from one whose worker is gone, without waiting for the broker's visibility timeout.
+
+    Refresh and release are both compare-and-set on the token this task generated. After a
+    Redis restart, or an expiry under a stalled event loop, the key can already belong to a
+    second worker; the rule is that the loser stands down rather than racing it through
+    delete_by_document.
+    """
+
+    _REFRESH_LUA = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('expire', KEYS[1], ARGV[2])
+    end
+    return 0
+    """
+
+    _RELEASE_LUA = """
+    if redis.call('get', KEYS[1]) == ARGV[1] then
+      return redis.call('del', KEYS[1])
+    end
+    return 0
+    """
+
+    def __init__(self, redis: Redis | None, document_id: str) -> None:
+        self._redis = redis
+        self._document_id = document_id
+        self._key = ingestion_lease_key(document_id)
+        self._token = uuid4().hex
+        self._ttl = get_ingest_lease_ttl_seconds()
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._owner: asyncio.Task[Any] | None = None
+        # EVALSHA with an EVAL fallback, so the refresh does not resend the script body on
+        # every tick. Registering is local — it only hashes the source.
+        self._refresh = redis.register_script(self._REFRESH_LUA) if redis is not None else None
+        self._release = redis.register_script(self._RELEASE_LUA) if redis is not None else None
+        self.held = False
+        self.lost = False
+
+    async def acquire(self) -> bool:
+        """True when this task may proceed, False when another worker already owns the document.
+
+        Redis being unreachable returns True without a lease: refusing to ingest is the worse
+        failure, and the reader-side recovery that depends on the lease cannot run while Redis
+        is down either.
+        """
+        if self._redis is None:
+            return True
+        try:
+            claimed = await self._redis.set(self._key, self._token, nx=True, ex=self._ttl)
+        except Exception:
+            logger.warning(
+                "pipeline.lease_unavailable",
+                extra={"document_id": self._document_id},
+                exc_info=True,
+            )
+            return True
+        if not claimed:
+            return False
+        self.held = True
+        return True
+
+    def start_heartbeat(self) -> None:
+        """Begin refreshing the lease. Records the calling task, which a lost lease cancels."""
+        if not self.held:
+            return
+        self._owner = asyncio.current_task()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self) -> None:
+        interval = get_ingest_heartbeat_interval_seconds()
+        while True:
+            await asyncio.sleep(interval)
+            if self._refresh is None:
+                return
+            try:
+                refreshed = await self._refresh(keys=[self._key], args=[self._token, self._ttl])
+            except Exception:
+                # A transient Redis error is not evidence the lease is gone. The TTL is sized
+                # to outlive a couple of missed refreshes; a real loss shows up on a later tick.
+                logger.warning(
+                    "pipeline.lease_refresh_failed",
+                    extra={"document_id": self._document_id},
+                    exc_info=True,
+                )
+                continue
+            if int(refreshed) == 1:
+                continue
+            self.lost = True
+            self.held = False
+            logger.error(
+                "pipeline.lease_lost",
+                extra={"document_id": self._document_id, "lease_ttl_seconds": self._ttl},
+            )
+            if self._owner is not None:
+                self._owner.cancel()
+            return
+
+    async def release(self) -> None:
+        """Stop the heartbeat and drop the key, but only while it is still this task's."""
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        if not self.held or self._release is None:
+            return
+        self.held = False
+        try:
+            await self._release(keys=[self._key], args=[self._token])
+        except Exception:
+            # The TTL reclaims it; the cost is one lease interval of an unclaimable document.
+            logger.warning(
+                "pipeline.lease_release_failed",
+                extra={"document_id": self._document_id},
+                exc_info=True,
+            )
+
+
+def _enforce_page_limit(pdf_path: Path) -> None:
+    """Fail a document that is too large to parse, before any model runs.
+
+    Cheap precheck, because the expensive failure is not a slow parse: a document past the
+    memory ceiling OOM-kills the container, and task_acks_late redelivers it until every
+    INGEST_MAX_ATTEMPTS is spent on container restarts, with no record of why. A PDF whose page
+    count cannot be read is let through — the parse is the better judge of a broken file.
+    """
+    from src.services.ingestion import docling_parser
+
+    max_pages = get_ingest_max_pages()
+    if max_pages <= 0:
+        return
+    pages = docling_parser.probe_page_count(pdf_path)
+    if pages is not None and pages > max_pages:
+        raise RuntimeError(
+            f"Document has {pages} pages, above the {max_pages}-page ingestion limit "
+            f"(INGEST_MAX_PAGES)"
+        )
+
+
+def _export_artifacts(document, out_dir: Path) -> tuple[Path, Path]:
+    """Write the DoclingDocument to `out_dir` as JSON and Markdown, returning both paths.
+
+    Clears every `pic.image` first, so it must run after `_upload_picture_crops`.
+    ImageRefMode.PLACEHOLDER only strips images from Markdown: `save_as_json` still serializes
+    each crop as a base64 data URI (~1.33x its bytes, a second copy of the pictures bucket).
+    Nothing downstream reads the crops — enrichment has run and the chunker serializes
+    pictures as placeholders — so dropping them also frees their memory before chunking.
+    `indent=None` because save_as_json builds the whole JSON string before writing it.
+    """
     from docling_core.types.doc.base import ImageRefMode
 
-    td = Path(tempfile.mkdtemp(prefix="docling_"))
+    for pic in document.pictures:
+        pic.image = None
+    json_p = out_dir / "docling.json"
+    md_p = out_dir / "document.md"
+    document.save_as_json(json_p, image_mode=ImageRefMode.PLACEHOLDER, indent=None)  # pyright: ignore[reportArgumentType]
+    document.save_as_markdown(md_p, image_mode=ImageRefMode.PLACEHOLDER)
+    return json_p, md_p
+
+
+def _encode_picture_crop(pic) -> dict[str, Any] | None:
+    """Encode one picture's in-memory crop to PNG bytes, with its top classification label if
+    Docling produced one (do_picture_classification, see docling_parser.py). None when the
+    picture has no crop or it fails to encode.
+
+    Crops only exist here because generate_picture_images=True keeps them on the
+    DoclingDocument through parse, until `_export_artifacts` clears them.
+    """
+    if pic.image is None:
+        return None
     try:
-        json_p = td / "doc.json"
-        md_p = td / "doc.md"
-        document.save_as_json(json_p, image_mode=ImageRefMode.PLACEHOLDER)
-        document.save_as_markdown(md_p, image_mode=ImageRefMode.PLACEHOLDER)
-        return json_p.read_bytes(), md_p.read_bytes()
+        pil_image = pic.image.pil_image
+        if pil_image is None:
+            raise ValueError("pil_image decode returned None")
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        label: str | None = None
+        confidence: float | None = None
+        if pic.meta is not None and pic.meta.classification is not None:
+            main = pic.meta.classification.get_main_prediction()
+            label, confidence = main.class_name, main.confidence
+        return {
+            "self_ref": pic.self_ref,
+            "data": buf.getvalue(),
+            "label": label,
+            "confidence": confidence,
+        }
+    except Exception:
+        # A crop is a re-runnable convenience artifact (Phase 5), not required for
+        # this document to become searchable — never fail the pipeline over one.
+        logger.warning(
+            "pipeline.picture_crop_encode_failed",
+            extra={"self_ref": pic.self_ref},
+            exc_info=True,
+        )
+        return None
+
+
+# Crops encoded and in flight at once. Bounds both the PNG bytes held and the concurrent
+# requests against Garage; unbounded, a 300-picture document opened 300 uploads together.
+_CROP_UPLOAD_CONCURRENCY = 8
+
+
+async def _load_persisted_document(key: str, document_id: str) -> DoclingDocument | None:
+    """The docling.json an earlier attempt uploaded, or None when it is missing or unreadable
+    (the caller then re-parses)."""
+    from docling_core.types.doc.document import DoclingDocument as _DoclingDocument
+
+    from src.services.ingestion import s3_client
+
+    try:
+        path = await s3_client.download_file(key, bucket=get_s3_docling_bucket())
+    except Exception:
+        logger.info("pipeline.resume_unavailable", extra={"document_id": document_id})
+        return None
+    try:
+        document = await asyncio.to_thread(_DoclingDocument.load_from_json, path)
+    except Exception:
+        logger.warning(
+            "pipeline.resume_load_failed", extra={"document_id": document_id}, exc_info=True
+        )
+        return None
     finally:
-        shutil.rmtree(td, ignore_errors=True)
+        path.unlink(missing_ok=True)
+    logger.info(
+        "pipeline.resumed_from_artifact",
+        extra={"document_id": document_id, "pictures": len(document.pictures)},
+    )
+    return document
 
 
-async def _run_pipeline(document_id: str) -> None:  # noqa: C901
+async def _upload_picture_crops(document, document_id: str) -> int:
+    """Encode, upload and release each picture crop, returning how many landed in S3.
+
+    Each crop is encoded under the semaphore and dropped as soon as its upload returns, so at
+    most `_CROP_UPLOAD_CONCURRENCY` encoded crops are live — never a list of all of them.
+    """
+    from src.services.ingestion import s3_client
+
+    sem = asyncio.Semaphore(_CROP_UPLOAD_CONCURRENCY)
+
+    async def _one(pic) -> bool:
+        async with sem:
+            crop = await asyncio.to_thread(_encode_picture_crop, pic)
+            if crop is None:
+                return False
+            # A crop is a re-runnable convenience artifact (Phase 5), not required for
+            # this document to become searchable — never fail the pipeline over one.
+            try:
+                await s3_client.upload_picture_crop(
+                    document_id,
+                    crop["self_ref"],
+                    crop["data"],
+                    label=crop["label"],
+                    confidence=crop["confidence"],
+                )
+            except Exception:
+                logger.warning(
+                    "pipeline.picture_crop_upload_failed",
+                    extra={"document_id": document_id, "self_ref": crop["self_ref"]},
+                    exc_info=True,
+                )
+                return False
+            return True
+
+    results = await asyncio.gather(*(_one(pic) for pic in document.pictures))
+    return sum(results)
+
+
+def _write_chunks_jsonl(path: Path, chunks: list[dict[str, Any]], db_chunks: list[Any]) -> None:
+    """Stream the chunk backup to disk one row at a time, rather than joining it into one
+    string and encoding a second copy."""
+    with path.open("w", encoding="utf-8") as f:
+        for i, (c, db) in enumerate(zip(chunks, db_chunks, strict=True)):
+            if i:
+                f.write("\n")
+            f.write(
+                json.dumps(
+                    {
+                        "chunk_id": str(db.id),
+                        "chunk_index": c["chunk_index"],
+                        "raw_text": c["raw_text"],
+                        "enriched_text": c["enriched_text"],
+                        "heading_trail": c.get("heading_trail"),
+                        "chunk_type": c.get("chunk_type"),
+                        "page_start": c.get("page_start"),
+                        "page_end": c.get("page_end"),
+                        "token_count": c.get("token_count"),
+                        "table_nl_summary": c.get("table_nl_summary"),
+                        "table_nl_summary_model": c.get("table_nl_summary_model"),
+                        "provenance": c.get("provenance"),
+                        "metadata": c.get("metadata", {}),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+
+
+async def _run_pipeline(document_id: str, mem: TaskMemory | None = None) -> None:  # noqa: C901
     from src.repository.chunk_repository import ChunkRepository
     from src.repository.document_repository import DocumentRepository
     from src.services.ingestion import (
@@ -143,24 +483,23 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
     sf = _session_factory
     doc_uuid = UUID(document_id)
     pdf_path: Path | None = None
+    work_dir: Path | None = None
     pipeline_started_at = perf_counter()
     stage_start = perf_counter()
     stage_times: dict[str, float] = {}
     stage_order: list[str] = []
-    stage_total = 12 if get_table_summarizer_enabled() else 11
+    stage_total = 13 + get_table_summarizer_enabled() + get_picture_enricher_enabled()
     stage_index = 0
     current_stage = "initializing"
     upload_metadata: dict = {}
-    stream_key = ingestion_stream_key(document_id)
+    lease = _DocumentLease(_redis_ingestion, document_id)
 
     async def _emit(event_type: str, data: dict) -> None:
         if _redis_ingestion is None:
             return
-        try:
-            payload = json.dumps({"type": event_type, **data})
-            await _redis_ingestion.xadd(stream_key, {"payload": payload}, "*", maxlen=100)
-        except Exception:
-            pass
+        # Progress reporting is never worth failing a document over.
+        with suppress(Exception):
+            await add_ingestion_event(_redis_ingestion, document_id, event_type, data)
 
     async def _log_stage(stage_name: str) -> None:
         nonlocal stage_index, current_stage, stage_start
@@ -169,6 +508,8 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
         stage_index += 1
         current_stage = stage_name
         stage_order.append(stage_name)
+        if mem is not None:
+            mem.stage(stage_name)
         stage_start = perf_counter()
         logger.info(
             f"pipeline.stage [{stage_index}/{stage_total}] {stage_name}",
@@ -212,6 +553,35 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             if doc is None:
                 raise LookupError(f"Document {document_id} not found")
 
+            # acks_late + reject_on_worker_lost means a SIGKILLed task is redelivered, and the
+            # broker's visibility timeout can hold that redelivery for an hour. By then the
+            # document may have been re-ingested and be serving queries: without this guard the
+            # redelivery spends an attempt, trips the max-attempts branch below and calls
+            # set_failed on a healthy row. Must stay the first thing after the load.
+            if doc.status == "ready":
+                logger.info("pipeline.already_ready", extra={"document_id": document_id})
+                return
+
+            # Claim the document before spending an attempt on it: a delivery that is refused
+            # here did no work, so it must not count as one. The claim also precedes the flip
+            # to `processing`, which keeps the invariant the readers rely on pointing the right
+            # way — a `processing` row with no lease means its owner is dead, never that its
+            # owner has not claimed it yet. A queued document is still `pending` and holds no
+            # lease, which is why they key on the status and not on the lease alone.
+            if not await lease.acquire():
+                logger.warning("pipeline.already_claimed", extra={"document_id": document_id})
+                return
+            lease.start_heartbeat()
+            # A worker has the document, so any outstanding re-enqueue marker has done its
+            # job. Clearing it here rather than letting it expire is what keeps the marker
+            # meaning "an enqueue is in flight" instead of "we re-enqueued recently" — the
+            # readers cannot tell a queued document from an abandoned one on their own, and
+            # a queue deeper than the marker's TTL would otherwise collect one duplicate
+            # task per TTL for as long as the document waits.
+            if _redis_ingestion is not None:
+                with suppress(Exception):
+                    await _redis_ingestion.delete(ingestion_reap_key(document_id))
+
             attempt = await repo.increment_attempt_count(doc_uuid)
             if attempt > INGEST_MAX_ATTEMPTS:
                 await repo.set_failed(
@@ -230,71 +600,168 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 )
                 return
 
+            if attempt == 1:
+                # First attempt only: on a redelivery created_at is the original upload,
+                # so the difference would report the failed attempt's runtime as queue wait.
+                INGESTION_QUEUE_WAIT.observe((datetime.now(UTC) - doc.created_at).total_seconds())
+
             storage_key = doc.storage_key
             user_id = str(doc.user_id)
+            prior_parse_status = doc.parse_status
+            if mem is not None:
+                mem.page_count = doc.page_count
             upload_metadata = dict(doc.document_metadata or {})
             await repo.update_status(doc_uuid, "processing", clear_processing_error=True)
             await session.commit()
 
-        # -- download raw PDF -----------------------------------------------
-        await _log_stage("download_pdf")
-        pdf_path = await s3_client.download_file(storage_key)
-
-        # -- parse with Docling (CPU/GPU-bound) -----------------------------
-        await _log_stage("parse_pdf_docling")
-        parse_result = await _timed("parse", asyncio.to_thread(docling_parser.parse, pdf_path))
-
-        # -- export artifacts (CPU-bound serialization) --------------------
-        await _log_stage("export_docling_artifacts")
-        json_bytes, md_bytes = await asyncio.to_thread(_export_artifacts, parse_result.document)
-
-        # -- update metadata + upload artifacts (parallel I/O) --------------
-        await _log_stage("save_metadata_and_upload_artifacts")
+        work_dir = Path(tempfile.mkdtemp(prefix="ingest_"))
         base_key = f"processed/{user_id}/{document_id}"
 
-        async def _save_metadata():
-            async with sf() as session:
-                repo = DocumentRepository(session)
-                merged_metadata = {
-                    **upload_metadata,
-                    **parse_result.metadata,
-                }
-                await repo.update_metadata(
-                    doc_uuid,
-                    page_count=parse_result.page_count,
-                    extracted_title=parse_result.extracted_title,
-                    parse_status=parse_result.parse_status,
-                    metadata=merged_metadata,
-                )
-                await session.commit()
+        # -- resume: a retry reuses the parse an earlier attempt persisted ----
+        # parse_status is written in the same step that uploads docling.json, which already
+        # carries the picture descriptions, and the crops are uploaded before it. So a retry
+        # that finds both skips download, parse, enrichment and export entirely.
+        document = None
+        if attempt > 1 and prior_parse_status is not None:
+            await _log_stage("load_persisted_parse")
+            document = await _load_persisted_document(f"{base_key}/docling.json", document_id)
+        if document is not None:
+            parse_status = prior_parse_status
+            # load_persisted_parse stands in for the parse path's own stages.
+            stage_total -= 4 + get_picture_enricher_enabled()
+        else:
+            # -- download raw PDF -----------------------------------------------
+            await _log_stage("download_pdf")
+            pdf_path = await s3_client.download_file(storage_key)
 
-        await asyncio.gather(
-            _save_metadata(),
-            s3_client.upload_bytes(
-                f"{base_key}/docling.json",
-                json_bytes,
-                "application/json",
-                bucket=get_s3_docling_bucket(),
-            ),
-            s3_client.upload_bytes(
-                f"{base_key}/document.md",
-                md_bytes,
-                "text/markdown",
-                bucket=get_s3_rendered_bucket(),
-            ),
-        )
+            # -- page-count guardrail (milliseconds, no models) ------------------
+            await asyncio.to_thread(_enforce_page_limit, pdf_path)
+
+            # -- parse with Docling (CPU/GPU-bound) -----------------------------
+            await _log_stage("parse_pdf_docling")
+            # Docling's own document_timeout bounds its page loop only; assembly, reading order and
+            # enrichment run outside it. This is the wall-clock ceiling on the whole parse. A thread
+            # cannot be killed, so the abandoned parse runs on until it finishes or Celery's hard
+            # time limit reaps the child; the document fails now rather than hanging.
+            parse_timeout = get_docling_parse_timeout()
+            try:
+                parse_result = await _timed(
+                    "parse",
+                    asyncio.wait_for(
+                        asyncio.to_thread(docling_parser.parse, pdf_path), timeout=parse_timeout
+                    ),
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Docling parse exceeded the {parse_timeout}s wall-clock limit "
+                    f"(DOCLING_PARSE_TIMEOUT_SECONDS)"
+                ) from exc
+            if mem is not None:
+                mem.page_count = parse_result.page_count
+
+            # -- describe pictures with a vision model (network-bound) ---------
+            # Must run before export and before chunking: it writes pic.meta.description, which
+            # the exported JSON carries and the chunker substitutes for `<!-- image -->`.
+            if get_picture_enricher_enabled():
+                await _log_stage("enrich_pictures")
+                try:
+                    # The enricher sizes its own budget from the picture count and keeps completed
+                    # batches on timeout; this cap keeps it inside the task's soft limit.
+                    remaining = (
+                        _task_soft_time_limit
+                        - (perf_counter() - pipeline_started_at)
+                        - _POST_ENRICH_RESERVE_SECONDS
+                    )
+                    described = await _enrich_pictures(parse_result.document, max_timeout=remaining)
+                    logger.info(
+                        "pipeline.pictures_enriched",
+                        extra={"document_id": document_id, "described": described},
+                    )
+                except Exception:
+                    # Enrichment degrades to Phase 4 quality; it never fails a document.
+                    logger.warning(
+                        "pipeline.picture_enrichment_failed",
+                        extra={"document_id": document_id},
+                        exc_info=True,
+                    )
+
+            # -- upload picture crops (bounded, one encoded crop per slot) -------
+            # Must run before export: export clears pic.image so docling.json carries no base64.
+            await _log_stage("upload_picture_crops")
+            crops_uploaded = await _upload_picture_crops(parse_result.document, document_id)
+            logger.info(
+                "pipeline.picture_crops_uploaded",
+                extra={
+                    "document_id": document_id,
+                    "uploaded": crops_uploaded,
+                    "pictures": len(parse_result.document.pictures),
+                },
+            )
+
+            # -- export artifacts to disk (CPU-bound serialization) -------------
+            await _log_stage("export_docling_artifacts")
+            json_path, md_path = await asyncio.to_thread(
+                _export_artifacts, parse_result.document, work_dir
+            )
+
+            # -- update metadata + upload artifacts (parallel I/O) --------------
+            await _log_stage("save_metadata_and_upload_artifacts")
+
+            async def _save_metadata():
+                async with sf() as session:
+                    repo = DocumentRepository(session)
+                    merged_metadata = {
+                        **upload_metadata,
+                        **parse_result.metadata,
+                    }
+                    await repo.update_metadata(
+                        doc_uuid,
+                        page_count=parse_result.page_count,
+                        extracted_title=parse_result.extracted_title,
+                        parse_status=parse_result.parse_status,
+                        metadata=merged_metadata,
+                    )
+                    await session.commit()
+
+            await asyncio.gather(
+                _save_metadata(),
+                s3_client.upload_file(
+                    json_path,
+                    f"{base_key}/docling.json",
+                    "application/json",
+                    bucket=get_s3_docling_bucket(),
+                ),
+                s3_client.upload_file(
+                    md_path,
+                    f"{base_key}/document.md",
+                    "text/markdown",
+                    bucket=get_s3_rendered_bucket(),
+                ),
+            )
+            json_path.unlink(missing_ok=True)
+            md_path.unlink(missing_ok=True)
+            document = parse_result.document
+            parse_status = parse_result.parse_status
 
         # -- chunk document (CPU-bound) -------------------------------------
         await _log_stage("chunk_document")
         chunks = await _timed(
-            "chunk", asyncio.to_thread(chunker.chunk_document, parse_result.document, document_id)
+            "chunk", asyncio.to_thread(chunker.chunk_document, document, document_id)
         )
         INGESTION_CHUNKS.observe(len(chunks))
 
         if not chunks:
-            logger.info(
+            # Zero chunks means nothing was indexed: the document is "ready" but no query can
+            # ever retrieve it. Logged at warning and counted under its own status rather than
+            # "success" — a scanned PDF with OCR disabled lands here, and as a plain success it
+            # was indistinguishable from a document that ingested correctly.
+            logger.warning(
                 "pipeline.no_chunks",
-                extra={"document_id": document_id, "stage": "chunk_document"},
+                extra={
+                    "document_id": document_id,
+                    "stage": "chunk_document",
+                    "parse_status": parse_status,
+                },
             )
             await _log_stage("finalize_ready")
             stage_times["finalize_ready"] = round(perf_counter() - stage_start, 3)
@@ -307,7 +774,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                 await repo.update_status(doc_uuid, "ready")
                 await repo.set_ingest_time_seconds(doc_uuid, ingest_times)
                 await session.commit()
-            INGESTION_DOCUMENTS.labels("success").inc()
+            INGESTION_DOCUMENTS.labels("no_content").inc()
             await _emit("done", {"chunks": 0})
             logger.info(
                 "pipeline.complete",
@@ -334,8 +801,6 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             if await DocumentRepository(session).get_by_id(doc_uuid) is None:
                 raise LookupError(f"Document {document_id} no longer exists")
             chunk_repo = ChunkRepository(session)
-            old_db_chunks = await chunk_repo.list_by_document(doc_uuid)
-            old_chunk_ids = [c.id for c in old_db_chunks]
             db_chunks = await chunk_repo.create_many(doc_uuid, chunks)
             await session.commit()
 
@@ -377,36 +842,37 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
 
         # -- ensure collections/indices exist (parallel) --------------------
         await _log_stage("ensure_vector_and_search_indexes")
-        dim = len(vectors[0]) if vectors else (get_embedding_dim() or 384)
+        dim = len(vectors[0]) if len(vectors) else (get_embedding_dim() or 384)
         await asyncio.gather(
             asyncio.to_thread(qdrant_ingest.ensure_collection, "documents", dim),
             asyncio.to_thread(opensearch_ingest.ensure_index, "chunks"),
         )
 
+        # -- purge any prior generation of this document's chunks ------------
+        # By document_id and *before* indexing, so re-ingestion is idempotent wherever a
+        # prior attempt died. The old chunk-id list came from Postgres and ran after
+        # indexing, so a rollback erased the only record of what needed cleaning.
+        # Skipped on the first attempt: ingest_attempt_count is never reset, so nothing can
+        # have been indexed under this document_id yet.
+        await _log_stage("purge_stale_chunks")
+        if attempt > 1:
+            await asyncio.gather(
+                asyncio.to_thread(qdrant_ingest.delete_by_document, "documents", document_id),
+                asyncio.to_thread(opensearch_ingest.delete_by_document, "chunks", document_id),
+            )
+
         # -- index + backup (Qdrant, OpenSearch, S3 chunks.jsonl — parallel)
         await _log_stage("index_and_backup_chunks")
-        chunks_jsonl = "\n".join(
-            json.dumps(
-                {
-                    "chunk_id": str(db.id),
-                    "chunk_index": c["chunk_index"],
-                    "raw_text": c["raw_text"],
-                    "enriched_text": c["enriched_text"],
-                    "heading_trail": c.get("heading_trail"),
-                    "chunk_type": c.get("chunk_type"),
-                    "page_start": c.get("page_start"),
-                    "page_end": c.get("page_end"),
-                    "token_count": c.get("token_count"),
-                    "table_nl_summary": c.get("table_nl_summary"),
-                    "table_nl_summary_model": c.get("table_nl_summary_model"),
-                    "provenance": c.get("provenance"),
-                    "metadata": c.get("metadata", {}),
-                },
-                ensure_ascii=False,
-                default=str,
+        chunks_jsonl_path = work_dir / "chunks.jsonl"
+
+        async def _backup_chunks() -> None:
+            await asyncio.to_thread(_write_chunks_jsonl, chunks_jsonl_path, chunks, db_chunks)
+            await s3_client.upload_file(
+                chunks_jsonl_path,
+                f"{base_key}/chunks.jsonl",
+                "application/jsonl",
+                bucket=get_s3_chunks_bucket(),
             )
-            for c, db in zip(chunks, db_chunks, strict=True)
-        ).encode()
 
         await asyncio.gather(
             _timed(
@@ -429,17 +895,7 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
                     user_id=user_id,
                 ),
             ),
-            s3_client.upload_bytes(
-                f"{base_key}/chunks.jsonl",
-                chunks_jsonl,
-                "application/jsonl",
-                bucket=get_s3_chunks_bucket(),
-            ),
-        )
-
-        await asyncio.gather(
-            asyncio.to_thread(qdrant_ingest.delete_by_chunk_ids, "documents", old_chunk_ids),
-            asyncio.to_thread(opensearch_ingest.bulk_delete, "chunks", old_chunk_ids),
+            _backup_chunks(),
         )
 
         # -- finalize -> ready ----------------------------------------------
@@ -466,6 +922,18 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             },
         )
 
+    except asyncio.CancelledError:
+        if not lease.lost:
+            raise
+        # The heartbeat found the lease in someone else's hands and cancelled us. Another
+        # worker owns this document now, so returning normally acks the delivery and leaves
+        # the row to the owner: writing anything from here would fight it. Deliberately not
+        # re-raised, and not counted as a failure — the document is not failing, it moved.
+        logger.warning(
+            "pipeline.abandoned_lost_lease",
+            extra={"document_id": document_id, "stage": current_stage},
+        )
+        return
     except LookupError:
         raise
     except SoftTimeLimitExceeded:
@@ -527,18 +995,103 @@ async def _run_pipeline(document_id: str) -> None:  # noqa: C901
             logger.exception("pipeline.set_failed_error", extra={"document_id": document_id})
         raise
     finally:
+        await lease.release()
         if pdf_path is not None:
             pdf_path.unlink(missing_ok=True)
+        if work_dir is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@celery_app.task(bind=True, name="ingest_document")
+@celery_app.task(
+    bind=True,
+    name="ingest_document",
+    soft_time_limit=_task_soft_time_limit,
+    time_limit=_task_time_limit,
+)
 def ingest_document(self, document_id: str) -> None:
     """Full ingestion pipeline: parse -> chunk -> embed -> index -> finalize."""
+    global _child_tasks
     logger.info("ingest_document.start", extra={"document_id": document_id})
+    _child_tasks += 1
+    mem = _record_task_start(_child_tasks)
+    try:
+        # One trace per document: the enrichment and summarization generations nest under
+        # it instead of each landing as a parentless trace.
+        with lf_span("ingest_document", as_type="chain", input={"document_id": document_id}):
+            _ingest_document(self, document_id, mem)
+    finally:
+        lf_client.flush()
+        # After _run_pipeline returned, so its locals (the parsed document) are gone and
+        # task_end reads the floor the next task inherits.
+        _record_task_end(mem, document_id)
+
+
+def _record_task_start(child_tasks: int) -> TaskMemory:
+    mem = TaskMemory.start(child_tasks)
+    INGESTION_WORKER_CHILD_TASKS.set(child_tasks)
+    if mem.rss_start is not None:
+        INGESTION_WORKER_RSS.labels("task_start").set(mem.rss_start)
+    return mem
+
+
+def _record_task_end(mem: TaskMemory, document_id: str) -> None:
+    """Publish the task's floor, peaks and growth, and log them as one pipeline.memory line.
+
+    finish() resets the peak, so the --max-memory-per-child check that billiard runs next
+    compares the threshold with the memory the task kept.
+    """
+    try:
+        # Before finish(): it reads the floor and resets the peak that billiard's recycle
+        # check compares, so trimming after it would recycle on memory already returned.
+        trimmed = False
+        cuda_emptied = False
+        trim_enabled = get_ingest_malloc_trim_enabled()
+        cuda_enabled = get_ingest_cuda_empty_cache_enabled()
+        if trim_enabled or cuda_enabled:
+            gc.collect()
+        if cuda_enabled:
+            # Ahead of the trim: releasing CUDA blocks drops the host-side bookkeeping that
+            # pins them, which malloc_trim can then return to the OS.
+            cuda_emptied = empty_cuda_cache()
+        if trim_enabled:
+            trimmed = malloc_trim()
+        report = mem.finish()
+        if report.rss_end is not None:
+            INGESTION_WORKER_RSS.labels("task_end").set(report.rss_end)
+        if report.malloc_end is not None:
+            INGESTION_WORKER_MALLOC_FREE.set(report.malloc_end.fordblks)
+        for stage, peak in mem.stage_peaks.items():
+            INGESTION_WORKER_PEAK_RSS.labels(stage).set(peak)
+        for stage, growth in mem.stage_growth.items():
+            INGESTION_WORKER_STAGE_GROWTH.labels(stage).set(growth)
+        if mem.task_peak is not None:
+            INGESTION_WORKER_PEAK_RSS.labels("task").set(mem.task_peak)
+        threshold_kib = get_ingest_worker_max_memory_per_child_kb()
+        recycle = bool(
+            threshold_kib and report.rss_end is not None and report.rss_end > threshold_kib * 1024
+        )
+        if recycle:
+            INGESTION_WORKER_RECYCLES.inc()
+        logger.info(
+            "pipeline.memory",
+            extra={
+                "document_id": document_id,
+                **report.log_fields(),
+                "recycle_threshold_mb": round(threshold_kib * 1024 / 1e6, 1),
+                "recycle_expected": recycle,
+                "malloc_trimmed": trimmed,
+                "cuda_cache_emptied": cuda_emptied,
+            },
+        )
+    except Exception:  # noqa: BLE001 — instrumentation never fails a task
+        logger.warning("pipeline.memory_failed", extra={"document_id": document_id}, exc_info=True)
+
+
+def _ingest_document(self, document_id: str, mem: TaskMemory) -> None:
     try:
         if _worker_loop is None or _worker_loop.is_closed():
             raise RuntimeError("Ingestion worker loop is not initialized")
-        _worker_loop.run_until_complete(_run_pipeline(document_id))
+        _worker_loop.run_until_complete(_run_pipeline(document_id, mem))
         logger.info("ingest_document.done", extra={"document_id": document_id})
     except LookupError:
         logger.warning(

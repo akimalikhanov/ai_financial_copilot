@@ -139,6 +139,9 @@ services:
     image: postgres:16.11-alpine
     container_name: postgres
     restart: unless-stopped
+    # Matches infra/k8s/base/data/postgres-statefulset.yaml: pgbouncer can open up to 120
+    # server connections, above the image default of 100.
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       # superuser / default DB created by entrypoint
       POSTGRES_USER: ${POSTGRES_USER}
@@ -330,9 +333,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     command:
       - --model-id
       - ${RERANKER_MODEL_NAME:-BAAI/bge-reranker-v2-m3}
@@ -354,6 +359,12 @@ services:
       - tei_data:/data
     cpus: "2.00"
     mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
     <<: *default-logging
     networks: [backend]
 
@@ -365,9 +376,11 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     command:
       - --model-id
       - ${EMBEDDER_MODEL_NAME:-BAAI/bge-m3}
@@ -389,6 +402,12 @@ services:
       - tei_data:/data
     cpus: "2.00"
     mem_limit: 12g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
     <<: *default-logging
     networks: [backend]
 
@@ -616,6 +635,10 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
+      # `copilot-logs` may only ever exist as the ILM rollover alias. Without this, fluent-bit
+      # racing es-bootstrap auto-creates it as a plain index and the alias can never be
+      # created. Everything else still auto-creates.
+      action.auto_create_index: "-copilot-logs,+*"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     volumes:
       - es_data:/usr/share/elasticsearch/data
@@ -683,6 +706,7 @@ services:
       <<: *app-env
       # Container logs go to stdout only; Fluent Bit collects via fluentd driver.
       LOG_FILE: ""
+      OTEL_SERVICE_NAME: api
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -723,6 +747,7 @@ services:
       <<: *app-env
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom_chat
       LOG_FILE: ""
+      OTEL_SERVICE_NAME: worker-chat
     command: ["python", "-m", "src.workers.chat_worker"]
     depends_on:
       pgbouncer:
@@ -735,12 +760,16 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      tei-embedder:
+        condition: service_healthy
+      tei:
+        condition: service_healthy
       garage:
         condition: service_started
       fluent-bit:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -762,17 +791,20 @@ services:
       <<: *app-env
       PROMETHEUS_MULTIPROC_DIR: /tmp/prom_ingestion
       LOG_FILE: ""
-      HF_HOME: /root/.cache/huggingface
+      OTEL_SERVICE_NAME: worker-ingestion
+      HF_HOME: /home/appuser/.cache/huggingface
     volumes:
-      - hf-model-cache:/root/.cache/huggingface
+      - hf-model-cache:/home/appuser/.cache/huggingface
     command: ["python", "-m", "src.workers.ingestion_worker"]
     deploy:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: 1
+            # CDI, not driver:nvidia — the latter is a silent no-op for unprivileged containers
+            - driver: cdi
               capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
     depends_on:
       pgbouncer:
         condition: service_healthy
@@ -784,18 +816,21 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      # Embedder only — ingestion never calls the reranker.
+      tei-embedder:
+        condition: service_healthy
       garage:
         condition: service_started
       fluent-bit:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
     cpus: "4.00"
-    mem_limit: 6g
+    mem_limit: 12g
     <<: *app-logging
     networks: [backend]
 

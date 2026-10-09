@@ -18,7 +18,7 @@ def _build_query(
     query_text: str, user_id: UUID, doc_ids: list[UUID] | None, top_k: int
 ) -> dict[str, Any]:
     filters: list[dict[str, Any]] = [{"term": {"user_id": str(user_id)}}]
-    if doc_ids:
+    if doc_ids is not None:
         filters.append({"terms": {"document_id": [str(doc_id) for doc_id in doc_ids]}})
 
     return {
@@ -117,9 +117,12 @@ async def retrieve(
     doc_ids: list[UUID] | None = None,
     top_k: int = get_keyword_search_top_k(),
 ) -> list[RetrievedChunk]:
-    """Search OpenSearch for a user's most relevant chunks."""
+    """Search OpenSearch for a user's most relevant chunks.
+
+    `doc_ids=None` searches all of the user's documents; `[]` matches nothing.
+    """
     query_text = query_text.strip()
-    if top_k <= 0 or not query_text:
+    if top_k <= 0 or not query_text or doc_ids == []:
         return []
 
     return await asyncio.to_thread(

@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from src.schemas.prompt import PromptTemplate
+from src.services.chat.agent.state import get_agent_settings, shape_config
 from src.services.prompts.prompt_loader import PromptLoader, PromptLoaderError
 from src.services.prompts.prompt_renderer import (
     PromptRenderer,
@@ -282,20 +283,8 @@ def test_get_system_prompt_loads_template(temp_prompts_dir):
         mock_loader_instance = PromptLoader(temp_prompts_dir)
         mock_loader.return_value = mock_loader_instance
 
-        result = get_system_prompt()
+        result = get_system_prompt(version="v1")
 
-        assert result == "You are a test assistant.\n"
-
-
-def test_get_system_prompt_uses_default_version(temp_prompts_dir):
-    """Test that get_system_prompt uses v1 by default."""
-    with patch("src.services.prompts.prompt_renderer.get_prompt_loader") as mock_loader:
-        mock_loader_instance = PromptLoader(temp_prompts_dir)
-        mock_loader.return_value = mock_loader_instance
-
-        result = get_system_prompt()
-
-        # Should load v1
         assert result == "You are a test assistant.\n"
 
 
@@ -328,7 +317,7 @@ def test_full_flow_load_and_render(temp_prompts_dir):
     # Get system prompt using the temp loader
     with patch("src.services.prompts.prompt_renderer.get_prompt_loader") as mock_loader:
         mock_loader.return_value = loader
-        system_prompt = get_system_prompt()
+        system_prompt = get_system_prompt(version="v1")
         assert "test assistant" in system_prompt.lower()
 
     # Render user message
@@ -359,8 +348,92 @@ def test_renderer_with_default_loader():
 def test_system_prompt_with_real_templates():
     """Test that get_system_prompt works with real templates."""
     # This uses the actual prompts directory
-    system_prompt = get_system_prompt()
+    system_prompt = get_system_prompt(version="v3_agent_synthesis")
 
     # Should contain the Financial Document Analyst prompt
     assert "Financial Document Analyst" in system_prompt
     assert "RAG-based" in system_prompt or "Retrieval-Augmented Generation" in system_prompt
+
+
+# -------------------------
+# Agent tool-model prompts
+# -------------------------
+
+
+@pytest.mark.parametrize("version", ["v4_agent", "v6_agent_analytical"])
+def test_agent_prompt_names_only_the_offered_tools(version: str):
+    """A prompt naming a tool the model was not given produces a call the dispatch rule
+    answers as unavailable."""
+    prompt = get_system_prompt(version=version)
+
+    assert "search_documents(" in prompt
+    assert "report_findings(" in prompt
+    assert "report_analytical_findings" not in prompt
+
+
+@pytest.mark.parametrize("shape", ["extraction", "analytical"])
+def test_agent_prompt_names_only_current_finding_fields(shape: str):
+    """A prompt describes exactly the finding fields its shape's report tool advertises —
+    telling the model to leave out a field the schema still asks for gets it filled anyway."""
+    config = shape_config(shape, get_agent_settings())
+    prompt = get_system_prompt(version=config.prompt)
+    finding = config.tools[1]["function"]["parameters"]["$defs"]["Finding"]
+
+    for retired in ("metric_requested", "source_chunks", "evidence_chunks", "substantiated"):
+        assert retired not in prompt
+    for field in finding["properties"]:
+        assert f"`{field}`" in prompt
+    if "figures" not in finding["properties"]:
+        assert "figures" not in prompt
+
+
+def test_analytical_prompt_drops_the_one_shot_finalizer_framing():
+    """The report tool is non-terminal and the loop owns termination. Prose telling the
+    model to call it ONCE, or that it ends the search phase, contradicts the loop."""
+    prompt = get_system_prompt(version="v6_agent_analytical")
+
+    assert "ONCE" not in prompt
+    assert "ends the search phase" not in prompt
+    assert "as soon as its evidence settles" in prompt
+
+
+def test_analytical_prompt_fixes_no_aspect_count():
+    """Width is anchored on the question, not a number: every seeded aspect is an
+    obligation that either lands a finding or surfaces as an unresolved gap, so a fixed
+    count spends searches on invented hypotheses and pads the answer with manufactured gaps."""
+    prompt = get_system_prompt(version="v6_agent_analytical")
+
+    assert "3–4" not in prompt
+    assert "sub_question" in prompt  # the mechanism that opens an aspect
+
+
+def test_synthesis_prompt_describes_the_one_block():
+    prompt = get_system_prompt(version="v5_agent_synthesis")
+
+    assert "[FINDINGS]" in prompt
+    assert "[STRUCTURED FINDINGS]" not in prompt
+    assert "[AGENT OBSERVATIONS]" not in prompt
+    # Every marker the renderer and the projection can emit is explained.
+    for marker in (
+        "[not disclosed]",
+        "(scale not stated)",
+        "UNVERIFIED: value not located in cited excerpt",
+        "Not searched:",
+        "Could not be checked",
+    ):
+        assert marker in prompt
+
+
+def test_analytical_prompt_caps_fanout_at_max_concurrent_searches():
+    """The turn-1 fan-out must not exceed AGENT_MAX_CONCURRENT_SEARCHES (default 3), or
+    the extra searches queue behind the semaphore instead of running in parallel."""
+    import re
+
+    from src.services.chat.agent.state import get_agent_settings
+
+    prompt = get_system_prompt(version="v6_agent_analytical")
+    example = prompt.split("## Example")[1]
+    turn_1 = example.split("Turn 2")[0]
+
+    fanout = len(re.findall(r"search_documents\(", turn_1))
+    assert fanout == get_agent_settings().max_concurrent_searches

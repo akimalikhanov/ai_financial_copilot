@@ -14,8 +14,7 @@ if TYPE_CHECKING:
 
     from src.models.llm_request import LLMRequest
     from src.schemas.query_router import DocumentScopeResult, RouterOutput
-    from src.schemas.query_transform import TransformedQuery
-    from src.schemas.retrieval import ProcessedQuery, RAGContext
+    from src.schemas.retrieval import RAGContext
     from src.services.chat.agent.state import AgentLoopMeta
     from src.services.context.conversation_history import ConversationHistory
     from src.services.llm_adapters.base_adapter import ChatMessage as AdapterChatMessage
@@ -29,6 +28,35 @@ class Role(str, Enum):
     tool = "tool"
 
 
+class TurnSummary(BaseModel):
+    """What the router resolved for a turn, stored on its answer for the session index.
+    Router-resolved fields only, never model-written prose."""
+
+    model_config = ConfigDict(frozen=True)
+
+    route: str
+    query_shape: str | None = None
+    entities: list[str] = []
+    # Documents the turn was scoped to; None means all of the user's documents.
+    doc_count: int | None = None
+
+
+class Turn(BaseModel):
+    """One prior question and its answer, the only shape conversation history takes.
+
+    No field can hold a findings block, so a carried block cannot reach any model's
+    history through here (Contract F1).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int  # position in the loaded tail, counting dropped turns
+    question: str  # sanitized
+    answer: str | None  # None when the turn produced no answer
+    from_carryover: bool = False
+    summary: TurnSummary | None = None
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -36,6 +64,20 @@ class ChatMessage(BaseModel):
     content: str
     name: str | None = None
     tool_call_id: str | None = None
+    # Set on an answer: what the router resolved for its turn (session index).
+    turn_summary: TurnSummary | None = None
+    # Rendered findings/observations block, for the router and synthesis only.
+    # Contract F1: must never reach the agent transcript.
+    findings_block: str | None = None
+    # Answered from a carried block, so its prose restates earlier numbers —
+    # the agent gets a stub instead of the text (Contract F1).
+    answer_derived_from_carryover: bool = False
+    # Turns this block has been inherited for. 0 = produced by a fresh agent run.
+    findings_block_hops: int = 0
+    # Documents the block was retrieved under, so a later turn can tell whether the
+    # scope moved underneath it. Only meaningful when findings_block is set, where
+    # None means "all documents" rather than "unknown".
+    findings_block_doc_ids: list[str] | None = None
 
 
 @dataclass
@@ -51,19 +93,30 @@ class ChatPipelineState:
     assistant_seq: int = 0
     history: ConversationHistory | None = None
     context_messages: list[ChatMessage] | None = None
+    # Prior turns from `prior_turns()`; each model caps and formats its own view.
+    prior_turns: list[Turn] = field(default_factory=list)
     user_query_raw: str = ""
-    processed_query: ProcessedQuery | None = None
     router_output: RouterOutput | None = None
     scope_result: DocumentScopeResult | None = None
-    transformed_query: TransformedQuery | None = None
     rag_context: RAGContext | None = None
     rag_context_str: str = ""
     adapter_messages: list[AdapterChatMessage] | None = None
     accumulated_content: str = ""
     clean_content: str = ""
     params: dict = field(default_factory=dict)
-    used_agent_loop: bool = False
     agent_meta: AgentLoopMeta | None = None
+    # Findings-processor outputs, carried from the agent stage to the trace payload.
+    agent_answer_entity: str | None = None
+    agent_fx_rates: dict = field(default_factory=dict)
+    agent_currency_converted: bool = False
+    # Rendered findings/observations block to persist for follow-up turns.
+    findings_block: str | None = None
+    # This turn was answered from a carried block rather than fresh retrieval.
+    answer_derived_from_carryover: bool = False
+    # Hop count to persist for this turn's block (0 when freshly retrieved).
+    findings_block_hops: int = 0
+    # Scope the block was retrieved under, persisted for the next turn's staleness check.
+    findings_block_doc_ids: list[str] | None = None
 
 
 class LLMResponseStats(BaseModel):
@@ -163,6 +216,31 @@ class ChatEnqueueRequest(BaseModel):
     model: str
     params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # False for API clients that can't show the clarification card: the run goes ahead with
+    # the best candidate, or the "not found" label.
+    allow_clarification: bool = True
+    # Set when answering a clarification card: the original question is re-run, and no new
+    # user message is created.
+    clarification_reply: ClarificationReply | None = None
+
+
+class ClarificationPick(BaseModel):
+    """The user's answer for one entity on a clarification card."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    raw_span: str
+    # A company display name, from the card's candidates or the user's company list.
+    company: str | None = None
+    # For an entity outside the UI scope: search that company anyway, or leave it out.
+    include_outside_scope: bool | None = None
+
+
+class ClarificationReply(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clarification_id: UUID  # the clarification card's assistant message
+    picks: list[ClarificationPick]
 
 
 class ChatEnqueueResponse(BaseModel):

@@ -1,3 +1,5 @@
+import type { ClarificationPick, ScopeClarification } from '../types';
+
 export type Role = 'system' | 'developer' | 'user' | 'assistant' | 'tool';
 
 // --- Auth token wiring (in-memory only; set by AuthContext) ---
@@ -67,6 +69,8 @@ export interface ApiError {
   message: string;
   errorType?: string;
   statusCode?: number;
+  /** From the Retry-After header, when the server sent one (503 at capacity, 429 rate limit). */
+  retryAfterSeconds?: number;
   raw?: unknown;
 }
 
@@ -76,7 +80,6 @@ export interface CitationSpanEvent {
   start: number;
   end: number;
   ref_ids: string[];
-  display_labels: string[];
 }
 
 export interface ReferencesEvent {
@@ -105,22 +108,27 @@ export interface MetadataEvent {
   confidence: 'low' | 'medium' | 'high' | 'none';
   ungrounded_claims: boolean | null;
   route: string | null;
+  /** Retrieval capabilities that were unavailable: 'dense' | 'keyword' | 'rerank'. */
+  degraded_retrieval?: string[] | null;
 }
 
-export interface StageEvent {
-  stage: string;
-  index: number;
-  total: number;
-}
+/** Unified event replacing the old StageEvent/ToolCallStarted/CompletedEvent/agent_turn_started/
+ * agent_synthesis_starting shapes. `_started` kinds carry `label`; `_ended` kinds are correlated
+ * to their `_started` counterpart via `id`, not by label/entity matching. */
+export type ActivityKind =
+  | 'stage_started'
+  | 'stage_ended'
+  | 'tool_call_started'
+  | 'tool_call_ended'
+  | 'round_started';
 
-export interface ToolCallStartedEvent {
-  entity: string;
-}
-
-export interface ToolCallCompletedEvent {
-  entity: string;
-  chunks_returned: number;
-  new_chunks_added: number;
+export interface ActivityEvent {
+  kind: ActivityKind;
+  id: string;
+  parent_id?: string;
+  label?: string;
+  detail?: Record<string, unknown>;
+  ts: number;
 }
 
 export interface ConversationTitleEvent {
@@ -171,15 +179,25 @@ const toApiError = (payload: unknown, options: ApiErrorOptions = {}): ApiError =
   };
 };
 
+const parseRetryAfter = (response: Response): number | undefined => {
+  const raw = response.headers.get('Retry-After');
+  if (!raw) return undefined;
+  const seconds = Number.parseInt(raw, 10);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+};
+
 const toApiErrorFromResponse = async (response: Response): Promise<ApiError> => {
   const fallbackMessage = `Request failed with status ${response.status}`;
   const text = await response.text();
+  const retryAfterSeconds = parseRetryAfter(response);
+  let error: ApiError;
   try {
     const payload = JSON.parse(text) as unknown;
-    return toApiError(payload, { statusCode: response.status, fallbackMessage });
+    error = toApiError(payload, { statusCode: response.status, fallbackMessage });
   } catch {
-    return toApiError(text, { statusCode: response.status, fallbackMessage });
+    error = toApiError(text, { statusCode: response.status, fallbackMessage });
   }
+  return retryAfterSeconds === undefined ? error : { ...error, retryAfterSeconds };
 };
 
 const toApiErrorFromThrowable = (error: unknown): ApiError => {
@@ -199,6 +217,7 @@ const toApiErrorFromThrowable = (error: unknown): ApiError => {
 type SseEvent = {
   event: string;
   data: string;
+  id?: string;
 };
 
 type FetchApiOptions = RequestInit & {
@@ -244,12 +263,17 @@ async function fetchApi(url: string, options: FetchApiOptions = {}): Promise<Res
 const parseSseEvent = (rawEvent: string): SseEvent | null => {
   const lines = rawEvent.split('\n');
   let event = '';
+  let id: string | undefined;
   const dataLines: string[] = [];
 
   for (const line of lines) {
     if (!line || line.startsWith(':')) continue;
     if (line.startsWith('event:')) {
       event = line.slice('event:'.length).trim();
+      continue;
+    }
+    if (line.startsWith('id:')) {
+      id = line.slice('id:'.length).trim();
       continue;
     }
     if (line.startsWith('data:')) {
@@ -264,14 +288,23 @@ const parseSseEvent = (rawEvent: string): SseEvent | null => {
   return {
     event: event || 'message',
     data: dataLines.join('\n'),
+    id,
   };
 };
 
 // --- Models API ---
 
+export interface ModelDefaultParams {
+  temperature?: number;
+  max_tokens?: number;
+  reasoning_effort?: 'low' | 'medium' | 'high' | null;
+  verbosity?: 'low' | 'medium' | 'high' | null;
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
+  default_params: ModelDefaultParams;
 }
 
 export interface ModelsResponse {
@@ -410,6 +443,7 @@ export interface DocumentListItemResponse {
   created_at: string;
   extracted_title: string | null;
   page_count: number | null;
+  parse_status: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -472,58 +506,99 @@ export interface IngestionStageEvent {
   stage_total: number;
 }
 
+// A long-lived ingestion stream sits idle whenever a pipeline stage is slow (model loading,
+// a large PDF), so proxies, tab throttling and network blips drop it routinely. Those drops
+// say nothing about the ingestion, which keeps running in the worker — only an `error` SSE
+// frame does. Transport failures therefore reconnect (the endpoint re-derives status from the
+// DB and replays the terminal event) and report through onTransportError, so callers can
+// re-read the real status instead of showing a healthy document as failed.
+const INGESTION_RECONNECT_BASE_MS = 1000;
+const INGESTION_RECONNECT_MAX_MS = 30000;
+
 export const subscribeIngestionStream = (
   documentId: string,
   onStage: (event: IngestionStageEvent) => void,
   onDone: () => void,
   onError: (message: string) => void,
+  onTransportError?: (message: string) => void,
+  // The worker died and the server put the document back on the queue. Not terminal: the
+  // replacement attempt writes to this same stream, so the stage events resume here.
+  onRetrying?: (attempt: number) => void,
 ): (() => void) => {
   const url = joinUrl(API_BASE_URL, `/v1/documents/${documentId}/stream`);
-  const token = getAccessTokenValue();
-  const headers: Record<string, string> = { Accept: 'text/event-stream' };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
 
   let cancelled = false;
-  const controller = new AbortController();
+  let finished = false;
+  let attempt = 0;
+  let controller = new AbortController();
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
-  (async () => {
-    try {
-      const response = await fetch(url, { headers, signal: controller.signal });
-      if (!response.ok || !response.body) {
-        onError(`HTTP ${response.status}`);
-        return;
-      }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      let eventType = 'stage';
+  // Reads one connection to completion. Resolves true when a terminal event settled the
+  // document (no reconnect), false when the connection dropped without one.
+  const readStream = async (): Promise<boolean> => {
+    const token = getAccessTokenValue();
+    const headers: Record<string, string> = { Accept: 'text/event-stream' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
 
-      while (!cancelled) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop() ?? '';
-        for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventType = line.slice(6).trim();
-          } else if (line.startsWith('data:')) {
-            try {
-              const payload = JSON.parse(line.slice(5).trim());
-              if (eventType === 'stage') onStage(payload as IngestionStageEvent);
-              else if (eventType === 'done') { onDone(); return; }
-              else if (eventType === 'error') { onError(payload.message ?? 'Ingestion failed'); return; }
-            } catch { /* ignore malformed */ }
-            eventType = 'stage';
-          }
+    controller = new AbortController();
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+
+    attempt = 0;   // a successful connect resets the backoff
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let eventType = 'stage';
+
+    while (!cancelled) {
+      const { done, value } = await reader.read();
+      if (done) return false;      // server closed without a terminal event — reconnect
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() ?? '';
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith('data:')) {
+          try {
+            const payload = JSON.parse(line.slice(5).trim());
+            if (eventType === 'stage') onStage(payload as IngestionStageEvent);
+            else if (eventType === 'retrying') onRetrying?.(Number(payload.attempt) || 0);
+            else if (eventType === 'done') { onDone(); return true; }
+            else if (eventType === 'error') { onError(payload.message ?? 'Ingestion failed'); return true; }
+          } catch { /* ignore malformed */ }
+          eventType = 'stage';
         }
       }
-    } catch (err) {
-      if (!cancelled) onError(String(err));
     }
-  })();
+    return false;
+  };
 
-  return () => { cancelled = true; controller.abort(); };
+  const run = async () => {
+    while (!cancelled && !finished) {
+      let message = '';
+      try {
+        if (await readStream()) { finished = true; return; }
+      } catch (err) {
+        if (cancelled) return;
+        message = String(err);
+      }
+      if (cancelled) return;
+      onTransportError?.(message || 'stream closed');
+
+      const delay = Math.min(INGESTION_RECONNECT_BASE_MS * 2 ** attempt, INGESTION_RECONNECT_MAX_MS);
+      attempt += 1;
+      await new Promise<void>(resolve => { retryTimer = setTimeout(resolve, delay); });
+    }
+  };
+
+  void run();
+
+  return () => {
+    cancelled = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    controller.abort();
+  };
 };
 
 // --- Conversations API ---
@@ -649,6 +724,7 @@ export interface MessageResponse {
   seq: number;
   created_at: string;
   metadata?: Record<string, unknown>;
+  trace?: { activity?: ActivityEvent[] } | null;
   feedback?: MessageFeedbackPayload | null;
 }
 
@@ -732,6 +808,9 @@ export interface ChatEnqueueRequest {
   model: string;
   params: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  allow_clarification?: boolean;
+  // Answers a card: the backend re-runs the original question instead of adding a message.
+  clarification_reply?: { clarification_id: string; picks: ClarificationPick[] };
 }
 
 export interface ChatEnqueueResponse {
@@ -775,17 +854,21 @@ export const chatStreamSubscribe = async (
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
-  onStage?: (stage: StageEvent) => void,
-  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
-  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
+  onClarification?: (event: ScopeClarification) => void,
 ): Promise<void> => {
+  let cursor = afterEventId;
   for (let attempt = 0; attempt <= MAX_SSE_RETRIES; attempt++) {
     const result = await _doStreamAttempt(
-      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, afterEventId, onMetadata, onStage, onToolCallStarted, onToolCallCompleted, onConversationTitle
+      requestId, onDelta, onCitationSpan, onReferences, onFinal, onError, cursor, onMetadata, onActivity, onConversationTitle,
+      onClarification
     );
-    if (result === 'done' || result === 'server-error') return;
-    // 'connection-error': retry only if no content was delivered (safe to replay from 0-0)
+    // Resume from the last event actually consumed, not the original cursor, so a
+    // reconnect doesn't re-stream (and re-render) everything already processed.
+    if (result.lastEventId) cursor = result.lastEventId;
+    if (result.status === 'done' || result.status === 'server-error') return;
+    // 'connection-error': retry, resuming from `cursor` (safe even mid-stream now)
     if (attempt < MAX_SSE_RETRIES) {
       await new Promise((r) => setTimeout(r, SSE_RETRY_DELAY_MS));
       continue;
@@ -799,7 +882,7 @@ export const chatStreamSubscribe = async (
  * Single SSE stream attempt. Returns:
  * - 'done': stream completed successfully (or onError called for a server-side error)
  * - 'server-error': non-retryable error (HTTP error, server-sent error event)
- * - 'connection-error': connection-level failure before any content events — safe to retry
+ * - 'connection-error': connection-level failure — retry, resuming from `lastEventId`
  */
 async function _doStreamAttempt(
   requestId: string,
@@ -810,11 +893,10 @@ async function _doStreamAttempt(
   onError: (error: ApiError) => void,
   afterEventId?: string,
   onMetadata?: (meta: MetadataEvent) => void,
-  onStage?: (stage: StageEvent) => void,
-  onToolCallStarted?: (event: ToolCallStartedEvent) => void,
-  onToolCallCompleted?: (event: ToolCallCompletedEvent) => void,
+  onActivity?: (event: ActivityEvent) => void,
   onConversationTitle?: (event: ConversationTitleEvent) => void,
-): Promise<'done' | 'server-error' | 'connection-error'> {
+  onClarification?: (event: ScopeClarification) => void,
+): Promise<{ status: 'done' | 'server-error' | 'connection-error'; lastEventId?: string }> {
   const params = new URLSearchParams({ request_id: requestId });
   if (afterEventId) {
     params.set('after_event_id', afterEventId);
@@ -827,20 +909,21 @@ async function _doStreamAttempt(
       headers: { Accept: 'text/event-stream' },
     });
   } catch {
-    return 'connection-error';
+    return { status: 'connection-error', lastEventId: afterEventId };
   }
   if (!response.ok) {
     onError(await toApiErrorFromResponse(response));
-    return 'server-error';
+    return { status: 'server-error' };
   }
   if (!response.body) {
     onError({ message: 'Stream response has no body', statusCode: response.status });
-    return 'server-error';
+    return { status: 'server-error' };
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let receivedContent = false;
+  let lastEventId = afterEventId;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -855,6 +938,7 @@ async function _doStreamAttempt(
         if (!rawEvent) continue;
         const parsed = parseSseEvent(rawEvent);
         if (!parsed) continue;
+        if (parsed.id) lastEventId = parsed.id;
         if (parsed.event === 'error') {
           let payload: unknown = parsed.data;
           try {
@@ -863,7 +947,7 @@ async function _doStreamAttempt(
             /* keep raw */
           }
           onError(toApiError(payload, { fallbackMessage: 'Streaming error', statusCode: response.status }));
-          return 'server-error';
+          return { status: 'server-error' };
         }
         // Handle citation_span events
         if (parsed.event === 'citation_span') {
@@ -891,24 +975,17 @@ async function _doStreamAttempt(
           } catch { /* ignore malformed */ }
           continue;
         }
-        // Handle stage progress events
-        if (parsed.event === 'stage') {
-          try {
-            const s = JSON.parse(parsed.data) as StageEvent;
-            onStage?.(s);
-          } catch { /* ignore malformed */ }
-          continue;
-        }
-        if (parsed.event === 'tool_call_started') {
-          try { onToolCallStarted?.(JSON.parse(parsed.data) as ToolCallStartedEvent); } catch { /* ignore */ }
-          continue;
-        }
-        if (parsed.event === 'tool_call_completed') {
-          try { onToolCallCompleted?.(JSON.parse(parsed.data) as ToolCallCompletedEvent); } catch { /* ignore */ }
+        // Handle agent/pipeline activity events (stage + round + tool-call lifecycle)
+        if (parsed.event === 'activity') {
+          try { onActivity?.(JSON.parse(parsed.data) as ActivityEvent); } catch { /* ignore malformed */ }
           continue;
         }
         if (parsed.event === 'conversation_title') {
           try { onConversationTitle?.(JSON.parse(parsed.data) as ConversationTitleEvent); } catch { /* ignore */ }
+          continue;
+        }
+        if (parsed.event === 'scope_clarification') {
+          try { onClarification?.(JSON.parse(parsed.data) as ScopeClarification); } catch { /* ignore */ }
           continue;
         }
         // Skip other non-content server events
@@ -918,13 +995,13 @@ async function _doStreamAttempt(
           payload = JSON.parse(parsed.data) as LLMStreamChunk;
         } catch {
           onError(toApiError(parsed.data, { fallbackMessage: 'Failed to parse stream payload', statusCode: response.status }));
-          return 'server-error';
+          return { status: 'server-error' };
         }
         const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
         const safePayload: LLMStreamChunk = { ...payload, is_final: isFinal };
         if (isFinal) {
           onFinal(safePayload);
-          return 'done';
+          return { status: 'done' };
         }
         onDelta(safePayload);
         receivedContent = true;
@@ -933,26 +1010,27 @@ async function _doStreamAttempt(
     if (buffer.trim().length > 0) {
       const parsed = parseSseEvent(buffer.trim());
       if (parsed?.data) {
+        if (parsed.id) lastEventId = parsed.id;
         try {
           const payload = JSON.parse(parsed.data) as LLMStreamChunk;
           const isFinal = parsed.event === 'usage' || Boolean(payload.is_final);
           const safePayload = { ...payload, is_final: isFinal };
           if (isFinal) {
             onFinal(safePayload);
-            return 'done';
+            return { status: 'done' };
           }
           onDelta(safePayload);
           receivedContent = true;
         } catch {
           onError(toApiError(buffer, { fallbackMessage: 'Failed to parse trailing payload', statusCode: response.status }));
-          return 'server-error';
+          return { status: 'server-error' };
         }
       }
     }
     // Stream ended without a final event
-    return receivedContent ? 'done' : 'connection-error';
+    return { status: receivedContent ? 'done' : 'connection-error', lastEventId };
   } catch {
-    return receivedContent ? 'done' : 'connection-error';
+    return { status: receivedContent ? 'done' : 'connection-error', lastEventId };
   } finally {
     reader.releaseLock();
   }

@@ -1,26 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.repository.document_repository import DocumentRepository
+from src.observability.langfuse import describe_error
+from src.observability.langfuse import mark_current as lf_mark_current
+from src.observability.metrics import observe_llm_latency
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
-from src.schemas.query_router import (
-    DocumentScopeResult,
-    EntityManifestItem,
-    RouterInput,
-    RouterOutput,
-)
+from src.schemas.query_router import DocumentScopeResult, RouterInput, RouterOutput
+from src.services.context.turns import cap_turns, router_history, session_index
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
 from src.services.llm_router import LLMRouter, get_router
 from src.services.prompts.prompt_loader import get_prompt_loader
 from src.services.prompts.prompt_renderer import get_prompt_renderer
 from src.services.router.parser import parse_router_response
 from src.services.router.scope_resolver import resolve_scope
-from src.utils.config import get_query_router_model, get_router_config
+from src.utils.config import (
+    get_query_router_model,
+    get_query_router_prompt_version,
+    get_router_config,
+)
 from src.utils.json_schema import build_response_format
 
 logger = logging.getLogger(__name__)
@@ -44,36 +47,44 @@ def _router_response_format() -> dict:
     return build_response_format("query_router", RouterOutput.model_json_schema())
 
 
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Rough token estimation: ~1 token per 4 chars. Truncates aggressively to stay under limit."""
-    token_count = len(text) // 4
-    if token_count <= max_tokens:
-        return text
-    char_limit = max_tokens * 4
-    return text[:char_limit].rstrip() + "..."
+def _digest_findings_block(block: str, max_chars: int = 1500) -> str:
+    """Strip a findings block down to what the router needs to classify a follow-up.
+
+    Keeps the claim, metric and value lines; drops what follows their first ` | ` (chunk
+    refs, FX detail and grounding markers), which costs tokens on every routed turn and
+    carries no routing signal.
+    """
+    lines: list[str] = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("["):
+            continue
+        lines.append(" ".join(line.split(" | ", 1)[0].split()))
+    digest = "\n".join(lines)
+    return digest[:max_chars] if len(digest) > max_chars else digest
 
 
-def _build_messages(
-    inp: RouterInput, system: str, max_assistant_tokens: int = 150
-) -> list[ChatMessage]:
-    """Build router messages with assistant turns truncated to token budget.
+def _build_messages(inp: RouterInput, system: str) -> list[ChatMessage]:
+    """The router's one user message: scope, carried findings digest, the session index,
+    the recent turns, then the query.
 
-    Args:
-        inp: Router input with query and conversation history
-        system: System prompt
-        max_assistant_tokens: Max tokens per assistant turn (default 150 per spec)
+    The index covers every prior turn, so a reference to a turn outside the recent window
+    ("go back to the Siemens comparison") still resolves.
     """
     history_block = ""
-    if inp.conversation_history:
-        turns = []
-        for turn in inp.conversation_history:
-            role = turn.get("role", "user")
-            content = turn.get("content", "")
-            # Truncate assistant turns to stay within token budget
-            if role == "assistant":
-                content = _truncate_to_tokens(content, max_assistant_tokens)
-            turns.append(f"{role}: {content}")
-        history_block = "Recent conversation:\n" + "\n".join(turns) + "\n\n"
+    if inp.prior_turns:
+        lines: list[str] = []
+        for t in cap_turns(inp.prior_turns, router_history()):
+            lines.append(f"user: {t.question}")
+            if t.answer is not None:
+                lines.append(f"assistant: {t.answer}")
+        history_block = (
+            "Session:\n"
+            + session_index(inp.prior_turns)
+            + "\n\nRecent conversation:\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
 
     scope_block = ""
     if inp.scope is not None:
@@ -89,9 +100,21 @@ def _build_messages(
         elif inp.scope.mode in ("selectedDocs", "thisDoc"):
             scope_block = "Active document scope: specific documents explicitly selected by user\n"
 
+    findings_block = ""
+    if inp.prior_findings_block:
+        digest = _digest_findings_block(inp.prior_findings_block)
+        if digest:
+            findings_block = (
+                "Data already retrieved in this conversation "
+                "(available without new retrieval):\n" + digest + "\n\n"
+            )
+
     return [
         ChatMessage(role=Role.system, content=system),
-        ChatMessage(role=Role.user, content=f"{scope_block}{history_block}User query: {inp.query}"),
+        ChatMessage(
+            role=Role.user,
+            content=f"{scope_block}{findings_block}{history_block}User query: {inp.query}",
+        ),
     ]
 
 
@@ -122,21 +145,26 @@ async def route_query(
         session is not None and parent_request_id is not None and conversation_id is not None
     )
 
+    async def scoped(output: RouterOutput) -> tuple[RouterOutput, DocumentScopeResult | None]:
+        return await _with_scope(
+            output, inp, session, user_id, router, parent_request_id, conversation_id
+        )
+
     try:
         llm = router.get(model_id)
     except Exception:
         logger.warning("route_query_model_unavailable", extra={"model": model_id})
-        return _FALLBACK, None
+        return await scoped(_FALLBACK)
 
     try:
-        prompt = get_prompt_loader().load("query_router", "v3")
+        prompt = get_prompt_loader().load("query_router", get_query_router_prompt_version())
         system = get_prompt_renderer()._render_template(prompt.template, {})
     except Exception:
         logger.warning("route_query_prompt_missing", extra={"model": model_id})
-        return _FALLBACK, None
+        return await scoped(_FALLBACK)
 
     response_format = _router_response_format()
-    messages = _build_messages(inp, system, max_assistant_tokens=150)
+    messages = _build_messages(inp, system)
 
     cfg = get_router_config()
     request_params = {
@@ -146,29 +174,46 @@ async def route_query(
     output: RouterOutput | None = None
     for attempt in range(2):
         try:
-            resp = await llm.complete(
-                messages=messages,
-                _lf_name="query_router",
-                temperature=cfg["temperature"],
-                max_tokens=int(cfg["max_tokens"]),
-                response_format=response_format,
+            # Without this the only bound is the SDK read timeout (120s), which the SDK
+            # retry then doubles, and the parse retry doubles again — 480s to route.
+            resp = await asyncio.wait_for(
+                llm.complete(
+                    messages=messages,
+                    _lf_name="query_router",
+                    temperature=cfg["temperature"],
+                    max_tokens=int(cfg["max_tokens"]),
+                    response_format=response_format,
+                ),
+                timeout=float(cfg["timeout"]),
             )
         except Exception as e:
             logger.exception("route_query_llm_error", extra={"error": str(e)})
-            return _FALLBACK, None
+            lf_mark_current("WARNING", f"router call failed ({describe_error(e)}); fallback route")
+            return await scoped(_FALLBACK)
+
+        observe_llm_latency(model_id, "router", resp.stats)
 
         if should_log_subrequest:
-            await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
-                parent_request_id=parent_request_id,  # type: ignore[arg-type]
-                conversation_id=conversation_id,  # type: ignore[arg-type]
-                user_id=user_id,
-                provider=llm.provider,
-                model=model_id,
-                request_type="router",
-                request_params=request_params,
-                status="completed",
-                **stats_to_request_kwargs(resp.stats),
-            )
+            # Best effort, in a SAVEPOINT: a failed INSERT rolls back only the savepoint.
+            # Rolling back the caller's session instead would expire its objects.
+            try:
+                async with session.begin_nested():  # type: ignore[union-attr]
+                    await LLMRequestRepository(session).create_subrequest(  # type: ignore[arg-type]
+                        parent_request_id=parent_request_id,  # type: ignore[arg-type]
+                        conversation_id=conversation_id,  # type: ignore[arg-type]
+                        user_id=user_id,
+                        provider=llm.provider,
+                        model=model_id,
+                        request_type="router",
+                        request_params=request_params,
+                        status="completed",
+                        **stats_to_request_kwargs(resp.stats),
+                    )
+            except Exception:
+                logger.warning("route_query_subrequest_failed", exc_info=True)
+            # Release the connection before the parse retry's LLM call and the
+            # disambiguator's; holding it converts transaction pooling into session pooling.
+            await session.commit()  # type: ignore[union-attr]
 
         raw = resp.text or ""
         result, error = parse_router_response(raw)
@@ -195,7 +240,8 @@ async def route_query(
             ]
 
     if output is None:
-        return _FALLBACK, None
+        lf_mark_current("WARNING", "router output unparseable after retry; fallback route")
+        return await scoped(_FALLBACK)
 
     # if output.route == "retrieval" and not output.entities and not _has_active_scope:
     #     # Retrieval with no entities and no scope — ask user to be more specific
@@ -216,37 +262,30 @@ async def route_query(
         extra={"model": model_id, "provider": llm.provider},
     )
 
-    if session is not None and user_id is not None and output.route == "retrieval":
-        scope_result = await resolve_scope(session, user_id, inp.scope, output)
-        scope_result = await _attach_entity_manifest(session, user_id, scope_result)
-        return output, scope_result
-
-    return output, None
+    return await scoped(output)
 
 
-async def _attach_entity_manifest(
-    session: AsyncSession,
-    user_id: UUID,
-    scope_result: DocumentScopeResult,
-) -> DocumentScopeResult:
-    """Fetch doc summaries for each entity and attach as entity_manifest.
-
-    One batched DB query regardless of entity count.
-    No-op when per_entity_doc_ids is absent.
-    """
-    if not scope_result.per_entity_doc_ids:
-        return scope_result
-
-    all_ids = list({d for ids in scope_result.per_entity_doc_ids.values() for d in ids})
-    rows = await DocumentRepository(session).get_scope_doc_summaries(user_id, all_ids, limit=50)
-    id_to_summary = {
-        row[0]: {"doc_id": str(row[0]), "name": row[1], "year": row[2]} for row in rows
-    }
-    manifest = [
-        EntityManifestItem(
-            entity_name=entity,
-            doc_summaries=[id_to_summary[d] for d in ids if d in id_to_summary],
-        )
-        for entity, ids in scope_result.per_entity_doc_ids.items()
-    ]
-    return scope_result.model_copy(update={"entity_manifest": manifest})
+async def _with_scope(
+    output: RouterOutput,
+    inp: RouterInput,
+    session: AsyncSession | None,
+    user_id: UUID | None,
+    llm_router: LLMRouter,
+    parent_request_id: UUID | None,
+    conversation_id: UUID | None,
+) -> tuple[RouterOutput, DocumentScopeResult | None]:
+    """Attach the resolved scope to a retrieval route. Runs on the fallback route too, so
+    a router failure still honours the UI scope and loses only entity narrowing."""
+    if session is None or user_id is None or output.route != "retrieval":
+        return output, None
+    scope_result = await resolve_scope(
+        session,
+        user_id,
+        inp.scope,
+        output,
+        query=inp.query,
+        llm_router=llm_router,
+        parent_request_id=parent_request_id,
+        conversation_id=conversation_id,
+    )
+    return output, scope_result

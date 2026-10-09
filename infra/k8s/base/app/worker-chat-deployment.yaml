@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-chat
+  namespace: copilot
+spec:
+  # 6 x CELERY_CHAT_WORKER_CONCURRENCY=4 = 24 slots -> ~35.6 answers/min at the measured 40.5s
+  # service time, ~70% utilisation at the 25 q/min design point. See docs/notes/capacity-model.md.
+  replicas: 6
+  # With a 420s grace period the default (maxUnavailable 25%) would leave the queue unserved
+  # while pods drain. Surge instead: new pods serve while old ones finish in-flight answers.
+  # maxSurge 2 rather than 1 — at 6 replicas, one-at-a-time is a ~42 minute rollout.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chat_worker
+  template:
+    metadata:
+      labels:
+        # NOTE: the label value is `chat_worker`, not `worker-chat`, on purpose. Phase 13's
+        # Prometheus relabel rule copies this label into the `job` label, and the six committed
+        # Grafana dashboards query job="chat_worker" (the compose prometheus.yml job_name).
+        # Renaming this breaks every chat-worker panel.
+        app.kubernetes.io/name: chat_worker
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Above CELERY_TASK_TIME_LIMIT_SECONDS (450), the hard limit: SIGTERM is a Celery warm
+      # shutdown — stop accepting, finish in flight — and it needs room to finish the longest
+      # task Celery would itself allow, measured from task start rather than from SIGTERM.
+      # Below that, the kubelet SIGKILLs a running answer before the parent can fail it and
+      # acks_late redelivers it, re-billing the provider.
+      terminationGracePeriodSeconds: 510
+      # Same depends_on port as api-deployment.yaml. fluent-bit is gone (Phase 14 tails node
+      # logs instead of receiving pushes) and qdrant-hc is gone (Phase 5 retired the sidecar).
+      initContainers:
+        - name: wait-for-pgbouncer
+          image: postgres:16.11-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h pgbouncer -p 6432 -U "$APP_DB_USER"; do
+                echo "waiting for pgbouncer:6432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: postgres-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-broker
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-broker -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-broker:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-redis-app
+          image: redis:7.2.12-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until redis-cli -h redis-app -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+                echo "waiting for redis-app:6379"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: redis-secret }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-opensearch
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://opensearch:9200/_cluster/health >/dev/null 2>&1; do
+                echo "waiting for opensearch:9200"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        # Without these, a worker that wins the startup race serves a degraded answer:
+        # every embed/rerank call fails connection-refused and the agent loop converges
+        # "search_unavailable", which reads to the user as "not found in the documents".
+        - name: wait-for-tei-embedder
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://tei-embedder:80/health >/dev/null 2>&1; do
+                echo "waiting for tei-embedder:80"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        - name: wait-for-tei
+          image: curlimages/curl:8.14.1
+          command:
+            - sh
+            - -c
+            - |
+              until curl -fsS http://tei:80/health >/dev/null 2>&1; do
+                echo "waiting for tei:80"; sleep 2
+              done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: worker-chat
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.workers.chat_worker"]
+          ports:
+            # Nothing dials this; it exists so Phase 13's pod SD has a named target and so
+            # `kubectl port-forward` works without guessing.
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: app-secret }
+          env:
+            # Celery prefork children each write their own metric shard here; the parent's
+            # HTTP server reads the directory. Must be set before prometheus_client is
+            # imported — src/workers/chat_worker.py does that ordering, same as `make worker`.
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom_chat
+            - name: LOG_FILE
+              value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: worker-chat
+          volumeMounts:
+            - name: prom-multiproc
+              mountPath: /tmp/prom_chat
+          # Celery serves no HTTP health endpoint; $HOSTNAME is the pod name, which is exactly
+          # the Celery node name. Timeout raised well above compose's 10s: the probe spawns a
+          # fresh interpreter that imports the whole app before it can ping, which does not fit
+          # in 10s under load. See worker-ingestion-deployment.yaml (incl. why env -u).
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping -d celery@$HOSTNAME >/dev/null 2>&1
+            initialDelaySeconds: 40
+            periodSeconds: 120
+            timeoutSeconds: 60
+            failureThreshold: 5
+          # requests.memory was 768Mi, below the measured idle container total of 1.257GiB.
+          # The scheduler places on requests, so under-requesting makes these pods first to be
+          # evicted once the node fills — which matters now that there are six of them.
+          resources:
+            requests: { cpu: "250m", memory: "1536Mi" }
+            limits:   { cpu: "2000m", memory: "3Gi" }   # compose: cpus 2.00 / mem_limit 3g
+      volumes:
+        # emptyDir, not a PVC: nothing here is worth persisting. Note it is *pod*-scoped, so
+        # it survives an OOMKill container restart — the app purges it at startup instead
+        # (src/observability/multiproc.py), which is what keeps the in-flight gauges honest.
+        - name: prom-multiproc
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-chat
+  namespace: copilot
+spec:
+  # Headless: nothing load-balances to a worker, but a Service gives Phase 13's Prometheus
+  # service discovery a stable object to target and makes port-forward straightforward.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: chat_worker
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100

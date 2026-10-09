@@ -1,0 +1,59 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-preload
+  namespace: copilot
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: preload
+          image: copilot/worker:dev
+          imagePullPolicy: IfNotPresent
+          # Warms the model cache PVC before any ingest runs. Without this, layout,
+          # TableFormer and the picture classifier are resolved lazily on the first PDF,
+          # inside the Celery task, so the first upload blocks on a multi-GB download while
+          # the UI shows it as stuck. `docling-tools models download` lays models out under
+          # --output-dir as a model-repo-folder tree (not the HF snapshot-cache format), so
+          # the worker is pointed at this same directory via DOCLING_ARTIFACTS_PATH
+          # (docling_parser.py) rather than falling back to HF_HOME's lazy per-repo download.
+          #
+          # `python -m docling.cli.tools`, not the `docling-tools` console script: that
+          # script's shebang bakes in the builder stage's absolute venv path
+          # (/build/.venv/bin/python3), which doesn't exist in the runtime image (venv is
+          # copied to /app/.venv) — exec fails with "no such file or directory".
+          command:
+            - python
+            - -m
+            - docling.cli.tools
+            - models
+            - download
+            - --output-dir
+            - $(DOCLING_ARTIFACTS_PATH)
+            - layout
+            - tableformer
+            - picture_classifier
+            # DOCLING_SCAN_OCR_ENABLED=true means a scanned PDF re-parses with full-page
+            # EasyOCR. With artifacts_path set, easyocr runs with downloads disabled, so the
+            # weights must be here or the ingest fails at parse_pdf_docling.
+            - easyocr
+          envFrom:
+            - configMapRef: { name: app-config }
+            - secretRef:    { name: app-secret }   # HF_TOKEN
+          env:
+            # HF_HUB_DISABLE_XET comes from app-config — without it this download crawls.
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+          volumeMounts:
+            - name: hf-model-cache
+              mountPath: /home/appuser/.cache/huggingface
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2000m", memory: "4Gi" }
+      volumes:
+        - name: hf-model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache

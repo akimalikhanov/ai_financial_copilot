@@ -21,7 +21,7 @@ class PromptRenderer:
 
     Usage:
         renderer = PromptRenderer()
-        system_prompt = get_system_prompt()
+        system_prompt = get_system_prompt(version="v3_bracket")
         user_message = renderer.render_user_message(
             context="Retrieved document excerpts...",
             user_query="What was Apple's revenue?"
@@ -140,12 +140,12 @@ class PromptRenderer:
             )
 
 
-def get_system_prompt(version: str = "v1") -> str:
+def get_system_prompt(version: str) -> str:
     """
     Get the system prompt by loading the system template.
 
     Args:
-        version: System template version. Defaults to "v1".
+        version: System template version, e.g. "v3_agent_synthesis".
 
     Returns:
         System prompt string.

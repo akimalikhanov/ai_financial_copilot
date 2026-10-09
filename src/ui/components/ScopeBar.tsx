@@ -12,6 +12,55 @@ interface ScopeBarProps {
   filterOptions?: { companies: string[]; years: number[] };
 }
 
+const SELECT_CLASS = `appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-full
+  px-3 py-1.5 pr-7 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1
+  focus:ring-[var(--focus-ring)] outline-none cursor-pointer transition-colors
+  hover:border-[var(--border-strong)]`;
+
+// Multi-select: a question comparing several companies needs several in the filter.
+const CompanyFilter: React.FC<{
+  companies: string[];
+  selected: string[];
+  onChange: (companies: string[] | undefined) => void;
+}> = ({ companies, selected, onChange }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  const toggle = (c: string) => {
+    const next = selected.includes(c) ? selected.filter(x => x !== c) : [...selected, c];
+    onChange(next.length ? next : undefined);
+  };
+  const label = selected.length === 0 ? 'All Companies'
+    : selected.length <= 2 ? selected.join(', ')
+    : `${selected.length} companies`;
+
+  return (
+    <div ref={ref} className="relative">
+      <button type="button" className={`${SELECT_CLASS} max-w-[16rem] truncate text-left`} onClick={() => setOpen(o => !o)}>
+        {label}
+      </button>
+      <ChevronDown size={10} className="absolute right-2 top-[7px] text-[var(--text-faint)] pointer-events-none" />
+      {open && (
+        <div className="absolute left-0 z-30 mt-1 w-64 max-h-72 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-1 shadow-lg">
+          {companies.map(c => (
+            <label key={c} className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-[var(--text)] cursor-pointer hover:bg-[var(--surface-3)]">
+              <input type="checkbox" checked={selected.includes(c)} onChange={() => toggle(c)} />
+              <span className="truncate">{c}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const MODES = [
   { id: 'allDocs' as Scope['mode'], label: 'All Docs', icon: Layers },
   { id: 'filteredByMetadata' as Scope['mode'], label: 'Filtered', icon: Filter },
@@ -67,27 +116,15 @@ export const ScopeBar: React.FC<ScopeBarProps> = ({ scope, docCount, onModeChang
       {/* Filters (only when filteredByMetadata) */}
       {scope.mode === 'filteredByMetadata' && (
         <div className="flex flex-wrap gap-2 animate-fade-in">
-          <div className="relative">
-            <select
-              className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-full
-                px-3 py-1.5 pr-7 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1
-                focus:ring-[var(--focus-ring)] outline-none cursor-pointer transition-colors
-                hover:border-[var(--border-strong)]"
-              value={scope.filters.company?.[0] ?? ''}
-              onChange={e => onFilterChange({ company: e.target.value ? [e.target.value] : undefined })}
-            >
-              <option value="">All Companies</option>
-              {(filterOptions?.companies ?? []).map(c => <option key={c} value={c}>{c}</option>)}
-            </select>
-            <ChevronDown size={10} className="absolute right-2 top-[7px] text-[var(--text-faint)] pointer-events-none" />
-          </div>
+          <CompanyFilter
+            companies={filterOptions?.companies ?? []}
+            selected={scope.filters.company ?? []}
+            onChange={company => onFilterChange({ company })}
+          />
 
           <div className="relative">
             <select
-              className="appearance-none bg-[var(--input-bg)] text-xs border border-[var(--input-border)] rounded-full
-                px-3 py-1.5 pr-7 text-[var(--text)] focus:border-[var(--input-border-focus)] focus:ring-1
-                focus:ring-[var(--focus-ring)] outline-none cursor-pointer transition-colors
-                hover:border-[var(--border-strong)]"
+              className={SELECT_CLASS}
               value={scope.filters.year?.[0] ?? ''}
               onChange={e => onFilterChange({ year: e.target.value ? [parseInt(e.target.value)] : undefined })}
             >

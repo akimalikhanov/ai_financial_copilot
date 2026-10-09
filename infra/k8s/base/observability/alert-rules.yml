@@ -1,0 +1,233 @@
+# Evaluated by Prometheus itself — there is no Alertmanager in this stack. A firing rule
+# becomes an ALERTS{alertname=...,alertstate="firing"} series, visible in Grafana's alert
+# view and in the "Firing Alerts" panel on the Resources dashboard, and it persists for the
+# 30d TSDB retention. That is the point: an OOMKill at 03:00 leaves a durable trace instead
+# of living only in pod status that the next restart overwrites.
+groups:
+  - name: container-resources
+    interval: 30s
+    rules:
+      # The alert that would have caught the miss: worker-ingestion hit its ceiling and was
+      # killed (exit 137) with nothing recording it. Restart-with-reason is what separates an
+      # OOM from a crash or an eviction; cAdvisor's container_oom_events_total does not.
+      - alert: ContainerOOMKilled
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="copilot"}[10m]) > 0
+          and on (namespace, pod, container)
+          kube_pod_container_status_last_terminated_reason{namespace="copilot", reason="OOMKilled"} == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} was OOMKilled"
+          description: >-
+            Killed by the kernel at its memory limit. Celery runs acks_late, so the in-flight
+            task is redelivered rather than lost — a repeating OOM shows up as duplicate work
+            and re-billed LLM calls, not as a task failure.
+
+      # Fires before the kill. Catches slow growth only: a single large allocation (a big PDF
+      # through Docling) outruns a 10m window, and ContainerOOMKilled is the net for that.
+      #
+      # The JVM/heap services are excluded because they reserve their heap at startup and then
+      # sit against the limit permanently — elasticsearch measured a 24h *minimum* of 0.93 and a
+      # steady 0.98. Alerting on them would fire forever and teach you to ignore the rule, which
+      # costs more than the coverage is worth; their real failure signal is a heap-pressure or
+      # GC metric, not working-set-vs-limit.
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          container_memory_working_set_bytes{namespace="copilot", container!~"|elasticsearch|opensearch|clickhouse"}
+            / container_spec_memory_limit_bytes{namespace="copilot", container!~"|elasticsearch|opensearch|clickhouse"} > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} at {{ $value | humanizePercentage }} of its memory limit"
+
+      # The CPU counterpart of an OOM, and quieter: no restart, no error, just latency. The
+      # cgroup throttles the container and task p95 drifts up with nothing else to show for it.
+      - alert: ContainerCPUThrottling
+        expr: |
+          rate(container_cpu_cfs_throttled_periods_total{namespace="copilot", container!=""}[5m])
+            / clamp_min(rate(container_cpu_cfs_periods_total{namespace="copilot", container!=""}[5m]), 1) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} CPU-throttled {{ $value | humanizePercentage }} of periods"
+
+      # Restarts that are not OOM — failed migration, bad config, a dependency that never came
+      # up. Threshold is above the readiness-probe flapping seen during a rolling update, and
+      # the owner join keeps one-shot bootstrap Jobs (which legitimately retry) out of it.
+      - alert: ContainerRestarting
+        expr: |
+          increase(kube_pod_container_status_restarts_total{namespace="copilot"}[1h]) > 3
+          and on (namespace, pod)
+          kube_pod_owner{namespace="copilot", owner_kind=~"ReplicaSet|StatefulSet|DaemonSet"}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }}/{{ $labels.container }} restarted {{ $value | printf \"%.0f\" }}x in the last hour"
+
+      # A pod stuck Pending is invisible in the app metrics: the workload just runs with fewer
+      # replicas and a deeper queue. 15m is past any normal image pull or init-container wait.
+      #
+      # Restricted to pods owned by a controller that is supposed to keep them running. Without
+      # the join this fires on every completed bootstrap Job in the namespace (garage-bootstrap,
+      # es-bootstrap, model-preload) and on superseded ReplicaSet pods left behind by a rollout —
+      # all of which sit in a terminal phase forever by design.
+      - alert: PodNotReady
+        expr: |
+          max by (namespace, pod, phase) (
+            kube_pod_status_phase{namespace="copilot", phase=~"Pending|Unknown"} == 1
+          )
+          and on (namespace, pod)
+          kube_pod_owner{namespace="copilot", owner_kind=~"ReplicaSet|StatefulSet|DaemonSet"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.pod }} stuck in {{ $labels.phase }} for 15m"
+
+  - name: node-resources
+    interval: 30s
+    rules:
+      # Node memory pressure evicts by QoS class, so a pod whose requests sit below its real
+      # working set goes first. Limits across this namespace sum well past node capacity, which
+      # is fine until several pods peak together.
+      - alert: NodeMemoryPressure
+        expr: |
+          sum by (node) (container_memory_working_set_bytes{namespace="copilot", container!=""})
+            / sum by (node) (kube_node_status_allocatable{resource="memory"}) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node {{ $labels.node }} at {{ $value | humanizePercentage }} of allocatable memory"
+
+      - alert: NodeConditionUnhealthy
+        expr: |
+          kube_node_status_condition{condition=~"MemoryPressure|DiskPressure|PIDPressure", status="true"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node {{ $labels.node }} reports {{ $labels.condition }} — pods will be evicted"
+
+  # The ingestion worker process is replaced when the memory it kept after a document passes
+  # the recycle threshold (--max-memory-per-child). Both rules watch that mechanism.
+  # Both key on rss_bytes deliberately. Do not rewrite them against
+  # ingestion_worker_malloc_free_bytes: that gauge tracks glibc's free lists rather than
+  # residency, so it stays high after a malloc_trim that returned the memory.
+  - name: ingestion-worker-memory
+    interval: 30s
+    rules:
+      # The last document started on more memory than the threshold allows, so the recycle that
+      # should have replaced the process did not happen. The next large document can OOM.
+      - alert: IngestionWorkerStartedAboveThreshold
+        expr: |
+          max(ingestion_worker_rss_bytes{point="task_start"})
+            > max(ingestion_worker_recycle_threshold_bytes > 0)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion worker started a document on {{ $value | humanize1024 }}, above the recycle threshold"
+          description: >-
+            The memory recycle is not working. Check that the worker runs with
+            --max-memory-per-child and that its pipeline.memory log lines show
+            recycle_expected=true for large documents.
+
+      # Recycling keeps a leak off the memory panels, so a growing leak shows up here instead.
+      # A 1000-page document takes ~10 min at one slot, so more than 10 recycles an hour means
+      # small documents are also leaving more than the threshold behind.
+      - alert: IngestionWorkerRecyclingOften
+        expr: sum(increase(ingestion_worker_recycles_total[1h])) > 10
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingestion worker process replaced {{ $value | printf \"%.0f\" }} times in the last hour"
+          description: >-
+            Each replacement reloads the Docling models. Compare rss_end_mb and stage_growth_mb
+            across recent pipeline.memory log lines to see what is keeping memory.
+
+  # A document whose worker died is re-enqueued by the API when something reads its row. The
+  # counter is the only outward sign that happened — the document itself recovers silently.
+  - name: ingestion-recovery
+    interval: 30s
+    rules:
+      # One reap means one ingestion worker died mid-document without running any handler:
+      # OOMKill, eviction, node loss. The document is already back on the queue, so this is
+      # not urgent on its own — it is the record that the kill happened at all, which pod
+      # status overwrites on the next restart.
+      - alert: IngestionDocumentsReaped
+        expr: sum(increase(ingestion_documents_reaped_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} stranded document(s) re-queued in the last 15m"
+          description: >-
+            An ingestion worker was killed mid-document. Check the same window for an
+            OOMKill or an eviction of worker-ingestion, and look for ingestion.reaped log
+            lines to see which documents were affected.
+
+      # Recovery that keeps firing is not recovery: the replacement attempt is dying the same
+      # way the first one did. Each attempt re-runs the parse, which is the expensive part,
+      # and the attempt cap ends with the document failing.
+      - alert: IngestionRecoveryNotConverging
+        expr: sum(increase(ingestion_documents_reaped_total[1h])) > 5
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingestion recovery fired {{ $value | printf \"%.0f\" }} times in the last hour"
+          description: >-
+            Documents are being re-queued faster than they are completing. Compare with
+            ingestion_documents_total to see whether any are reaching ready, and check
+            whether one oversized document is killing every worker that picks it up.
+
+  # A cut-off run still answers, from partial findings or raw excerpts, so nothing errors.
+  - name: agent-latency
+    interval: 30s
+    rules:
+      - alert: AgentRunsCutOff
+        expr: |
+          100 * sum(increase(agent_stop_reasons_total{reason=~"timeout|deadline|truncated"}[6h]))
+            / sum(increase(agent_stop_reasons_total[6h])) > 2
+          and sum(increase(agent_stop_reasons_total[6h])) >= 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | printf \"%.1f\" }} of every 100 agent runs cut off by a timeout, the deadline or the token cap (6h)"
+          description: >-
+            Check the "Failed Tool-Model Calls" panel for which turn kind is failing, and
+            llm_requests rows with status timeout or truncated for the runs.
+
+      # A call gets what is left of the 180s run less a 15s reserve, so a 45s report turn
+      # late in a run can run out of budget.
+      - alert: AgentReportTurnSlow
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(agent_tool_model_duration_seconds_bucket{turn_kind=~"report|final"}[30m])
+          )) > 45
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Report-turn p95 at {{ $value | printf \"%.0f\" }}s"
+          description: >-
+            Compare "Reasoning Tokens per Tool-Model Call" for the same window: a rise there
+            means longer reasoning; flat reasoning means provider throughput dropped.
+
+  - name: scrape-health
+    interval: 30s
+    rules:
+      # Without this, monitoring that has itself fallen over is indistinguishable from nothing
+      # being wrong: every rule above silently stops evaluating when its exporter stops answering.
+      - alert: TargetDown
+        expr: up == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus target {{ $labels.job }} ({{ $labels.instance }}) has been down for 10m"

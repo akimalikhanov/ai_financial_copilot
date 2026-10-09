@@ -4,41 +4,66 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.observability.langfuse import span as lf_span
+from src.observability.trace_payload import cap_list
 from src.repository.document_repository import DocumentRepository
-from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterOutput
-from src.services.router.entity_resolver import _resolve_all_entities
-from src.utils.config import get_router_config
+from src.schemas.query_router import (
+    ChatScope,
+    DocumentScopeResult,
+    EntityClarification,
+    EntityManifestItem,
+    RouterOutput,
+    ScopeSource,
+)
+from src.services.llm_router import LLMRouter
+from src.services.router.company_name import normalize_company
+from src.services.router.entity_resolver import resolve_entities
+from src.utils.config import get_scope_max_companies
 
 
-async def _group_docs_by_company(
-    session: AsyncSession,
-    user_id: UUID,
-    doc_ids: list[UUID],
-) -> dict[str, list[UUID]] | None:
-    """Group explicitly-scoped doc_ids by their company metadata.
+def scope_outcome(router_output: RouterOutput, scope: DocumentScopeResult) -> str:
+    """The request's `llm_requests.scope_outcome`, in order of precedence. `clarification`
+    means the card was shown, which only the caller knows."""
+    if scope.too_broad_count is not None:
+        return "too_broad"
+    if scope.unresolved_entities:
+        return "unresolved"
+    return "resolved" if router_output.entities else "no_entities"
 
-    The agent loop identifies which company each search targets via per_entity_doc_ids.
-    When the user scopes by selecting documents (rather than naming a company in the
-    query), the company names live in document metadata — derive per-entity grouping
-    from there so the agent knows the entity name (e.g. answering "this company").
 
-    Docs without a company value are grouped under a single "Selected documents" bucket
-    so they remain searchable. Returns None when there are no docs.
-    """
-    if not doc_ids:
-        return None
-    repo = DocumentRepository(session)
-    summaries = await repo.get_scope_doc_summaries(user_id, doc_ids, limit=len(doc_ids))
-    per_entity: dict[str, list[UUID]] = {}
-    unnamed: list[UUID] = []
-    for doc_id, company, _year in summaries:
-        if company:
-            per_entity.setdefault(company, []).append(doc_id)
-        else:
-            unnamed.append(doc_id)
-    if unnamed:
-        per_entity.setdefault("Selected documents", []).extend(unnamed)
-    return per_entity or None
+# Documents uploaded without a company count together as one company.
+NO_COMPANY = "Documents without a company"
+
+_Doc = tuple[UUID, str | None, str | None, int | None]  # id, company_norm, company, year
+
+
+async def _universe(
+    repo: DocumentRepository, user_id: UUID, scope: ChatScope | None
+) -> tuple[list[_Doc], ScopeSource]:
+    """The documents the UI scope allows, and which kind of scope produced them. An empty
+    selection counts as all documents."""
+    if scope is not None and scope.mode in ("selectedDocs", "thisDoc") and scope.doc_ids:
+        return await repo.get_scope_docs(user_id, scope.doc_ids), "explicit"
+    if scope is not None and scope.mode == "filteredByMetadata":
+        ids = await repo.find_by_metadata_filters(
+            user_id,
+            companies=scope.filters.company or None,
+            years=scope.filters.year or None,
+            types=scope.filters.type or None,
+        )
+        return await repo.get_scope_docs(user_id, ids), "filtered"
+    return await repo.get_scope_docs(user_id), "all"
+
+
+def _by_company(docs: list[_Doc]) -> dict[str, list[_Doc]]:
+    """Universe documents per company display name, keyed via company_norm."""
+    groups: dict[str | None, list[_Doc]] = {}
+    for doc in docs:
+        groups.setdefault(doc[1], []).append(doc)
+    return {
+        NO_COMPANY if norm is None else min(d[2] or norm for d in group): group
+        for norm, group in groups.items()
+    }
 
 
 async def resolve_scope(
@@ -46,89 +71,138 @@ async def resolve_scope(
     user_id: UUID,
     scope: ChatScope | None,
     router_output: RouterOutput,
+    *,
+    query: str = "",
+    llm_router: LLMRouter | None = None,
+    parent_request_id: UUID | None = None,
+    conversation_id: UUID | None = None,
 ) -> DocumentScopeResult:
-    """Resolve document scope using two layers:
-    Layer 1 — user-explicit scope (selectedDocs/thisDoc/filteredByMetadata).
-    Layer 2 — entity narrowing (allDocs or broad filteredByMetadata).
+    """Scope in three steps, the same in every UI scope mode:
+
+    1. Universe: the documents the UI scope allows.
+    2. Entities: resolved against all of the user's companies, so "not in your documents"
+       and "not in your current selection" stay distinguishable.
+    3. Combine: each resolved entity keeps its documents inside the universe. A question
+       naming no company covers every company in the universe. More than
+       SCOPE_MAX_COMPANIES covered companies is too broad.
+
+    The keyword arguments feed the entity disambiguator's LLM call and its sub-request row.
     """
-    cfg = get_router_config()
-    filtered_md_thresh = int(cfg["filtered_md_thresh"])
-    has_entities = bool(router_output.entities)
+    repo = DocumentRepository(session)
+    with lf_span(
+        "resolve_scope", input={"entities": [e.name for e in router_output.entities]}
+    ) as root:
+        with lf_span(
+            "scope_universe",
+            input=scope.model_dump(mode="json") if scope else {"mode": "allDocs"},
+        ) as obs:
+            docs, source = await _universe(repo, user_id, scope)
+            companies = _by_company(docs)
+            if obs:
+                obs.update(output={"doc_count": len(docs), "company_count": len(companies)})
 
-    # --- selectedDocs / thisDoc: use doc_ids directly, skip Layer 2 ---
-    # If the user picked this mode but selected zero docs (e.g. clicked "Selected" without
-    # actually choosing), fall through to entity resolution rather than searching everything.
-    if scope is not None and scope.mode in ("selectedDocs", "thisDoc") and scope.doc_ids:
-        return DocumentScopeResult(
-            doc_ids=scope.doc_ids,
-            source="explicit",
-            per_entity_doc_ids=await _group_docs_by_company(session, user_id, scope.doc_ids),
-        )
-    # Empty selection — treat as allDocs and let entity resolution narrow it down below
-
-    # --- filteredByMetadata: resolve filters (Layer 1), then optionally narrow (Layer 2) ---
-    if scope is not None and scope.mode == "filteredByMetadata":
-        repo = DocumentRepository(session)
-        layer1_ids = await repo.find_by_metadata_filters(
-            user_id,
-            companies=scope.filters.company or None,
-            years=scope.filters.year or None,
-            types=scope.filters.type or None,
-        )
-
-        # Small result set — treat like selectedDocs, skip Layer 2
-        if len(layer1_ids) <= filtered_md_thresh:
-            return DocumentScopeResult(
-                doc_ids=layer1_ids or None,
-                source="filtered",
-                per_entity_doc_ids=await _group_docs_by_company(session, user_id, layer1_ids),
-            )
-
-        # Large result set + entities → intersect with entity resolution
-        if has_entities:
-            per_entity = await _resolve_all_entities(
+        covered: dict[str, list[_Doc]] = {}
+        mentioned_as: dict[str, list[str]] = {}
+        unresolved: list[str] = []
+        clarifications: list[EntityClarification] = []
+        if router_output.entities:
+            resolutions = await resolve_entities(
                 session,
                 user_id,
+                query,
                 router_output.entities,
-                constrain_to=layer1_ids,
-                threshold=float(cfg["entity_similarity_threshold"]),
-                max_candidates=int(cfg["entity_max_candidates"]),
+                llm_router=llm_router,
+                parent_request_id=parent_request_id,
+                conversation_id=conversation_id,
             )
-            matched = list({doc_id for ids in per_entity.values() for doc_id in ids})
-            return DocumentScopeResult(
-                doc_ids=matched if matched else layer1_ids,
-                source="filtered",
-                per_entity_doc_ids=per_entity if per_entity else None,
+            with lf_span(
+                "scope_combine",
+                input={
+                    e.name: {
+                        "decision": r.decision,
+                        "method": r.method,
+                        "candidates": cap_list([c.display_name for c in r.candidates]),
+                    }
+                    for e, r in zip(router_output.entities, resolutions, strict=True)
+                },
+            ) as obs:
+                outcomes: dict[str, str] = {}
+                for entity, res in zip(router_output.entities, resolutions, strict=True):
+                    pick = res.candidates[0] if res.decision != "none" else None
+                    inside = [d for d in docs if pick and d[1] == pick.company_norm]
+                    if pick and not inside and res.outside_scope == "include":
+                        # The user chose to search this company despite the UI scope.
+                        inside = await repo.get_scope_docs(user_id, pick.doc_ids)
+                    if pick and inside:
+                        covered[pick.display_name] = inside
+                        if normalize_company(entity.raw_span) != pick.company_norm:
+                            mentioned_as.setdefault(pick.display_name, []).append(entity.raw_span)
+                        outcomes[entity.name] = f"{res.decision}: {pick.display_name}"
+                        if res.decision == "resolved":
+                            continue
+                        outcome = "ambiguous"
+                    else:
+                        outcome = "outside_scope" if pick else "none"
+                        unresolved.append(entity.name)
+                        outcomes[entity.name] = outcome
+                        if res.outside_scope == "exclude":
+                            continue  # already answered: leave it out, don't ask again
+                    # Only companies get a card; persons and products keep the plain
+                    # "not found" label.
+                    if entity.entity_type != "company":
+                        continue
+                    clarifications.append(
+                        EntityClarification(
+                            entity=entity.name,
+                            raw_span=entity.raw_span,
+                            outcome=outcome,
+                            candidates=res.candidates,
+                        )
+                    )
+                source = "entity_resolved" if covered else "unresolved"
+                if obs:
+                    obs.update(output={"outcomes": outcomes, "covered": list(covered)})
+        else:
+            covered = companies
+
+        max_companies = get_scope_max_companies()
+        if len(covered) > max_companies:
+            result = DocumentScopeResult(
+                doc_ids=[],
+                source=source,
+                unresolved_entities=unresolved,
+                clarifications=clarifications,
+                too_broad_count=len(covered),
             )
-
-        # Large result set, no entities → return Layer 1, grouped by company so the
-        # agent still knows the entity names of the filtered documents.
-        return DocumentScopeResult(
-            doc_ids=layer1_ids,
-            source="filtered",
-            per_entity_doc_ids=await _group_docs_by_company(session, user_id, layer1_ids),
-        )
-
-    # --- allDocs / None → Layer 2 does the heavy lifting ---
-    if has_entities:
-        per_entity = await _resolve_all_entities(
-            session,
-            user_id,
-            router_output.entities,
-            threshold=float(cfg["entity_similarity_threshold"]),
-            max_candidates=int(cfg["entity_max_candidates"]),
-        )
-        matched = list({doc_id for ids in per_entity.values() for doc_id in ids})
-        if matched:
-            return DocumentScopeResult(
-                doc_ids=matched,
-                source="entity_resolved",
-                per_entity_doc_ids=per_entity if per_entity else None,
+        else:
+            per_entity = {name: [d[0] for d in group] for name, group in covered.items()}
+            per_entity.update({name: [] for name in unresolved})
+            result = DocumentScopeResult(
+                doc_ids=[d for ids in per_entity.values() for d in ids],
+                source=source,
+                per_entity_doc_ids=per_entity or None,
+                unresolved_entities=unresolved,
+                entity_manifest=[
+                    EntityManifestItem(
+                        entity_name=name,
+                        doc_summaries=[
+                            {"doc_id": str(d[0]), "name": d[2], "year": d[3]} for d in group
+                        ],
+                        mentioned_as=mentioned_as.get(name, []),
+                    )
+                    for name, group in covered.items()
+                ]
+                or None,
+                clarifications=clarifications,
             )
-        return DocumentScopeResult(
-            doc_ids=None,
-            source="all",
-        )
-
-    # No entities, no scope → no pre-filter
-    return DocumentScopeResult(doc_ids=None, source="all")
+        if root:
+            root.update(
+                output={
+                    "source": result.source,
+                    "covered": cap_list(list(covered)),
+                    "too_broad": result.too_broad_count is not None,
+                    "max_companies": max_companies,
+                    "doc_count": len(result.doc_ids or []),
+                }
+            )
+        return result

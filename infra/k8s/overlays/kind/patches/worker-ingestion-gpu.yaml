@@ -1,0 +1,25 @@
+# Gives worker-ingestion the host GPU, restoring compose parity for Docling parsing.
+#
+# Kept in the overlay (not base) because base must stay schedulable on a GPU-less cluster:
+# nvidia.com/gpu is an extended resource with no CPU fallback, so a pod requesting one on a
+# cluster with no device plugin sits Pending indefinitely rather than running slower.
+#
+# Strategic-merge patch: containers merge by name, and `resources.limits` is a map, so the
+# nvidia.com/gpu key is ADDED to the cpu/memory limits from base rather than replacing them.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-ingestion
+spec:
+  template:
+    spec:
+      # Belt-and-braces on a single-node cluster, but it is the shape EKS needs in Stage 19
+      # and it makes the failure mode legible: without a GPU node the pod stays Pending with
+      # a clear "didn't match node selector" event instead of failing at CUDA-init runtime.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: worker-ingestion
+          resources:
+            limits:
+              nvidia.com/gpu: 1

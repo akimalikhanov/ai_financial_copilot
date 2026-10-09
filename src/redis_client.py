@@ -9,16 +9,26 @@ from uuid import uuid4
 from redis.asyncio import Redis
 
 from src.utils.config import (
+    get_chat_events_maxlen,
+    get_chat_events_ttl,
     get_chat_tail_max_messages,
     get_chat_tail_ttl,
+    get_ingest_events_ttl,
     get_rate_limit_max_requests,
     get_rate_limit_window_ms,
     get_redis_app_url,
+    get_redis_broker_url,
 )
 
 CHAT_EVENTS_STREAM_PREFIX = "chat:events:"
-CHAT_TAIL_KEY_PREFIX = "chat:tail:"
+# v2: entries carry findings_block/answer_derived_from_carryover. Versioned so a rolling
+# deploy doesn't mix payload shapes (old workers reject unknown keys, extra="forbid").
+CHAT_TAIL_KEY_PREFIX = "chat:tail:v2:"
 INGESTION_STREAM_PREFIX = "ingestion:events:"
+# One event per pipeline stage, so this is a runaway guard rather than a working limit.
+INGESTION_EVENTS_MAXLEN = 100
+INGESTION_LEASE_PREFIX = "ingest:lease:"
+INGESTION_REAP_PREFIX = "ingest:reap:"
 
 
 def events_stream_key(request_id: str) -> str:
@@ -31,9 +41,34 @@ def ingestion_stream_key(document_id: str) -> str:
     return f"{INGESTION_STREAM_PREFIX}{document_id}"
 
 
+def ingestion_lease_key(document_id: str) -> str:
+    """Return the Redis key holding the ingestion worker's claim on a document.
+
+    The key is both mutual exclusion (only one worker may hold it) and liveness (the holder
+    refreshes its TTL while it works). A document row sitting at `processing` with no lease
+    key means the worker that owned it died without running any exception handler.
+    """
+    return f"{INGESTION_LEASE_PREFIX}{document_id}"
+
+
+def ingestion_reap_key(document_id: str) -> str:
+    """Return the key that debounces re-enqueueing one abandoned document.
+
+    A document sitting in the queue is indistinguishable from an abandoned one — `processing`
+    with no lease — so this key marks the ones already re-enqueued and keeps a backed-up
+    queue from collecting a copy per read.
+    """
+    return f"{INGESTION_REAP_PREFIX}{document_id}"
+
+
 async def create_redis_app_client() -> Redis:
     """Create async Redis client for app (rate limit, cache, SSE stream)."""
     return Redis.from_url(get_redis_app_url(), decode_responses=True)
+
+
+async def create_redis_broker_client() -> Redis:
+    """Create async Redis client for the Celery broker (queue-depth reads for admission control)."""
+    return Redis.from_url(get_redis_broker_url(), decode_responses=True)
 
 
 async def close_redis_client(client: Redis) -> None:
@@ -212,11 +247,82 @@ async def invalidate_chat_tail(redis: Redis, conv_id: str) -> None:
 
 
 async def add_event(redis: Redis, request_id: str, event_type: str, data: dict[str, Any]) -> str:
-    """Add an event to the request's events stream. Returns event id."""
+    """Add an event to the request's events stream. Returns event id.
+
+    Refreshes the stream's TTL on every write, not just at completion
+    (expire_event_stream). A stream stays alive as long as something is actively writing to
+    it; a pipeline that crashes, times out, or is killed mid-run stops writing, so its last
+    event's TTL is what reclaims the key instead of leaving it to live forever. Without this,
+    only requests that reach a normal exit path (which calls expire_event_stream) ever get
+    cleaned up — every abandoned request leaked indefinitely, maxlen bounding size but never
+    reclaiming the key itself.
+    """
     stream_key = events_stream_key(request_id)
     payload = json.dumps({"type": event_type, **data})
-    event_id = await redis.xadd(stream_key, {"payload": payload}, "*")
+    async with redis.pipeline(transaction=False) as pipe:
+        pipe.xadd(
+            stream_key,
+            {"payload": payload},
+            "*",
+            # ~maxlen: trims on radix node boundaries, O(1) amortised instead of O(n).
+            maxlen=get_chat_events_maxlen(),
+            approximate=True,
+        )
+        pipe.expire(stream_key, get_chat_events_ttl())
+        event_id, _ = await pipe.execute()
     return event_id
+
+
+async def add_ingestion_event(
+    redis: Redis, document_id: str, event_type: str, data: dict[str, Any]
+) -> str:
+    """Add an event to a document's ingestion stream. Returns event id.
+
+    The ingestion counterpart of add_event, and a TTL on every write for the same reason:
+    maxlen bounds how much a stream holds but never reclaims the key, and nothing else
+    expires these. An ingestion that is killed mid-document writes no terminal event at all,
+    so its last stage event is the only thing that can ever clean the stream up.
+
+    The cap is small and exact because these carry one event per pipeline stage — a few
+    dozen, against the thousands a chat answer streams.
+    """
+    stream_key = ingestion_stream_key(document_id)
+    payload = json.dumps({"type": event_type, **data})
+    async with redis.pipeline(transaction=False) as pipe:
+        pipe.xadd(stream_key, {"payload": payload}, "*", maxlen=INGESTION_EVENTS_MAXLEN)
+        pipe.expire(stream_key, get_ingest_events_ttl())
+        event_id, _ = await pipe.execute()
+    return event_id
+
+
+async def expire_event_stream(redis: Redis, request_id: str) -> None:
+    """Give a finished request's stream a TTL. Idempotent; safe to call on every exit path."""
+    await redis.expire(events_stream_key(request_id), get_chat_events_ttl())
+
+
+async def get_activity_log(redis: Redis, request_id: str) -> list[dict]:
+    """Replay the request's events stream and return the ordered `activity` events.
+
+    Read back rather than accumulated in-process: `activity` events are emitted from
+    both the pipeline (tasks.py) and the agent loop (agent/loop.py), and the stream is
+    already the single ordered record of everything either one sent — reading it back
+    avoids threading an accumulator across that module boundary.
+    """
+    stream_key = events_stream_key(request_id)
+    entries = await redis.xrange(stream_key)
+    activity: list[dict] = []
+    for _entry_id, fields in entries:
+        raw = fields.get("payload")
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "activity":
+            event = {k: v for k, v in event.items() if k != "type"}
+            activity.append(event)
+    return activity
 
 
 # Sliding-window rate limit for chat (LLM cost protection).

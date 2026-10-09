@@ -25,6 +25,8 @@ celery_app = Celery(
     ],
 )
 
+# App-wide default, sized for chat. ingest_document overrides both on its own decorator —
+# a large parse outlives these by an order of magnitude (see src/services/ingestion/tasks.py).
 _task_soft_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
 _task_limit = _get_int_env("CELERY_TASK_TIME_LIMIT_SECONDS")
 

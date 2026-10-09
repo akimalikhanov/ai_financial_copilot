@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any, cast
@@ -16,6 +17,7 @@ from docling_core.transforms.chunker.hierarchical_chunker import (
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.transforms.serializer.markdown import MarkdownParams, MarkdownTableSerializer
+from docling_core.types.doc.document import DocItem, InlineGroup, ListGroup, SectionHeaderItem
 from docling_core.types.doc.labels import DocItemLabel
 from pydantic import Field, PrivateAttr
 from transformers import AutoTokenizer
@@ -30,10 +32,95 @@ from src.utils.config import (
 if TYPE_CHECKING:
     from docling_core.types.doc.document import DoclingDocument
 
+logger = logging.getLogger(__name__)
+
+_IMAGE_PLACEHOLDER = "<!-- image -->"
+
 
 def _pg_sanitize(text: str) -> str:
     """Strip characters PostgreSQL UTF-8 rejects (null bytes from PDF form fields)."""
     return text.replace("\x00", "")
+
+
+def _picture_refs(doc_chunk: DocChunk) -> list[str]:
+    """self_refs of this chunk's picture doc_items, in document order."""
+    return [
+        item.self_ref
+        for item in doc_chunk.meta.doc_items
+        if getattr(item, "label", None) == DocItemLabel.PICTURE and getattr(item, "self_ref", None)
+    ]
+
+
+def _substitute_placeholders(
+    text: str, refs: Iterator[str], pic_descriptions: dict[str, str]
+) -> str:
+    """Replace each `<!-- image -->` occurrence with that picture's description, in order.
+
+    A picture with no description drops the placeholder entirely rather than indexing it.
+    `refs` is consumed positionally, one ref per occurrence.
+    """
+    if _IMAGE_PLACEHOLDER not in text:
+        return text
+    parts = text.split(_IMAGE_PLACEHOLDER)
+    rendered = [parts[0]]
+    for part in parts[1:]:
+        ref = next(refs, None)
+        rendered.append(pic_descriptions.get(ref, "") if ref else "")
+        rendered.append(part)
+    return "".join(rendered)
+
+
+# Meta fields docling renders straight into the chunk text (MarkdownMetaSerializer), which we
+# suppress: `description` is written by picture_enricher and belongs at the placeholder, not
+# ahead of it — leaving both on emits it twice. `classification` renders the classifier label
+# ("Line chart", "Photograph") as prose, which is noise once a real description exists.
+_BLOCKED_META_NAMES = frozenset({"description", "classification"})
+
+# Deepest level a header run is nested to; headers past it replace the deepest slot.
+_MAX_RUN_DEPTH = 5
+
+
+def _nest_header_runs(dl_doc: DoclingDocument) -> list[tuple[SectionHeaderItem, int]]:
+    """Nest each run of back-to-back section headers so the chunker keeps all of them.
+
+    Docling's PDF pipeline gives every section header level 1, and the hierarchical chunker
+    keeps one heading per level, so a statement title split over several lines ("Aurora
+    Innovation, Inc." / "Consolidated Statements of Operations" / "(in millions)") reached
+    the chunk as its last line only. Within a run each header is levelled one below the
+    previous; a repeated header reuses its earlier level, so the chunker drops what was
+    nested under it rather than repeating it. A run ends at a page break: headers carried
+    across one are mostly running titles, siblings or misordered headers, not parents.
+
+    Levels are changed in place; returns (item, original level) pairs for restoring.
+    """
+    changed: list[tuple[SectionHeaderItem, int]] = []
+    run: dict[str, int] = {}  # normalized header text -> level assigned in this run
+    prev = 0
+    run_page: int | None = None
+
+    # Same traversal as HierarchicalChunker.chunk, so "back-to-back" matches its order.
+    for item, _ in dl_doc.iterate_items(with_groups=True):
+        if isinstance(item, SectionHeaderItem):
+            page = item.prov[0].page_no if item.prov else None
+            if page != run_page:
+                run, prev, run_page = {}, 0, page
+            key = " ".join(item.text.split()).casefold()
+            if key in run:
+                level = run[key]
+                run = {k: v for k, v in run.items() if v <= level}
+            elif item.level > prev:
+                level = item.level
+            else:
+                level = min(prev + 1, _MAX_RUN_DEPTH)
+            run[key] = prev = level
+            if level != item.level:
+                changed.append((item, item.level))
+                item.level = level
+        elif isinstance(item, DocItem | ListGroup | InlineGroup):
+            # Content ends the run; plain container groups carry none and are skipped.
+            run, prev = {}, 0
+
+    return changed
 
 
 class AnnualReportSerializerProvider(ChunkingSerializerProvider):
@@ -43,7 +130,10 @@ class AnnualReportSerializerProvider(ChunkingSerializerProvider):
         return ChunkingDocSerializer(
             doc=doc,
             table_serializer=MarkdownTableSerializer(),
-            params=MarkdownParams(image_placeholder="<!-- image -->"),
+            params=MarkdownParams(
+                image_placeholder=_IMAGE_PLACEHOLDER,
+                blocked_meta_names=set(_BLOCKED_META_NAMES),
+            ),
         )
 
 
@@ -64,10 +154,33 @@ class CustomHybridChunker(HybridChunker):
     def chunk(self, dl_doc: DoclingDocument, **kwargs: Any) -> Iterator[BaseChunk]:
         self._pieces_by_key.clear()
 
-        chunks = [DocChunk.model_validate(c) for c in super().chunk(dl_doc=dl_doc, **kwargs)]
+        nested = _nest_header_runs(dl_doc)
+        try:
+            chunks = [DocChunk.model_validate(c) for c in super().chunk(dl_doc=dl_doc, **kwargs)]
+        finally:
+            for item, level in nested:
+                item.level = level
 
         for chunk in chunks:
             self._pieces_by_key[self._chunk_key(chunk)] = [self._piece(chunk)]
+
+        # Each count runs the full custom contextualize, so counts are cached, and a merge
+        # candidate is costed as the sum of its members plus delimiters rather than built and
+        # tokenized. contextualize(merge(a, b)) renders as contextualize(a) + delim +
+        # contextualize(b), so the sum is exact up to tokenizer effects at the join. Only an
+        # accepted merge is built and tokenized.
+        counts: dict[tuple[str, ...], int] = {}
+        delim_tokens = self.tokenizer.count_tokens(self.delim)
+
+        def tokens(c: DocChunk) -> int:
+            key = self._chunk_key(c)
+            n = counts.get(key)
+            if n is None:
+                n = counts[key] = self._count_chunk_tokens(c)
+            return n
+
+        def fits(a: DocChunk, b: DocChunk) -> bool:
+            return tokens(a) + delim_tokens + tokens(b) <= self.merge_limit
 
         out: list[DocChunk] = []
         i = 0
@@ -75,53 +188,52 @@ class CustomHybridChunker(HybridChunker):
         while i < len(chunks):
             cur = chunks[i]
 
-            if self._count_chunk_tokens(cur) >= self.min_tokens:
+            if tokens(cur) >= self.min_tokens:
                 out.append(cur)
                 i += 1
                 continue
 
             group = [cur]
+            group_tokens = tokens(cur)
             i += 1
 
             while i < len(chunks):
                 nxt = chunks[i]
-                if self._count_chunk_tokens(nxt) >= self.min_tokens:
+                if tokens(nxt) >= self.min_tokens:
                     break
-
-                candidate = self._merge([*group, nxt])
-                if self._count_chunk_tokens(candidate) > self.merge_limit:
+                if group_tokens + delim_tokens + tokens(nxt) > self.merge_limit:
                     break
 
                 group.append(nxt)
+                group_tokens += delim_tokens + tokens(nxt)
                 i += 1
 
             merged = group[0] if len(group) == 1 else self._merge(group)
 
-            if self._count_chunk_tokens(merged) < self.min_tokens:
-                if i < len(chunks):
-                    candidate = self._merge([merged, chunks[i]])
-                    if self._count_chunk_tokens(candidate) <= self.merge_limit:
-                        chunks[i] = candidate
-                        continue
+            if tokens(merged) < self.min_tokens:
+                if i < len(chunks) and fits(merged, chunks[i]):
+                    chunks[i] = self._merge([merged, chunks[i]])
+                    continue
 
-                if out:
-                    candidate = self._merge([out[-1], merged])
-                    if self._count_chunk_tokens(candidate) <= self.merge_limit:
-                        out[-1] = candidate
-                        continue
+                if out and fits(out[-1], merged):
+                    out[-1] = self._merge([out[-1], merged])
+                    continue
 
             out.append(merged)
 
         yield from out
 
-    def contextualize(self, chunk: BaseChunk) -> str:
+    def contextualize(
+        self, chunk: BaseChunk, pic_descriptions: dict[str, str] | None = None
+    ) -> str:
         doc_chunk = DocChunk.model_validate(chunk)
         pieces = self._pieces_by_key.get(self._chunk_key(doc_chunk), [self._piece(doc_chunk)])
+        refs = iter(_picture_refs(doc_chunk))
 
         rendered: list[str] = []
         for piece in pieces:
             headings = self._unique(cast(Iterable[str], piece["headings"]))
-            text = cast(str, piece["text"])
+            text = _substitute_placeholders(cast(str, piece["text"]), refs, pic_descriptions or {})
 
             if headings:
                 rendered.append("\n".join(f"[SECTION] {h}" for h in headings))
@@ -160,9 +272,11 @@ class CustomHybridChunker(HybridChunker):
 
     @staticmethod
     def _chunk_key(chunk: DocChunk) -> tuple[str, ...]:
-        return tuple(
-            ref for ref in (getattr(item, "self_ref", None) for item in chunk.meta.doc_items) if ref
-        )
+        # The text is part of the key: docling splits an oversized item (a long table) into
+        # several chunks with identical doc_items, and keyed by refs alone they all rendered
+        # the last segment's text.
+        refs = (getattr(item, "self_ref", None) for item in chunk.meta.doc_items)
+        return (*(ref for ref in refs if ref), chunk.text)
 
 
 def _dump_model(value: Any) -> Any:
@@ -226,9 +340,10 @@ def parse_chunk_metadata(chunk: BaseChunk) -> dict[str, Any]:
 
 
 def _infer_chunk_type(doc_items: Iterable[Any]) -> str:
-    if any(getattr(item, "label", None) == DocItemLabel.TABLE for item in doc_items):
+    labels = [getattr(item, "label", None) for item in doc_items]
+    if DocItemLabel.TABLE in labels:
         return "table"
-    if any(getattr(item, "label", None) == DocItemLabel.PICTURE for item in doc_items):
+    if labels and all(label == DocItemLabel.PICTURE for label in labels):
         return "picture"
     return "text"
 
@@ -268,12 +383,21 @@ def _build_picture_descriptions(document: DoclingDocument) -> dict[str, str]:
     return result
 
 
-def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[dict[str, Any]]:
+def chunk_document(
+    document: DoclingDocument,
+    document_id: UUID | str,
+    pic_descriptions: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Chunk a DoclingDocument with the custom HybridChunker.
 
     Returns a list of dicts ready for ChunkRepository.create_many().
     Each chunk includes document_id for tracing and Qdrant payload.
+
+    `pic_descriptions` maps a picture's `self_ref` to its VLM description text. When
+    omitted it is built from `document.pictures`; callers that already have crops and
+    descriptions without a parsed `DoclingDocument` (e.g. a re-run over persisted crops)
+    can pass it directly.
     """
     tokenizer = _get_tokenizer()
     chunker = CustomHybridChunker(
@@ -284,7 +408,8 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         max_merge_multiplier=get_chunking_max_merge_multiplier(),
     )
     doc_id_str = str(document_id)
-    pic_descriptions = _build_picture_descriptions(document)
+    if pic_descriptions is None:
+        pic_descriptions = _build_picture_descriptions(document)
     rows: list[dict[str, Any]] = []
 
     for i, chunk in enumerate(chunker.chunk(dl_doc=document)):
@@ -295,22 +420,20 @@ def chunk_document(document: DoclingDocument, document_id: UUID | str) -> list[d
         page_span = chunk_meta["page_span"]
         labels = sorted({label for item in doc_items if (label := _label_to_str(item)) is not None})
 
-        raw_text = chunk.text
-        if chunk_type == "picture":
-            for ref in chunk_meta["doc_item_refs"]:
-                if ref in pic_descriptions:
-                    raw_text = pic_descriptions[ref]
-                    break
+        picture_refs = _picture_refs(doc_chunk)
+        placeholder_count = chunk.text.count(_IMAGE_PLACEHOLDER)
+        if placeholder_count != len(picture_refs):
+            logger.warning(
+                "chunk %d has %d image placeholders but %d picture doc_items "
+                "(document_id=%s); substitution will misalign",
+                i,
+                placeholder_count,
+                len(picture_refs),
+                doc_id_str,
+            )
 
-        # For picture chunks with a VLM description, build enriched_text manually
-        # (chunker.contextualize would return the useless "<!-- image -->" placeholder)
-        if chunk_type == "picture" and raw_text != chunk.text:
-            headings = chunk_meta["headings"] or []
-            parts = [f"[SECTION] {h}" for h in headings]
-            parts.append(raw_text)
-            enriched_text = "\n".join(parts)
-        else:
-            enriched_text = chunker.contextualize(chunk=chunk)
+        raw_text = _substitute_placeholders(chunk.text, iter(picture_refs), pic_descriptions)
+        enriched_text = chunker.contextualize(chunk=chunk, pic_descriptions=pic_descriptions)
 
         raw_text = _pg_sanitize(raw_text)
         enriched_text = _pg_sanitize(enriched_text)

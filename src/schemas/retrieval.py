@@ -2,34 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
 
 RetrievalSource = Literal["vector", "keyword", "hybrid"]
-
-Route = Literal["direct_answer", "retrieve", "out_of_scope"]
-
-
-class RouterOutput(BaseModel):
-    """Schema for LLM router response. LLM must output valid JSON matching this structure."""
-
-    route: Route
-    user_intent: str
-    reason: str | None = None
-
-
-@dataclass(slots=True, frozen=True)
-class ProcessedQuery:
-    """Result of query preprocessing and routing."""
-
-    normalized_text: str
-    route: Route
-    user_intent: str
-    reason: str | None = None
-
 
 REF_PLACEHOLDER = "__REF__"  # safer than str.format() for arbitrary chunk text
 SOURCE_REF_PREFIX = "S"
@@ -157,34 +136,6 @@ class AnswerCitationSpan:
 
 
 @dataclass
-class DisplayLabelMap:
-    """Maps source ref_ids to presentation-layer display labels (C1, C2, ...).
-
-    Labels are assigned sequentially by first appearance in the answer text,
-    so the display order is independent of retrieval/reranker order.
-    """
-
-    _source_to_label: dict[str, str] = field(default_factory=dict)
-    _next_index: int = field(default=1)
-
-    def get_or_assign(self, ref_id: str) -> str:
-        """Get existing label or assign next sequential one."""
-        if ref_id not in self._source_to_label:
-            self._source_to_label[ref_id] = f"C{self._next_index}"
-            self._next_index += 1
-        return self._source_to_label[ref_id]
-
-    def get_labels_for_refs(self, ref_ids: tuple[str, ...]) -> tuple[str, ...]:
-        """Get or assign labels for multiple refs, preserving order."""
-        return tuple(self.get_or_assign(r) for r in ref_ids)
-
-    @property
-    def mapping(self) -> dict[str, str]:
-        """Return a copy of the current source-to-display mapping."""
-        return dict(self._source_to_label)
-
-
-@dataclass
 class ParserOutput:
     """Output from feeding a chunk to the citation parser."""
 
@@ -224,3 +175,18 @@ class RetrievalTrace(BaseModel):
     sub_passes: list[dict] | None = None
     dropped_chunks: list[DroppedChunk] = []
     flagged_chunks: list[FlaggedChunk] = []
+    # Every enabled backend errored or timed out, so zero results means "unreachable",
+    # not "not in the corpus" (P1-F).
+    all_backends_failed: bool = False
+    # Per-capability health. `all_backends_failed` only fires on a *total* outage, so
+    # without these a half-broken retrieval is indistinguishable from a healthy one:
+    # a dead Qdrant still returns keyword hits, and the answer looks fully grounded.
+    # Default True so traces persisted before these existed deserialize unchanged.
+    embed_ok: bool = True
+    vector_ok: bool = True
+    keyword_ok: bool = True
+    rerank_ok: bool = True
+    # Whether `reranked` carries cross-encoder scores (~0–1) or fusion scores (RRF, ~0.05).
+    # Distinct from rerank_ok: reranking switched off yields unscored-but-healthy, while a
+    # fall-open yields unscored-and-degraded. Confidence thresholds only apply when True.
+    scores_are_rerank: bool = True

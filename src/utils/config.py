@@ -95,13 +95,24 @@ def load_models_config(config_path: str | Path | None = None) -> dict[str, Any]:
     Load models.yaml config file with environment variable expansion.
 
     Args:
-        config_path: Path to models.yaml. If None, uses infra/config/models.yaml relative to project root.
+        config_path: Path to models.yaml. If None, checks the MODELS_CONFIG_PATH env var, then
+            falls back to infra/config/models.yaml relative to project root. The env var is the
+            hook a load-test deployment uses to swap in infra/config/models.loadtest.yaml
+            without touching any call site — see docs/notes/loadtest-concepts.md §6.
+
+            A relative value is resolved against the project root, so one setting
+            ("infra/config/models.loadtest.yaml") works both on the host and inside a
+            container, where the repo lives at /app. Prefer that over an absolute
+            container path, which breaks host-side tooling like pytest.
 
     Returns:
         Parsed YAML dict with env vars expanded.
     """
+    config_path = config_path or os.environ.get("MODELS_CONFIG_PATH")
     if config_path is None:
         return load_yaml_config("infra/config/models.yaml", expand_env_vars=True)
+    if not Path(config_path).is_absolute():
+        return load_yaml_config(str(config_path), expand_env_vars=True)
     return load_yaml_config("", config_path=config_path, expand_env_vars=True)
 
 
@@ -205,8 +216,208 @@ def get_chat_tail_ttl() -> int:
 
 
 def get_chat_tail_max_messages() -> int:
-    """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 50)."""
-    return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "50"))
+    """Max messages in chat tail cache (CHAT_TAIL_MAX_MESSAGES, default 70). The tail is
+    every model's history source, so it must hold a 30-turn session (60 messages)."""
+    return int(os.getenv("CHAT_TAIL_MAX_MESSAGES", "70"))
+
+
+def get_chat_events_maxlen() -> int:
+    """Cap on entries in one chat SSE stream (CHAT_EVENTS_MAXLEN, default 5000).
+
+    A runaway guard, not the accumulation fix (that is the TTL below). Must stay above the
+    real entry count: get_activity_log() rebuilds the persisted trace by replaying the whole
+    stream with XRANGE, so trimming below it silently truncates that trace. Measured max is
+    2,258 entries.
+    """
+    return int(os.getenv("CHAT_EVENTS_MAXLEN", "5000"))
+
+
+def get_chat_events_ttl() -> int:
+    """TTL applied to a finished request's chat SSE stream (CHAT_EVENTS_TTL, default 3600).
+
+    Long enough for a browser reconnect (Last-Event-ID replay), short enough to bound growth.
+    """
+    return int(os.getenv("CHAT_EVENTS_TTL", "3600"))
+
+
+def get_chat_stream_abandoned_after_seconds() -> float:
+    """CHAT_STREAM_ABANDONED_AFTER_SECONDS (default: 510.0).
+
+    How long an SSE subscriber waits with no progress before reporting the worker gone.
+    A worker killed without warning (OOMKill, eviction, node loss) never runs its exception
+    handlers, so the request's status stays non-terminal and the stream's only other
+    give-up path never fires. The default is CELERY_TASK_TIME_LIMIT_SECONDS=450 plus a 60 s
+    margin: a task that is genuinely running is bounded by that hard limit, so anything past
+    it is a worker that is gone rather than one that is slow.
+    """
+    try:
+        return float(os.getenv("CHAT_STREAM_ABANDONED_AFTER_SECONDS", "510"))
+    except ValueError:
+        return 510.0
+
+
+def get_chat_max_request_age_seconds() -> float:
+    """CHAT_MAX_REQUEST_AGE_SECONDS (default: 900.0).
+
+    Ceiling on how stale a chat request may be and still be worth processing. acks_late
+    redelivery is gated on the broker's visibility timeout, which is sized for ingestion's
+    2700 s parses and so runs an hour on the chat queue too. Past this age the subscriber has
+    already been told the worker is gone, so re-running the agent loop only re-bills work
+    nobody asked for any more. Sits above the worst legitimate queue wait plus a full task
+    (~590 s) and far below the visibility timeout.
+    """
+    try:
+        return float(os.getenv("CHAT_MAX_REQUEST_AGE_SECONDS", "900"))
+    except ValueError:
+        return 900.0
+
+
+def get_llm_timeout_seconds() -> float:
+    """Per-request LLM timeout (LLM_TIMEOUT_SECONDS, default 120.0).
+
+    Not passing a timeout does not mean "no limit" — it means the SDK default, which is 600s
+    for openai-python. Must not exceed AGENT_TURN_TIMEOUT_CAP_SECONDS (120s) for tool calls,
+    and must fit inside the Celery soft limit (900s) for synthesis.
+    """
+    return float(os.getenv("LLM_TIMEOUT_SECONDS", "120.0"))
+
+
+def get_llm_connect_timeout_seconds() -> float:
+    """Connection-establishment timeout (LLM_CONNECT_TIMEOUT_SECONDS, default 5.0).
+
+    Separate from the read timeout: failing to *reach* a provider should be detected in
+    seconds, not minutes.
+    """
+    return float(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "5.0"))
+
+
+def get_llm_max_retries() -> int:
+    """SDK-level retries (LLM_MAX_RETRIES, default 1).
+
+    Attempts multiply across layers: 2 attempts times the router's app-level parse retry
+    is 4 HTTP calls for one routing decision (the openai default of 2 retries would make
+    it 6). Each layer is separately bounded by its own timeout.
+    """
+    return int(os.getenv("LLM_MAX_RETRIES", "1"))
+
+
+def get_max_open_streams() -> int:
+    """SSE streams one API pod serves before /readyz sheds traffic (MAX_OPEN_STREAMS,
+    default 200).
+
+    A local capacity signal, not a global one: it counts this process's own streams, so a pod
+    at the cap leaves the endpoint list while its peers keep serving.
+    """
+    return int(os.getenv("MAX_OPEN_STREAMS", "200"))
+
+
+def get_chat_queue_max_depth() -> int:
+    """Queued chat tasks before the API sheds load (CHAT_QUEUE_MAX_DEPTH, default 36).
+
+    Global, unlike the per-user rate limit: 100 users each inside their own limit can still
+    admit far more than the worker pool can serve. Sized as
+    `slots x (longest promised wait / service time)` = 24 x (60s / 40.5s) ~= 36.
+
+    The depth is only meaningful against that 40.5s service time (measured 2026-09-07, see
+    docs/notes/capacity-model.md). If service time doubles, the same depth silently becomes a
+    two-minute buffer instead of a one-minute one — re-derive it whenever service time is
+    re-measured.
+    """
+    return int(os.getenv("CHAT_QUEUE_MAX_DEPTH", "36"))
+
+
+def get_readiness_redis_timeout_seconds() -> float:
+    """Budget for the /readyz Redis ping (READINESS_REDIS_TIMEOUT_SECONDS, default 2.0).
+
+    Must stay well under the probe's own timeoutSeconds, or the probe times out before the
+    handler can answer and the failure reads as "app hung" rather than "Redis slow".
+    """
+    return float(os.getenv("READINESS_REDIS_TIMEOUT_SECONDS", "2.0"))
+
+
+def get_followup_max_inherit_hops() -> int:
+    """How many turns a findings block may be inherited before it goes stale
+    (FOLLOWUP_MAX_INHERIT_HOPS, default 3). Past the cap the block is dropped, so the
+    router sees no carried data and the next follow-up re-retrieves."""
+    return int(os.getenv("FOLLOWUP_MAX_INHERIT_HOPS", "3"))
+
+
+# --- Conversation history (prior turns), one budget per model ---
+# MAX_ANSWER_TOKENS=0 keeps answers whole. STEP: the window may start only at a turn index
+# that is a multiple of it, so the cached prompt prefix holds between moves.
+def get_router_history_budget_tokens() -> int:
+    """Recent-turn history the router sees (ROUTER_HISTORY_BUDGET_TOKENS, default 2000)."""
+    return int(os.getenv("ROUTER_HISTORY_BUDGET_TOKENS", "2000"))
+
+
+def get_router_history_max_answer_tokens() -> int:
+    """Per-answer cap in the router's history (ROUTER_HISTORY_MAX_ANSWER_TOKENS, default
+    400). Long enough to keep the list or table a "the second one" refers to."""
+    return int(os.getenv("ROUTER_HISTORY_MAX_ANSWER_TOKENS", "400"))
+
+
+def get_router_history_step() -> int:
+    """Window step for the router's history (ROUTER_HISTORY_STEP, default 1)."""
+    return int(os.getenv("ROUTER_HISTORY_STEP", "1"))
+
+
+def get_router_session_index_question_chars() -> int:
+    """Question length per line of the router's session index
+    (ROUTER_SESSION_INDEX_QUESTION_CHARS, default 80)."""
+    return int(os.getenv("ROUTER_SESSION_INDEX_QUESTION_CHARS", "80"))
+
+
+def get_agent_history_budget_tokens() -> int:
+    """Recent-turn history the agent tool model sees (AGENT_HISTORY_BUDGET_TOKENS,
+    default 4000)."""
+    return int(os.getenv("AGENT_HISTORY_BUDGET_TOKENS", "4000"))
+
+
+def get_agent_history_max_answer_tokens() -> int:
+    """Per-answer cap in the tool model's history (AGENT_HISTORY_MAX_ANSWER_TOKENS,
+    default 800)."""
+    return int(os.getenv("AGENT_HISTORY_MAX_ANSWER_TOKENS", "800"))
+
+
+def get_agent_history_step() -> int:
+    """Window step for the tool model's history (AGENT_HISTORY_STEP, default 1)."""
+    return int(os.getenv("AGENT_HISTORY_STEP", "1"))
+
+
+def get_answer_history_budget_tokens() -> int:
+    """Recent-turn history the answering model sees (ANSWER_HISTORY_BUDGET_TOKENS,
+    default 12000)."""
+    return int(os.getenv("ANSWER_HISTORY_BUDGET_TOKENS", "12000"))
+
+
+def get_answer_history_max_answer_tokens() -> int:
+    """Per-answer cap in the answering model's history (ANSWER_HISTORY_MAX_ANSWER_TOKENS,
+    default 0: whole turns, since a cut answer loses its conclusion and table totals)."""
+    return int(os.getenv("ANSWER_HISTORY_MAX_ANSWER_TOKENS", "0"))
+
+
+def get_answer_history_step() -> int:
+    """Window step for the answering model's history (ANSWER_HISTORY_STEP, default 5)."""
+    return int(os.getenv("ANSWER_HISTORY_STEP", "5"))
+
+
+def get_agent_shown_heading_chars() -> int:
+    """Heading length when a search result names a chunk already shown
+    ("Already shown above: S3 <heading>") (AGENT_SHOWN_HEADING_CHARS, default 40)."""
+    return int(os.getenv("AGENT_SHOWN_HEADING_CHARS", "40"))
+
+
+def get_agent_fallback_max_chunks() -> int:
+    """Most excerpts synthesis serves when the findings cite none, taken round-robin across
+    the run's searches (AGENT_FALLBACK_MAX_CHUNKS, default 25)."""
+    return int(os.getenv("AGENT_FALLBACK_MAX_CHUNKS", "25"))
+
+
+def get_agent_trace_chunk_chars() -> int:
+    """Chunk text kept per search hit on the agent turn's trace span; the next turn's
+    GENERATION input carries LANGFUSE_TRACE_EXCERPT_CHARS of it (AGENT_TRACE_CHUNK_CHARS,
+    default 200)."""
+    return int(os.getenv("AGENT_TRACE_CHUNK_CHARS", "200"))
 
 
 # --- Redis ---
@@ -277,6 +488,11 @@ def get_s3_chunks_bucket() -> str:
     return os.getenv("S3_CHUNKS_BUCKET", "chunks")
 
 
+def get_s3_pictures_bucket() -> str:
+    """Bucket for persisted picture crops (S3_PICTURES_BUCKET, default pictures)."""
+    return os.getenv("S3_PICTURES_BUCKET", "pictures")
+
+
 def get_s3_access_key() -> str:
     """S3/Garage access key (AWS_ACCESS_KEY_ID). Required for uploads."""
     val = os.getenv("AWS_ACCESS_KEY_ID")
@@ -321,13 +537,23 @@ def get_docling_generate_picture_images() -> bool:
     return _parse_bool(os.getenv("DOCLING_GENERATE_PICTURE_IMAGES"), False)
 
 
+def get_docling_do_picture_classification() -> bool:
+    """DOCLING_DO_PICTURE_CLASSIFICATION (default: true).
+
+    Warm (post `torch.compile` autotune) it runs at ~3.4 ms/picture; the labels feed
+    Phase 11's per-class enrichment routing.
+    """
+    return _parse_bool(os.getenv("DOCLING_DO_PICTURE_CLASSIFICATION"), True)
+
+
 def get_docling_generate_page_images() -> bool:
+    """DOCLING_GENERATE_PAGE_IMAGES (default: false).
+
+    Page images are not needed for picture description: the VLM crops from the page
+    backend (kept alive via `keep_backend`), not from a rendered page PNG. Full-page
+    images are exported with `ImageRefMode.PLACEHOLDER` and discarded, so leaving this
+    off costs nothing even with picture description on.
     """
-    DOCLING_GENERATE_PAGE_IMAGES (default: false).
-    When do_picture_description is true, this is forced to true (VLM needs page images).
-    """
-    if get_docling_do_picture_description():
-        return True
     return _parse_bool(os.getenv("DOCLING_GENERATE_PAGE_IMAGES"), False)
 
 
@@ -347,12 +573,263 @@ def get_docling_picture_vlm_prompt() -> str:
 
 
 def get_docling_document_timeout() -> float:
-    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 300.0)."""
-    val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "300")
+    """DOCLING_DOCUMENT_TIMEOUT in seconds (default: 1200.0).
+
+    Bounds Docling's page loop only. Assembly, reading order and enrichment run outside it —
+    see get_docling_parse_timeout() for the wall-clock ceiling on the whole parse.
+
+    Exceeding it truncates the document silently: Docling stops the page loop, returns
+    PARTIAL_SUCCESS, and the pages never parsed are simply absent. docling_parser._check_status
+    fails the document rather than indexing the remainder. Sized from a measured ~0.45s/page
+    (1043 pages in ~470s) with 2.5x headroom for a slower box or a denser document.
+    """
+    val = os.getenv("DOCLING_DOCUMENT_TIMEOUT", "1200")
     try:
         return float(val)
     except ValueError:
-        return 300.0
+        return 1200.0
+
+
+def get_docling_parse_timeout() -> float:
+    """DOCLING_PARSE_TIMEOUT_SECONDS in seconds (default: 1800.0).
+
+    Wall-clock ceiling on the entire parse, unlike DOCLING_DOCUMENT_TIMEOUT. Must stay above it
+    with room for assembly and reading order, which run after the page loop, and for the
+    OCR fallback, which re-converts the whole document inside this same budget under its own
+    DOCLING_OCR_DOCUMENT_TIMEOUT. Both page loops cannot run to their own ceilings inside this
+    one — a document that needs the full OCR fallback is bounded here, not there.
+    """
+    val = os.getenv("DOCLING_PARSE_TIMEOUT_SECONDS", "1800")
+    try:
+        return float(val)
+    except ValueError:
+        return 1800.0
+
+
+def get_docling_ocr_fallback_enabled() -> bool:
+    """DOCLING_OCR_FALLBACK_ENABLED (default: true).
+
+    Re-parse with forced full-page OCR when a parse yields garbled text. Plain DOCLING_DO_OCR
+    does not cover this case: Docling only OCRs regions lacking a text layer, and a broken-font
+    PDF has one — it is just wrong.
+    """
+    return os.getenv("DOCLING_OCR_FALLBACK_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def get_docling_ocr_document_timeout() -> float:
+    """DOCLING_OCR_DOCUMENT_TIMEOUT in seconds (default: 1800.0).
+
+    Page-loop timeout for the forced-OCR fallback converter only. Full-page OCR runs ~4.3s a
+    page against ~0.6s for a normal parse, so the standard DOCLING_DOCUMENT_TIMEOUT truncates
+    the very documents the fallback exists to rescue.
+    """
+    val = os.getenv("DOCLING_OCR_DOCUMENT_TIMEOUT", "1800")
+    try:
+        return float(val)
+    except ValueError:
+        return 1800.0
+
+
+def get_docling_ocr_max_pages() -> int:
+    """DOCLING_OCR_MAX_PAGES (default: 300; 0 disables the cap).
+
+    Above this the OCR retries are skipped: a re-convert doubles peak memory and costs ~4.3s a
+    page, inside the parse budget the first pass already spent from.
+    """
+    try:
+        return int(os.getenv("DOCLING_OCR_MAX_PAGES", "300"))
+    except ValueError:
+        return 300
+
+
+def get_ingest_lease_ttl_seconds() -> int:
+    """INGEST_LEASE_TTL_SECONDS (default: 45).
+
+    Lifetime of the Redis key an ingestion task holds while it owns a document. A worker
+    killed without warning (OOMKill, eviction, node loss) never releases it, so this is how
+    long a dead worker's document stays unclaimable. Must stay comfortably above
+    INGEST_HEARTBEAT_INTERVAL_SECONDS: a live worker whose refresh is merely late must not
+    lose a document it is still parsing.
+    """
+    try:
+        return int(os.getenv("INGEST_LEASE_TTL_SECONDS", "45"))
+    except ValueError:
+        return 45
+
+
+def get_ingest_heartbeat_interval_seconds() -> int:
+    """INGEST_HEARTBEAT_INTERVAL_SECONDS (default: 15).
+
+    How often the running task refreshes its lease. Docling parses in a worker thread, so the
+    event loop is free through the slowest stage and the refresh keeps ticking there. Three
+    intervals fit inside the default TTL, so two consecutive misses are survivable.
+    """
+    try:
+        return int(os.getenv("INGEST_HEARTBEAT_INTERVAL_SECONDS", "15"))
+    except ValueError:
+        return 15
+
+
+def get_ingest_events_ttl() -> int:
+    """TTL applied to a document's ingestion SSE stream (INGEST_EVENTS_TTL, default 3600).
+
+    Refreshed on every event, so a stream lives as long as something is writing to it. Only
+    a document that reaches a terminal stage stops writing at a predictable point; one whose
+    worker is killed stops writing wherever it happened to be, and without an expiry that
+    key is never reclaimed by anything.
+    """
+    try:
+        return int(os.getenv("INGEST_EVENTS_TTL", "3600"))
+    except ValueError:
+        return 3600
+
+
+def get_ingest_stream_abandoned_after_seconds() -> float:
+    """INGEST_STREAM_ABANDONED_AFTER_SECONDS (default: 2760.0).
+
+    Backstop only: how long an uploader's SSE stream waits with no progress before reporting
+    the worker gone. The lease normally detects a dead worker in seconds and the document is
+    re-enqueued while the stream stays open, so this fires only when the lease is unreadable
+    too. The default is INGEST_TASK_TIME_LIMIT_SECONDS=2700 plus a margin: a task that is
+    genuinely running is bounded by that hard limit.
+    """
+    try:
+        return float(os.getenv("INGEST_STREAM_ABANDONED_AFTER_SECONDS", "2760"))
+    except ValueError:
+        return 2760.0
+
+
+def get_ingest_reap_debounce_seconds() -> int:
+    """INGEST_REAP_DEBOUNCE_SECONDS (default: 3600).
+
+    Lifetime of the marker that says a re-enqueue for this document is already in flight. A
+    document waiting in the queue looks exactly like an abandoned one — `processing`, no
+    lease — so without the marker every read of that row would queue another copy of it.
+    The task deletes the marker as soon as it claims the document, so this is only the
+    ceiling for an enqueue that never arrives at a worker at all; that is the same failure
+    the broker's visibility timeout covers, so they are sized alike.
+    """
+    try:
+        return int(os.getenv("INGEST_REAP_DEBOUNCE_SECONDS", "3600"))
+    except ValueError:
+        return 3600
+
+
+def get_ingest_max_pages() -> int:
+    """INGEST_MAX_PAGES (default: 1200; 0 disables the guardrail).
+
+    Hard page ceiling, checked before the parse. A fresh child needs ~2.44 GB + 4.9 MB/page, and
+    that has to fit on top of the floor the memory recycle allows (see
+    get_ingest_worker_max_memory_per_child_kb). Move it only together with that and the limit.
+    """
+    try:
+        return int(os.getenv("INGEST_MAX_PAGES", "1200"))
+    except ValueError:
+        return 1200
+
+
+def get_ingest_worker_max_memory_per_child_kb() -> int:
+    """INGEST_WORKER_MAX_MEMORY_PER_CHILD_KB (default: 4882812 = 5.0 GB; 0 disables).
+
+    Passed to the ingestion worker as --max-memory-per-child. billiard compares it with the
+    child's ru_maxrss after each task. ingest_document resets that peak at task end, so the
+    check sees the memory the task kept, and no child starts a document on a floor above T.
+    Sized as limit - margin - parent - demand(INGEST_MAX_PAGES).
+    """
+    try:
+        return int(os.getenv("INGEST_WORKER_MAX_MEMORY_PER_CHILD_KB", "4882812"))
+    except ValueError:
+        return 4882812
+
+
+def get_ingest_malloc_trim_enabled() -> bool:
+    """Whether to malloc_trim() after each document (INGEST_MALLOC_TRIM, default: false).
+
+    Returns memory glibc has freed but kept on its heaps, which otherwise accumulates over a
+    worker's lifetime.
+    """
+    return os.getenv("INGEST_MALLOC_TRIM", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_ingest_cuda_empty_cache_enabled() -> bool:
+    """Whether to empty torch's CUDA cache after each document (INGEST_CUDA_EMPTY_CACHE,
+    default: true).
+
+    The VRAM counterpart to INGEST_MALLOC_TRIM. Torch keeps the blocks it grabbed for parse-time
+    intermediates, so without this a worker's VRAM floor steps up on its first document and
+    never comes back down.
+    """
+    return os.getenv("INGEST_CUDA_EMPTY_CACHE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def get_docling_text_quality_threshold() -> float:
+    """DOCLING_TEXT_QUALITY_THRESHOLD (default: 0.02).
+
+    Minimum stopword ratio for a parse to count as readable. Real documents measured 0.06+,
+    a broken-font one measured 0.0003.
+    """
+    try:
+        return float(os.getenv("DOCLING_TEXT_QUALITY_THRESHOLD", "0.02"))
+    except ValueError:
+        return 0.02
+
+
+def get_docling_scan_ocr_enabled() -> bool:
+    """DOCLING_SCAN_OCR_ENABLED (default: true).
+
+    Re-parse with forced full-page OCR when a PDF has no text layer at all (a scan). Separate
+    from DOCLING_OCR_FALLBACK_ENABLED, which covers a *present but garbled* text layer: this
+    path costs ~4.3s a page on documents that would otherwise finish in seconds, so it is the
+    one to turn off first when the single ingestion slot is the binding constraint. Left on by
+    default because the alternative is a document that completes with zero chunks and is
+    marked ready — silently unsearchable.
+    """
+    return _parse_bool(os.getenv("DOCLING_SCAN_OCR_ENABLED"), True)
+
+
+def get_docling_device() -> str:
+    """DOCLING_DEVICE (default: cuda). Passed to AcceleratorOptions; Docling also accepts
+    a specific index such as "cuda:1"."""
+    return os.getenv("DOCLING_DEVICE", "cuda")
+
+
+def get_docling_ocr_use_gpu() -> bool:
+    """DOCLING_OCR_USE_GPU (default: true).
+
+    Independent of DOCLING_DEVICE: EasyOcrOptions.use_gpu is its own flag, not derived
+    from the accelerator device.
+    """
+    return _parse_bool(os.getenv("DOCLING_OCR_USE_GPU"), True)
+
+
+def get_docling_images_scale() -> float:
+    """DOCLING_IMAGES_SCALE (default: 2.0). Resolution multiplier for generated page/picture
+    images."""
+    val = os.getenv("DOCLING_IMAGES_SCALE", "2.0")
+    try:
+        return float(val)
+    except ValueError:
+        return 2.0
+
+
+def get_docling_artifacts_path() -> Path | None:
+    """DOCLING_ARTIFACTS_PATH — local directory with pre-downloaded Docling model weights
+    (layout, TableFormer, picture classifier), populated by model-preload-job.yaml.
+
+    Unset (default) falls back to Docling's lazy per-repo HuggingFace download, which
+    still lands in HF_HOME but only starts once a Celery task actually needs the model.
+    """
+    val = os.getenv("DOCLING_ARTIFACTS_PATH")
+    return Path(val) if val else None
 
 
 def get_chunking_tokenizer_model() -> str:
@@ -410,6 +887,64 @@ def get_embedder_timeout_seconds() -> float:
         return 30.0
 
 
+def get_embedder_query_timeout_seconds() -> float:
+    """EMBEDDER_QUERY_TIMEOUT_SECONDS (default: 5.0).
+
+    Per-attempt budget for the chat path only. Deliberately far below
+    EMBEDDER_TIMEOUT_SECONDS: an ingestion batch can afford to wait, but a query embed
+    sits inside an agent search and shares AGENT_SEARCH_TIMEOUT_SECONDS with retrieval and
+    rerank.
+    """
+    try:
+        return float(os.getenv("EMBEDDER_QUERY_TIMEOUT_SECONDS", "5.0"))
+    except ValueError:
+        return 5.0
+
+
+def get_embedder_query_max_attempts() -> int:
+    """EMBEDDER_QUERY_MAX_ATTEMPTS (default: 2). Total attempts, not extra retries."""
+    try:
+        return max(1, int(os.getenv("EMBEDDER_QUERY_MAX_ATTEMPTS", "2")))
+    except ValueError:
+        return 2
+
+
+def get_embedder_query_retry_backoff_seconds() -> float:
+    """EMBEDDER_QUERY_RETRY_BACKOFF_SECONDS (default: 0.15), jittered per attempt."""
+    try:
+        return float(os.getenv("EMBEDDER_QUERY_RETRY_BACKOFF_SECONDS", "0.15"))
+    except ValueError:
+        return 0.15
+
+
+def get_embedder_batch_size() -> int:
+    """EMBEDDER_BATCH_SIZE — inputs per TEI request (default: 64).
+
+    Must not exceed TEI's --max-client-batch-size; the embedder clamps to the server's
+    reported value rather than trusting this.
+    """
+    try:
+        return max(1, int(os.getenv("EMBEDDER_BATCH_SIZE", "64")))
+    except ValueError:
+        return 64
+
+
+def get_embedder_concurrency() -> int:
+    """EMBEDDER_CONCURRENCY — in-flight TEI requests per embed call (default: 4)."""
+    try:
+        return max(1, int(os.getenv("EMBEDDER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+def get_embedding_device() -> str:
+    """EMBEDDING_DEVICE for the local SentenceTransformer provider (default: cpu).
+
+    Only consulted when EMBEDDING_PROVIDER=local; TEI and OpenAI place the model themselves.
+    """
+    return os.getenv("EMBEDDING_DEVICE", "cpu")
+
+
 def get_embedding_dim() -> int | None:
     """EMBEDDING_DIM (optional). If set, validates embedding vector length."""
     raw = os.getenv("EMBEDDING_DIM")
@@ -422,24 +957,25 @@ def get_embedding_dim() -> int | None:
 
 
 # --- RAG retrieval ---
+def get_query_router_prompt_version() -> str:
+    """Router prompt version (QUERY_ROUTER_PROMPT_VERSION, default v5). v4 asks for the
+    legal name instead of the span's expansion — set it to roll back entity extraction."""
+    return os.getenv("QUERY_ROUTER_PROMPT_VERSION", "v5")
+
+
 def get_query_router_model() -> str:
     """Model ID for query routing (QUERY_ROUTER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
     return os.getenv("QUERY_ROUTER_MODEL", "gpt-4o-mini")
 
 
-def get_query_transformer_model() -> str:
-    """Model ID for query transformation (QUERY_TRANSFORMER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
-    return os.getenv("QUERY_TRANSFORMER_MODEL", "gpt-4o-mini")
+def get_entity_disambiguator_model() -> str:
+    """Model ID for the entity disambiguator (ENTITY_DISAMBIGUATOR_MODEL, default: gpt-4o-mini)."""
+    return os.getenv("ENTITY_DISAMBIGUATOR_MODEL", "gpt-4o-mini")
 
 
-def get_query_transformer_config() -> dict:
-    return {
-        "temperature": float(os.getenv("QUERY_TRANSFORMER_TEMPERATURE", "0.0")),
-        "max_tokens": int(os.getenv("QUERY_TRANSFORMER_MAX_TOKENS", "1200")),
-        "timeout": float(os.getenv("QUERY_TRANSFORMER_TIMEOUT", "10.0")),
-        "max_scope_docs": int(os.getenv("QUERY_TRANSFORMER_MAX_SCOPE_DOCS", "10")),
-        "conv_history_tokens": int(os.getenv("QUERY_TRANSFORMER_CONV_HISTORY_TOKENS", "1200")),
-    }
+def get_entity_disambiguator_prompt_version() -> str:
+    """Entity disambiguator prompt version (ENTITY_DISAMBIGUATOR_PROMPT_VERSION, default v1)."""
+    return os.getenv("ENTITY_DISAMBIGUATOR_PROMPT_VERSION", "v1")
 
 
 # Agent config lives in src.services.chat.agent.state.get_agent_settings() (validated,
@@ -472,9 +1008,128 @@ def get_table_summarizer_enable_thinking() -> bool:
     }
 
 
+def get_table_summarizer_concurrency() -> int:
+    """In-flight table summarizer batches (TABLE_SUMMARIZER_CONCURRENCY, default: 4)."""
+    try:
+        return max(1, int(os.getenv("TABLE_SUMMARIZER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
 def get_table_summarizer_batch_size() -> int:
     """Number of tables to summarize per LLM call (TABLE_SUMMARIZER_BATCH_SIZE, default: 3)."""
     return int(os.getenv("TABLE_SUMMARIZER_BATCH_SIZE", "3"))
+
+
+def get_picture_enricher_enabled() -> bool:
+    """Whether picture description enrichment is enabled (PICTURE_ENRICHER_ENABLED, default: false).
+
+    Defaults off: it adds paid vision calls per document, so it must be turned on deliberately.
+    With it off, ingestion output is identical to the Phase 4 lean-parse baseline.
+    """
+    return os.getenv("PICTURE_ENRICHER_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def get_picture_enricher_model() -> str:
+    """Model for the chart/diagram lane (PICTURE_ENRICHER_MODEL, default: gpt-5-mini).
+    Must exist in models.yaml with capabilities.vision true."""
+    return os.getenv("PICTURE_ENRICHER_MODEL", "gpt-5-mini")
+
+
+def get_picture_enricher_cheap_model() -> str:
+    """Model for the one-line caption lane (PICTURE_ENRICHER_CHEAP_MODEL, default: gpt-4o-mini).
+    Must exist in models.yaml with capabilities.vision true."""
+    return os.getenv("PICTURE_ENRICHER_CHEAP_MODEL", "gpt-4o-mini")
+
+
+def get_picture_enricher_batch_size() -> int:
+    """Pictures per LLM call (PICTURE_ENRICHER_BATCH_SIZE, default: 3). Each picture is a
+    base64 image part, so batches are large requests — raise this cautiously."""
+    return int(os.getenv("PICTURE_ENRICHER_BATCH_SIZE", "3"))
+
+
+def get_picture_enricher_min_confidence() -> float:
+    """Classification confidence below which a picture is routed to the generic caption lane
+    instead of its label's lane (PICTURE_ENRICHER_MIN_CONFIDENCE, default: 0.5)."""
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_MIN_CONFIDENCE", "0.5"))
+    except ValueError:
+        return 0.5
+
+
+def get_picture_enricher_min_completion_tokens() -> int:
+    """Floor for a picture batch's completion budget (PICTURE_ENRICHER_MIN_COMPLETION_TOKENS,
+    default: 4000). On reasoning models the budget covers reasoning too, so a short tail batch
+    scaled purely by size can be consumed before any JSON is emitted."""
+    try:
+        return int(os.getenv("PICTURE_ENRICHER_MIN_COMPLETION_TOKENS", "4000"))
+    except ValueError:
+        return 4000
+
+
+def get_picture_enricher_concurrency() -> int:
+    """In-flight enricher batches across both lanes (PICTURE_ENRICHER_CONCURRENCY, default: 4).
+
+    These are network waits, so overlapping them is nearly free — but the cap is shared by both
+    lanes, since the provider rate limit is per-account, not per-lane. Deliberately conservative;
+    raise only after watching for 429s.
+    """
+    try:
+        return max(1, int(os.getenv("PICTURE_ENRICHER_CONCURRENCY", "4")))
+    except ValueError:
+        return 4
+
+
+def get_picture_enricher_stage_timeout() -> float:
+    """Floor of the enrichment stage budget (PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS, default: 300);
+    the budget grows with picture count, see get_picture_enricher_seconds_per_picture.
+
+    Enrichment runs after the parse, so DOCLING_PARSE_TIMEOUT_SECONDS does not cover it; without
+    this only Celery's soft limit would, which fails the whole document. Timing out here leaves
+    the pictures described so far in place — the chunker drops the rest.
+    """
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_STAGE_TIMEOUT_SECONDS", "300"))
+    except ValueError:
+        return 300.0
+
+
+def get_picture_enricher_seconds_per_picture() -> float:
+    """Per-picture share of the enrichment stage budget (PICTURE_ENRICHER_SECONDS_PER_PICTURE,
+    default: 1.0). The budget is max(stage timeout, pictures x this); measured ~0.7 s/picture
+    at concurrency 4 on a 1043-page filing."""
+    try:
+        return float(os.getenv("PICTURE_ENRICHER_SECONDS_PER_PICTURE", "1.0"))
+    except ValueError:
+        return 1.0
+
+
+def get_picture_enricher_max_image_px() -> int:
+    """Longest edge a crop is downscaled to before sending (PICTURE_ENRICHER_MAX_IMAGE_PX,
+    default: 1536). 0 disables resizing.
+
+    Crops are base64-inlined, which inflates by 4/3, so an un-resized p95 crop costs ~864 KiB on
+    the wire and a 3-image batch ~2.6 MiB. Vision models downsample to their own tile grid
+    anyway, so sending more pixels than this buys nothing.
+    """
+    try:
+        return max(0, int(os.getenv("PICTURE_ENRICHER_MAX_IMAGE_PX", "1536")))
+    except ValueError:
+        return 1536
+
+
+def get_picture_enricher_reasoning_effort() -> str:
+    """Reasoning effort for the picture enricher lanes (PICTURE_ENRICHER_REASONING_EFFORT,
+    default: low). Ignored by non-GPT-5 models. Set to "none" to disable."""
+    value = os.getenv("PICTURE_ENRICHER_REASONING_EFFORT", "low").strip().lower()
+    if value not in {"none", "minimal", "low", "medium", "high"}:
+        return "low"
+    return value
 
 
 def get_rag_top_k() -> int:
@@ -491,10 +1146,6 @@ def get_rag_max_tokens() -> int:
 
 def get_rag_vector_weight() -> float:
     return float(os.getenv("RAG_VECTOR_WEIGHT", "0.6"))
-
-
-def get_rag_score_threshold() -> float:
-    return float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
 
 
 def get_vector_search_top_k() -> int:
@@ -568,11 +1219,6 @@ def get_injection_scan_chunks_enabled() -> bool:
     return _parse_bool(os.getenv("INJECTION_SCAN_CHUNKS"), True)
 
 
-def get_system_prompt_version() -> str:
-    """SYSTEM_PROMPT_VERSION (default: v2). Controls which system prompt YAML is loaded."""
-    return os.getenv("SYSTEM_PROMPT_VERSION", "v2")
-
-
 def get_chat_retrieval_timeout() -> float:
     """CHAT_RETRIEVAL_TIMEOUT in seconds (default: 200.0). Per-backend retrieval timeout, fail-open."""
     val = os.getenv("CHAT_RETRIEVAL_TIMEOUT", "200")
@@ -587,16 +1233,41 @@ def get_router_config() -> dict[str, float | int]:
     """Query router configuration from environment variables.
 
     Returns:
-        Dict with keys: temperature, max_tokens, entity_similarity_threshold,
-        entity_max_candidates, filtered_md_thresh.
+        Dict with keys: temperature, max_tokens, timeout, entity_max_candidates,
+        entity_candidate_sim_threshold, entity_candidate_word_threshold,
+        disambiguator_timeout, disambiguator_max_tokens, disambiguator_max_titles.
     """
     return {
         "temperature": float(os.getenv("ROUTER_TEMPERATURE", "0.0")),
         "max_tokens": int(os.getenv("ROUTER_MAX_TOKENS", "800")),
-        "entity_similarity_threshold": float(os.getenv("ENTITY_SIMILARITY_THRESHOLD", "0.3")),
+        "timeout": float(os.getenv("ROUTER_TIMEOUT", "10.0")),
         "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
-        "filtered_md_thresh": int(os.getenv("FILTERED_MD_THRESH", "5")),
+        # Candidate generation is deliberately loose: pg_trgm `%` (similarity) and `<<%`
+        # (strict_word_similarity) thresholds. They bound recall: the disambiguator only
+        # picks among these matches. Precision is its job.
+        "entity_candidate_sim_threshold": float(os.getenv("ENTITY_CANDIDATE_SIM_THRESHOLD", "0.2")),
+        "entity_candidate_word_threshold": float(
+            os.getenv("ENTITY_CANDIDATE_WORD_THRESHOLD", "0.25")
+        ),
+        "disambiguator_timeout": float(os.getenv("ENTITY_DISAMBIGUATOR_TIMEOUT", "8.0")),
+        "disambiguator_max_tokens": int(os.getenv("ENTITY_DISAMBIGUATOR_MAX_TOKENS", "400")),
+        # Document titles shown per candidate company.
+        "disambiguator_max_titles": int(os.getenv("ENTITY_DISAMBIGUATOR_MAX_TITLES", "3")),
     }
+
+
+def get_scope_max_companies() -> int:
+    """Most companies one retrieval question may cover (SCOPE_MAX_COMPANIES, default 5).
+    Each covered company is an agent plan item, so it may not exceed AGENT_MAX_PLAN_ITEMS."""
+    from src.services.chat.agent.state import get_agent_settings
+
+    value = int(os.getenv("SCOPE_MAX_COMPANIES", "5"))
+    max_plan_items = get_agent_settings().max_plan_items
+    if value > max_plan_items:
+        raise ValueError(
+            f"SCOPE_MAX_COMPANIES={value} exceeds AGENT_MAX_PLAN_ITEMS={max_plan_items}"
+        )
+    return value
 
 
 def get_multi_pass_chunks_per_sub() -> int:
@@ -620,6 +1291,36 @@ def get_langfuse_config() -> dict[str, str | float | bool]:
         "sample_rate": float(os.getenv("LANGFUSE_SAMPLE_RATE", "1.0")),
         "environment": os.getenv("LANGFUSE_ENVIRONMENT", "development"),
     }
+
+
+def get_langfuse_trace_system_prompt_chars() -> int:
+    """System prompt text kept on a GENERATION input; the prompt version is in the trace
+    metadata (LANGFUSE_TRACE_SYSTEM_PROMPT_CHARS, default 300)."""
+    return int(os.getenv("LANGFUSE_TRACE_SYSTEM_PROMPT_CHARS", "300"))
+
+
+def get_langfuse_trace_excerpt_chars() -> int:
+    """Body text kept per `<retrieved_excerpt>` on a GENERATION input
+    (LANGFUSE_TRACE_EXCERPT_CHARS, default 400)."""
+    return int(os.getenv("LANGFUSE_TRACE_EXCERPT_CHARS", "400"))
+
+
+def get_langfuse_trace_message_chars() -> int:
+    """Upper bound on any one message's text on a GENERATION input, after excerpt capping
+    (LANGFUSE_TRACE_MESSAGE_CHARS, default 4000)."""
+    return int(os.getenv("LANGFUSE_TRACE_MESSAGE_CHARS", "4000"))
+
+
+def get_langfuse_trace_dedup_min_chars() -> int:
+    """A message at least this long that an earlier GENERATION in the same trace already
+    logged is replaced by a pointer to it (LANGFUSE_TRACE_DEDUP_MIN_CHARS, default 200)."""
+    return int(os.getenv("LANGFUSE_TRACE_DEDUP_MIN_CHARS", "200"))
+
+
+def get_langfuse_trace_max_hits() -> int:
+    """Entries kept in a traced list of retrieval hits or doc ids; the total count is
+    logged beside it (LANGFUSE_TRACE_MAX_HITS, default 20)."""
+    return int(os.getenv("LANGFUSE_TRACE_MAX_HITS", "20"))
 
 
 # --- Eval ---

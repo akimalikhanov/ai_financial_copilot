@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: copilot
+spec:
+  serviceName: postgres-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.11-alpine
+          # Image default is 100, and pgbouncer can now open up to 120 server connections
+          # (app 60 + langfuse 30 + postgres 30). Below this, the pool hits a Postgres refusal.
+          args: ["postgres", "-c", "max_connections=200"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - configMapRef: { name: postgres-config }   # POSTGRES_DB, APP_DB, APP_DB_USER, LANGFUSE_DB, LANGFUSE_DB_USER
+            - secretRef:    { name: postgres-secret }   # POSTGRES_USER/PASSWORD, APP_DB_PASSWORD, LANGFUSE_DB_PASSWORD
+          env:
+            # The image writes PGDATA at the volume root; local-path volumes are
+            # not empty (lost+found is absent here, but keep the subdir habit —
+            # it is mandatory on EBS in Stage 19).
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10     # compose: start_period 20s
+            periodSeconds: 5            # compose: interval 5s
+            timeoutSeconds: 3           # compose: timeout 3s
+            failureThreshold: 10        # compose: retries 10
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - pg_isready -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "2",    memory: "2Gi" }   # compose: cpus 2.00 / mem_limit 2g
+        # Engine-level metrics for Prometheus. Grafana's `PostgreSQL` datasource queries
+        # pg_stat_activity over SQL at render time, which shows only the present moment —
+        # there was no history for it, so a load-test scenario could not be measured after
+        # the fact (T3 hit exactly this: docs/notes/loadtest-readiness-audit.md §4.1).
+        #
+        # --collector.stat_activity is NOT on by default and is the whole reason this sidecar
+        # exists: it emits pg_stat_activity_count{datname,state}, including the
+        # state="idle in transaction" series T3's pass bar is written against. Six series per
+        # database, labels stable.
+        # database_wraparound (datfrozenxid age) is a built-in; the xmin horizon T6 needs is
+        # not, hence the query file. --extend.query-path is deprecated but the only mechanism
+        # that loads custom queries in v0.20.x.
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+          args:
+            - --collector.stat_activity
+            - --collector.database_wraparound
+            - --extend.query-path=/etc/postgres-exporter/postgres-exporter-queries.yaml
+          ports:
+            - name: metrics
+              containerPort: 9187
+          env:
+            # Superuser: pg_stat_activity otherwise hides other users' backends, which are
+            # precisely the app/pgbouncer sessions worth counting. Same secret the pgbouncer
+            # exporter uses; $(VAR) is expanded by kubelet, not a shell.
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: postgres-secret, key: POSTGRES_PASSWORD } }
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:5432/postgres?sslmode=disable"
+          volumeMounts:
+            - name: exporter-queries
+              mountPath: /etc/postgres-exporter
+              readOnly: true
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
+      volumes:
+        - name: exporter-queries
+          configMap:
+            name: postgres-exporter-queries
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+            defaultMode: 0o755          # ENTRYPOINT only executes *.sh that are executable
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,41 +1,11 @@
-"""Unit tests for BracketCitationParser and DisplayLabelMap."""
+"""Unit tests for BracketCitationParser."""
 
 from __future__ import annotations
 
 import pytest
 
-from src.schemas.retrieval import AnswerCitationSpan, DisplayLabelMap
+from src.schemas.retrieval import AnswerCitationSpan
 from src.services.chat.citation_parser import BracketCitationParser
-
-# ---------------------------------------------------------------------------
-# DisplayLabelMap (unchanged schema — tests kept as-is)
-# ---------------------------------------------------------------------------
-
-
-class TestDisplayLabelMap:
-    def test_sequential_assignment(self) -> None:
-        m = DisplayLabelMap()
-        assert m.get_or_assign("S1") == "C1"
-        assert m.get_or_assign("S2") == "C2"
-        assert m.get_or_assign("S3") == "C3"
-
-    def test_repeated_ref_returns_same_label(self) -> None:
-        m = DisplayLabelMap()
-        assert m.get_or_assign("S5") == "C1"
-        assert m.get_or_assign("S5") == "C1"
-
-    def test_get_labels_for_refs_mixed(self) -> None:
-        m = DisplayLabelMap()
-        m.get_or_assign("S1")  # C1
-        labels = m.get_labels_for_refs(("S3", "S1", "S2"))
-        assert labels == ("C2", "C1", "C3")
-
-    def test_mapping_property(self) -> None:
-        m = DisplayLabelMap()
-        m.get_or_assign("S2")
-        m.get_or_assign("S1")
-        assert m.mapping == {"S2": "C1", "S1": "C2"}
-
 
 # ---------------------------------------------------------------------------
 # BracketCitationParser — single-chunk basics
@@ -267,25 +237,18 @@ class TestParserMalformed:
 
 
 # ---------------------------------------------------------------------------
-# BracketCitationParser — display label ordering
+# BracketCitationParser — span ordering
 # ---------------------------------------------------------------------------
 
 
-class TestParserDisplayLabels:
-    def test_labels_by_first_appearance(self) -> None:
-        """First citation refs S3, second refs S1 — display labels C1, C2."""
+class TestParserSpanOrder:
+    def test_spans_follow_answer_order(self) -> None:
+        """Spans come out in answer order — `build_references_list` derives the
+        evidence-panel order from that, so the parser must not resort."""
         p = BracketCitationParser()
         p.feed("First. [S3] Second. [S1]")
         p.finalize()
-        assert p.label_map.get_or_assign("S3") == "C1"
-        assert p.label_map.get_or_assign("S1") == "C2"
-
-    def test_repeated_ref_keeps_label(self) -> None:
-        p = BracketCitationParser()
-        p.feed("A. [S1] B. [S2] C. [S1]")
-        p.finalize()
-        assert p.label_map.mapping["S1"] == "C1"
-        assert p.label_map.mapping["S2"] == "C2"
+        assert [sp.ref_ids for sp in p.all_spans] == [("S3",), ("S1",)]
 
     def test_all_spans_property(self) -> None:
         p = BracketCitationParser()

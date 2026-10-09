@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
+from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.observability import langfuse as lf_client
+from src.observability.langfuse import mark as lf_mark
+from src.observability.langfuse import span as lf_span
 from src.observability.metrics import RAG_CHUNKS, RAG_RETRIEVAL
-from src.schemas.query_transform import TransformedQuery
+from src.observability.trace_payload import cap_list
 from src.schemas.retrieval import RAGContext, RetrievalHit, RetrievalTrace, RetrievedChunk
-from src.services.ingestion.embedder import embed_chunks
+from src.services.ingestion.embedder import embed_query
 from src.services.retrieval.context_assembler import assemble_rag_context
 from src.services.retrieval.hybrid_retriever import fuse_rrf
 from src.services.retrieval.opensearch_retriever import retrieve as opensearch_retrieve
@@ -29,32 +30,7 @@ from src.utils.config import (
     get_vector_search_top_k,
 )
 
-if TYPE_CHECKING:
-    from langfuse import Langfuse
-
-
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def _span(
-    lf: Langfuse | None,
-    name: str,
-    *,
-    as_type: str = "span",
-    input: object = None,
-    **metadata: object,
-):
-    if lf is None:
-        yield None
-        return
-    with lf.start_as_current_observation(
-        as_type=as_type,  # type: ignore[arg-type]
-        name=name,
-        input=input,
-        metadata=metadata or None,
-    ) as obs:
-        yield obs
 
 
 def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
@@ -66,18 +42,36 @@ def _to_hit(chunk: RetrievedChunk) -> RetrievalHit:
     )
 
 
-async def _retrieve_with_timeout(coro, timeout: float | None = None) -> list:
-    """Run retrieval coroutine with timeout. Fail open: return [] on error/timeout."""
+async def _retrieve_with_timeout(coro, timeout: float | None = None) -> tuple[list, bool]:
+    """Run retrieval coroutine with timeout.
+
+    Fails open with ``[]`` so one dead backend cannot take down the request, but reports
+    it via ``ok=False``: callers must be able to tell "the corpus does not discuss this"
+    from "the index was unreachable" (P1-F), which an empty list alone cannot express.
+    """
     timeout = timeout if timeout is not None else get_chat_retrieval_timeout()
     try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except (TimeoutError, Exception) as e:
+        return await asyncio.wait_for(coro, timeout=timeout), True
+    except TimeoutError as e:
+        logger.warning("retrieval_backend_failed", extra={"error": str(e), "reason": "timeout"})
+        return [], False
+    except Exception as e:
         logger.warning("retrieval_backend_failed", extra={"error": str(e)})
-        return []
+        return [], False
+
+
+@dataclass(frozen=True)
+class _PassResult:
+    vector: list[RetrievedChunk]
+    keyword: list[RetrievedChunk]
+    fused: list[RetrievedChunk]
+    vector_ok: bool
+    keyword_ok: bool
+    all_backends_failed: bool
 
 
 async def _run_single_pass(
-    semantic_vector: list[float],
+    semantic_vector: list[float] | None,
     keyword_query: str,
     user_id: UUID,
     doc_ids: list[UUID] | None,
@@ -85,26 +79,38 @@ async def _run_single_pass(
     vector_top_k: int,
     keyword_top_k: int,
     search_mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
-) -> tuple[list[RetrievedChunk], list[RetrievedChunk], list[RetrievedChunk]]:
+) -> _PassResult:
     """Run retrieval backends in parallel (skipping one when search_mode is single-backend).
 
-    Returns (vector_results, keyword_results, fused).
-    For single-backend modes, fused == the single backend's results (no RRF).
+    For single-backend modes, fused == the single backend's results (no RRF), and
+    all_backends_failed reflects that one backend alone.
+
+    `semantic_vector` is None when the query could not be embedded; the vector leg is
+    then skipped as unavailable rather than treated as empty.
     """
+    if semantic_vector is None and search_mode != "keyword":
+        if search_mode == "vector":
+            return _PassResult([], [], [], False, True, True)
+        search_mode = "keyword"
+
     if search_mode == "vector":
-        vector_results = await _retrieve_with_timeout(
+        assert semantic_vector is not None
+        vector_results, vec_ok = await _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
             timeout,
         )
-        return vector_results, [], vector_results
+        return _PassResult(vector_results, [], vector_results, vec_ok, True, not vec_ok)
     if search_mode == "keyword":
-        keyword_results = await _retrieve_with_timeout(
+        keyword_results, kw_ok = await _retrieve_with_timeout(
             opensearch_retrieve(keyword_query, user_id, doc_ids=doc_ids, top_k=keyword_top_k),
             timeout,
         )
-        return [], keyword_results, keyword_results
+        # vector_ok stays True only when the dense leg was never meant to run; a failed
+        # embed downgrades it at the call site, which is the one place that knows.
+        return _PassResult([], keyword_results, keyword_results, True, kw_ok, not kw_ok)
 
-    vector_results, keyword_results = await asyncio.gather(
+    assert semantic_vector is not None
+    (vector_results, vec_ok), (keyword_results, kw_ok) = await asyncio.gather(
         _retrieve_with_timeout(
             qdrant_retrieve(semantic_vector, user_id, doc_ids=doc_ids, top_k=vector_top_k),
             timeout,
@@ -115,13 +121,17 @@ async def _run_single_pass(
         ),
     )
     fused = fuse_rrf(vector_results, keyword_results)
-    return vector_results, keyword_results, fused
+    # Only a total outage sets all_backends_failed: with one backend alive the request
+    # still has real retrieval, and calling that "search unavailable" would be a false
+    # alarm. The per-leg flags carry the partial case, which callers surface separately.
+    return _PassResult(vector_results, keyword_results, fused, vec_ok, kw_ok, not (vec_ok or kw_ok))
 
 
 async def run_chat_rag_pipeline(
     session: AsyncSession,
     *,
-    transformed: TransformedQuery,
+    semantic_query: str,
+    keyword_query: str,
     user_id: UUID,
     doc_ids: list[UUID] | None,
     timeout: float | None = None,
@@ -130,6 +140,8 @@ async def run_chat_rag_pipeline(
     top_k_override: int | None = None,
 ) -> tuple[RAGContext, RetrievalTrace, list[RetrievedChunk]]:
     """Embed query, run retrieval (single-pass), rerank, assemble RAGContext.
+
+    `semantic_query` is embedded and drives the reranker; `keyword_query` goes to BM25.
 
     search_mode controls which backends run:
       - "hybrid": Qdrant + OpenSearch in parallel, fused via RRF (default)
@@ -144,36 +156,44 @@ async def run_chat_rag_pipeline(
     if reranker is None:
         reranker = get_reranker()
 
-    lf = lf_client.get_client()
-
-    with _span(lf, "embed_query", as_type="embedding", input=[transformed.semantic_query]) as obs:
+    # Fails open like every other retrieval backend. Embedding sits *in front of* both
+    # of them — it produces an argument to the fan-out rather than running inside it — so
+    # letting it raise would take keyword search down with it while OpenSearch is healthy,
+    # which is the one thing the per-backend fail-open below exists to prevent.
+    semantic_vector: list[float] | None = None
+    with lf_span("embed_query", as_type="embedding", input=[semantic_query]) as obs:
         _t = perf_counter()
-        vectors_list = await asyncio.to_thread(embed_chunks, [transformed.semantic_query])
+        try:
+            semantic_vector = await asyncio.to_thread(embed_query, semantic_query)
+        except Exception as e:
+            logger.warning("embed_query_failed", extra={"error": str(e)})
         RAG_RETRIEVAL.labels("embed").observe(perf_counter() - _t)
         if obs:
             obs.update(
                 output={
-                    "vector_count": len(vectors_list),
-                    "dims": len(vectors_list[0]) if vectors_list else 0,
+                    "vector_count": 1 if semantic_vector else 0,
+                    "dims": len(semantic_vector) if semantic_vector else 0,
+                    "ok": semantic_vector is not None,
                 }
             )
-    semantic_vector = vectors_list[0]
+            if semantic_vector is None:
+                lf_mark(obs, "WARNING", "embedding failed; dense search skipped")
+    embed_ok = semantic_vector is not None
 
-    with _span(
-        lf,
+    with lf_span(
         "hybrid_retrieve",
         as_type="retriever",
         input={
-            "semantic_query": transformed.semantic_query,
-            "keyword_query": transformed.keyword_query,
+            "semantic_query": semantic_query,
+            "keyword_query": keyword_query,
             "search_mode": search_mode,
         },
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        vec_r, kw_r, fused = await _run_single_pass(
+        _pass = await _run_single_pass(
             semantic_vector,
-            transformed.keyword_query,
+            keyword_query,
             user_id,
             doc_ids,
             timeout,
@@ -181,74 +201,83 @@ async def run_chat_rag_pipeline(
             keyword_top_k,
             search_mode=search_mode,
         )
+        vec_r, kw_r, fused = _pass.vector, _pass.keyword, _pass.fused
+        all_backends_failed = _pass.all_backends_failed
+        vector_ok = _pass.vector_ok and embed_ok
+        keyword_ok = _pass.keyword_ok
         RAG_RETRIEVAL.labels("hybrid_retrieve").observe(perf_counter() - _t)
         RAG_CHUNKS.labels("vector").observe(len(vec_r))
         RAG_CHUNKS.labels("keyword").observe(len(kw_r))
         RAG_CHUNKS.labels("fused").observe(len(fused))
         if obs:
+            # Fused hits carry both legs' scores, so the per-leg lists would only repeat them.
             obs.update(
                 output={
                     "counts": {"vector": len(vec_r), "keyword": len(kw_r), "fused": len(fused)},
-                    "vector": [_to_hit(c).model_dump(exclude_none=True) for c in vec_r],
-                    "keyword": [_to_hit(c).model_dump(exclude_none=True) for c in kw_r],
-                    "fused": [_to_hit(c).model_dump(exclude_none=True) for c in fused],
+                    "fused_top": [
+                        _to_hit(c).model_dump(exclude_none=True) for c in cap_list(fused)
+                    ],
                 }
             )
+            if all_backends_failed:
+                lf_mark(obs, "ERROR", "all retrieval backends failed")
+            elif not (vector_ok and keyword_ok):
+                failed = [n for n, ok in (("dense", vector_ok), ("keyword", keyword_ok)) if not ok]
+                lf_mark(obs, "WARNING", f"degraded: {', '.join(failed)} unavailable")
     capped = fused[:reranker_max_input]
     if not capped:
         trace = RetrievalTrace(
             qdrant=[_to_hit(c) for c in vec_r],
             opensearch=[_to_hit(c) for c in kw_r],
+            all_backends_failed=all_backends_failed,
+            embed_ok=embed_ok,
+            vector_ok=vector_ok,
+            keyword_ok=keyword_ok,
         )
         return RAGContext(formatted_context="", items=(), chunk_count=0), trace, []
 
     chunk_ids = [c.chunk_id for c in capped]
     payloads = await get_chunk_prompt_payloads(session, chunk_ids)
     texts_map = {cid: payloads[cid].prompt_text for cid in chunk_ids if cid in payloads}
-    with _span(
-        lf,
+    # The candidates are the head of `hybrid_retrieve`'s fused list, logged there.
+    with lf_span(
         "rerank",
         as_type="retriever",
-        input={
-            "query": transformed.semantic_query,
-            "input_count": len(capped),
-            "chunks": [{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in capped],
-        },
+        input={"query": semantic_query, "input_count": len(capped)},
         mode="single_pass",
     ) as obs:
         _t = perf_counter()
-        reranked = await reranker.rerank(transformed.semantic_query, capped, texts_map)
+        outcome = await reranker.rerank(semantic_query, capped, texts_map)
+        reranked = outcome.chunks
         RAG_RETRIEVAL.labels("rerank").observe(perf_counter() - _t)
         RAG_CHUNKS.labels("reranked").observe(len(reranked))
         if obs:
             obs.update(
                 output={
                     "output_count": len(reranked),
+                    "scored": outcome.scored,
                     "chunks": [
-                        {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked
+                        {"chunk_id": str(c.chunk_id), "score": round(c.score, 4)}
+                        for c in cap_list(reranked)
                     ],
                 }
             )
+            if outcome.degraded:
+                lf_mark(obs, "WARNING", "reranker unavailable; fusion order kept")
 
     trace = RetrievalTrace(
         qdrant=[_to_hit(c) for c in vec_r],
         opensearch=[_to_hit(c) for c in kw_r],
         fused=[_to_hit(c) for c in fused],
         reranked=[_to_hit(c) for c in reranked],
+        all_backends_failed=all_backends_failed,
+        embed_ok=embed_ok,
+        vector_ok=vector_ok,
+        keyword_ok=keyword_ok,
+        rerank_ok=not outcome.degraded,
+        scores_are_rerank=outcome.scored,
     )
-    with _span(
-        lf,
-        "assemble_context",
-        input=[{"chunk_id": str(c.chunk_id), "score": round(c.score, 4)} for c in reranked],
-    ) as obs:
-        ctx, guardrails = assemble_rag_context(reranked, payloads)
-        if obs:
-            obs.update(
-                output={
-                    "chunk_count": ctx.chunk_count,
-                    "context_chars": len(ctx.formatted_context or ""),
-                }
-            )
+    ctx, guardrails = assemble_rag_context(reranked, payloads)
     trace.dropped_chunks = guardrails.dropped
     trace.flagged_chunks = guardrails.flagged
     return ctx, trace, reranked

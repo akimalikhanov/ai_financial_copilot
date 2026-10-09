@@ -1,112 +1,20 @@
-"""Transcript — the model's view of the conversation.
+"""Transcript — the model's view of the run.
 
-Token-bounded, ordered, lossy, compacted, written in prose. It is a *view*, not a
-record — compaction is allowed to destroy it, because `EvidenceLedger` (evidence.py)
-retains what it drops (Contract C1).
+Append-only: no earlier message is ever rewritten. The provider caches the whole prefix,
+and every S-label the model can cite stays on screen, so a claim can only be grounded on
+text the model can still read. `EvidenceLedger` (evidence.py) remains the record that
+resolves those labels.
 
-Compaction is evidence-aware and aggressive: it evicts the bulky rendered tool-result
-context of all but the most recent turn while keeping the assistant's reasoning and
-tool-call structure. That is safe precisely because the ledger owns chunk_id ↔ S-label
-— an evicted tool result drops the label from the model's *view*, but the model can
-still cite it and it resolves via `EvidenceLedger.resolve_refs` (Contract C1). No LLM
-call; this is tool-result eviction (step 9, work item 1 — most of the win).
-
-An evicted result is not blanked to a generic stub: it keeps a one-line breadcrumb of
-which search produced it (entity + query) and which labels it yielded (e.g. S1–S8),
-so the model still knows what it already has and can cite those labels without
-re-searching.
+The run is bounded by the USD budget and the iteration cap, not by evicting old results.
 """
 
 from __future__ import annotations
 
-import json
-import re
-from dataclasses import replace
-
 from src.services.llm_adapters.base_adapter import ChatMessage, Role, ToolCallRef
-
-# Excerpts are rendered as <retrieved_excerpt id="Sn" ...> (context_assembler); the
-# label is the stable handle the ledger resolves, so an evicted result keeps its
-# label range as a breadcrumb.
-_LABEL_RE = re.compile(r'id="(S\d+)"')
 
 
 def assistant_msg_with_tool_calls(tool_calls: list[ToolCallRef]) -> ChatMessage:
     return ChatMessage(role=Role.assistant, content=None, tool_calls=tuple(tool_calls))
-
-
-def stub_rejected_tool_call(tc: ToolCallRef) -> ToolCallRef:
-    """Strip a rejected finalizer call's claim/evidence payload before it re-enters history.
-
-    Otherwise the model keeps seeing its own rejected draft claims verbatim (assistant
-    tool-call messages survive compaction), inviting it to copy a stale claim into the
-    eventually-accepted call without re-deriving fresh evidence for it.
-    """
-    return replace(tc, arguments=json.dumps({"status": "rejected"}))
-
-
-def _summarize_evicted(content: str, call: ToolCallRef | None) -> str:
-    """A compact, still-informative replacement for an evicted search result.
-
-    The bulky excerpt bodies go; what the model needs to keep reasoning stays: which
-    search this was (entity + query, from the surviving tool call) and which labels it
-    yielded — those still resolve via the ledger, so the model can cite them without
-    re-searching (Contract C1).
-    """
-    nums = sorted(int(m[1:]) for m in _LABEL_RE.findall(content))
-    span = f"S{nums[0]}" if len(nums) == 1 else f"S{nums[0]}–S{nums[-1]}"
-    body = f"{len(nums)} excerpt{'s' if len(nums) != 1 else ''} {span}, still citable by label"
-    if call is not None:
-        try:
-            args = json.loads(call.arguments)
-            query = str(args.get("query") or "")
-            query = query[:80] + "…" if len(query) > 80 else query
-            head = f'{call.name}(entity="{args.get("entity") or "?"}", query="{query}")'
-        except (json.JSONDecodeError, TypeError):
-            head = call.name
-        return f"[compacted] {head} → {body}"
-    return f"[compacted] {body}"
-
-
-def _compress_history(messages: list[ChatMessage], keep_last_n_turns: int) -> list[ChatMessage]:
-    """Replace rendered search results from turns older than keep_last_n_turns with a
-    compact summary stub (which search, which labels), keeping the turn structure.
-
-    A "turn" is an assistant message that contains tool_calls followed by its tool
-    result messages. Whole turns are compacted so the agent never sees a partial view
-    of a prior turn's evidence. Only tool results carrying rendered excerpts (an S-label)
-    are compacted — error/rejection notices have no labels and pass through untouched, so
-    the model never loses *why* something was rejected.
-    """
-    turn_starts: list[int] = [
-        i for i, m in enumerate(messages) if m.role == Role.assistant and m.tool_calls
-    ]
-    if len(turn_starts) <= keep_last_n_turns:
-        return messages
-
-    cutoff_idx = turn_starts[-(keep_last_n_turns)]
-    calls_by_id: dict[str, ToolCallRef] = {
-        tc.id: tc for m in messages for tc in (m.tool_calls or ())
-    }
-
-    result = []
-    for i, m in enumerate(messages):
-        if i < cutoff_idx and m.role == Role.tool and _LABEL_RE.search(m.content or ""):
-            result.append(
-                ChatMessage(
-                    role=Role.tool,
-                    tool_call_id=m.tool_call_id,
-                    content=_summarize_evicted(
-                        m.content or "", calls_by_id.get(m.tool_call_id or "")
-                    ),
-                )
-            )
-        else:
-            # Assistant tool-call messages are kept as-is so their tool_calls (entity +
-            # query) — and the tool_call_id linkage — survive; everything else passes
-            # through unchanged.
-            result.append(m)
-    return result
 
 
 class Transcript:
@@ -118,12 +26,3 @@ class Transcript:
 
     def append_tool_calls(self, tool_calls: list[ToolCallRef]) -> None:
         self.messages.append(assistant_msg_with_tool_calls(tool_calls))
-
-    def compress(self, keep_last_n_turns: int = 1) -> None:
-        """Evict bulky tool-result context from all but the most recent turn(s).
-
-        Aggressive by default (`keep_last_n_turns=1`): only the latest turn's rendered
-        chunks stay in the model's view. Licensed by Contract C1 — every evicted S-label
-        still resolves through `EvidenceLedger`, so the model can cite it regardless.
-        """
-        self.messages = _compress_history(self.messages, keep_last_n_turns)

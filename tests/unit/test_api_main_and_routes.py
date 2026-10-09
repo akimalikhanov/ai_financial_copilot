@@ -35,6 +35,9 @@ def test_lifespan_sets_router_and_closes(monkeypatch: pytest.MonkeyPatch):
     mock_redis = MagicMock()
     mock_redis.aclose = AsyncMock()
     monkeypatch.setattr(main, "create_redis_app_client", AsyncMock(return_value=mock_redis))
+    # A real client built from .env would outlive this test and export later tests' spans.
+    monkeypatch.setattr(main.lf_client, "initialize", lambda: None)
+    monkeypatch.setattr(main.lf_client, "flush", lambda: None)
 
     app = main.create_app()
     with TestClient(app):

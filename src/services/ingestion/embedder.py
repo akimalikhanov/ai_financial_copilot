@@ -2,24 +2,37 @@
 
 from __future__ import annotations
 
+import logging
+import random
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import httpx
+import numpy as np
 
 from src.utils.config import (
     get_embedder_base_url,
+    get_embedder_batch_size,
+    get_embedder_concurrency,
+    get_embedder_query_max_attempts,
+    get_embedder_query_retry_backoff_seconds,
+    get_embedder_query_timeout_seconds,
     get_embedder_timeout_seconds,
+    get_embedding_device,
     get_embedding_dim,
     get_embedding_model,
     get_embedding_provider,
 )
 
+_LOG = logging.getLogger(__name__)
+
 _st_lock = threading.Lock()
 
 
 @lru_cache(maxsize=1)
-def _get_sentence_transformer(model_name: str):
+def _get_sentence_transformer(model_name: str, device: str):
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as exc:
@@ -27,7 +40,7 @@ def _get_sentence_transformer(model_name: str):
             "sentence-transformers is required for local embeddings. "
             "Install it with `.venv/bin/python -m pip install sentence-transformers`."
         ) from exc
-    return SentenceTransformer(model_name, device="cpu")
+    return SentenceTransformer(model_name, device=device)
 
 
 @lru_cache(maxsize=1)
@@ -44,62 +57,163 @@ def _get_openai_client():
 
 def reset_clients() -> None:
     """Clear cached clients/models (call after fork)."""
+    global _tei_batch_size
     _get_sentence_transformer.cache_clear()
     _get_openai_client.cache_clear()
+    with _tei_lock:
+        _tei_batch_size = None
 
 
-_TEI_BATCH_SIZE = 64
+_tei_lock = threading.Lock()
+_tei_batch_size: int | None = None
 
 
-def _embed_tei(chunks: list[str]) -> list[list[float]]:
+def _resolve_tei_batch_size(base_url: str, timeout: float) -> int:
+    """EMBEDDER_BATCH_SIZE, clamped to what this TEI server actually accepts.
+
+    The two have to agree: over --max-client-batch-size TEI rejects the request outright.
+    Probing /info once per process makes an oversized config self-correct instead of failing
+    at ingest time. Falls back to the configured value if /info is unreachable.
+    """
+    global _tei_batch_size
+    if _tei_batch_size is not None:
+        return _tei_batch_size
+    with _tei_lock:
+        if _tei_batch_size is not None:
+            return _tei_batch_size
+        configured = get_embedder_batch_size()
+        resolved = configured
+        try:
+            info = httpx.get(f"{base_url}/info", timeout=timeout).json()
+            server_max = int(info["max_client_batch_size"])
+            resolved = min(configured, server_max)
+            if resolved != configured:
+                _LOG.warning(
+                    "embedder.batch_size_clamped",
+                    extra={"configured": configured, "server_max": server_max},
+                )
+        except Exception:
+            _LOG.warning(
+                "embedder.info_probe_failed",
+                extra={"base_url": base_url, "batch_size": configured},
+                exc_info=True,
+            )
+        _tei_batch_size = resolved
+        return resolved
+
+
+def _post_batch(client: httpx.Client, base_url: str, batch: list[str]) -> np.ndarray:
+    response = client.post(f"{base_url}/embed", json={"inputs": batch, "normalize": True})
+    response.raise_for_status()
+    # float32 per batch: as Python float lists a 1024-dim vector costs ~32 KB, not 4 KB.
+    return np.asarray(response.json(), dtype=np.float32)
+
+
+def _embed_tei(chunks: list[str], timeout: float | None = None) -> np.ndarray:
     base_url = get_embedder_base_url().rstrip("/")
-    timeout = get_embedder_timeout_seconds()
-    results: list[list[float]] = []
-    for i in range(0, len(chunks), _TEI_BATCH_SIZE):
-        batch = chunks[i : i + _TEI_BATCH_SIZE]
-        response = httpx.post(
-            f"{base_url}/embed",
-            json={"inputs": batch, "normalize": True},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        results.extend(response.json())
-    return results
+    timeout = timeout if timeout is not None else get_embedder_timeout_seconds()
+    batch_size = _resolve_tei_batch_size(base_url, timeout)
+    batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
+    # TEI queues each input separately and batches across requests, so one in-flight request
+    # leaves the GPU idle between round-trips. Concurrency keeps its queue non-empty; the
+    # ceiling is --max-concurrent-requests (512), far above anything we send.
+    concurrency = min(get_embedder_concurrency(), len(batches))
+    with httpx.Client(
+        timeout=timeout, limits=httpx.Limits(max_connections=max(concurrency, 1))
+    ) as client:
+        if concurrency <= 1:
+            batch_vectors = [_post_batch(client, base_url, b) for b in batches]
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                # .map preserves input order, so vectors stay aligned with chunks, and
+                # re-raises the first batch failure when the results are consumed.
+                batch_vectors = list(pool.map(lambda b: _post_batch(client, base_url, b), batches))
+    return np.concatenate(batch_vectors)
 
 
-def _embed_local(chunks: list[str], model_name: str) -> list[list[float]]:
+def _embed_local(chunks: list[str], model_name: str) -> np.ndarray:
     with _st_lock:
-        model = _get_sentence_transformer(model_name)
+        model = _get_sentence_transformer(model_name, get_embedding_device())
     vectors = model.encode(chunks, batch_size=32, convert_to_numpy=True, show_progress_bar=False)
-    return vectors.tolist()
+    return np.asarray(vectors, dtype=np.float32)
 
 
-def _embed_openai(chunks: list[str], model_name: str) -> list[list[float]]:
+def _embed_openai(chunks: list[str], model_name: str) -> np.ndarray:
     client = _get_openai_client()
     response = client.embeddings.create(model=model_name, input=chunks)
-    return [list(item.embedding) for item in response.data]
+    return np.asarray([item.embedding for item in response.data], dtype=np.float32)
 
 
-def embed_chunks(chunks: list[str]) -> list[list[float]]:
-    """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer."""
+def embed_chunks(chunks: list[str], timeout: float | None = None) -> np.ndarray:
+    """Batch-embed chunk texts using TEI, OpenAI, or local SentenceTransformer.
+
+    Returns a float32 array of shape (len(chunks), dim).
+    """
     if not chunks:
-        return []
+        return np.empty((0, 0), dtype=np.float32)
 
     provider = get_embedding_provider()
     model_name = get_embedding_model()
 
     if provider == "tei":
-        vectors = _embed_tei(chunks)
+        vectors = _embed_tei(chunks, timeout)
     elif provider == "openai":
         vectors = _embed_openai(chunks, model_name)
     else:
         vectors = _embed_local(chunks, model_name)
 
     expected_dim = get_embedding_dim()
-    if expected_dim is not None and any(len(v) != expected_dim for v in vectors):
-        actual = len(vectors[0]) if vectors else 0
+    if expected_dim is not None and vectors.shape[1] != expected_dim:
+        actual = vectors.shape[1]
         raise RuntimeError(
             f"Embedding dimension mismatch: expected {expected_dim}, got {actual} from provider '{provider}'"
         )
 
     return vectors
+
+
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry fast, transient failures only.
+
+    A read/pool timeout means TEI is saturated, so retrying adds load to the queue that
+    is already the problem (the retry-amplification shape in the load-test audit §4.6).
+    A refused connection or a 503, by contrast, is what a rolling TEI pod looks like:
+    it fails in milliseconds and the next attempt may well land on the new pod.
+    """
+    if isinstance(exc, httpx.ReadTimeout | httpx.PoolTimeout | httpx.WriteTimeout):
+        return False
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    return isinstance(exc, httpx.ConnectTimeout | httpx.NetworkError | httpx.RemoteProtocolError)
+
+
+def embed_query(text: str) -> list[float]:
+    """Embed one query for the chat critical path, with a bounded retry.
+
+    Separate entry point from `embed_chunks` because the two callers have opposite
+    latency budgets: ingestion batches may wait EMBEDDER_TIMEOUT_SECONDS, while this
+    runs inside an agent search, which shares AGENT_SEARCH_TIMEOUT_SECONDS with retrieval
+    and rerank, so total wall clock, not attempt count, is what has to be bounded here.
+
+    Raises the last exception if every attempt fails; callers fail open (see
+    `run_chat_rag_pipeline`, which degrades to keyword-only).
+    """
+    attempts = get_embedder_query_max_attempts()
+    backoff = get_embedder_query_retry_backoff_seconds()
+    timeout = get_embedder_query_timeout_seconds()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return embed_chunks([text], timeout=timeout)[0].tolist()
+        except Exception as exc:
+            if attempt >= attempts or not _is_retryable(exc):
+                raise
+            _LOG.warning(
+                "embedder.query_retry",
+                extra={"attempt": attempt, "attempts": attempts, "error": str(exc)},
+            )
+            time.sleep(backoff * attempt * (0.5 + random.random()))
+    raise AssertionError("unreachable")  # pragma: no cover — loop either returns or raises

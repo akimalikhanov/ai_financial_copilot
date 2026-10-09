@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import logging
+import re
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import replace
 from typing import Any, cast
 
 from src.services.llm_runtime.exception_mapper import map_google_error
+from src.utils.config import get_llm_max_retries, get_llm_timeout_seconds
 from src.utils.llm_utils import (
     calc_cost_google,
     compute_tps,
@@ -13,7 +16,23 @@ from src.utils.llm_utils import (
     now_ms,
 )
 
-from .base_adapter import ChatRequest, LLMAdapter, LLMResponse, LLMResponseStats, LLMStreamChunk
+from .base_adapter import (
+    ChatRequest,
+    ImagePart,
+    LLMAdapter,
+    LLMResponse,
+    LLMResponseStats,
+    LLMStreamChunk,
+)
+
+logger = logging.getLogger(__name__)
+
+# Per-part media_resolution is Gemini 3 only and experimental (it rides on v1beta, the SDK
+# default, so it needs no client changes). Older models take a single request-level value.
+_GEMINI_3_RE = re.compile(r"^gemini-3[.\-]")
+
+# "auto" means "let the provider decide" and maps to no field at all on either level.
+_DETAIL_RANK = {"auto": 0, "low": 1, "high": 2}
 
 
 class GeminiAdapter(LLMAdapter):
@@ -30,9 +49,23 @@ class GeminiAdapter(LLMAdapter):
         super().__init__(default_model=default_model)
 
         from google import genai
+        from google.genai import types as genai_types
 
+        # google-genai defaults to 5 attempts and no request timeout. Note `timeout` here is
+        # in milliseconds, unlike every other timeout in this codebase; `attempts` counts the
+        # original request, so max_retries + 1.
+        http_options = genai_types.HttpOptions(
+            timeout=int(get_llm_timeout_seconds() * 1000),
+            retry_options=genai_types.HttpRetryOptions(
+                attempts=get_llm_max_retries() + 1,
+            ),
+        )
         # If api_key is None, genai.Client() will read GEMINI_API_KEY from env.
-        self._client = genai.Client(api_key=api_key) if api_key else genai.Client()
+        self._client = (
+            genai.Client(api_key=api_key, http_options=http_options)
+            if api_key
+            else genai.Client(http_options=http_options)
+        )
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -49,24 +82,76 @@ class GeminiAdapter(LLMAdapter):
         if hasattr(result, "__await__"):
             await result
 
+    @staticmethod
+    def _max_detail(images: Sequence[ImagePart]) -> str:
+        return max((img.detail for img in images), key=lambda d: _DETAIL_RANK[d], default="auto")
+
+    @staticmethod
+    def _resolution_level(detail: str):
+        """Map ImagePart.detail onto the SDK enum, or None for "auto"."""
+        from google.genai import types
+
+        return {
+            "low": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW,
+            "high": types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH,
+        }.get(detail)
+
     def _build_contents_and_config(self, req: ChatRequest):
         from google.genai import types
+
+        per_part_resolution = bool(_GEMINI_3_RE.match(req.model))
 
         # Convert "system/developer" messages into a single system instruction
         sys_parts: list[str] = []
         contents: list[types.Content] = []
+        all_images: list[ImagePart] = []
 
         for m in req.messages:
             content = m.content or ""
             if m.role in ("system", "developer"):
+                if m.images:
+                    # These collapse into system_instruction, which is text. Attaching images
+                    # here would drop them silently.
+                    role_name = getattr(m.role, "value", m.role)
+                    raise ValueError(f"images are not supported on {role_name} messages")
                 sys_parts.append(content)
                 continue
 
             # Gemini uses "user" and "model" roles for chat history
             role = "user" if m.role == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=content)]))
+            # An image-only message is valid; an empty text part alongside images is not useful.
+            parts = [types.Part.from_text(text=content)] if content or not m.images else []
+            for img in m.images or ():
+                all_images.append(img)
+                parts.append(
+                    types.Part.from_bytes(
+                        data=img.data,
+                        mime_type=img.mime_type,
+                        media_resolution=(
+                            self._resolution_level(img.detail) if per_part_resolution else None
+                        ),
+                    )
+                )
+            contents.append(types.Content(role=role, parts=parts))
 
         config_kwargs: dict[str, Any] = {}
+        if all_images and not per_part_resolution:
+            # One request-level slot for n parts: take the maximum any part asked for. Under-
+            # resolving a chart yields a confident description that could not read the axis
+            # labels, which then gets embedded; over-resolving a caption just costs tokens.
+            merged = self._max_detail(all_images)
+            if merged != "auto":
+                config_kwargs["media_resolution"] = (
+                    types.MediaResolution.MEDIA_RESOLUTION_HIGH
+                    if merged == "high"
+                    else types.MediaResolution.MEDIA_RESOLUTION_LOW
+                )
+            requested = sorted({img.detail for img in all_images})
+            if len(requested) > 1 or merged != "auto":
+                logger.warning(
+                    "gemini_adapter.media_resolution_merged",
+                    extra={"model": req.model, "requested": requested, "applied": merged},
+                )
         if sys_parts:
             config_kwargs["system_instruction"] = "\n".join(sys_parts)
         if req.temperature is not None:

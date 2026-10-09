@@ -24,9 +24,13 @@ RUN npm run build
 # ── Stage 2: nginx static server ───────────────────────────────────────────────
 FROM nginx:1.27-alpine AS runtime
 
-# Drop default nginx config; copy ours as a template for envsubst substitution at startup
+# Drop default nginx config; copy ours as a template for envsubst substitution at startup.
+# NGINX_CONF_VARIANT picks between the Compose config (default, uses Docker's embedded
+# DNS resolver so nginx re-resolves the api container's IP across restarts) and the K8s
+# config (nginx.k8s.conf — plain proxy_pass, since Service ClusterIPs don't change).
+ARG NGINX_CONF_VARIANT=nginx.conf
 RUN rm /etc/nginx/conf.d/default.conf
-COPY src/ui/nginx.conf /etc/nginx/templates/app.conf.template
+COPY src/ui/${NGINX_CONF_VARIANT} /etc/nginx/templates/app.conf.template
 
 # Copy the built SPA
 COPY --from=builder /app/dist /usr/share/nginx/html

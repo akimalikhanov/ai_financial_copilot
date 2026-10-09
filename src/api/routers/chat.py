@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from time import perf_counter
 from typing import cast
 from uuid import UUID
 
@@ -12,21 +14,46 @@ from celery import Task
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUserDep, LLMRouterDep, RedisDep, chat_rate_limit
+from src.api.deps import (
+    CurrentUserDep,
+    LLMRouterDep,
+    RedisBrokerDep,
+    RedisDep,
+    chat_admission_control,
+    chat_rate_limit,
+)
 from src.api.exceptions import _sse_event
-from src.db import DbSessionDep
+from src.api.stream_liveness import (
+    CHAT_TERMINAL_STATUSES,
+    _stream_event_time,
+    _worker_gone,
+)
+from src.db import DbSessionDep, get_session_factory
+from src.models.conversation import Conversation
 from src.models.llm_request import LLMRequest
-from src.models.message import MessageRole
+from src.models.message import Message, MessageRole
+from src.observability.metrics import (
+    SSE_STREAM_DURATION,
+    sse_stream_closed,
+    sse_stream_opened,
+)
 from src.redis_client import events_stream_key
 from src.repository import (
     ConversationRepository,
     LLMRequestRepository,
     MessageRepository,
 )
+from src.repository.document_repository import DocumentRepository
 from src.schemas import chat as schemas
 from src.services.chat.tasks import process_chat
 from src.services.context import ConversationHistory
+from src.services.router.company_name import normalize_company
+
+# The liveness rule is shared with the ingestion stream, which faces the same dead-worker
+# case; these names are re-exported here because this is where both were written.
+_TERMINAL_STATUSES = CHAT_TERMINAL_STATUSES
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 
@@ -99,6 +126,7 @@ async def chat_enqueue(
     req: schemas.ChatEnqueueRequest,
     session: DbSessionDep,
     redis: RedisDep,
+    redis_broker: RedisBrokerDep,
     llm_router: LLMRouterDep,
     current_user: CurrentUserDep,
 ) -> schemas.ChatEnqueueResponse:
@@ -132,8 +160,19 @@ async def chat_enqueue(
             status=existing.status or "queued",
         )
 
-    # Create or find user message (idempotent by client_msg_id)
-    user_message = await message_repo.get_by_client_msg_id(req.conversation_id, req.client_msg_id)
+    # After the idempotency return, so a client retrying an already-queued request gets its IDs
+    # back instead of a 503.
+    await chat_admission_control(redis_broker)
+
+    if req.clarification_reply is not None:
+        # Re-run the question the card was about; no new user message.
+        user_message = await _apply_clarification_reply(
+            session, current_user.id, conversation, req.clarification_reply
+        )
+    else:
+        user_message = await message_repo.get_by_client_msg_id(
+            req.conversation_id, req.client_msg_id
+        )
     if not user_message:
         user_message = await message_repo.create(
             conversation_id=req.conversation_id,
@@ -159,10 +198,13 @@ async def chat_enqueue(
         request_params=req.params,
         initial_status="queued",
     )
+    if not req.allow_clarification:
+        assistant_placeholder.message_metadata = {"allow_clarification": False}
     await session.commit()
 
-    history = ConversationHistory(redis, message_repo)
-    await history.append_user(req.conversation_id, req.content, user_message.seq)
+    if req.clarification_reply is None:
+        history = ConversationHistory(redis, message_repo)
+        await history.append_user(req.conversation_id, req.content, user_message.seq)
 
     cast(Task, process_chat).delay(str(llm_request.id))
 
@@ -174,6 +216,61 @@ async def chat_enqueue(
         assistant_seq=assistant_placeholder.seq,
         status="queued",
     )
+
+
+async def _apply_clarification_reply(
+    session: AsyncSession,
+    user_id: UUID,
+    conversation: Conversation,
+    reply: schemas.ClarificationReply,
+) -> Message:
+    """Check each pick against the card and the user's companies, store the picks as
+    conversation bindings, mark the card answered, and return the user message to re-run."""
+    message_repo = MessageRepository(session)
+    card_msg = await message_repo.get_by_id(reply.clarification_id)
+    meta = dict(card_msg.message_metadata or {}) if card_msg else {}
+    if (
+        card_msg is None
+        or card_msg.conversation_id != conversation.id
+        or meta.get("kind") != "clarification"
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Clarification not found")
+    if meta.get("answered"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Clarification already answered")
+    # The re-run takes the latest question from history, so only the last card can answer.
+    if (conversation.last_seq or 0) > card_msg.seq:
+        raise HTTPException(status.HTTP_409_CONFLICT, "The conversation has moved on")
+
+    asked = {u["raw_span"]: u for u in meta["clarification"]["unresolved"]}
+    companies = {c.company_norm for c in await DocumentRepository(session).list_companies(user_id)}
+    bindings: dict[str, dict] = {}
+    for pick in reply.picks:
+        entity = asked.get(pick.raw_span)
+        if entity is None:
+            raise HTTPException(422, f"{pick.raw_span!r} is not on this clarification")
+        binding: dict[str, str] = {}
+        if pick.include_outside_scope is not None:
+            if entity["outcome"] != "outside_scope" or not entity["candidates"]:
+                raise HTTPException(422, f"{pick.raw_span!r} is not outside the scope")
+            company = entity["candidates"][0]["company"]
+            binding["outside_scope"] = "include" if pick.include_outside_scope else "exclude"
+        elif pick.company:
+            company = pick.company
+        else:
+            raise HTTPException(422, f"No choice for {pick.raw_span!r}")
+        company_norm = normalize_company(company)
+        if company_norm not in companies:
+            raise HTTPException(422, f"{company!r} is not one of your companies")
+        bindings[normalize_company(pick.raw_span)] = {"company_norm": company_norm, **binding}
+    if not bindings:
+        raise HTTPException(422, "No picks")
+
+    await ConversationRepository(session).merge_entity_bindings(conversation.id, bindings)
+    card_msg.message_metadata = {**meta, "answered": True}
+    user_message = await message_repo.get_by_id(UUID(meta["user_message_id"]))
+    if user_message is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Original question not found")
+    return user_message
 
 
 @router.get("/stream")
@@ -194,26 +291,62 @@ async def chat_stream_subscribe(
     conversation = await conversation_repo.get_by_id(llm_request.conversation_id)
     if not conversation or conversation.user_id != current_user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+
+    # Release the pgbouncer server connection before the stream starts. `session` is injected
+    # via get_current_user whether or not this signature asks for it, and FastAPI holds yield
+    # dependencies until the streaming body finishes — so this commit is the only thing that
+    # ends the transaction. Everything below needs only plain UUIDs.
+    await session.commit()
+
     last_id = request.headers.get("Last-Event-ID") or after_event_id
     stream_key = events_stream_key(str(request_id))
+    session_factory = get_session_factory()
+
+    async def _failure_message(last_event_id: str) -> str | None:
+        """Short-lived session for the liveness re-check — opened only when needed.
+
+        Two ways a request can be over. The worker may have *reported* failure, which is the
+        `failed` status below. Or its process may be gone — OOMKilled, evicted, node lost —
+        in which case no handler ever ran, the status is still whatever it was mid-pipeline,
+        and this check would otherwise keep returning None and keep the client on a
+        heart-beating stream indefinitely. The second case is bounded by elapsed time since
+        the request last made progress: a task that is genuinely running is capped by Celery's
+        hard time limit, so past that limit plus a margin the worker is gone rather than slow.
+        """
+        async with session_factory() as s:
+            req = await LLMRequestRepository(s).get_by_id(request_id)
+            if req is None:
+                return None
+            if req.status == "failed":
+                return req.error_message or "Processing failed"
+            if req.status in _TERMINAL_STATUSES:
+                return None
+            progress_at = _stream_event_time(last_event_id) or req.updated_at
+            if _worker_gone(req.status, progress_at, datetime.now(UTC)):
+                return "Processing stopped unexpectedly. Please ask again."
+            return None
 
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        yield ": ok\n\n"
+        sse_stream_opened("chat")
+        _started = perf_counter()
+        outcome = "client_closed"
         try:
+            yield ": ok\n\n"
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=10)
                 if not result:
                     empty_polls += 1
                     if empty_polls >= 3:
-                        req = await llm_request_repo.get_by_id(request_id)
-                        if req and req.status == "failed":
+                        failure_message = await _failure_message(last_id)
+                        if failure_message is not None:
+                            outcome = "error"
                             yield _sse_event(
                                 "error",
                                 {
                                     "error_type": "WorkerError",
-                                    "message": req.error_message or "Processing failed",
+                                    "message": failure_message,
                                 },
                             )
                             return
@@ -235,15 +368,21 @@ async def chat_stream_subscribe(
                             continue
                         event_type = data.get("type", "message")
                         sse_data = {k: v for k, v in data.items() if k != "type"}
-                        yield _sse_event(event_type, sse_data)
+                        yield _sse_event(event_type, sse_data, event_id=eid)
                         if event_type == "usage" and sse_data.get("persisted"):
+                            outcome = "complete"
                             return
                         if event_type == "error":
+                            outcome = "error"
                             return
         except asyncio.CancelledError:
             raise
         except Exception:
+            outcome = "error"
             yield _sse_event("error", {"error": "Stream read failed"})
+        finally:
+            sse_stream_closed("chat")
+            SSE_STREAM_DURATION.labels("chat", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(
         event_stream(),

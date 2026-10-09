@@ -1,0 +1,120 @@
+"""Deterministic number-grounding: does the cited chunk text contain the asserted magnitude?
+
+The label half (does the ref resolve to a real chunk) is `EvidenceLedger.resolve_refs` +
+`FindingsLedger.record`'s grounding filter; this is the orthogonal question those cannot
+answer — a correctly-resolved citation to a chunk that does not state the number.
+
+Advisory by construction: this module returns a verdict, never raises and never filters.
+Its check has false negatives, so enforcing it would reject correct findings.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Sequence
+from enum import StrEnum
+
+UNIT_TO_MILLIONS: dict[str, float] = {
+    "B": 1_000.0,
+    "M": 1.0,
+    "K": 0.001,
+    "": 0.000_001,  # absolute / units
+}
+
+
+def to_millions(value: float, unit: str) -> float:
+    """Scale value to millions for unit-safe comparison."""
+    return value * UNIT_TO_MILLIONS[unit]
+
+
+class NumberGrounding(StrEnum):
+    GROUNDED = "grounded"
+    NOT_FOUND = "not_found"
+    UNVERIFIABLE = "unverifiable"
+
+
+_NUMBER_RE = re.compile(
+    r"\(?\s*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*\)?|\(?\s*[-+]?\d+(?:\.\d+)?\s*\)?"
+)
+# Scale words expressed in millions, so they line up with UNIT_TO_MILLIONS.
+_SCALE_WORDS: dict[str, float] = {
+    "billion": 1_000.0,
+    "billions": 1_000.0,
+    "bn": 1_000.0,
+    "b": 1_000.0,
+    "million": 1.0,
+    "millions": 1.0,
+    "mn": 1.0,
+    "m": 1.0,
+    "thousand": 0.001,
+    "thousands": 0.001,
+    "k": 0.001,
+}
+_TRAILING_WINDOW = 20  # chars scanned after a number for an adjacent scale word
+# A table's stated scale, e.g. "(in millions, except per share data)".
+_STATED_SCALE_RE = re.compile(r"\bin (thousands|millions|billions)\b", re.IGNORECASE)
+_STATED_UNIT = {"thousands": "K", "millions": "M", "billions": "B"}
+# Nil, i.e. zero: a table cell holding only a dash (optionally after a currency sign), or a
+# currency sign and a dash with no digit after it in prose ("$68 million and $-").
+_NIL_RE = re.compile(r"\|\s*[$€£]?\s*[-–—]\s*(?=\|)|[$€£][ \t]*[-–—](?![ \t]*[\d.])")
+
+_REL_TOL = 0.005
+_ABS_TOL = 1e-9
+
+
+def _parse_number(token: str) -> float | None:
+    negative = "(" in token
+    cleaned = token.strip().strip("()").replace(",", "").strip()
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return -value if negative else value
+
+
+def _candidates(raw: float, trailing: str, text_unit: str) -> list[float]:
+    """Magnitudes (in millions) a bare number token could plausibly denote."""
+    out = [raw * UNIT_TO_MILLIONS[""]]  # literal, treated as an absolute value
+    word_match = re.match(r"\s*([a-zA-Z]+)", trailing)
+    if word_match:
+        scale = _SCALE_WORDS.get(word_match.group(1).lower())
+        if scale is not None:
+            out.append(raw * scale)
+    # The text's scale — covers a table whose scale sits in a header far from the cell.
+    out.append(to_millions(raw, text_unit))
+    return out
+
+
+def _matches(a: float, b: float) -> bool:
+    return math.isclose(abs(a), abs(b), rel_tol=_REL_TOL, abs_tol=_ABS_TOL)
+
+
+def verify_value(
+    value: float | None,
+    unit: str | None,
+    texts: Sequence[str],
+) -> NumberGrounding:
+    """Scan `texts` for a number matching `value` (scaled by `unit`) within tolerance.
+
+    Bare numbers are read at the text's stated scale ("in millions"); only a text that
+    states none falls back to `unit`, so a wrong unit cannot confirm itself. A zero
+    grounds on a nil dash. With no unit at all, the value must appear as printed."""
+    if value is None or not texts:
+        return NumberGrounding.UNVERIFIABLE
+
+    unit = "" if unit is None else unit
+    target = to_millions(value, unit)
+    for text in texts:
+        if value == 0 and _NIL_RE.search(text):
+            return NumberGrounding.GROUNDED
+        stated = _STATED_SCALE_RE.search(text)
+        text_unit = _STATED_UNIT[stated.group(1).lower()] if stated else unit
+        for m in _NUMBER_RE.finditer(text):
+            raw = _parse_number(m.group())
+            if raw is None:
+                continue
+            trailing = text[m.end() : m.end() + _TRAILING_WINDOW]
+            if any(_matches(target, c) for c in _candidates(raw, trailing, text_unit)):
+                return NumberGrounding.GROUNDED
+    return NumberGrounding.NOT_FOUND

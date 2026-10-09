@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from src.services.llm_runtime.exception_mapper import map_openai_error
+from src.utils.config import (
+    get_llm_connect_timeout_seconds,
+    get_llm_max_retries,
+    get_llm_timeout_seconds,
+)
 from src.utils.llm_utils import (
     calc_cost_openai,
     compute_tps,
@@ -17,11 +23,13 @@ from .base_adapter import (
     AssistantTurnResult,
     ChatMessage,
     ChatRequest,
+    ImagePart,
     LLMAdapter,
     LLMResponse,
     LLMResponseStats,
     LLMStreamChunk,
     ToolCallRef,
+    reject_images,
 )
 
 
@@ -50,9 +58,19 @@ class OpenAIAdapter(LLMAdapter):
         if provider_name is not None:
             self.provider_name = provider_name
 
+        import httpx
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # Unset, these default to a 600s read timeout and 3 attempts — ten minutes inside a
+        # 900s task budget, and retries that multiply with the app-level parse retries.
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(
+                get_llm_timeout_seconds(), connect=get_llm_connect_timeout_seconds()
+            ),
+            max_retries=get_llm_max_retries(),
+        )
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -128,9 +146,28 @@ class OpenAIAdapter(LLMAdapter):
         )
 
     @staticmethod
-    def _serialize_msg(m: ChatMessage) -> dict[str, Any]:
+    def _serialize_image(img: ImagePart) -> dict[str, Any]:
+        """One image_url content part. vLLM implements the same schema, and accepts and
+        ignores `detail`, so this needs no provider branching."""
+        b64 = base64.b64encode(img.data).decode("ascii")
+        image_url: dict[str, Any] = {"url": f"data:{img.mime_type};base64,{b64}"}
+        if img.detail != "auto":
+            image_url["detail"] = img.detail
+        return {"type": "image_url", "image_url": image_url}
+
+    @classmethod
+    def _serialize_msg(cls, m: ChatMessage) -> dict[str, Any]:
         d: dict[str, Any] = {"role": m.role}
-        d["content"] = m.content if m.content is not None else ""
+        if m.images:
+            # Multimodal turns take a content parts list. The text part is omitted entirely
+            # when there is no text: an image-only message is valid, "" is not a useful part.
+            parts: list[dict[str, Any]] = []
+            if m.content:
+                parts.append({"type": "text", "text": m.content})
+            parts.extend(cls._serialize_image(img) for img in m.images)
+            d["content"] = parts
+        else:
+            d["content"] = m.content if m.content is not None else ""
         if m.name:
             d["name"] = m.name
         if m.tool_call_id:
@@ -219,6 +256,7 @@ class OpenAIAdapter(LLMAdapter):
         verbosity: Literal["high", "medium", "low"] | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[LLMStreamChunk, None]:
+        reject_images(messages, f"{self.__class__.__name__}.stream")
         req = self._build_request(
             messages,
             model=model,
@@ -253,19 +291,34 @@ class OpenAIAdapter(LLMAdapter):
         self,
         messages: Sequence[ChatMessage],
         tools: list[dict[str, Any]],
+        allowed_tools: list[str] | None = None,
         **kwargs: Any,
     ) -> AssistantTurnResult:
+        reject_images(messages, f"{self.__class__.__name__}.complete_with_tools")
         req = self._build_request(messages, **kwargs)
         kw = self._build_kwargs(req)
         kw["tools"] = tools
-        kw["tool_choice"] = "auto"
+        # `allowed_tools` restricts the callable subset while `tools` stays byte-identical,
+        # so the cached prompt prefix survives the restriction.
+        kw["tool_choice"] = (
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "auto",
+                    "tools": [{"type": "function", "function": {"name": n}} for n in allowed_tools],
+                },
+            }
+            if allowed_tools
+            else "auto"
+        )
         start_ms = now_ms()
         try:
             resp = await self._client.chat.completions.create(**cast(Any, kw))
         except Exception as e:
             raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
         latency_ms = elapsed_ms(start_ms)
-        msg = resp.choices[0].message
+        choice = resp.choices[0]
+        msg = choice.message
         tool_calls = [
             ToolCallRef(id=tc.id, name=tc.function.name, arguments=tc.function.arguments)
             for tc in (msg.tool_calls or [])
@@ -273,7 +326,12 @@ class OpenAIAdapter(LLMAdapter):
         stats = self._build_stats_from_usage(
             getattr(resp, "usage", None), model=req.model, latency_ms=latency_ms
         )
-        return AssistantTurnResult(text=msg.content or "", tool_calls=tool_calls, stats=stats)
+        return AssistantTurnResult(
+            text=msg.content or "",
+            tool_calls=tool_calls,
+            stats=stats,
+            finish_reason=choice.finish_reason,
+        )
 
     async def _stream(self, req: ChatRequest) -> AsyncGenerator[LLMStreamChunk, None]:
         kwargs = self._build_kwargs(req)

@@ -44,6 +44,7 @@ interface ControlPaneProps {
   onToggle: () => void;
   params: ModelParams;
   onParamsChange: (params: Partial<ModelParams>) => void;
+  defaultParams: ModelParams;
   capabilities: ModelCapabilities;
   stats: RequestStats | null;
   statsHistory: RequestStats[];
@@ -388,6 +389,7 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
   onToggle,
   params,
   onParamsChange,
+  defaultParams,
   capabilities,
   stats,
   statsHistory,
@@ -430,14 +432,9 @@ export const ControlPane: React.FC<ControlPaneProps> = ({
     { tokens: 0, cost: 0, requests: 0 }
   );
 
-  // Reset params to defaults
+  // Reset params to the active model's defaults
   const handleReset = () => {
-    onParamsChange({
-      temperature: 0.2,
-      maxTokens: 2000,
-      reasoningEffort: null,
-      verbosity: null,
-    });
+    onParamsChange(defaultParams);
   };
 
   return (

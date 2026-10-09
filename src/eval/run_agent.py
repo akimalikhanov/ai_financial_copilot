@@ -6,10 +6,8 @@ Usage:
         [--output data/eval/runs/<auto>.json] \
         [--retrieval-only] [--compare <prev.json>] [--compare-to-latest-db] \
         [--limit N] [--model <model_id>] [--judge-model <judge_id>] \
-        [--user-id <uuid>] [--k 5 10]
+        [--user-id <uuid>] [--k 5 10] [--persist-requests]
 
-All flags are identical to src.eval.run (classic pipeline) so results can be
-compared with --compare without changing mental models.
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -37,15 +35,14 @@ from src.eval.metrics.correctness import Kind, score_correctness
 from src.eval.metrics.judge import hallucination_rate, judge_one
 from src.eval.metrics.retrieval import compute_retrieval_metrics, context_to_page_keys
 from src.eval.pipeline_agent import run_one
-from src.eval.run import _compute_aggregate, _print_summary
 from src.eval.schemas import (
+    AggregateMetrics,
     CorrectnessResult,
     ExcludedEntry,
     PerQuestionResult,
     RunManifest,
     RunOutput,
 )
-from src.schemas.agent_findings import AnalyticalFindings
 from src.services.llm_router import get_router
 from src.utils.config import (
     get_eval_judge_model,
@@ -98,8 +95,8 @@ def _build_args() -> argparse.Namespace:
     p.add_argument("--model", default="gpt-4o-mini")
     p.add_argument(
         "--prompt-version",
-        default="v3_agent_synthesis",
-        help="System prompt version for the synthesis step (e.g. v3_agent_synthesis, v3_bracket)",
+        default="v5_agent_synthesis",
+        help="System prompt version for the synthesis step (e.g. v5_agent_synthesis, v3_bracket)",
     )
     p.add_argument("--judge-model", default=None)
     p.add_argument("--user-id", default=None)
@@ -161,6 +158,15 @@ def _build_args() -> argparse.Namespace:
         default=None,
         help="Optional free-text note stored on the run (e.g. what this run is testing).",
     )
+    p.add_argument(
+        "--persist-requests",
+        action="store_true",
+        default=False,
+        help=(
+            "Save every tool-model call to llm_requests, under an 'eval_agent' parent row per "
+            "question tagged '<run-kind>-<UTC timestamp>' in request_params.eval_run."
+        ),
+    )
     return p.parse_args()
 
 
@@ -181,6 +187,11 @@ async def _run(args: argparse.Namespace) -> RunOutput:
             raise RuntimeError(f"No questions matched --qid {args.qid}")
     elif args.limit:
         questions = questions[: args.limit]
+
+    requests_tag = None
+    if args.persist_requests:
+        requests_tag = f"{args.run_kind}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        logger.info("persisting llm_requests under eval_run=%s", requests_tag)
 
     await init_db()
     session_factory = get_session_factory()
@@ -239,6 +250,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         llm_router=llm_router,
                         retrieval_only=args.retrieval_only,
                         redis=redis,
+                        persist_requests_tag=requests_tag,
                     )
                 except Exception:
                     logger.exception("pipeline_error qid=%s", q.qid)
@@ -250,6 +262,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
 
                 result.route = pr.route
                 result.query_shape = pr.query_shape
+                result.scope_outcome = pr.scope_outcome
                 result.latency_s = round(time.monotonic() - t0, 3)
 
                 if pr.usage:
@@ -271,6 +284,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         "cost_usd_total": m.cost_usd_total,
                         "input_tokens_total": m.input_tokens_total,
                         "output_tokens_total": m.output_tokens_total,
+                        "last_turn_input_tokens": m.last_turn_input_tokens,
                     }
                     logger.info(
                         "agent_meta qid=%s query_shape=%s iterations=%d tool_calls=%d "
@@ -284,11 +298,11 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         m.cost_usd_total,
                     )
 
-                if isinstance(pr.agent_findings, AnalyticalFindings):
+                if pr.agent_findings is not None:
                     af = pr.agent_findings
-                    result.observations_count = len(af.observations)
-                    result.confidence_counts = dict(Counter(o.confidence for o in af.observations))
-                    result.gaps_count = len(af.gaps) if af.gaps else 0
+                    result.findings_count = len(af.findings)
+                    result.confidence_counts = dict(Counter(f.confidence for f in af.findings))
+                    result.unresolved_count = len(af.unresolved)
 
                 if pr.rag_context and pr.rag_context.items:
                     retrieved_keys = context_to_page_keys(pr.rag_context)
@@ -421,6 +435,218 @@ async def _fetch_latest_db_run_as_dict(run_kind: str = "agentic") -> dict | None
             return _canary_run_to_compare_dict(with_results)
     finally:
         await shutdown_db()
+
+
+def _compute_aggregate(
+    results: list[PerQuestionResult], _k_values: tuple[int, ...]
+) -> AggregateMetrics:
+    retrieval_rows = [r for r in results if r.metrics and r.excluded_reason is None]
+    judge_rows = [r for r in results if r.judge and r.excluded_reason is None]
+    correctness_rows = [r for r in results if r.correctness and r.excluded_reason is None]
+
+    # Retrieval
+    ret: dict[str, float] = {}
+    if retrieval_rows:
+        keys = list(retrieval_rows[0].metrics.keys())
+        for k in keys:
+            vals = [r.metrics[k] for r in retrieval_rows if k in r.metrics]
+            ret[k] = round(sum(vals) / len(vals), 4) if vals else 0.0
+
+    # Correctness
+    correct_agg: dict = {}
+    if correctness_rows:
+        overall = sum(1 for r in correctness_rows if r.correctness and r.correctness.correct)
+        correct_agg["overall"] = round(overall / len(correctness_rows), 4)
+        by_kind: dict[str, dict] = {}
+        for r in correctness_rows:
+            kind = r.kind
+            if kind not in by_kind:
+                by_kind[kind] = {"n": 0, "correct": 0}
+            by_kind[kind]["n"] += 1
+            if r.correctness and r.correctness.correct:
+                by_kind[kind]["correct"] += 1
+        correct_agg["by_kind"] = {
+            k: {"n": v["n"], "acc": round(v["correct"] / v["n"], 4)} for k, v in by_kind.items()
+        }
+
+    # Judge
+    judge_agg: dict[str, float] = {}
+    if judge_rows:
+        for dim in ("faithfulness", "relevance", "citation_accuracy", "completeness"):
+            scores = [
+                r.judge[dim]["score"]
+                for r in judge_rows
+                if r.judge and dim in r.judge and isinstance(r.judge[dim], dict)
+            ]
+            if scores:
+                judge_agg[f"{dim}_mean"] = round(sum(scores) / len(scores), 4)
+
+    # Hallucination
+    hal_agg: dict = {}
+    if judge_rows:
+        rates = [
+            r.judge["hallucination_rate"]
+            for r in judge_rows
+            if r.judge and "hallucination_rate" in r.judge
+        ]
+        if rates:
+            hal_agg["rate_mean"] = round(sum(rates) / len(rates), 4)
+        hal_agg["questions_with_any_unsupported"] = sum(
+            1 for r in judge_rows if r.judge and r.judge.get("unsupported_claims")
+        )
+
+    # Agent loop (agentic path only; empty for classic-path results), cut by query_shape
+    agent_agg: dict[str, Any] = {}
+    agent_rows = [r for r in results if r.agent_meta]
+    if agent_rows:
+
+        def _summarize(rows: list[PerQuestionResult]) -> dict[str, Any]:
+            n = len(rows)
+            conv: Counter[str] = Counter()
+            conf: Counter[str] = Counter()
+            iterations: list[int] = []
+            tool_calls: list[int] = []
+            costs: list[float] = []
+            unresolved: list[int] = []
+            for r in rows:
+                m = r.agent_meta or {}
+                conv[m.get("convergence_reason", "unknown")] += 1
+                iterations.append(m.get("iterations", 0))
+                tool_calls.append(m.get("tool_calls_total", 0))
+                costs.append(m.get("cost_usd_total", 0.0))
+                if r.unresolved_count is not None:
+                    unresolved.append(r.unresolved_count)
+                if r.confidence_counts:
+                    conf.update(r.confidence_counts)
+            return {
+                "n": n,
+                "convergence_reason": dict(conv),
+                "mean_iterations": round(sum(iterations) / n, 2),
+                "mean_tool_calls": round(sum(tool_calls) / n, 2),
+                "mean_cost_usd": round(sum(costs) / n, 4),
+                "unresolved_nonempty_rate": (
+                    round(sum(1 for u in unresolved if u > 0) / len(unresolved), 4)
+                    if unresolved
+                    else None
+                ),
+                "confidence_counts": dict(conf),
+            }
+
+        agent_agg["overall"] = _summarize(agent_rows)
+        by_shape: dict[str, list[PerQuestionResult]] = {}
+        for r in agent_rows:
+            by_shape.setdefault(r.query_shape or "unknown", []).append(r)
+        agent_agg["by_query_shape"] = {shape: _summarize(rows) for shape, rows in by_shape.items()}
+
+        # Router misclassification rate — gold label (EvalQuestion.query_shape) vs the
+        # router's live prediction, over rows where a gold label was hand-authored.
+        labeled_rows = [r for r in agent_rows if r.expected_query_shape is not None]
+        if labeled_rows:
+            misclassified = [r for r in labeled_rows if r.query_shape != r.expected_query_shape]
+            agent_agg["query_shape_misclassification_rate"] = round(
+                len(misclassified) / len(labeled_rows), 4
+            )
+            agent_agg["query_shape_misclassified_qids"] = [r.qid for r in misclassified]
+
+    # How often scope resolution took each path; eval runs with clarification off, so
+    # "unresolved" and "too_broad" are the cases a user would have been asked about.
+    scope_outcomes = Counter(r.scope_outcome for r in results if r.scope_outcome)
+    if scope_outcomes:
+        agent_agg["scope_outcomes"] = dict(scope_outcomes)
+
+    return AggregateMetrics(
+        retrieval=ret,
+        correctness=correct_agg,
+        judge=judge_agg,
+        hallucination=hal_agg,
+        agent=agent_agg,
+    )
+
+
+def _print_summary(output: RunOutput, out_path: Path) -> None:
+    pqs = output.per_question
+    agg = output.aggregate
+    m = output.manifest
+
+    latencies = [q.latency_s for q in pqs if q.latency_s is not None]
+    total_cost = sum(q.usage["cost_usd"] for q in pqs if q.usage and "cost_usd" in q.usage)
+    total_input = sum(q.usage["input_tokens"] for q in pqs if q.usage and "input_tokens" in q.usage)
+    total_output = sum(
+        q.usage["output_tokens"] for q in pqs if q.usage and "output_tokens" in q.usage
+    )
+
+    w = 54
+    print(f"\n{'━' * w}")
+    print(
+        f"  EVAL COMPLETE — {m.evaluated}/{m.total_questions} questions  ({len(m.excluded)} excluded)"
+    )
+    print(f"{'━' * w}")
+
+    if agg.retrieval:
+        print("  RETRIEVAL")
+        print(
+            f"    precision@5 / @10   {agg.retrieval.get('precision@5', 0):.3f} / {agg.retrieval.get('precision@10', 0):.3f}"
+        )
+        print(
+            f"    recall@5    / @10   {agg.retrieval.get('recall@5', 0):.3f} / {agg.retrieval.get('recall@10', 0):.3f}"
+        )
+        print(f"    MRR                 {agg.retrieval.get('mrr', 0):.3f}")
+        print(f"    NDCG@10             {agg.retrieval.get('ndcg@10', 0):.3f}")
+
+    if agg.correctness:
+        print(f"  CORRECTNESS         {agg.correctness.get('overall', 0):.1%} overall")
+        for kind, stats in (agg.correctness.get("by_kind") or {}).items():
+            print(f"    {kind:<10}  n={stats['n']}   acc={stats['acc']:.1%}")
+
+    if agg.judge:
+        print("  JUDGE (mean 1–5)")
+        for dim in ("faithfulness", "relevance", "citation_accuracy", "completeness"):
+            val = agg.judge.get(f"{dim}_mean")
+            if val is not None:
+                print(f"    {dim:<22} {val:.2f}")
+
+    if agg.hallucination:
+        print("  HALLUCINATION")
+        print(f"    rate (mean)         {agg.hallucination.get('rate_mean', 0):.3f}")
+        print(
+            f"    questions w/ any    {agg.hallucination.get('questions_with_any_unsupported', 0)}"
+        )
+
+    if agg.agent.get("scope_outcomes"):
+        outcomes = ", ".join(f"{k}={v}" for k, v in agg.agent["scope_outcomes"].items())
+        print(f"  SCOPE OUTCOMES   {outcomes}")
+
+    if agg.agent:
+        print("  AGENT LOOP (by query_shape)")
+        misclass_rate = agg.agent.get("query_shape_misclassification_rate")
+        if misclass_rate is not None:
+            print(f"    router misclassification rate: {misclass_rate:.1%}")
+        for shape, s in (agg.agent.get("by_query_shape") or {}).items():
+            conv = ", ".join(f"{k}={v}" for k, v in s["convergence_reason"].items())
+            conf = ", ".join(f"{k}={v}" for k, v in s["confidence_counts"].items()) or "—"
+            unresolved_rate = s["unresolved_nonempty_rate"]
+            print(f"    {shape:<12} n={s['n']}  convergence: {conv}")
+            print(
+                f"      {'':<12} mean_iter={s['mean_iterations']:.2f}  "
+                f"mean_tool_calls={s['mean_tool_calls']:.2f}  mean_cost=${s['mean_cost_usd']:.4f}"
+            )
+            print(
+                f"      {'':<12} confidence: {conf}  "
+                "unresolved_nonempty_rate="
+                f"{unresolved_rate if unresolved_rate is None else f'{unresolved_rate:.2f}'}"
+            )
+
+    print("  COST & LATENCY")
+    if latencies:
+        print(f"    avg latency         {sum(latencies) / len(latencies):.1f}s")
+        print(f"    total wall time     {sum(latencies):.0f}s")
+    if total_cost:
+        print(f"    tokens in / out     {total_input:,} / {total_output:,}")
+        print(f"    total cost          ${total_cost:.4f}")
+
+    print(f"{'━' * w}")
+    print(f"  output → {out_path}")
+    print(f"{'━' * w}\n")
 
 
 def main() -> None:

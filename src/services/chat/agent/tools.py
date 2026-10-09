@@ -1,22 +1,24 @@
-"""Tool schemas + registry for the agent loop.
+"""Tool schemas for the agent loop.
 
 Pydantic arg models are the single source of truth: their JSON schemas drive the tool
 definitions handed to the LLM, and the same models parse the tool-call arguments back
-— schema and parser cannot drift (P2-10, P0-3).
+— schema and parser cannot drift.
 
-`TOOL_REGISTRY` replaces the old `_FINALIZER_NAMES` frozenset + hardcoded dispatch
-(P2-14): it is the single place that knows which tool names are terminal (finalizers)
-and, per doc's Contract C3, which gates guard them (structural before sufficiency).
+There is no registry: no tool is terminal and no tool has gates, so the only thing a
+caller ever needs is the schema list.
+
+Every shape offers `search_documents` and `report_findings`; the schemas differ by shape,
+picked by `ShapeConfig.tools`. The pool is also the dispatch rule: a call to a tool
+outside the turn's pool gets "tool not available" and is never parsed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import copy
 
 from pydantic import BaseModel, Field
 
-from src.schemas.agent_findings import AgentFindings, AnalyticalFindings
-from src.services.chat.agent.gates import GateFn, analytical_insufficiency_gate, missing_entity_gate
+from src.schemas.agent_findings import FindingsReport
 from src.utils.json_schema import make_strict
 
 
@@ -30,65 +32,93 @@ def tool_schema(name: str, description: str, args: type[BaseModel]) -> dict:
     }
 
 
+_ENTITY_DESC = "The entity (company, fund, etc.) to search documents for."
+_QUERY_DESC = (
+    "Short phrase in the filing's own wording, for semantic search. Not a question. "
+    "No company name."
+)
+_KEYWORDS_DESC = (
+    "3-8 terms likely to appear verbatim in the filing, for keyword search: metric "
+    "names, filing synonyms (revenue / net sales), years, currency codes. No company "
+    "name, no intent words (change, highest, compare)."
+)
+_SUB_QUESTION_DESC = (
+    "The question this search is trying to answer, in plain words. A new "
+    "sub_question opens a new aspect; reuse the exact wording to re-search an "
+    "aspect you already opened."
+)
+
+
 class SearchDocumentsArgs(BaseModel):
-    entity: str = Field(description="The entity (company, fund, etc.) to search documents for.")
-    query: str = Field(description="What to look for in that entity's documents.")
+    """Parses every `search_documents` call, on both paths.
+
+    `keywords` and `sub_question` stay optional here so one parser accepts either pool's
+    payload. The advertised *schemas* (below) are stricter; a call missing `keywords`
+    still parses, and the loop searches BM25 with `query` instead.
+    """
+
+    entity: str = Field(description=_ENTITY_DESC)
+    query: str = Field(description=_QUERY_DESC)
+    keywords: str | None = Field(default=None, description=_KEYWORDS_DESC)
+    sub_question: str | None = Field(default=None, description=_SUB_QUESTION_DESC)
+
+
+class _ExtractionSearchArgs(BaseModel):
+    """Schema-only: the search the extraction path advertises.
+
+    Separate schema models rather than nullable fields on the parser because
+    `make_strict` forces every property into `required` — a nullable `keywords` would let
+    the model emit null, and `sub_question` would oblige the extraction model to emit a
+    null for a concept `v4_agent` never explains.
+    """
+
+    entity: str = Field(description=_ENTITY_DESC)
+    query: str = Field(description=_QUERY_DESC)
+    keywords: str = Field(description=_KEYWORDS_DESC)
+
+
+class _AnalyticalSearchArgs(_ExtractionSearchArgs):
+    """Schema-only: the extraction search plus the aspect-minting `sub_question`."""
+
+    sub_question: str | None = Field(default=None, description=_SUB_QUESTION_DESC)
 
 
 SEARCH_TOOL = tool_schema(
     "search_documents",
     "Search financial documents for a specific entity. Call once per entity.",
-    SearchDocumentsArgs,
+    _ExtractionSearchArgs,
 )
+
+SEARCH_ANALYTICAL_TOOL = tool_schema(
+    "search_documents",
+    "Search financial documents for one aspect of the question. "
+    "Each call targets ONE aspect, not one entity.",
+    _AnalyticalSearchArgs,
+)
+
+
+REPORT_TOOL_NAME = "report_findings"
 
 REPORT_FINDINGS_TOOL = tool_schema(
-    "report_findings",
-    "Call this once when you have finished searching. Report extracted values for all entities. This ends the search phase.",
-    AgentFindings,
-)
-
-REPORT_ANALYTICAL_TOOL = tool_schema(
-    "report_analytical_findings",
-    "Call this once when you have a complete chain of observations for a causal or narrative question. This ends the search phase.",
-    AnalyticalFindings,
+    REPORT_TOOL_NAME,
+    "Report findings for keys whose evidence has settled. "
+    "You may call this more than once, and may search in the same turn — "
+    "report each key as soon as its evidence settles.",
+    FindingsReport,
 )
 
 
-@dataclass(frozen=True)
-class ToolRegistration:
-    schema: dict
-    terminal: bool = False
-    gates: tuple[GateFn, ...] = field(default_factory=tuple)
+def _without_figures(tool: dict) -> dict:
+    """The same tool with `figures` dropped from each finding. `FindingsReport` still
+    parses the calls, with `figures` left empty."""
+    tool = copy.deepcopy(tool)
+    params = tool["function"]["parameters"]
+    finding = params["$defs"]["Finding"]
+    del finding["properties"]["figures"]
+    finding["required"].remove("figures")
+    del params["$defs"]["Figure"]
+    return tool
 
 
-TOOL_REGISTRY: dict[str, ToolRegistration] = {
-    "search_documents": ToolRegistration(schema=SEARCH_TOOL),
-    "report_findings": ToolRegistration(
-        schema=REPORT_FINDINGS_TOOL, terminal=True, gates=(missing_entity_gate,)
-    ),
-    "report_analytical_findings": ToolRegistration(
-        schema=REPORT_ANALYTICAL_TOOL, terminal=True, gates=(analytical_insufficiency_gate,)
-    ),
-}
-
-# Stage 1.5: one tool pool for every query_shape. Each gate is registered against the
-# specific finalizer it guards (missing_entity_gate only fires for report_findings,
-# analytical_insufficiency_gate only for report_analytical_findings), so handing the
-# model both finalizers unconditionally does not change which gate fires for which
-# candidate type — it only removes the branch that built two separate tool lists.
-# Prompt selection (v3_agent vs v3_agent_analytical) still varies by query_shape.
-ALL_TOOLS = [
-    TOOL_REGISTRY["search_documents"].schema,
-    TOOL_REGISTRY["report_findings"].schema,
-    TOOL_REGISTRY["report_analytical_findings"].schema,
-]
-
-
-def is_terminal(name: str) -> bool:
-    reg = TOOL_REGISTRY.get(name)
-    return reg is not None and reg.terminal
-
-
-def gates_for(name: str) -> tuple[GateFn, ...]:
-    reg = TOOL_REGISTRY.get(name)
-    return reg.gates if reg is not None else ()
+# Analytical findings state their numbers in `claim`.
+REPORT_ANALYTICAL_TOOL = _without_figures(REPORT_FINDINGS_TOOL)

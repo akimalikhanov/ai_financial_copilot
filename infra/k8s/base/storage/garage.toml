@@ -1,0 +1,57 @@
+# /etc/garage.toml — K8s copy of infra/docker/garage/garage.toml.
+# One deliberate edit vs. the compose original (stage-17 plan Phase 9, concept 2):
+# rpc_public_addr below is the cluster Service DNS name, not 127.0.0.1 — in a pod,
+# 127.0.0.1 is meaningless to other nodes trying to dial this one. Everything else
+# is unchanged; keep it that way so the divergence stays obvious. Not auto-synced —
+# this file and infra/docker/garage/garage.toml are edited by hand independently.
+
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+# For single-node this is OK. For higher throughput consider lmdb (and read migration notes).
+db_engine = "sqlite"
+
+replication_factor = 1
+
+# -----------------------
+# RPC (internal cluster)
+# -----------------------
+rpc_bind_addr = "[::]:3901"
+
+# Single-node, in-cluster: the Service DNS name other nodes (and the bootstrap Job) dial.
+rpc_public_addr = "garage:3901"
+
+# RPC secret: used for node-to-node auth. Mounted from the garage-secret Secret at
+# /run/secrets (see garage-statefulset.yaml / garage-bootstrap-job.yaml volumeMounts).
+rpc_secret_file = "/run/secrets/garage_rpc_secret"
+
+# -----------------------
+# S3 API
+# -----------------------
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+# -----------------------
+# S3 Web
+# -----------------------
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+# Optional K2V API (unused, kept for parity with the compose original)
+[k2v_api]
+api_bind_addr = "[::]:3904"
+
+# -----------------------
+# Admin + Metrics
+# -----------------------
+# Admin token: for garage CLI / admin API. Metrics token: for Prometheus etc.
+# Mounted from the garage-secret Secret at /run/secrets.
+[admin]
+api_bind_addr = "[::]:3903"
+
+admin_token_file = "/run/secrets/garage_admin_token"
+metrics_token_file = "/run/secrets/garage_metrics_token"

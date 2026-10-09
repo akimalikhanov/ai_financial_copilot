@@ -225,7 +225,7 @@ def configure_worker_logging() -> None:
     if only_ingestion_logs:
         pipeline_filter = IncludeLoggerPrefixFilter(
             prefixes=(
-                "src.services.ingestion.tasks",
+                "src.services.ingestion",
                 "celery.worker.strategy",
                 "docling",
             )
@@ -238,6 +238,17 @@ def configure_worker_logging() -> None:
         root.addHandler(h)
     root.setLevel(level)
 
+    # Celery sets up billiard's logger only when nothing handles setup_logging, and the workers
+    # do. Without this, pool warnings (the memory recycle, child errors) are dropped silently.
+    # It does not propagate, so it gets its own unfiltered handler.
+    from billiard.util import get_logger as get_billiard_logger
+
+    pool_handler = FlushingStreamHandler(sys.stdout)
+    pool_handler.setFormatter(formatter)
+    pool_logger = get_billiard_logger()
+    pool_logger.handlers = [pool_handler]
+    pool_logger.setLevel(logging.WARNING)
+
 
 # ---------------------------------------------------------------------------
 # Unified Request Logging Middleware
@@ -246,13 +257,24 @@ def configure_worker_logging() -> None:
 _request_logger = logging.getLogger("api.request")
 
 
+_UNLOGGED_PATHS = frozenset({"/metrics", "/metrics/", "/healthz", "/readyz"})
+
+
 async def request_logging_middleware(request: Request, call_next) -> Response:
     """
     Unified request middleware that:
     1. Sets up request context with ID and timing
     2. Calls the route handler
     3. Emits a single JSON log with all accumulated metadata
+
+    Skips logging/metrics bookkeeping for /metrics, /healthz and /readyz — Prometheus and
+    the probes hit these every few seconds and carry no business signal, so logging them
+    would just flood output with zero-value noise. /readyz matters most: at a 5s period it
+    is the most frequent request the API serves.
     """
+    if request.url.path in _UNLOGGED_PATHS:
+        return await call_next(request)
+
     request_id = request.headers.get(REQUEST_ID_HEADER) or str(uuid4())
 
     ctx = RequestContext(
@@ -301,10 +323,24 @@ def _route_template(request: Request) -> str:
     """
     from starlette.routing import Match
 
-    for route in request.app.routes:
-        if route.matches(request.scope)[0] == Match.FULL:
-            return getattr(route, "path", "unmatched")
-    return "unmatched"
+    # FastAPI >=0.139 keeps `include_router` results nested as `_IncludedRouter` objects
+    # (BaseRoute subclasses with no `.path`) rather than flattening them into app.routes,
+    # so a match has to recurse to reach the APIRoute that owns the template.
+    def _resolve(routes: list) -> str | None:
+        for route in routes:
+            if route.matches(request.scope)[0] != Match.FULL:
+                continue
+            path = getattr(route, "path", None)
+            if path is not None:
+                return path
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                resolved = _resolve(inner.routes)
+                if resolved is not None:
+                    return resolved
+        return None
+
+    return _resolve(request.app.routes) or "unmatched"
 
 
 def _record_http_metrics(ctx: RequestContext, endpoint: str) -> None:

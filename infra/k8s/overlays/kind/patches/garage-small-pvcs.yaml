@@ -1,0 +1,25 @@
+# Same shrink-for-kind intent as small-pvcs.yaml, but as its own patch: garage is the only
+# StatefulSet with two volumeClaimTemplates ("meta" + "data"), and a strategic-merge patch on
+# this field replaces the whole array rather than merging by name — so both claims must be
+# listed here even though only "data" is actually changing size, or "meta" silently vanishes
+# from the rendered StatefulSet (see kustomization.yaml's patches: comment).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: garage
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

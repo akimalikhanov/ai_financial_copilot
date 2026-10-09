@@ -1,0 +1,31 @@
+# Fault-injection knobs for T7-T9 (docs/notes/loadtest-readiness-audit.md §5). The values
+# committed here are the no-fault defaults, so applying this overlay without a scenario
+# changes nothing; `make k8s-loadtest` rewrites them in place from LOADTEST_FAKE_LLM_LATENCY_MS
+# and LOADTEST_OPENSEARCH_HOST before applying.
+#
+# Kept separate from worker-chat-fake-llm.yaml on purpose: that patch is the money-safety
+# guarantee and must stay readable as such. This one is scenario configuration.
+#
+# Both keys are `env`, not `envFrom` — an explicit env entry beats every envFrom source, so
+# OPENSEARCH_HOST here overrides the app-endpoints ConfigMap the base Deployment loads.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-chat
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker-chat
+          env:
+            # T7 (slow LLM). Fixed latency in ms for every FakeAdapter call, including the
+            # "fast" structured-output profile — see fake_adapter.py::_sample_latency_seconds.
+            # Empty means sampled, which is what every other scenario wants.
+            # The trailing comment is sed's anchor in `make k8s-loadtest` — keep it.
+            - name: FAKE_LLM_LATENCY_MS
+              value: "" # FAKE_LLM_LATENCY_MS
+            # T8 (slow OpenSearch). "toxiproxy" routes the keyword leg through the latency
+            # injector in toxiproxy.yaml; "opensearch" dials the cluster directly. The port
+            # is the same either way, so OPENSEARCH_HTTP_PORT needs no override.
+            - name: OPENSEARCH_HOST
+              value: "opensearch" # OPENSEARCH_HOST

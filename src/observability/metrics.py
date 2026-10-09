@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
+from src.services.llm_adapters.base_adapter import LLMResponseStats
+
 # --- HTTP ---
 HTTP_REQUESTS = Counter(
     "http_requests_total",
@@ -26,6 +28,73 @@ HTTP_IN_PROGRESS = Gauge(
     "http_requests_in_progress",
     "In-flight requests",
     ["method", "endpoint"],
+    # livesum, not the default "all": under multiprocess the default keeps a per-PID
+    # series (unbounded cardinality across restarts, and every query needs its own
+    # sum()), and mark_process_dead only deletes live* shards — so a SIGKILLed
+    # process's leaked +1 would have no cleanup path at all.
+    multiprocess_mode="livesum",
+)
+
+# --- SSE streams ---
+# Naive middleware records duration/in-progress at call_next return, which for a
+# StreamingResponse is when headers are ready, not when the body finishes — so these are
+# instrumented directly in the generator instead of via HTTP_DURATION/HTTP_IN_PROGRESS.
+SSE_STREAMS_OPEN = Gauge(
+    "sse_streams_open",
+    "Currently open SSE streams",
+    ["endpoint"],
+    multiprocess_mode="livesum",  # same reasoning as HTTP_IN_PROGRESS
+)
+SSE_STREAM_DURATION = Histogram(
+    "sse_stream_duration_seconds",
+    "SSE stream lifetime",
+    ["endpoint", "outcome"],
+    # Answers run 12s mean / 43s p95, so the default 10s-capped buckets are useless here.
+    buckets=(1, 5, 10, 30, 60, 120, 300, 600),
+)
+
+# /readyz needs this count to decide whether the pod is at capacity, and the Gauge cannot
+# supply it: the API runs with PROMETHEUS_MULTIPROC_DIR set (Dockerfile.api), where a Gauge
+# holds no readable in-process value — reading it means touching prometheus_client internals.
+# A plain int in this process is the honest source for a local capacity check anyway; the
+# Gauge stays the source for scraping. Single-threaded event loop, so no lock is needed.
+_open_streams: dict[str, int] = {}
+
+
+def sse_stream_opened(endpoint: str) -> None:
+    """Record an SSE stream opening. Bumps the scrape Gauge and the /readyz counter together."""
+    SSE_STREAMS_OPEN.labels(endpoint).inc()
+    _open_streams[endpoint] = _open_streams.get(endpoint, 0) + 1
+
+
+def sse_stream_closed(endpoint: str) -> None:
+    """Record an SSE stream closing. Must be called from a `finally` so the count cannot leak."""
+    SSE_STREAMS_OPEN.labels(endpoint).dec()
+    _open_streams[endpoint] = max(0, _open_streams.get(endpoint, 0) - 1)
+
+
+def open_stream_count() -> int:
+    """Total SSE streams open in this process, across endpoints."""
+    return sum(_open_streams.values())
+
+
+CHAT_QUEUE_WAIT = Histogram(
+    "chat_queue_wait_seconds",
+    "Enqueue -> task start",
+    buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
+)
+# What the user waits for: enqueue -> first answer delta, so it includes queue wait, routing
+# and the agent loop. query_shape: extraction | comparison | analytical, or "direct" for
+# turns answered without retrieval.
+CHAT_TTFT = Histogram(
+    "chat_time_to_first_token_seconds",
+    "Chat request enqueue -> first answer token emitted",
+    ["query_shape"],
+    buckets=(0.5, 1, 2, 3, 5, 10, 20, 30, 60, 120, 300, 600),
+)
+CHAT_ADMISSION_REJECTED = Counter(
+    "chat_admission_rejected_total",
+    "Chat requests refused with 503 because the queue was at CHAT_QUEUE_MAX_DEPTH",
 )
 
 # --- Celery ---
@@ -38,7 +107,27 @@ CELERY_DURATION = Histogram(
     # every ingestion into +Inf, breaking histogram_quantile (NaN).
     buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
 )
-CELERY_QUEUE = Gauge("celery_queue_length", "Queue depth", ["queue_name"])
+CELERY_QUEUE = Gauge(
+    "celery_queue_length",
+    "Broker queue depth (waiting tasks only — excludes in-flight/unacked work)",
+    ["queue_name"],
+    # Absolute .set() of an external truth (Redis LLEN), not a delta, so it cannot leak
+    # the way the in-flight gauges do. livemostrecent still beats the default "all":
+    # it drops the pid label and, if a sampler is ever replaced, reports the newest
+    # sample instead of exposing two competing series.
+    multiprocess_mode="livemostrecent",
+)
+CELERY_TASKS_IN_FLIGHT = Gauge(
+    "celery_tasks_in_flight",
+    "Tasks currently executing (prerun -> postrun)",
+    ["task_name"],
+    # Incremented in prefork children, so the default per-PID series would need
+    # summing by the query. livesum does it here and drops dead children's values —
+    # but only children that reached worker_process_shutdown. A SIGKILLed child's +1
+    # survives on disk, so correctness also depends on purge_multiproc_dir() running
+    # at startup; see src/observability/multiproc.py.
+    multiprocess_mode="livesum",
+)
 
 # --- Agentic RAG ---
 RAG_RETRIEVAL = Histogram(
@@ -48,6 +137,10 @@ RAG_RETRIEVAL = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
 )
 RAG_CHUNKS = Histogram("rag_chunks_retrieved", "Chunks per query", ["retriever"])
+RAG_CHUNKS_UNHYDRATED = Counter(
+    "rag_chunks_unhydrated_total",
+    "Retrieved chunks skipped at assembly: no Postgres row (stale Qdrant/OpenSearch entry)",
+)
 RAG_CONTEXT_TOKENS = Histogram(
     "rag_context_tokens",
     "Context tokens",
@@ -64,9 +157,27 @@ AGENT_ITERATIONS = Histogram(
     buckets=(1, 2, 3, 4, 5, 8),
 )
 AGENT_TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["tool", "status"])
+# Subset of AGENT_TOOL_CALLS{status="error"} that excludes timeouts and backend failures.
+# Per-turn rate: divide by rate(agent_loop_iterations_sum).
+AGENT_TOOL_ARG_ERRORS = Counter(
+    "agent_tool_arg_errors_total",
+    "Tool calls whose arguments failed schema validation",
+    ["tool"],
+)
+# reason: ConvergenceReason. query_shape: extraction | comparison | analytical | none.
+AGENT_STOP_REASONS = Counter(
+    "agent_stop_reasons_total",
+    "Agent runs by stop reason",
+    ["reason", "query_shape"],
+)
 CITATION_REFS_DROPPED = Counter(
     "citation_refs_dropped_total",
     "Finding citations dropped (no excerpt in synthesis context)",
+)
+AGENT_LAST_TURN_INPUT_TOKENS = Histogram(
+    "agent_last_turn_input_tokens",
+    "Tool-model input tokens on a run's last call: the size the transcript reached",
+    buckets=(2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000),
 )
 AGENT_TOOL_DURATION = Histogram(
     "agent_tool_duration_seconds",
@@ -75,21 +186,111 @@ AGENT_TOOL_DURATION = Histogram(
     # search_documents wraps full RAG retrieve+rerank and can exceed 10s.
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
+# Tool-model calls split by what the turn did. Search and report turns differ 3-5x in
+# latency, so they need separate percentiles. turn_kind: search | report | mixed | final |
+# none (prose, no call), or unknown for a non-final call that failed before it answered.
+# outcome: as on llm_request_duration_seconds.
+AGENT_TOOL_MODEL_DURATION = Histogram(
+    "agent_tool_model_duration_seconds",
+    "Tool-model call latency by turn kind",
+    ["model", "turn_kind", "outcome"],
+    buckets=(1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120),
+)
+# part: reasoning | visible. The two sum to the call's output tokens; reasoning is most of
+# a report turn's latency.
+AGENT_TOOL_MODEL_OUTPUT_TOKENS = Counter(
+    "agent_tool_model_output_tokens_total",
+    "Tool-model output tokens by turn kind",
+    ["model", "turn_kind", "part"],
+)
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
+# outcome: carried | none | dropped_hop_cap | dropped_scope
+FOLLOWUP_FINDINGS_CARRIED = Counter(
+    "followup_findings_carried_total",
+    "Prior-turn findings block reuse on non-retrieval turns",
+    ["outcome"],
+)
+# grounded: whether the direct answer had a carried block behind it
+FOLLOWUP_DIRECT_ANSWER = Counter(
+    "router_followup_direct_answer_total",
+    "Turns answered without retrieval",
+    ["grounded"],
+)
 GUARDRAIL_BLOCKS = Counter("guardrail_blocks_total", "Guardrail blocks", ["type"])
 PIPELINE_ERRORS = Counter("chat_pipeline_errors_total", "Chat pipeline failures", ["stage"])
 
-# --- LLM cost/tokens ---
+CHAT_STAGE_DURATION = Histogram(
+    "chat_pipeline_stage_duration_seconds",
+    "Chat pipeline stage latency",
+    # stage: one of the _STAGE_LABELS keys in services/chat/tasks.py
+    ["stage"],
+    # agent_loop and stream_llm_response run tens of seconds; the rest are ms-scale.
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120),
+)
+
+# --- LLM cost/tokens/latency ---
 LLM_TOKENS = Counter("llm_tokens_total", "Tokens", ["direction", "model"])
 LLM_COST = Counter("llm_cost_usd_total", "Cost USD", ["model"])
 LLM_CACHE_HIT_TOKENS = Counter("llm_cache_hit_tokens_total", "Cached input tokens", ["model"])
+# request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
+# router | conversation_naming. outcome: ok | length (answered, but hit its token cap) |
+# timeout | cancelled | error — only agent_tool_call observes the non-ok outcomes so far.
+LLM_DURATION = Histogram(
+    "llm_request_duration_seconds",
+    "LLM call latency, first byte to last",
+    ["model", "request_type", "outcome"],
+    buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120),
+)
+LLM_TTFT = Histogram(
+    "llm_time_to_first_token_seconds",
+    "LLM time to first token (streaming calls only)",
+    ["model", "request_type"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 10, 30),
+)
+
+
+def observe_llm_latency(
+    model: str, request_type: str, stats: LLMResponseStats | None, outcome: str = "ok"
+) -> None:
+    """Record one LLM call's latency histograms."""
+    if stats is None:
+        return
+    if stats.latency_ms is not None:
+        LLM_DURATION.labels(model, request_type, outcome).observe(stats.latency_ms / 1000.0)
+    if stats.ttft_ms is not None:
+        LLM_TTFT.labels(model, request_type).observe(stats.ttft_ms / 1000.0)
+
+
+def observe_llm_failure(model: str, request_type: str, outcome: str, seconds: float) -> None:
+    """Record how long a call that never answered ran before it timed out, was cancelled or
+    errored. Without it the latency histogram only ever sees the calls that finished."""
+    LLM_DURATION.labels(model, request_type, outcome).observe(seconds)
+
 
 # --- Ingestion ---
 INGESTION_DOCUMENTS = Counter("ingestion_documents_total", "Documents processed", ["status"])
+INGESTION_REAPED = Counter(
+    "ingestion_documents_reaped_total",
+    "Documents re-enqueued after their worker died without reporting it",
+    ["source"],
+)
 INGESTION_CHUNKS = Histogram(
     "ingestion_chunks_per_document",
     "Chunks per document",
     buckets=(10, 25, 50, 100, 200, 500, 1000),
+)
+PICTURE_ENRICHER = Counter(
+    "picture_enricher_pictures_total",
+    "Pictures by lane and outcome",
+    # status: described | empty | skipped | failed. "empty" is the signature of a starved
+    # completion budget (reasoning spends it before any JSON is emitted) — graph it.
+    ["lane", "status"],
+)
+PICTURE_ENRICHER_DURATION = Histogram(
+    "picture_enricher_batch_seconds",
+    "Per-batch latency",
+    ["lane"],
+    buckets=(0.5, 1, 2.5, 5, 10, 30, 60),
 )
 INGESTION_DURATION = Histogram(
     "ingestion_stage_duration_seconds",
@@ -97,5 +298,62 @@ INGESTION_DURATION = Histogram(
     ["stage"],  # parse | chunk | embed | upsert_qdrant | upsert_opensearch
     # Stages span ms-scale upserts to minute-scale Docling parses; default
     # buckets top out at 10s and dump every parse into +Inf (breaks quantiles).
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300),
+    # Ceiling is 900 to clear DOCLING_PARSE_TIMEOUT_SECONDS=600 and the 1200s
+    # Celery hard limit — a slow parse must land in a bucket, not in +Inf.
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900),
+)
+INGESTION_QUEUE_WAIT = Histogram(
+    "ingestion_queue_wait_seconds",
+    "Upload -> task start",
+    # Mirrors CHAT_QUEUE_WAIT. At one ingestion slot this is most of the
+    # user-visible latency, so the buckets run out to the 1200s hard limit.
+    # Measured from documents.created_at, which is stamped before the S3 PUT:
+    # a large upload inflates this by the PUT's duration.
+    buckets=(0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200),
+)
+
+# --- Ingestion worker memory ---
+# Set in the prefork pool child ("worker process") that runs the documents. mostrecent keeps
+# the last value after that child is recycled, so the document that caused a recycle stays on
+# the dashboard until the next document replaces it.
+INGESTION_WORKER_RSS = Gauge(
+    "ingestion_worker_rss_bytes",
+    "Worker process RSS when the last document started and when it finished",
+    ["point"],  # task_start | task_end
+    multiprocess_mode="mostrecent",
+)
+# Sizing, not residency, and not a progress metric: malloc_trim unmaps the pages under this
+# free space but leaves the space on glibc's free lists, so a trim that returns GBs of RSS
+# moves this barely at all. Use it to see how much of the floor might be reclaimable; judge
+# whether it was by ingestion_worker_rss_bytes{point="task_end"}.
+INGESTION_WORKER_MALLOC_FREE = Gauge(
+    "ingestion_worker_malloc_free_bytes",
+    "Free space on glibc's heap free lists after the last document (may or may not be resident)",
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_PEAK_RSS = Gauge(
+    "ingestion_worker_peak_rss_bytes",
+    "Worker process peak RSS per pipeline stage, last document that ran it (stage=task: whole)",
+    ["stage"],
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_STAGE_GROWTH = Gauge(
+    "ingestion_worker_stage_growth_bytes",
+    "How far RSS rose above its level at the start of the stage, last document that ran it",
+    ["stage"],
+    multiprocess_mode="mostrecent",
+)
+INGESTION_WORKER_CHILD_TASKS = Gauge(
+    "ingestion_worker_child_tasks",
+    "Documents the current worker process has started",
+    multiprocess_mode="livemostrecent",
+)
+INGESTION_WORKER_RECYCLE_THRESHOLD = Gauge(
+    "ingestion_worker_recycle_threshold_bytes",
+    "--max-memory-per-child in bytes (0 = off)",
+    multiprocess_mode="livemax",  # set once, in the parent
+)
+INGESTION_WORKER_RECYCLES = Counter(
+    "ingestion_worker_recycles_total",
+    "Documents after which the worker process kept more than the threshold and was replaced",
 )

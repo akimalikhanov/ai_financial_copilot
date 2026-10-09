@@ -1,0 +1,16 @@
+# Gives the embedder TEI deployment the host GPU. See worker-ingestion-gpu.yaml for the
+# full rationale (extended resources, base-vs-overlay split, why nodeSelector matters).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei-embedder
+spec:
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: tei-embedder
+          resources:
+            limits:
+              nvidia.com/gpu: 1

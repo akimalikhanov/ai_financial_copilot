@@ -26,9 +26,17 @@ def _db_message_to_chat_message(message: Message) -> schemas.ChatMessage:
         MessageRole.assistant: schemas.Role.assistant,
         MessageRole.tool: schemas.Role.tool,
     }
+    # Cold-cache path: must carry the same fields the Redis tail does, or behavior
+    # silently differs once the cache expires.
+    meta = message.message_metadata or {}
     return schemas.ChatMessage(
         role=role_map[message.role],
         content=message.content,
+        findings_block=meta.get("findings_block"),
+        answer_derived_from_carryover=bool(meta.get("answer_derived_from_carryover", False)),
+        findings_block_hops=int(meta.get("findings_block_hops", 0) or 0),
+        findings_block_doc_ids=meta.get("findings_block_doc_ids"),
+        turn_summary=meta.get("turn_summary"),
     )
 
 
@@ -91,13 +99,28 @@ class ConversationHistory:
                 extra={"conversation_id": str(conversation_id)},
             )
 
-    async def append_assistant(self, conversation_id: UUID, content: str, seq: int) -> None:
+    async def append_assistant(
+        self,
+        conversation_id: UUID,
+        content: str,
+        seq: int,
+        findings_block: str | None = None,
+        answer_derived_from_carryover: bool = False,
+        findings_block_hops: int = 0,
+        findings_block_doc_ids: list[str] | None = None,
+        turn_summary: schemas.TurnSummary | None = None,
+    ) -> None:
         await append_chat_tail(
             self._redis,
             str(conversation_id),
             schemas.ChatMessage(
                 role=schemas.Role.assistant,
                 content=content,
+                findings_block=findings_block,
+                answer_derived_from_carryover=answer_derived_from_carryover,
+                findings_block_hops=findings_block_hops,
+                findings_block_doc_ids=findings_block_doc_ids,
+                turn_summary=turn_summary,
             ).model_dump(mode="json"),
             seq,
         )
@@ -115,6 +138,11 @@ class ConversationHistory:
             self._max_messages,
             before_seq=before_seq,
         )
-        messages = [_db_message_to_chat_message(msg) for msg in db_messages]
+        # Clarification cards are never history: the Redis tail skips them too.
+        messages = [
+            _db_message_to_chat_message(msg)
+            for msg in db_messages
+            if (msg.message_metadata or {}).get("kind") != "clarification"
+        ]
         latest_seq = db_messages[-1].seq if db_messages else 0
         return messages, latest_seq

@@ -13,6 +13,10 @@ class FakeIndices:
     def __init__(self, exists: bool) -> None:
         self._exists = exists
         self.create_calls: list[dict] = []
+        self.refresh_calls: list[dict] = []
+
+    def refresh(self, **kwargs) -> None:
+        self.refresh_calls.append(kwargs)
 
     def exists(self, index: str) -> bool:  # noqa: ARG002
         return self._exists
@@ -24,6 +28,10 @@ class FakeIndices:
 class FakeClient:
     def __init__(self, index_exists: bool = False) -> None:
         self.indices = FakeIndices(index_exists)
+        self.delete_by_query_calls: list[dict] = []
+
+    def delete_by_query(self, **kwargs) -> None:
+        self.delete_by_query_calls.append(kwargs)
 
 
 class TestEnsureIndex:
@@ -50,7 +58,8 @@ class TestBulkIndex:
     def test_bulk_called_with_index_actions(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls = []
         monkeypatch.setattr("opensearchpy.helpers.bulk", lambda *a, **k: calls.append((a, k)))
-        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: FakeClient())
+        client = FakeClient()
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
 
         chunk_id = uuid4()
         chunks = [
@@ -66,6 +75,9 @@ class TestBulkIndex:
         actions = calls[0][0][1]
         assert actions[0]["_op_type"] == "index"
         assert actions[0]["_id"] == str(chunk_id)
+        # P1-3: no forced refresh per 500-action request; one explicit refresh at the end.
+        assert calls[0][1]["refresh"] is False
+        assert client.indices.refresh_calls == [{"index": "chunks"}]
 
 
 class TestBulkDelete:
@@ -87,3 +99,17 @@ class TestBulkDelete:
         actions = calls[0][0][1]
         assert actions[0]["_op_type"] == "delete"
         assert actions[0]["_id"] == str(cid)
+
+
+class TestDeleteByDocument:
+    def test_noop_when_index_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(index_exists=False)
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
+        opensearch_ingest.delete_by_document("chunks", uuid4())  # must not raise
+        assert client.delete_by_query_calls == []
+
+    def test_deletes_when_index_exists(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient(index_exists=True)
+        monkeypatch.setattr(opensearch_ingest, "get_client", lambda: client)
+        opensearch_ingest.delete_by_document("chunks", uuid4())
+        assert len(client.delete_by_query_calls) == 1

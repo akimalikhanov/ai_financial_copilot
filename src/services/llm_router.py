@@ -1,12 +1,15 @@
 # llm_router_runtime.py
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from src.observability import langfuse as _lf_mod
+from src.observability.trace_payload import compact_messages, trace_params
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     ChatMessage,
@@ -14,26 +17,73 @@ from src.services.llm_adapters.base_adapter import (
     LLMResponse,
     LLMStreamChunk,
 )
+from src.services.llm_adapters.fake_adapter import FakeAdapter
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
-from src.services.llm_runtime.exceptions import LLMNotFoundError, LLMServerError
+from src.services.llm_runtime.exceptions import LLMError, LLMNotFoundError, LLMServerError
 from src.utils.config import load_models_config
+
+logger = logging.getLogger(__name__)
 
 
 def _role_str(role: Any) -> str:
     return role.value if hasattr(role, "value") else role
 
 
+def _trace_content(m: ChatMessage) -> Any:
+    """Text, or an OpenAI-style content parts list when the message carries images.
+
+    The shape matters: Langfuse's media manager walks the payload for strings that look like
+    base64 data URIs, uploads them to its own object storage and leaves a reference token, so
+    the crop is viewable in the trace and the blob never reaches ClickHouse. Reusing the
+    OpenAI serializer keeps the trace identical to the wire payload on that provider, and
+    puts the data URI where Langfuse looks for it on every other one.
+    """
+    if not m.images:
+        return m.content or ""
+    parts: list[dict[str, Any]] = []
+    if m.content:
+        parts.append({"type": "text", "text": m.content})
+    parts.extend(OpenAIAdapter._serialize_image(img) for img in m.images)
+    return parts
+
+
 def _trace_message(m: ChatMessage) -> dict[str, Any]:
     """Serialize a message for a Langfuse observation input, preserving tool-call
     structure so tool-calling turns are legible in the trace (not a bare content: "")."""
-    out: dict[str, Any] = {"role": _role_str(m.role), "content": m.content or ""}
+    out: dict[str, Any] = {"role": _role_str(m.role), "content": _trace_content(m)}
     if m.tool_call_id:
         out["tool_call_id"] = m.tool_call_id
     if m.tool_calls:
         out["tool_calls"] = [
             {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls
         ]
+    return out
+
+
+def trace_input(messages: Sequence[ChatMessage], generation_name: str) -> list[dict[str, Any]]:
+    """A GENERATION input: serialized, capped, and de-duplicated within the trace."""
+    return compact_messages([_trace_message(m) for m in messages], generation_name)
+
+
+def trace_usage(stats: Any) -> dict[str, Any]:
+    """`usage_details` / `cost_details` for a generation from `LLMResponseStats`."""
+    if stats is None:
+        return {}
+    out: dict[str, Any] = {
+        "usage_details": {
+            k: v
+            for k, v in {
+                "input": stats.input_tokens,
+                "output": stats.output_tokens,
+                "cache_read_input_tokens": stats.cached_input_tokens,
+                "total": stats.total_tokens,
+            }.items()
+            if v is not None
+        }
+    }
+    if stats.cost_usd is not None:
+        out["cost_details"] = {"total": stats.cost_usd}
     return out
 
 
@@ -55,7 +105,22 @@ def _normalize_base_url(host: str, port: Any, base_path: str = "") -> str:
     return f"{host}:{port}{base_path}"
 
 
+def _fake_llm_only() -> bool:
+    return os.environ.get("FAKE_LLM_ONLY", "").strip().lower() in {"1", "true", "yes"}
+
+
 def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
+    # Fail closed during load tests: a pod that races the config rollout, or a models.yaml
+    # that was never swapped, would otherwise bill a real provider. Refusing to construct
+    # the adapter at all is the only check that cannot be lost to a stale lru_cache'd router.
+    if provider != "fake" and _fake_llm_only():
+        raise LLMServerError(
+            f"FAKE_LLM_ONLY is set but model resolved to provider {provider!r}; "
+            "refusing to call a real LLM provider",
+            provider=provider,
+            status_code=500,
+        )
+
     if provider == "openai":
         model_name = model_cfg.get("model_name")
         if not model_name:
@@ -108,6 +173,9 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             provider_name="vllm",
         )
 
+    if provider == "fake":
+        return FakeAdapter(default_model=model_cfg.get("model_name") or "fake")
+
     raise LLMServerError(f"Unsupported provider: {provider!r}", provider=provider, status_code=500)
 
 
@@ -131,25 +199,15 @@ class RoutedLLM:
             as_type="generation",
             name=_lf_name,
             model=self.model_id,
-            input=[_trace_message(m) for m in messages],
+            model_parameters=trace_params(merged),
+            input=trace_input(messages, _lf_name),
         ) as gen:
-            response = await self.adapter.complete(messages=messages, **merged)
-            update_kwargs: dict = {"output": response.text}
-            if response.stats:
-                s = response.stats
-                update_kwargs["usage_details"] = {
-                    k: v
-                    for k, v in {
-                        "input": s.input_tokens,
-                        "output": s.output_tokens,
-                        "cache_read_input_tokens": s.cached_input_tokens,
-                        "total": s.total_tokens,
-                    }.items()
-                    if v is not None
-                }
-                if s.cost_usd is not None:
-                    update_kwargs["cost_details"] = {"total": s.cost_usd}
-            gen.update(**update_kwargs)
+            try:
+                response = await self.adapter.complete(messages=messages, **merged)
+            except BaseException as exc:
+                _lf_mod.mark(gen, "ERROR", _lf_mod.describe_error(exc))
+                raise
+            gen.update(output=response.text, **trace_usage(response.stats))
             return response
 
     async def complete_with_tools(
@@ -164,37 +222,33 @@ class RoutedLLM:
         merged = _merge_params(self.default_params, params)
         if lf is None:
             return await self.adapter.complete_with_tools(messages=messages, tools=tools, **merged)  # type: ignore[union-attr]
+        name = "llm.complete_with_tools"
         with lf.start_as_current_observation(
             as_type="generation",
-            name="llm.complete_with_tools",
+            name=name,
             model=self.model_id,
-            input=[_trace_message(m) for m in messages],
-            metadata={"tools": [t["function"]["name"] for t in tools if "function" in t]},
+            model_parameters=trace_params(merged),
+            input=trace_input(messages, name),
+            metadata={
+                "tools": [t["function"]["name"] for t in tools if "function" in t],
+                # Callable subset when the request restricts `tools` via allowed_tools.
+                **({"allowed_tools": allowed} if (allowed := merged.get("allowed_tools")) else {}),
+            },
         ) as gen:
-            result = await self.adapter.complete_with_tools(
-                messages=messages, tools=tools, **merged
-            )  # type: ignore[union-attr]
-            update_kwargs: dict = {
-                "output": [
+            try:
+                result = await self.adapter.complete_with_tools(
+                    messages=messages, tools=tools, **merged
+                )  # type: ignore[union-attr]
+            except BaseException as exc:
+                _lf_mod.mark(gen, "ERROR", _lf_mod.describe_error(exc))
+                raise
+            gen.update(
+                output=[
                     {"name": tc.name, "arguments": tc.arguments} for tc in (result.tool_calls or [])
                 ]
                 or result.text,
-            }
-            if result.stats:
-                s = result.stats
-                update_kwargs["usage_details"] = {
-                    k: v
-                    for k, v in {
-                        "input": s.input_tokens,
-                        "output": s.output_tokens,
-                        "cache_read_input_tokens": s.cached_input_tokens,
-                        "total": s.total_tokens,
-                    }.items()
-                    if v is not None
-                }
-                if s.cost_usd is not None:
-                    update_kwargs["cost_details"] = {"total": s.cost_usd}
-            gen.update(**update_kwargs)
+                **trace_usage(result.stats),
+            )
             return result
 
     def stream(
@@ -217,6 +271,47 @@ class RoutedLLM:
             return self.stream(messages, **params)
         else:
             return self.complete(messages, **params)
+
+
+class FallbackStream:
+    """Streams from the first model in `chain` that responds; advances to the
+    next model only if the previous one raised before yielding any content
+    (so partial output already sent to the user is never duplicated/lost).
+
+    `served` reflects whichever model actually produced the response — check
+    it after iteration if the caller needs to log/persist the serving model.
+    """
+
+    def __init__(self, chain: Sequence[RoutedLLM], messages: Sequence[ChatMessage], **params: Any):
+        self._chain = chain
+        self._messages = messages
+        self._params = params
+        self.served: RoutedLLM = chain[0]
+
+    async def __aiter__(self) -> AsyncGenerator[LLMStreamChunk, None]:
+        last_err: LLMError | None = None
+        for i, llm in enumerate(self._chain):
+            self.served = llm
+            got_chunk = False
+            try:
+                async for chunk in llm.stream(self._messages, **self._params):
+                    got_chunk = True
+                    yield chunk
+                return
+            except LLMError as e:
+                last_err = e
+                if got_chunk or i == len(self._chain) - 1:
+                    raise
+                logger.warning(
+                    "llm_fallback",
+                    extra={
+                        "from_model": llm.model_id,
+                        "to_model": self._chain[i + 1].model_id,
+                        "error": type(e).__name__,
+                    },
+                )
+        if last_err:
+            raise last_err
 
 
 class LLMRouter:
@@ -242,12 +337,21 @@ class LLMRouter:
 
         self._models: dict[str, RoutedLLM] = {}
 
+    def default_params_for(self, model_id: str) -> dict[str, Any]:
+        """Merged default params (global defaults + per-model params_override) without
+        building the model's adapter, so it's safe to call for unconfigured providers."""
+        cfg = self._model_cfgs.get(model_id)
+        if cfg is None:
+            raise LLMNotFoundError(f"Unknown model_id: {model_id}")
+        params = dict(self._global_default_params)
+        params.update(cfg.get("params_override") or {})
+        return params
+
     def _build_routed(self, model_id: str, m: Mapping[str, Any]) -> RoutedLLM:
         provider = m["provider"]
         adapter = _build_adapter(provider, m)
 
-        params = dict(self._global_default_params)
-        params.update(m.get("params_override") or {})
+        params = self.default_params_for(model_id)
 
         return RoutedLLM(
             adapter=adapter,
@@ -274,6 +378,15 @@ class LLMRouter:
         routed = self._build_routed(model_id, cfg)
         self._models[model_id] = routed
         return routed
+
+    def get_with_fallback(self, model_id: str) -> list[RoutedLLM]:
+        """Primary model followed by its configured `fallback_model`, if any.
+        Always at least length 1."""
+        chain = [self.get(model_id)]
+        fallback_id = self._model_cfgs[model_id].get("fallback_model")
+        if fallback_id and fallback_id in self._model_cfgs:
+            chain.append(self.get(fallback_id))
+        return chain
 
     def list_models(self) -> list[str]:
         return sorted(self._model_cfgs.keys())

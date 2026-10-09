@@ -7,6 +7,8 @@ import json
 import logging
 import os
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
+from time import perf_counter
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -19,7 +21,18 @@ from sqlalchemy import text
 
 from src.api.deps import CurrentUserDep, RedisDep
 from src.api.exceptions import _sse_event
-from src.db import DbSessionDep
+from src.api.stream_liveness import (
+    INGEST_TERMINAL_STATUSES,
+    _stream_event_time,
+    _worker_gone,
+)
+from src.db import DbSessionDep, get_session_factory
+from src.models.document import Document
+from src.observability.metrics import (
+    SSE_STREAM_DURATION,
+    sse_stream_closed,
+    sse_stream_opened,
+)
 from src.redis_client import ingestion_stream_key
 from src.repository import DocumentRepository
 from src.schemas.documents import (
@@ -29,13 +42,17 @@ from src.schemas.documents import (
     UploadDocumentResponse,
 )
 from src.services.ingestion import opensearch_ingest, qdrant_ingest
+from src.services.ingestion.recovery import reap_abandoned
 from src.services.ingestion.s3_client import build_raw_storage_key, upload_pdf
 from src.services.ingestion.tasks import ingest_document
+from src.services.router.company_name import normalize_company
 from src.utils.config import (
+    get_ingest_stream_abandoned_after_seconds,
     get_s3_access_key,
     get_s3_chunks_bucket,
     get_s3_docling_bucket,
     get_s3_endpoint_url,
+    get_s3_pictures_bucket,
     get_s3_raw_bucket,
     get_s3_rendered_bucket,
     get_s3_secret_key,
@@ -53,9 +70,15 @@ logger = logging.getLogger(__name__)
 async def list_documents(
     session: DbSessionDep,
     current_user: CurrentUserDep,
+    redis: RedisDep,
 ) -> ListDocumentsResponse:
     repo = DocumentRepository(session)
     docs = await repo.list_by_user(current_user.id)
+    # This already loads every one of the user's documents, so checking which of the
+    # `processing` ones still have a live worker costs one pipelined round trip. It is also
+    # the request that fires when someone is looking at the list, which is when a document
+    # stranded by a dead worker is worth recovering.
+    await reap_abandoned(redis, list(docs), source="list")
     items = [
         DocumentListItem(
             id=d.id,
@@ -64,6 +87,7 @@ async def list_documents(
             created_at=d.created_at,
             extracted_title=d.extracted_title,
             page_count=d.page_count,
+            parse_status=d.parse_status,
             metadata=d.document_metadata,
         )
         for d in docs
@@ -137,6 +161,7 @@ async def upload_document(
         content_type=ALLOWED_CONTENT_TYPE,
         file_size_bytes=file_size,
         metadata=metadata if metadata else None,
+        company_norm=normalize_company(company) if company else None,
     )
     await session.commit()
 
@@ -146,7 +171,6 @@ async def upload_document(
             doc_id=doc_id,
             filename=filename,
             fileobj=file.file,
-            content_length=file_size,
         )
     except Exception:
         await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": doc_id})
@@ -184,15 +208,22 @@ async def delete_document(
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "documents")
     opensearch_index = os.getenv("OPENSEARCH_INDEX", "chunks")
 
+    # Index cleanup must succeed before the Postgres row goes: a swallowed failure here
+    # (backend down/restarting) leaves chunks indexed with no row to hydrate them, and
+    # nothing ever collects them. Failing the request keeps the document deletable later.
     try:
-        qdrant_ingest.delete_by_document(qdrant_collection, document_id)
+        await asyncio.gather(
+            asyncio.to_thread(qdrant_ingest.delete_by_document, qdrant_collection, document_id),
+            asyncio.to_thread(opensearch_ingest.delete_by_document, opensearch_index, document_id),
+        )
     except Exception:
-        logger.warning("delete_document.qdrant_failed", extra={"document_id": str(document_id)})
-
-    try:
-        opensearch_ingest.delete_by_document(opensearch_index, document_id)
-    except Exception:
-        logger.warning("delete_document.opensearch_failed", extra={"document_id": str(document_id)})
+        logger.exception(
+            "delete_document.index_cleanup_failed", extra={"document_id": str(document_id)}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Search index cleanup failed; document not deleted. Please retry.",
+        ) from None
 
     s3_keys = {
         get_s3_raw_bucket(): [doc.storage_key],
@@ -218,6 +249,22 @@ async def delete_document(
                         "delete_document.s3_failed",
                         extra={"bucket": bucket, "key": key},
                     )
+
+        # Crops are one object per picture under `{document_id}/pictures/N.png`
+        # (build_picture_crop_key), so this sweeps a prefix rather than deleting a fixed key.
+        pictures_bucket = get_s3_pictures_bucket()
+        prefix = f"{document_id}/"
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(Bucket=pictures_bucket, Prefix=prefix):
+                batch = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+                if batch:
+                    await s3.delete_objects(Bucket=pictures_bucket, Delete={"Objects": batch})
+        except Exception:
+            logger.warning(
+                "delete_document.s3_failed",
+                extra={"bucket": pictures_bucket, "key": prefix},
+            )
 
     await session.execute(text("DELETE FROM chunks WHERE document_id = :id"), {"id": document_id})
     await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
@@ -261,29 +308,79 @@ async def ingestion_stream(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    # Release the pgbouncer server connection before the stream starts — the yield
+    # dependency is held until the streaming body finishes otherwise.
+    await session.commit()
+
     stream_key = ingestion_stream_key(str(document_id))
     last_id = "0-0"
+    session_factory = get_session_factory()
+
+    async def _fetch_status() -> Document | None:
+        """Short-lived session for the periodic liveness re-check."""
+        async with session_factory() as s:
+            return await DocumentRepository(s).get_by_id(document_id)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         nonlocal last_id
         empty_polls = 0
-        yield ": ok\n\n"
+        sse_stream_opened("ingestion")
+        _started = perf_counter()
+        outcome = "client_closed"
         try:
+            yield ": ok\n\n"
             while True:
                 result = await redis.xread({stream_key: last_id}, block=15000, count=20)
                 if not result:
                     empty_polls += 1
                     if empty_polls >= 4:
                         # Worker may have died — check DB status
-                        fresh = await repo.get_by_id(document_id)
+                        fresh = await _fetch_status()
                         if fresh and fresh.status == "ready":
+                            outcome = "complete"
                             yield _sse_event("done", {})
                             return
                         if fresh and fresh.status == "failed":
+                            outcome = "error"
                             yield _sse_event(
                                 "error", {"message": fresh.processing_error or "Ingestion failed"}
                             )
                             return
+                        if fresh is not None:
+                            # Neither status a dead worker can write. Re-enqueue it and keep
+                            # the stream open: the replacement attempt writes to this same
+                            # stream, so the uploader sees a stall and then stage events
+                            # again rather than a failure it would have to act on.
+                            if await reap_abandoned(redis, [fresh], source="stream"):
+                                empty_polls = 0
+                                yield _sse_event(
+                                    "retrying",
+                                    {"attempt": (fresh.ingest_attempt_count or 0) + 1},
+                                )
+                                continue
+                            # Backstop for the case the lease itself is unreadable: without
+                            # it a Redis outage puts this stream back to heart-beating until
+                            # the client gives up. `created_at`, not `updated_at` — status
+                            # writes do not touch `updated_at`, so it can still hold the
+                            # upload time on a document that has been processing for an hour.
+                            progress_at = _stream_event_time(last_id) or fresh.created_at
+                            if _worker_gone(
+                                fresh.status,
+                                progress_at,
+                                datetime.now(UTC),
+                                terminal=INGEST_TERMINAL_STATUSES,
+                                after_seconds=get_ingest_stream_abandoned_after_seconds(),
+                            ):
+                                outcome = "error"
+                                logger.warning(
+                                    "ingestion_stream.worker_gone",
+                                    extra={"document_id": str(document_id)},
+                                )
+                                yield _sse_event(
+                                    "error",
+                                    {"message": "Processing stopped unexpectedly. Please retry."},
+                                )
+                                return
                     yield ": keepalive\n\n"
                     continue
 
@@ -304,11 +401,22 @@ async def ingestion_stream(
                         sse_data = {k: v for k, v in data.items() if k != "type"}
                         yield _sse_event(event_type, sse_data)
                         if event_type in ("done", "error"):
+                            outcome = "complete" if event_type == "done" else "error"
                             return
         except asyncio.CancelledError:
             raise
         except Exception:
-            yield _sse_event("error", {"message": "Stream read failed"})
+            # A Redis read failure says nothing about the ingestion itself, which keeps running
+            # in the worker. Emitting `error` here would make the UI mark a healthy document as
+            # failed. End the stream instead and let the client reconnect and re-read status.
+            outcome = "error"
+            logger.exception(
+                "ingestion_stream.read_failed", extra={"document_id": str(document_id)}
+            )
+            return
+        finally:
+            sse_stream_closed("ingestion")
+            SSE_STREAM_DURATION.labels("ingestion", outcome).observe(perf_counter() - _started)
 
     return StreamingResponse(
         event_stream(),

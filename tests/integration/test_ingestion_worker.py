@@ -108,20 +108,20 @@ def _mock_ingestion_services():
     """Patch all external ingestion services with mocks."""
     mock_chunks = _create_mock_chunks()
     fake_embeddings = [[0.1] * 384, [0.2] * 384]
-    fake_artifacts = (b'{"mock": "json"}', b"# Mock Markdown")
+    fake_artifacts = (Path("/tmp/fake_docling.json"), Path("/tmp/fake_document.md"))
 
     with (
         patch("src.services.ingestion.s3_client.download_file") as mock_s3_download,
-        patch("src.services.ingestion.s3_client.upload_bytes") as mock_s3_upload,
+        patch("src.services.ingestion.s3_client.upload_file") as mock_s3_upload,
         patch("src.services.ingestion.docling_parser.parse") as mock_parse,
         patch("src.services.ingestion.tasks._export_artifacts") as mock_export,
         patch("src.services.ingestion.chunker.chunk_document") as mock_chunk,
         patch("src.services.ingestion.embedder.embed_chunks") as mock_embed,
         patch("src.services.ingestion.qdrant_ingest.ensure_collection") as mock_qdrant_ensure,
-        patch("src.services.ingestion.qdrant_ingest.delete_by_chunk_ids") as mock_qdrant_delete,
+        patch("src.services.ingestion.qdrant_ingest.delete_by_document") as mock_qdrant_delete,
         patch("src.services.ingestion.qdrant_ingest.upsert_chunks") as mock_qdrant_upsert,
         patch("src.services.ingestion.opensearch_ingest.ensure_index") as mock_os_ensure,
-        patch("src.services.ingestion.opensearch_ingest.bulk_delete") as mock_os_delete,
+        patch("src.services.ingestion.opensearch_ingest.delete_by_document") as mock_os_delete,
         patch("src.services.ingestion.opensearch_ingest.bulk_index") as mock_os_bulk,
     ):
         mock_s3_download.return_value = Path("/tmp/fake_doc.pdf")
@@ -246,9 +246,12 @@ async def test_ingest_document_empty_chunks_still_ready(
 
     with (
         patch("src.services.ingestion.s3_client.download_file", return_value=Path("/tmp/fake.pdf")),
-        patch("src.services.ingestion.s3_client.upload_bytes", return_value=None),
+        patch("src.services.ingestion.s3_client.upload_file", return_value=None),
         patch("src.services.ingestion.docling_parser.parse", return_value=MockParseResult()),
-        patch("src.services.ingestion.tasks._export_artifacts", return_value=(b"{}", b"# md")),
+        patch(
+            "src.services.ingestion.tasks._export_artifacts",
+            return_value=(Path("/tmp/fake_docling.json"), Path("/tmp/fake_document.md")),
+        ),
         patch("src.services.ingestion.chunker.chunk_document", return_value=[]),
     ):
         from src.services.ingestion.tasks import _run_pipeline

@@ -1,0 +1,113 @@
+# T8's latency injector (docs/notes/loadtest-readiness-audit.md §5, concepts §7 step 7).
+#
+# A TCP proxy in front of OpenSearch that adds a fixed delay to every byte it forwards, so
+# the dependency stays REAL — §6 of the concepts note is explicit that only the LLM may be
+# faked, because T8/T9 are about how the retrieval code behaves against a genuine backend.
+#
+# Deployed for every load-test run and harmless when unused: nothing dials it unless
+# worker-chat-faults.yaml / api-faults.yaml set OPENSEARCH_HOST=toxiproxy. That keeps the
+# scenario a one-variable change rather than an apply of extra resources.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: toxiproxy
+  namespace: copilot
+  labels:
+    app.kubernetes.io/name: toxiproxy
+spec:
+  selector:
+    app.kubernetes.io/name: toxiproxy
+  ports:
+    # Deliberately the same 9200 OpenSearch serves on, so OPENSEARCH_HTTP_PORT never has to
+    # change — the fault is one env var, and a run cannot half-apply it.
+    - name: opensearch
+      port: 9200
+      targetPort: 9200
+    # The control API, so a toxic can be added, retuned or removed mid-run without a rollout.
+    - name: api
+      port: 8474
+      targetPort: 8474
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: copilot
+  labels:
+    app.kubernetes.io/name: toxiproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: toxiproxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: toxiproxy
+    spec:
+      containers:
+        - name: toxiproxy
+          # Mirrored into the kind registry by `make k8s-loadtest-toxiproxy-image`: the node
+          # has no direct pull path to ghcr.io, and the registry is already wired into its
+          # containerd hosts.toml.
+          image: localhost:5001/toxiproxy:2.12.0
+          args: ["-host=0.0.0.0"]
+          ports:
+            - name: opensearch
+              containerPort: 9200
+            - name: api
+              containerPort: 8474
+          readinessProbe:
+            # The control API answering is not enough — it answers before any proxy exists,
+            # and a pod that passed readiness with no listener on 9200 would make every
+            # OpenSearch call fail connection-refused, which reads as T9, not T8. Probe the
+            # proxy the configure container creates instead.
+            httpGet: { path: /proxies/opensearch, port: 8474 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+        # The image is distroless and ships neither a shell nor toxiproxy-cli, and the
+        # `-config` file format carries proxies but not toxics — so the toxic has to be
+        # POSTed to the control API after the server is listening. A sidecar rather than a
+        # postStart hook because postStart output is not in `kubectl logs`, and a silently
+        # failed toxic is the one failure mode that would make T8 report a clean pass while
+        # injecting nothing.
+        - name: configure
+          image: curlimages/curl:8.14.1
+          env:
+            - name: TOXIPROXY_LATENCY_MS
+              value: "8000"
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until curl -fsS http://127.0.0.1:8474/version >/dev/null 2>&1; do
+                echo "waiting for the toxiproxy control API"; sleep 1
+              done
+              # Idempotent: the pod may restart while the Deployment stays, and a 409 on an
+              # existing proxy must not wedge the sidecar in CrashLoopBackOff.
+              curl -fsS -X POST http://127.0.0.1:8474/proxies \
+                -H 'Content-Type: application/json' \
+                -d '{"name":"opensearch","listen":"0.0.0.0:9200","upstream":"opensearch:9200","enabled":true}' \
+                || echo "proxy already exists, continuing"
+              # Downstream only. An 8s upstream toxic plus an 8s downstream one would be 16s
+              # per call, past the opensearch-py client's 10s timeout — which turns the
+              # scenario into a fail-open test (that is T9) instead of a slow-but-working one.
+              curl -fsS -X POST http://127.0.0.1:8474/proxies/opensearch/toxics \
+                -H 'Content-Type: application/json' \
+                -d "{\"name\":\"latency_downstream\",\"type\":\"latency\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"latency\":${TOXIPROXY_LATENCY_MS},\"jitter\":0}}" \
+                || echo "toxic already present, continuing"
+              echo "toxiproxy configured:"
+              curl -fsS http://127.0.0.1:8474/proxies/opensearch
+              echo
+              # Stays alive so the container does not restart-loop behind a Deployment whose
+              # restartPolicy is necessarily Always.
+              while true; do sleep 3600; done
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }

@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 import logging
-import re
+import time
+import uuid
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repository.chunk_repository import ChunkRepository
-from src.schemas.retrieval import (
-    AnswerCitationSpan,
-    ChunkProvenance,
-    Citation,
-    DisplayLabelMap,
-    RAGContext,
-)
+from src.schemas.query_router import DocumentScopeResult
+from src.schemas.retrieval import AnswerCitationSpan, ChunkProvenance, Citation, RAGContext
 from src.services.llm_adapters.base_adapter import LLMResponseStats
 from src.services.retrieval.payload_hydrator import _parse_provenance
 
@@ -68,6 +65,81 @@ def out_of_scope_response() -> str:
     )
 
 
+def too_broad_response(covered: int, max_companies: int) -> str:
+    """Fixed reply when a question covers more companies than one run can analyse."""
+    return (
+        f"This question covers {covered} companies, and I can analyse up to {max_companies} "
+        "at once. Name the companies you want compared, or narrow the scope to fewer "
+        "companies, and ask again."
+    )
+
+
+def build_scope_clarification_event(
+    clarification_id: UUID,
+    scope: DocumentScopeResult,
+    named_companies: bool,
+    max_companies: int,
+) -> dict:
+    """Payload of the `scope_clarification` event, also stored on the card's message so a
+    reload renders the same card. ``outcome`` is "too_broad" or "entities"."""
+    # An ambiguous entity provisionally covers its top candidate; that's a guess, not a match.
+    guesses = {
+        c.candidates[0].display_name
+        for c in scope.clarifications
+        if c.outcome == "ambiguous" and c.candidates
+    }
+    return {
+        "clarification_id": str(clarification_id),
+        "outcome": "too_broad" if scope.too_broad_count is not None else "entities",
+        "named_companies": named_companies,
+        "unresolved": [
+            {
+                "raw_span": c.raw_span,
+                "outcome": c.outcome,
+                "candidates": [
+                    {
+                        "company": k.display_name,
+                        "years": sorted(k.years),
+                        "doc_count": len(k.doc_ids),
+                    }
+                    for k in c.candidates
+                ],
+            }
+            for c in scope.clarifications
+        ],
+        "resolved": [
+            n for n, ids in (scope.per_entity_doc_ids or {}).items() if ids and n not in guesses
+        ],
+        "covered_count": scope.too_broad_count,
+        "max_companies": max_companies,
+    }
+
+
+def clarification_text(payload: dict) -> str:
+    """The card as plain text: the message content, for history, copy and API clients."""
+    if payload["outcome"] == "too_broad":
+        if payload["named_companies"]:
+            return (
+                f"I can compare up to {payload['max_companies']} companies per question. "
+                "Split it into smaller questions."
+            )
+        return (
+            f"This covers {payload['covered_count']} companies. I can analyse up to "
+            f"{payload['max_companies']} at once — pick which ones."
+        )
+    lines = []
+    for u in payload["unresolved"]:
+        span = u["raw_span"]
+        if u["outcome"] == "ambiguous":
+            lines.append(f'I couldn\'t tell which company you mean by "{span}".')
+        elif u["outcome"] == "none":
+            lines.append(f'I found no document for "{span}".')
+        else:
+            company = u["candidates"][0]["company"] if u["candidates"] else span
+            lines.append(f"{company} isn't in your current selection.")
+    return "\n\n".join(lines)
+
+
 _GENERIC_USER_ERROR = "Something went wrong. Please try again."
 
 
@@ -85,6 +157,41 @@ def error_event(exc: Exception, user_message: str | None = None) -> dict:
         "message": str(exc),
         "user_message": user_message or _GENERIC_USER_ERROR,
     }
+
+
+ActivityKind = Literal[
+    "stage_started",
+    "stage_ended",
+    "tool_call_started",
+    "tool_call_ended",
+    "round_started",
+]
+
+
+def build_activity_event(
+    kind: ActivityKind,
+    *,
+    event_id: str | None = None,
+    label: str | None = None,
+    parent_id: str | None = None,
+    detail: dict | None = None,
+) -> tuple[str, dict]:
+    """Build an `activity` event payload. Returns (id, event_data) — the id is the
+    caller's handle for emitting the matching `_ended` event later (e.g. `stage_ended`
+    or `tool_call_ended` reference the `_started` event's id, not its label), so
+    correlation doesn't depend on label/entity string matching under concurrency.
+
+    Pass `event_id` when closing a previously-started activity — it must be the id
+    returned for that activity's `_started` event, not a fresh one."""
+    event_id = event_id or str(uuid.uuid4())
+    data: dict = {"kind": kind, "id": event_id, "ts": time.time()}
+    if parent_id is not None:
+        data["parent_id"] = parent_id
+    if label is not None:
+        data["label"] = label
+    if detail is not None:
+        data["detail"] = detail
+    return event_id, data
 
 
 def _provenance_bbox_hints(provenance: ChunkProvenance | None) -> list[dict] | None:
@@ -142,50 +249,20 @@ def citation_to_dict(c: Citation, provenance: ChunkProvenance | None = None) -> 
     return d
 
 
-def extract_used_citations(text: str, rag_context: RAGContext) -> list[Citation]:
-    """Parse [S1], [S2], [C1], [C2], etc. from LLM output and map to citation objects.
-
-    Matches both S-prefixed (new) and C-prefixed (legacy) ref_ids that exist
-    in rag_context (whitelist) to avoid false positives.
-    """
-    ref_by_id = {item.ref_id: item.citation for item in rag_context.items}
-    if not ref_by_id:
-        return []
-    valid_ref_ids = sorted(ref_by_id, key=lambda r: (-len(r), r))  # longer first (S10 before S1)
-    pattern = re.compile(r"\[(" + "|".join(re.escape(r) for r in valid_ref_ids) + r")\]")
-    seen: set[str] = set()
-    result: list[Citation] = []
-    for m in pattern.finditer(text):
-        ref_id = m.group(1)
-        if ref_id not in seen:
-            seen.add(ref_id)
-            result.append(ref_by_id[ref_id])
-    return result
-
-
-def build_references_list(
-    rag_context: RAGContext,
-    label_map: DisplayLabelMap,
-) -> list[dict]:
-    """Build ordered references list from label map and RAG context.
-
-    Returns references sorted by display label (C1, C2, ...).
-    Only includes sources that were actually cited in the answer.
-    """
+def build_references_list(rag_context: RAGContext, cited_ref_ids: list[str]) -> list[dict]:
+    """Build the references list for the sources the answer actually cited, ordered by
+    first appearance in the answer."""
     item_by_id = {item.ref_id: item for item in rag_context.items}
     result: list[dict] = []
     unresolved: list[str] = []
-    for source_id, display_label in sorted(
-        label_map.mapping.items(),
-        key=lambda x: int(x[1][1:]),  # sort by numeric part of "C1", "C2", ...
-    ):
-        ctx_item = item_by_id.get(source_id)
+    for ref_id in cited_ref_ids:
+        ctx_item = item_by_id.get(ref_id)
         if ctx_item:
             entry = citation_to_dict(ctx_item.citation, ctx_item.provenance)
-            entry["display_label"] = display_label
+            entry["display_label"] = ref_id
             result.append(entry)
         else:
-            unresolved.append(f"{source_id}->{display_label}")
+            unresolved.append(ref_id)
     if unresolved:
         # The model cited a source ID with no matching context item — the citation
         # pill for it will render but won't resolve to an evidence entry.
@@ -199,23 +276,18 @@ def build_references_list(
     return result
 
 
-def span_to_dict(span: AnswerCitationSpan, display_labels: tuple[str, ...]) -> dict:
+def span_to_dict(span: AnswerCitationSpan) -> dict:
     """Serialize an AnswerCitationSpan for JSON event payload."""
-    return {
-        "start": span.start,
-        "end": span.end,
-        "ref_ids": list(span.ref_ids),
-        "display_labels": list(display_labels),
-    }
+    return {"start": span.start, "end": span.end, "ref_ids": list(span.ref_ids)}
 
 
 def build_all_references(rag_context: RAGContext) -> list[dict]:
-    """Build references from ALL RAG items for weak models (citation_mode: none).
+    """Build references from ALL RAG items — the fallback when the model emitted no
+    parseable citations at all.
 
-    Items are ordered by reranker score (S1 = highest). The display label keeps
-    the original S-prefix (S1, S2, ...) so it matches any S-labels the model
-    may have written naturally in its answer, since weak models see those labels
-    in the context but are not instructed to format them as bracket citations.
+    Sorting by score agrees with the S-labels here: the agent path now assigns labels in
+    global score order, so S1 really is the highest-scoring chunk. The display label keeps
+    the original S-prefix so it matches any S-labels the model wrote naturally.
     """
     sorted_items = sorted(rag_context.items, key=lambda i: i.score, reverse=True)
     result = []
@@ -227,13 +299,11 @@ def build_all_references(rag_context: RAGContext) -> list[dict]:
 
 
 def build_usage_event(
-    accumulated_content: str,
-    rag_context: RAGContext | None,
     assistant_message_id: UUID,
     assistant_seq: int,
     stats: LLMResponseStats | None,
     citation_spans: list[AnswerCitationSpan] | None = None,
-    label_map: DisplayLabelMap | None = None,
+    references: list[dict] | None = None,
 ) -> dict:
     """Build usage_data dict for the usage event."""
     usage_data: dict = {
@@ -253,22 +323,10 @@ def build_usage_event(
             "cost_usd": stats.cost_usd,
         }
 
-    if citation_spans and label_map:
-        # New structured citation spans
-        usage_data["citation_spans"] = [
-            span_to_dict(s, label_map.get_labels_for_refs(s.ref_ids)) for s in citation_spans
-        ]
-
-    if rag_context and rag_context.items:
-        if label_map and label_map.mapping:
-            # Build references from label map (only cited sources)
-            usage_data["references"] = build_references_list(rag_context, label_map)
-            # Backwards-compat: also include flat citations list
-            usage_data["citations"] = usage_data["references"]
-        else:
-            # Regex fallback: no <claim> tags were found, extract [S1] or [C1] patterns
-            used = extract_used_citations(accumulated_content, rag_context)
-            usage_data["citations"] = [citation_to_dict(c) for c in used]
+    if citation_spans:
+        usage_data["citation_spans"] = [span_to_dict(sp) for sp in citation_spans]
+    if references:
+        usage_data["references"] = references
 
     return usage_data
 
@@ -320,23 +378,3 @@ async def hydrate_bbox_hints(
         cid = entry.get("chunk_id")
         if isinstance(cid, str) and cid in bbox_by_chunk:
             entry["bbox_hints"] = bbox_by_chunk[cid]
-
-
-def agent_turn_started_event(iteration: int) -> dict:
-    return {"iteration": iteration}
-
-
-def tool_call_started_event(entity: str, search_mode: str) -> dict:
-    return {"entity": entity, "search_mode": search_mode}
-
-
-def tool_call_completed_event(entity: str, chunks_returned: int, new_chunks_added: int) -> dict:
-    return {
-        "entity": entity,
-        "chunks_returned": chunks_returned,
-        "new_chunks_added": new_chunks_added,
-    }
-
-
-def agent_synthesis_starting_event(total_chunks: int, iterations: int) -> dict:
-    return {"total_chunks": total_chunks, "iterations": iterations}

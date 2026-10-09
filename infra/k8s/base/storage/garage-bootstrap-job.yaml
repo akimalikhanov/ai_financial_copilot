@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: garage-bootstrap
+  namespace: copilot
+spec:
+  backoffLimit: 6
+  # High so `kubectl logs job/garage-bootstrap` still works after a Complete run while
+  # developing; trim once this is unattended (Stage 19).
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure          # required for Jobs; Always is rejected
+      # curlimages/curl runs as non-root by default (uid 100), which can't `apk add`. This Job
+      # is short-lived and talks only to the in-cluster Garage admin API, so running it as root
+      # is a small, contained trade-off — same one infra/docker/docker-compose.yml's
+      # garage-secrets container makes for the same reason (`apk add --no-cache openssl`).
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: bootstrap
+          image: curlimages/curl:8.14.1
+          command: ["/bin/sh", "-c", "apk add --no-cache jq >/dev/null && /bin/sh /bootstrap/garage-bootstrap.sh"]
+          env:
+            - name: GARAGE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: { name: garage-secret, key: garage_admin_token }
+            - name: GARAGE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: { name: garage-secret, key: garage_s3_access_key_id }
+            - name: GARAGE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: garage-secret, key: garage_s3_secret_access_key }
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: garage-bootstrap-script
+            defaultMode: 0o755

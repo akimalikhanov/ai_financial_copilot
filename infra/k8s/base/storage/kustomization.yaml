@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - garage-service.yaml
+  - garage-statefulset.yaml
+  - garage-bootstrap-job.yaml
+
+# garage.toml and garage-bootstrap.sh are deliberately-diverged rewrites of
+# infra/docker/garage/garage.toml and infra/scripts/garage_bootstrap.sh (stage-17 plan
+# Phase 9, concepts 2-4), not literal copies — so no make k8s-sync-*/k8s-check-* drift target
+# applies here the way it does for postgres/es-bootstrap. Edit both pairs by hand.
+configMapGenerator:
+  - name: garage-toml
+    files:
+      - garage.toml
+  - name: garage-bootstrap-script
+    files:
+      - garage-bootstrap.sh

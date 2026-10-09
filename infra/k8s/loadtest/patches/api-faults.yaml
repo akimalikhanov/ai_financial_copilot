@@ -1,0 +1,23 @@
+# The api half of the T8 fault (docs/notes/loadtest-readiness-audit.md §5). See
+# worker-chat-faults.yaml for why these live outside the fake-llm patches.
+#
+# The api needs the override because T8's second half is §4.4: `DELETE /v1/documents` calls
+# opensearch_ingest.delete_by_document, and the bar is that a slow delete does not stall the
+# event loop and with it every open SSE stream. Pointing only worker-chat at the proxy would
+# leave that leg talking to a healthy cluster and the scenario would measure nothing.
+#
+# No FAKE_LLM_LATENCY_MS here: the api makes no LLM call on the chat path (T7 lives entirely
+# in the worker), so adding it would only widen the blast radius of a typo.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            # The trailing comment is sed's anchor in `make k8s-loadtest` — keep it.
+            - name: OPENSEARCH_HOST
+              value: "opensearch" # OPENSEARCH_HOST

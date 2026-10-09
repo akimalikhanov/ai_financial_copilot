@@ -58,6 +58,37 @@ class TestRetrieveEdgeCases:
         assert client.calls == []
 
 
+class TestDocIdsFilter:
+    @pytest.mark.asyncio
+    async def test_empty_doc_ids_returns_empty_no_client_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient([_point()])
+        monkeypatch.setattr(qdrant_retriever, "get_client", lambda: client)
+        assert await retrieve([0.1], uuid4(), doc_ids=[], top_k=5) == []
+        assert client.calls == []
+
+    @pytest.mark.asyncio
+    async def test_none_doc_ids_applies_no_document_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = FakeClient([])
+        monkeypatch.setattr(qdrant_retriever, "get_client", lambda: client)
+        await retrieve([0.1], uuid4(), doc_ids=None, top_k=5)
+        keys = [c.key for c in client.calls[0]["query_filter"].must]
+        assert keys == ["user_id"]
+
+    @pytest.mark.asyncio
+    async def test_doc_ids_filter_by_document(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = FakeClient([])
+        monkeypatch.setattr(qdrant_retriever, "get_client", lambda: client)
+        did = uuid4()
+        await retrieve([0.1], uuid4(), doc_ids=[did], top_k=5)
+        doc_cond = client.calls[0]["query_filter"].must[1]
+        assert doc_cond.key == "document_id"
+        assert doc_cond.match.any == [str(did)]
+
+
 class TestRetrieveHappyPath:
     @pytest.mark.asyncio
     async def test_correct_chunk_construction(self, monkeypatch: pytest.MonkeyPatch) -> None:

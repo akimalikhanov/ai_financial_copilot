@@ -5,10 +5,10 @@ import type { Components } from 'react-markdown';
 import {
   MessageSquare, BookOpen, Plus, Send, Search,
   LogOut, User, FileText, Trash2, Layers, AlertTriangle,
-  ChevronDown, ChevronLeft, ChevronRight, Bot, Sun, Moon, Monitor, SlidersHorizontal,
+  ChevronDown, ChevronLeft, ChevronRight, Sun, Moon, Monitor, SlidersHorizontal,
   Pencil, Loader2, PanelLeft, Sparkles,
 } from 'lucide-react';
-import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem, BoundingBox } from './types';
+import { Document, Chat, Message, MessageMetadata, Scope, ViewMode, MobileTab, Citation, ReferenceItem, BoundingBox, ClarificationPick, ScopeClarification } from './types';
 import { CitedText } from './components/CitedText';
 import {
   chatEnqueue,
@@ -27,10 +27,11 @@ import {
   subscribeIngestionStream,
   ApiError,
   ModelInfo,
+  type ModelDefaultParams,
   type RequestStatsItem,
   type UserInfo,
   type DocumentListItemResponse,
-  type StageEvent,
+  type ActivityEvent,
 } from './services/api';
 import { useAuth } from './context/AuthContext';
 import { LoginPage } from './components/LoginPage';
@@ -41,14 +42,38 @@ import { UploadModal } from './components/UploadModal';
 import { DocPickerModal } from './components/DocPickerModal';
 import { ControlPane, ModelParams, RequestStats, ModelCapabilities } from './components/ControlPane';
 import { MessageActions } from './components/MessageActions';
+import { ClarificationCard } from './components/ClarificationCard';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 
 const FALLBACK_MODELS: ModelInfo[] = [
-  { id: 'gpt-4o-mini', name: 'GPT-4o-mini' },
+  { id: 'gpt-4o-mini', name: 'GPT-4o-mini', default_params: { temperature: 0.2, max_tokens: 6000 } },
 ];
 
+const modelParamsFromDefaults = (defaults: ModelDefaultParams | undefined): ModelParams => ({
+  temperature: defaults?.temperature ?? 0.2,
+  maxTokens: defaults?.max_tokens ?? 6000,
+  reasoningEffort: defaults?.reasoning_effort ?? null,
+  verbosity: defaults?.verbosity ?? null,
+});
+
 const generateId = () => Math.random().toString(36).slice(2, 11);
+
+const DEGRADED_RETRIEVAL_LABELS: Record<string, string> = {
+  dense: 'semantic search',
+  keyword: 'keyword search',
+  rerank: 'result ranking',
+};
+
+/** Names what was unavailable rather than just saying "degraded" — the user can judge
+ *  whether it matters for their question, and it is actionable when reported. */
+const describeDegradedRetrieval = (degraded: string[]): string => {
+  const names = degraded.map(d => DEGRADED_RETRIEVAL_LABELS[d] ?? d);
+  const joined = names.length > 1
+    ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+    : names[0];
+  return `Search ran degraded — ${joined} unavailable`;
+};
 const mapDocStatus = (s: string): Document['status'] =>
   s === 'ready' ? 'Ready' : s === 'failed' ? 'Error' : 'Processing';
 
@@ -90,7 +115,7 @@ function groupChatsByDate(chats: Chat[]): { label: string; items: Chat[] }[] {
 
 const toUiMessage = (msg: { id: string; role: string; content: string; created_at: string; metadata?: Record<string, unknown>; feedback?: { rating: 'up' | 'down'; comment?: string | null } | null }): Message => {
   const meta = msg.metadata || {};
-  const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels: string[] }> | undefined;
+  const spans = meta.citation_spans as Array<{ start: number; end: number; ref_ids: string[]; display_labels?: string[] }> | undefined;
   const refs = meta.references as Array<Record<string, unknown>> | undefined;
   return {
     id: msg.id,
@@ -98,7 +123,9 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
     content: msg.content,
     timestamp: new Date(msg.created_at).getTime(),
     citations: meta.citations as Citation[] | undefined,
-    citationSpans: spans?.map((s) => ({ start: s.start, end: s.end, refIds: s.ref_ids, displayLabels: s.display_labels })),
+    // display_labels is absent on messages persisted after the C-label hop was removed;
+    // those pills render the S-labels the references carry.
+    citationSpans: spans?.map((s) => ({ start: s.start, end: s.end, refIds: s.ref_ids, displayLabels: s.display_labels ?? s.ref_ids })),
     references: refs?.map((r: Record<string, unknown>) => ({
       refId: r.ref_id as string,
       displayLabel: r.display_label as string,
@@ -112,6 +139,18 @@ const toUiMessage = (msg: { id: string; role: string; content: string; created_a
       bboxHints: (r.bbox_hints as ReferenceItem['bboxHints'] | undefined) ?? undefined,
     })),
     feedback: msg.feedback ? { rating: msg.feedback.rating, comment: msg.feedback.comment ?? null } : null,
+    // Carried through so quality badges survive a reload — they are streamed on the
+    // `metadata` SSE event, which only ever reaches the client that was connected.
+    metadata: {
+      confidence: meta.confidence as MessageMetadata['confidence'],
+      ungrounded_claims: meta.ungrounded_claims as boolean | null | undefined,
+      route: meta.route as string | null | undefined,
+      degraded_retrieval: meta.degraded_retrieval as string[] | null | undefined,
+    },
+    ...(meta.kind === 'clarification' && {
+      clarification: meta.clarification as ScopeClarification,
+      clarificationAnswered: Boolean(meta.answered),
+    }),
   };
 };
 
@@ -123,6 +162,7 @@ const toUiDoc = (d: DocumentListItemResponse): Document => ({
   type: (d.metadata?.type as string | undefined) ?? '',
   pages: d.page_count ?? 0,
   status: mapDocStatus(d.status),
+  partialParse: d.parse_status != null && d.parse_status !== 'success',
   tags: [],
 });
 
@@ -249,45 +289,6 @@ function EvidenceList({
   );
 }
 
-const STAGE_LABELS: Record<string, string> = {
-  load_and_validate_request: 'Loading request',
-  build_conversation_context: 'Building context',
-  scan_user_input: 'Scanning input',
-  route_query: 'Routing query',
-  agent_loop: 'Searching documents',
-  // classic (non-agent) fallback stages — shown if agent loop is disabled
-  transform_query: 'Transforming query',
-  build_rag_context: 'Retrieving sources',
-  render_prompt: 'Rendering prompt',
-  stream_llm_response: 'Generating answer',
-  persist_and_emit: 'Finalizing',
-};
-
-// Ordered stages as seen by the agent path (used for the stepper)
-const AGENT_STAGES = [
-  'load_and_validate_request',
-  'build_conversation_context',
-  'scan_user_input',
-  'route_query',
-  'agent_loop',
-  'render_prompt',
-  'stream_llm_response',
-  'persist_and_emit',
-];
-
-// Ordered stages for classic (non-agent) path
-const CLASSIC_STAGES = [
-  'load_and_validate_request',
-  'build_conversation_context',
-  'scan_user_input',
-  'route_query',
-  'transform_query',
-  'build_rag_context',
-  'render_prompt',
-  'stream_llm_response',
-  'persist_and_emit',
-];
-
 const MD_COMPONENTS: Components = {
   p: ({ children }) => <p className="mb-3 last:mb-0 leading-relaxed">{children}</p>,
   strong: ({ children }) => <strong className="font-semibold text-[var(--text)]">{children}</strong>,
@@ -325,6 +326,8 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   fetch_document_record: 'Starting',
   download_pdf: 'Downloading',
   parse_pdf_docling: 'Parsing',
+  upload_picture_crops: 'Uploading',
+  load_persisted_parse: 'Resuming',
   export_docling_artifacts: 'Exporting',
   save_metadata_and_upload_artifacts: 'Saving',
   chunk_document: 'Chunking',
@@ -334,30 +337,202 @@ const INGEST_STAGE_LABELS: Record<string, string> = {
   ensure_vector_and_search_indexes: 'Indexing',
   index_and_backup_chunks: 'Indexing',
   finalize_ready: 'Finalizing',
+  retrying: 'Retrying',
 };
-interface StageRecord { stage: string; startedAt: number; endedAt?: number; }
 
-interface ToolCallRecord { entity: string; startedAt: number; endedAt?: number; chunksReturned?: number; }
+const ingestionLabel = (doc: Document): string => {
+  const stage = doc.ingestionStage;
+  if (!stage) return doc.status;
+  const name = INGEST_STAGE_LABELS[stage] ?? stage.replace(/_/g, ' ');
+  if (stage === 'retrying') return doc.ingestionAttempt ? `${name} (attempt ${doc.ingestionAttempt})` : name;
+  if (doc.ingestionStageIndex != null && doc.ingestionStageTotal != null) {
+    return `${name} ${doc.ingestionStageIndex}/${doc.ingestionStageTotal}`;
+  }
+  return name;
+};
+// One *_started event plus its matching *_ended data, once it arrives.
+interface ActivityRecord {
+  event: ActivityEvent;
+  endedAt?: number;
+  endDetail?: Record<string, unknown>;
+}
 
 interface StageSnapshot {
-  current: StageEvent;
-  records: StageRecord[];
-  toolCalls: ToolCallRecord[];
+  stages: ActivityRecord[]; // stage_started records, in arrival order — no fixed reference list
+  rounds: ActivityRecord[]; // round_started records, in arrival order — no _ended kind exists
+  toolCalls: ActivityRecord[]; // tool_call_started records; event.parent_id groups them under a round
   done: boolean;
+}
+
+// Applies one activity event to a snapshot. Used both live (SSE) and when replaying a
+// persisted `trace.activity` log on load — same fold, two sources.
+function applyActivityEvent(snap: StageSnapshot, ev: ActivityEvent): StageSnapshot {
+  switch (ev.kind) {
+    case 'stage_started':
+      if (snap.stages.some(r => r.event.id === ev.id)) return snap;
+      return { ...snap, stages: [...snap.stages, { event: ev }] };
+    case 'stage_ended':
+      return {
+        ...snap,
+        stages: snap.stages.map(r =>
+          r.event.id === ev.id ? { ...r, endedAt: ev.ts * 1000, endDetail: ev.detail } : r
+        ),
+      };
+    case 'round_started':
+      if (snap.rounds.some(r => r.event.id === ev.id)) return snap;
+      return { ...snap, rounds: [...snap.rounds, { event: ev }] };
+    case 'tool_call_started':
+      if (snap.toolCalls.some(r => r.event.id === ev.id)) return snap;
+      return { ...snap, toolCalls: [...snap.toolCalls, { event: ev }] };
+    case 'tool_call_ended':
+      return {
+        ...snap,
+        toolCalls: snap.toolCalls.map(r =>
+          r.event.id === ev.id ? { ...r, endedAt: ev.ts * 1000, endDetail: ev.detail } : r
+        ),
+      };
+    default:
+      return snap;
+  }
+}
+
+function snapshotFromActivityLog(events: ActivityEvent[]): StageSnapshot {
+  const folded = events.reduce(applyActivityEvent, { stages: [], rounds: [], toolCalls: [], done: true });
+  // The pipeline's final stage_ended fires after the trace snapshot used to persist
+  // `trace.activity` is taken (see tasks.py), so it's never in this log — close any
+  // still-open record here the same way the live SSE path does on completion.
+  const lastTs = events.length > 0 ? events[events.length - 1].ts * 1000 : Date.now();
+  const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: lastTs } : r);
+  return { ...folded, stages: folded.stages.map(closeOpen), toolCalls: folded.toolCalls.map(closeOpen) };
+}
+
+// Rehydrates agent-step snapshots for messages loaded from history, so they survive a
+// page reload instead of only existing for the duration of the live SSE stream.
+function stageSnapshotsFromMessages(
+  messages: { id: string; trace?: { activity?: ActivityEvent[] } | null }[]
+): Record<string, StageSnapshot> {
+  const result: Record<string, StageSnapshot> = {};
+  for (const m of messages) {
+    if (m.trace?.activity?.length) result[m.id] = snapshotFromActivityLog(m.trace.activity);
+  }
+  return result;
+}
+
+// Rounds of tool calls that occurred during one stage's time window, grouped by
+// parent_id rather than flattened — a repeat search on the same entity in a later
+// round reads as a second pass, not a duplicate row.
+function RoundsList({ rounds, toolCalls }: { rounds: ActivityRecord[]; toolCalls: ActivityRecord[] }) {
+  if (rounds.length === 0) return null;
+  return (
+    <div className="ml-8 mb-1 flex flex-col gap-2">
+      {rounds.map((round, ri) => {
+        const calls = toolCalls.filter(tc => tc.event.parent_id === round.event.id);
+        const lookups = calls.filter(tc => tc.event.detail?.tool !== 'report');
+        const reports = calls.filter(tc => tc.event.detail?.tool === 'report');
+        const allDone = calls.length > 0 && calls.every(tc => !!tc.endedAt);
+        const roundDur = allDone
+          ? ((Math.max(...calls.map(tc => tc.endedAt!)) - round.event.ts * 1000) / 1000).toFixed(1) + 's'
+          : null;
+        const summary = [
+          lookups.length > 0 ? `${lookups.length} lookup${lookups.length === 1 ? '' : 's'}` : null,
+          reports.length > 0 ? `${reports.length} report${reports.length === 1 ? '' : 's'}` : null,
+        ].filter(Boolean).join(', ') || '0 lookups';
+        return (
+          <div key={round.event.id}>
+            <div
+              className="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded mb-1"
+              style={{ background: 'var(--surface-2)', color: 'var(--text-faint)', border: '1px solid var(--border)' }}
+            >
+              round {ri + 1} · {summary}
+              {roundDur ? ` · ${roundDur}` : calls.length > 0 ? ' · running' : ''}
+            </div>
+            <div className="flex flex-col gap-1">
+              {calls.map((tc, ti) => {
+                const tcStartedAt = tc.event.ts * 1000;
+                const tcDone = !!tc.endedAt;
+                const tcDur = tc.endedAt
+                  ? ((tc.endedAt - tcStartedAt) / 1000).toFixed(2) + 's'
+                  : ((Date.now() - tcStartedAt) / 1000).toFixed(1) + 's';
+                const chunksReturned = tc.endDetail?.chunks_returned as number | undefined;
+                return (
+                  <div
+                    key={tc.event.id}
+                    className="tc-row-enter flex items-center gap-2"
+                    style={{ animationDelay: `${ti * 40}ms` }}
+                  >
+                    {/* Status dot */}
+                    <span
+                      className={tcDone ? 'tc-dot-pop' : ''}
+                      style={{
+                        display: 'inline-block',
+                        width: 6, height: 6,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        background: tcDone ? 'var(--accent)' : 'var(--text-faint)',
+                        opacity: tcDone ? 0.8 : 0.35,
+                        transition: 'background 0.3s ease, opacity 0.3s ease',
+                      }}
+                    />
+
+                    {/* Entity name — shimmer while running, solid when done */}
+                    <span
+                      className={`text-[10px] leading-none ${!tcDone ? 'tc-shimmer' : ''}`}
+                      style={tcDone ? { color: 'var(--text-faint)' } : {}}
+                    >
+                      {tc.event.label}
+                    </span>
+
+                    {/* Chunk count badge — fades in on completion */}
+                    {chunksReturned !== undefined && (
+                      <span
+                        className="text-[9px] px-1 py-px rounded-full"
+                        style={{
+                          background: 'var(--surface-2)',
+                          color: 'var(--text-faint)',
+                          border: '1px solid var(--border)',
+                          opacity: tcDone ? 0.75 : 0,
+                          transition: 'opacity 0.4s ease',
+                        }}
+                      >
+                        {chunksReturned} chunks
+                      </span>
+                    )}
+
+                    {/* Elapsed time */}
+                    <span
+                      className="text-[9px] font-mono ml-1"
+                      style={{
+                        color: 'var(--text-faint)',
+                        opacity: tcDone ? 0.45 : 0.3,
+                        transition: 'opacity 0.3s ease',
+                      }}
+                    >
+                      {tcDur}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
   const [expanded, setExpanded] = React.useState(false);
   const [tick, setTick] = React.useState(0);
-  const prevStageRef = React.useRef(snapshot.current.stage);
+  const activeStage = snapshot.done ? undefined : snapshot.stages[snapshot.stages.length - 1];
+  const prevStageIdRef = React.useRef(activeStage?.event.id);
   const [labelKey, setLabelKey] = React.useState(0);
 
   React.useEffect(() => {
-    if (snapshot.current.stage !== prevStageRef.current) {
-      prevStageRef.current = snapshot.current.stage;
+    if (activeStage?.event.id !== prevStageIdRef.current) {
+      prevStageIdRef.current = activeStage?.event.id;
       setLabelKey(k => k + 1);
     }
-  }, [snapshot.current.stage]);
+  }, [activeStage?.event.id]);
 
   React.useEffect(() => {
     if (snapshot.done) return;
@@ -367,20 +542,20 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
 
   void tick;
 
-  // Default to agent path; only switch to classic if transform_query is seen
-  const isClassicPath = snapshot.records.some(r => r.stage === 'transform_query') ||
-    snapshot.current.stage === 'transform_query';
-  const stages = isClassicPath ? CLASSIC_STAGES : AGENT_STAGES;
-
-  const first = snapshot.records[0]?.startedAt;
-  const last = snapshot.records[snapshot.records.length - 1]?.endedAt;
+  const first = snapshot.stages[0]?.event.ts;
+  const last = snapshot.stages[snapshot.stages.length - 1]?.endedAt;
   const totalElapsed = snapshot.done
-    ? (first && last ? ((last - first) / 1000).toFixed(1) : null)
-    : (first ? ((Date.now() - first) / 1000).toFixed(1) : null);
+    ? (first && last ? (last / 1000 - first).toFixed(1) : null)
+    : (first ? (Date.now() / 1000 - first).toFixed(1) : null);
 
-  const label = snapshot.done
-    ? 'Done'
-    : STAGE_LABELS[snapshot.current.stage] ?? snapshot.current.stage.replace(/_/g, ' ');
+  const label = snapshot.done ? 'Done' : activeStage?.event.label ?? '…';
+
+  const activeRound = snapshot.done ? undefined : snapshot.rounds[snapshot.rounds.length - 1];
+  const activeRoundCalls = activeRound
+    ? snapshot.toolCalls.filter(tc => tc.event.parent_id === activeRound.event.id)
+    : [];
+  const activeRoundLookups = activeRoundCalls.filter(tc => tc.event.detail?.tool !== 'report').length;
+  const activeRoundReports = activeRoundCalls.filter(tc => tc.event.detail?.tool === 'report').length;
 
   return (
     <div className="pl-4 py-1">
@@ -407,8 +582,12 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
           {label}
         </span>
 
-        {!snapshot.done && (
-          <span className="text-[var(--text-faint)]">{snapshot.current.index}/{snapshot.current.total}</span>
+        {activeRound && (activeRoundLookups > 0 || activeRoundReports > 0) && (
+          <span className="text-[var(--text-faint)]">
+            round {snapshot.rounds.length}
+            {activeRoundLookups > 0 && ` · ${activeRoundLookups} lookup${activeRoundLookups === 1 ? '' : 's'}`}
+            {activeRoundReports > 0 && ' · recording findings'}
+          </span>
         )}
 
         {totalElapsed !== null && (
@@ -433,23 +612,26 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
       >
         <div className="overflow-hidden">
           <div className="mt-2.5 ml-1 flex flex-col">
-            {stages.map((s, i) => {
-              const rec = snapshot.records.find(r => r.stage === s);
-              const isDone = !!rec?.endedAt;
-              const isActive = !snapshot.done && s === snapshot.current.stage;
-              const isPending = !rec;
+            {snapshot.stages.map((rec, i) => {
+              const isDone = !!rec.endedAt;
+              const isActive = rec.event.id === activeStage?.event.id;
+              const startedAt = rec.event.ts * 1000;
+              const stageEnd = rec.endedAt ?? Infinity;
+              // Rounds that happened while THIS stage was open — not a flat trailing
+              // list, so they render under the stage that actually produced them.
+              const stageRounds = snapshot.rounds.filter(r => {
+                const t = r.event.ts * 1000;
+                return t >= startedAt && t < stageEnd;
+              });
 
-              const dur = rec?.endedAt
-                ? ((rec.endedAt - rec.startedAt) / 1000).toFixed(2) + 's'
+              const dur = rec.endedAt
+                ? ((rec.endedAt - startedAt) / 1000).toFixed(2) + 's'
                 : isActive
-                  ? ((Date.now() - rec!.startedAt) / 1000).toFixed(1) + 's'
+                  ? ((Date.now() - startedAt) / 1000).toFixed(1) + 's'
                   : null;
 
-              // Skip optional scan_user_input if it never ran
-              if (s === 'scan_user_input' && isPending) return null;
-
               return (
-                <React.Fragment key={s}>
+                <React.Fragment key={rec.event.id}>
                   <div className="flex items-stretch gap-3">
                     {/* Track column */}
                     <div className="flex flex-col items-center flex-shrink-0" style={{ width: 14 }}>
@@ -476,10 +658,10 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
                       <div
                         className="w-px flex-1"
                         style={{
-                          minHeight: i === stages.length - 1 ? 0 : 6,
+                          minHeight: i === snapshot.stages.length - 1 ? 0 : 6,
                           background: isDone ? 'var(--accent)' : 'var(--border)',
                           transition: 'background 0.4s ease',
-                          visibility: i === stages.length - 1 ? 'hidden' : 'visible',
+                          visibility: i === snapshot.stages.length - 1 ? 'hidden' : 'visible',
                         }}
                       />
                     </div>
@@ -490,11 +672,10 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
                         style={{
                           color: isActive ? 'var(--text)' : 'var(--text-faint)',
                           fontWeight: isActive ? 500 : 400,
-                          opacity: isPending ? 0.4 : 1,
-                          transition: 'color 0.3s, opacity 0.3s',
+                          transition: 'color 0.3s',
                         }}
                       >
-                        {STAGE_LABELS[s]}
+                        {rec.event.label}
                       </span>
                       {dur && (
                         <span
@@ -510,75 +691,7 @@ function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
                       )}
                     </div>
                   </div>
-
-                  {/* Tool call sub-items under agent_loop */}
-                  {s === 'agent_loop' && snapshot.toolCalls.length > 0 && (
-                    <div className="ml-8 mb-1 flex flex-col gap-1">
-                      {snapshot.toolCalls.map((tc, ti) => {
-                        const tcDone = !!tc.endedAt;
-                        const tcDur = tc.endedAt
-                          ? ((tc.endedAt - tc.startedAt) / 1000).toFixed(2) + 's'
-                          : ((Date.now() - tc.startedAt) / 1000).toFixed(1) + 's';
-                        return (
-                          <div
-                            key={`${tc.entity}-${ti}`}
-                            className="tc-row-enter flex items-center gap-2"
-                            style={{ animationDelay: `${ti * 40}ms` }}
-                          >
-                            {/* Status dot */}
-                            <span
-                              className={tcDone ? 'tc-dot-pop' : ''}
-                              style={{
-                                display: 'inline-block',
-                                width: 6, height: 6,
-                                borderRadius: '50%',
-                                flexShrink: 0,
-                                background: tcDone ? 'var(--accent)' : 'var(--text-faint)',
-                                opacity: tcDone ? 0.8 : 0.35,
-                                transition: 'background 0.3s ease, opacity 0.3s ease',
-                              }}
-                            />
-
-                            {/* Entity name — shimmer while running, solid when done */}
-                            <span
-                              className={`text-[10px] leading-none ${!tcDone ? 'tc-shimmer' : ''}`}
-                              style={tcDone ? { color: 'var(--text-faint)' } : {}}
-                            >
-                              {tc.entity}
-                            </span>
-
-                            {/* Chunk count badge — fades in on completion */}
-                            {tc.chunksReturned !== undefined && (
-                              <span
-                                className="text-[9px] px-1 py-px rounded-full"
-                                style={{
-                                  background: 'var(--surface-2)',
-                                  color: 'var(--text-faint)',
-                                  border: '1px solid var(--border)',
-                                  opacity: tcDone ? 0.75 : 0,
-                                  transition: 'opacity 0.4s ease',
-                                }}
-                              >
-                                {tc.chunksReturned} chunks
-                              </span>
-                            )}
-
-                            {/* Elapsed time */}
-                            <span
-                              className="text-[9px] font-mono ml-1"
-                              style={{
-                                color: 'var(--text-faint)',
-                                opacity: tcDone ? 0.45 : 0.3,
-                                transition: 'opacity 0.3s ease',
-                              }}
-                            >
-                              {tcDur}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                  <RoundsList rounds={stageRounds} toolCalls={snapshot.toolCalls} />
                 </React.Fragment>
               );
             })}
@@ -648,12 +761,9 @@ export default function App() {
 
   // Control Pane State
   const [isControlPaneOpen, setIsControlPaneOpen] = useState(false);
-  const [modelParams, setModelParams] = useState<ModelParams>({
-    temperature: 0.2,
-    maxTokens: 2000,
-    reasoningEffort: null,
-    verbosity: null,
-  });
+  const [modelParams, setModelParams] = useState<ModelParams>(
+    modelParamsFromDefaults(FALLBACK_MODELS[0].default_params)
+  );
   const [lastRequestStats, setLastRequestStats] = useState<RequestStats | null>(null);
   const [statsHistory, setStatsHistory] = useState<RequestStats[]>([]);
 
@@ -746,7 +856,23 @@ export default function App() {
 
   const refreshDocs = useCallback(async () => {
     const [docsRes, opts] = await Promise.all([listDocuments(), fetchFilterOptions()]);
-    setDocs(docsRes.documents.map(toUiDoc));
+    setDocs(prev => {
+      const stages = new Map(prev.map(d => [d.id, d]));
+      return docsRes.documents.map(raw => {
+        const doc = toUiDoc(raw);
+        // Carry the live stage across a refresh for anything still ingesting: this also runs
+        // when a dropped stream re-reads status, and dropping it would blank the progress text.
+        const prevDoc = stages.get(doc.id);
+        if (doc.status !== 'Processing' || !prevDoc) return doc;
+        return {
+          ...doc,
+          ingestionStage: prevDoc.ingestionStage,
+          ingestionStageIndex: prevDoc.ingestionStageIndex,
+          ingestionStageTotal: prevDoc.ingestionStageTotal,
+          ingestionAttempt: prevDoc.ingestionAttempt,
+        };
+      });
+    });
     setFilterOptions(opts);
   }, []);
 
@@ -775,6 +901,16 @@ export default function App() {
               unsub();
               setDocs(prev => prev.map(d =>
                 d.id === doc.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
+              ));
+            },
+            // Transport drop, not a failed ingest: re-read the real status while the stream
+            // reconnects, so a dropped connection can't mark a healthy document as Error.
+            () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
+            // The worker died and the document went back on the queue. Still Processing —
+            // the next attempt's stage events arrive on this same stream.
+            (attempt) => {
+              setDocs(prev => prev.map(d =>
+                d.id === doc.id ? { ...d, ingestionStage: 'retrying', ingestionStageIndex: undefined, ingestionStageTotal: undefined, ingestionAttempt: attempt } : d
               ));
             },
           );
@@ -814,6 +950,13 @@ export default function App() {
         unsub();
         setDocs(prev => prev.map(d =>
           d.id === uploaded.id ? { ...d, status: 'Error', ingestionStage: undefined } : d
+        ));
+      },
+      // See the mount-time subscription above: a dropped stream is not a failed ingest.
+      () => { void refreshDocs().catch(() => { /* offline; the retry will re-read */ }); },
+      (attempt) => {
+        setDocs(prev => prev.map(d =>
+          d.id === uploaded.id ? { ...d, ingestionStage: 'retrying', ingestionStageIndex: undefined, ingestionStageTotal: undefined, ingestionAttempt: attempt } : d
         ));
       },
     );
@@ -865,6 +1008,7 @@ export default function App() {
         const response = await fetchMessages(conversationId, { limit: 50 });
         if (!cancelled) {
           setMessagesByConversation(prev => ({ ...prev, [conversationId]: response.messages.map(toUiMessage) }));
+          setStageSnapshots(prev => ({ ...stageSnapshotsFromMessages(response.messages), ...prev }));
           setMessagesHasMore(prev => ({ ...prev, [conversationId]: response.has_more }));
           if (response.messages.length > 0) {
             const minSeq = Math.min(...response.messages.map(m => m.seq));
@@ -907,6 +1051,7 @@ export default function App() {
                   uniqueMessages.sort((a, b) => a.timestamp - b.timestamp);
                   return { ...prev, [conversationId]: uniqueMessages };
                 });
+                setStageSnapshots(prev => ({ ...stageSnapshotsFromMessages(response.messages), ...prev }));
                 setMessagesHasMore(prev => ({ ...prev, [conversationId]: response.has_more }));
                 if (response.messages.length > 0) {
                   const newMinSeq = Math.min(...response.messages.map(m => m.seq));
@@ -922,6 +1067,11 @@ export default function App() {
     container.addEventListener('scroll', handleScroll);
     return () => { container.removeEventListener('scroll', handleScroll); if (scrollTimeout) clearTimeout(scrollTimeout); };
   }, [activeChat?.conversationId, messagesHasMore, messagesLoading, messagesMinSeq]);
+
+  useEffect(() => {
+    const active = models.find(m => m.id === activeModel);
+    setModelParams(modelParamsFromDefaults(active?.default_params));
+  }, [activeModel, models]);
 
   const modelCapabilities: ModelCapabilities = React.useMemo(() => {
     const supportsAdvanced = activeModel.startsWith('gpt-5') || activeModel.includes('o1') || activeModel.includes('o3');
@@ -989,10 +1139,15 @@ export default function App() {
     setIsTyping(false);
   }, []);
 
-  const handleSendMessage = async (text: string = inputMessage) => {
+  // `reply` answers a clarification card (the backend re-runs `text`, no new user message).
+  const handleSendMessage = async (
+    text: string = inputMessage,
+    reply?: { cardId: string; picks: ClarificationPick[] },
+  ) => {
     if (!text.trim() || !activeChatId || !activeChat?.conversationId) return;
     const conversationId = activeChat.conversationId;
-    setInputMessage('');
+    if (text === inputMessage) setInputMessage('');
+    if (reply) updateMessage(conversationId, reply.cardId, m => ({ ...m, clarificationAnswered: true }));
     setIsTyping(true);
     setIsAwaitingResponse(true);
     const clientMsgId = crypto.randomUUID();
@@ -1012,8 +1167,9 @@ export default function App() {
         model: activeModel,
         params: { temperature: modelParams.temperature, max_tokens: modelParams.maxTokens, ...extraParams },
         metadata: { scope: { mode: scope.mode, docIds: scope.docIds, filters: scope.filters } },
+        ...(reply && { clarification_reply: { clarification_id: reply.cardId, picks: reply.picks } }),
       });
-      appendMessage(conversationId, { id: enqueueRes.user_message_id, role: 'user', content: text, timestamp: Date.now() });
+      if (!reply) appendMessage(conversationId, { id: enqueueRes.user_message_id, role: 'user', content: text, timestamp: Date.now() });
       const placeholderId = enqueueRes.assistant_message_id;
       appendMessage(conversationId, { id: placeholderId, role: 'assistant', content: '', timestamp: Date.now() });
       await chatStreamSubscribe(
@@ -1025,7 +1181,7 @@ export default function App() {
         (span) => {
           updateMessage(conversationId, placeholderId, m => ({
             ...m,
-            citationSpans: [...(m.citationSpans || []), { start: span.start, end: span.end, refIds: span.ref_ids, displayLabels: span.display_labels }],
+            citationSpans: [...(m.citationSpans || []), { start: span.start, end: span.end, refIds: span.ref_ids, displayLabels: span.ref_ids }],
           }));
         },
         (refs) => {
@@ -1044,60 +1200,56 @@ export default function App() {
           if (chunk.stats) fetchStats(conversationId);
           setIsTyping(false);
           setIsAwaitingResponse(false);
-          // Mark snapshot done and clear live state
+          // Mark snapshot done and close any still-open stage/tool-call rows
           setStageSnapshots(snaps => {
             const prev = snaps[placeholderId];
             if (!prev) return snaps;
-            const finalRecs = prev.records.map(r => r.endedAt ? r : { ...r, endedAt: Date.now() });
-            return { ...snaps, [placeholderId]: { ...prev, records: finalRecs, done: true } };
+            const now = Date.now();
+            const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: now } : r);
+            return {
+              ...snaps,
+              [placeholderId]: {
+                stages: prev.stages.map(closeOpen),
+                rounds: prev.rounds,
+                toolCalls: prev.toolCalls.map(closeOpen),
+                done: true,
+              },
+            };
           });
         },
         (error) => {
           updateMessage(conversationId, placeholderId, m => ({ ...m, content: m.content || `Error: ${error.message}` }));
           setIsTyping(false);
           setIsAwaitingResponse(false);
+          // Mark snapshot done and close any still-open stage/tool-call rows so the
+          // agent timeline stops ticking — no further activity events will arrive.
+          setStageSnapshots(snaps => {
+            const prev = snaps[placeholderId];
+            if (!prev) return snaps;
+            const now = Date.now();
+            const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: now } : r);
+            return {
+              ...snaps,
+              [placeholderId]: {
+                stages: prev.stages.map(closeOpen),
+                rounds: prev.rounds,
+                toolCalls: prev.toolCalls.map(closeOpen),
+                done: true,
+              },
+            };
+          });
         },
         undefined,
         (meta) => {
           updateMessage(conversationId, placeholderId, m => ({
             ...m,
-            metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route },
+            metadata: { confidence: meta.confidence, ungrounded_claims: meta.ungrounded_claims, route: meta.route, degraded_retrieval: meta.degraded_retrieval },
           }));
         },
-        (stage) => {
-          const now = Date.now();
-          setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId];
-            const records: StageRecord[] = prev?.records ?? [];
-            const closed = records.map((r: StageRecord) => r.endedAt ? r : { ...r, endedAt: now });
-            const exists = closed.find((r: StageRecord) => r.stage === stage.stage);
-            const next = exists ? closed : [...closed, { stage: stage.stage, startedAt: now }];
-            return { ...snaps, [placeholderId]: { current: stage, records: next, toolCalls: prev?.toolCalls ?? [], done: false } };
-          });
-        },
         (ev) => {
-          // tool_call_started: add a new in-flight entry
           setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId];
-            if (!prev) return snaps;
-            const tc: ToolCallRecord = { entity: ev.entity, startedAt: Date.now() };
-            return { ...snaps, [placeholderId]: { ...prev, toolCalls: [...prev.toolCalls, tc] } };
-          });
-        },
-        (ev) => {
-          // tool_call_completed: close the most recent entry for this entity
-          setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId];
-            if (!prev) return snaps;
-            let found = false;
-            const updated = [...prev.toolCalls].reverse().map(tc => {
-              if (!found && tc.entity === ev.entity && !tc.endedAt) {
-                found = true;
-                return { ...tc, endedAt: Date.now(), chunksReturned: ev.chunks_returned };
-              }
-              return tc;
-            }).reverse();
-            return { ...snaps, [placeholderId]: { ...prev, toolCalls: updated } };
+            const prev = snaps[placeholderId] ?? { stages: [], rounds: [], toolCalls: [], done: false };
+            return { ...snaps, [placeholderId]: applyActivityEvent(prev, ev) };
           });
         },
         (ev) => {
@@ -1105,11 +1257,19 @@ export default function App() {
             c.conversationId === ev.conversation_id ? { ...c, title: ev.title } : c
           ));
         },
+        (card) => {
+          updateMessage(conversationId, placeholderId, m => ({ ...m, clarification: card }));
+        },
       );
     } catch (err) {
       const error = err as ApiError;
-      appendMessage(conversationId, { id: `temp-${clientMsgId}`, role: 'user', content: text, timestamp: Date.now() });
-      appendMessage(conversationId, { id: `error-${Date.now()}`, role: 'assistant', content: `Error: ${error.message}`, timestamp: Date.now() });
+      // A 503 here is admission control shedding load, not a fault. Say so, or a system that is
+      // degrading on purpose reads to the user as one that is broken.
+      const content = error.statusCode === 503
+        ? `The assistant is at capacity right now. Please resend your question${error.retryAfterSeconds ? ` in about ${error.retryAfterSeconds} seconds` : ' shortly'}.`
+        : `Error: ${error.message}`;
+      if (!reply) appendMessage(conversationId, { id: `temp-${clientMsgId}`, role: 'user', content: text, timestamp: Date.now() });
+      appendMessage(conversationId, { id: `error-${Date.now()}`, role: 'assistant', content, timestamp: Date.now() });
       setIsTyping(false);
       setIsAwaitingResponse(false);
     }
@@ -1380,7 +1540,7 @@ export default function App() {
       return (
         <div className="flex-1 flex flex-col items-center justify-center text-center p-8 animate-fade-in">
           <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-6 border border-[var(--border)]">
-            <Bot className="text-[var(--text-faint)]" size={32} />
+            <Sparkles className="text-[var(--text-faint)]" size={32} />
           </div>
           <h2 className="text-xl font-semibold text-[var(--text)] mb-2">AI Financial Copilot</h2>
           <p className="text-[var(--text-muted)] max-w-md mb-6 leading-relaxed">
@@ -1418,7 +1578,7 @@ export default function App() {
           ) : isChatEmpty ? (
             <div className="h-full flex flex-col items-center justify-center text-center animate-fade-in">
               <div className="w-16 h-16 bg-[var(--surface-2)] rounded-2xl flex items-center justify-center mb-5 border border-[var(--border)]">
-                <Bot className="text-[var(--text-faint)]" size={32} />
+                <Sparkles className="text-[var(--text-faint)]" size={32} />
               </div>
               <h2 className="text-xl font-semibold text-[var(--text)] mb-2">Ask anything</h2>
               <p className="text-[var(--text-muted)] max-w-md mb-6 leading-relaxed text-sm">
@@ -1449,7 +1609,7 @@ export default function App() {
                           ? 'bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 opacity-100'
                           : 'opacity-0 pointer-events-none'
                       }`}>
-                        <Bot size={16} className="text-[var(--accent)]" />
+                        <Sparkles size={16} className="text-[var(--accent)]" />
                       </div>
                     )}
 
@@ -1457,10 +1617,19 @@ export default function App() {
                       {msg.role === 'assistant' && stageSnapshots[msg.id] && (
                         <AgentTimeline snapshot={stageSnapshots[msg.id]} />
                       )}
-                      {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieve' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
+                      {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieval' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
                         <div className="pl-4 mb-1">
                           <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
                             Limited source coverage — answer may be incomplete
+                          </span>
+                        </div>
+                      )}
+                      {/* Separate from the coverage badge above: that one is about how well the
+                          corpus answered, this one about search running in a degraded state. */}
+                      {msg.role === 'assistant' && ((msg.metadata as MessageMetadata)?.degraded_retrieval?.length ?? 0) > 0 && (
+                        <div className="pl-4 mb-1">
+                          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20">
+                            {describeDegradedRetrieval((msg.metadata as MessageMetadata).degraded_retrieval!)}
                           </span>
                         </div>
                       )}
@@ -1483,6 +1652,21 @@ export default function App() {
                               )}
                             </>
                           )}
+                          {msg.clarification && (() => {
+                            const question = activeMessages.slice(0, msgIdx).reverse().find(m => m.role === 'user')?.content ?? '';
+                            return (
+                              <ClarificationCard
+                                card={msg.clarification}
+                                companies={filterOptions.companies}
+                                disabled={Boolean(msg.clarificationAnswered) || !isLastMsg || isAwaitingResponse}
+                                filteredCompanies={scope.mode === 'filteredByMetadata' ? scope.filters.company?.length ?? 0 : 0}
+                                onReply={picks => handleSendMessage(question, { cardId: msg.id, picks })}
+                                onNarrowScope={() => setScope(s => ({ ...s, mode: 'filteredByMetadata' }))}
+                                onAskAgain={() => handleSendMessage(question)}
+                                onUpload={() => setIsUploadOpen(true)}
+                              />
+                            );
+                          })()}
                         </div>
                       ) : (
                         /* User bubble */
@@ -1504,7 +1688,7 @@ export default function App() {
                       )}
 
                       {/* Action row (Copy + Thumbs Up/Down) for completed assistant messages */}
-                      {msg.role === 'assistant' && !isStreaming && msg.content && activeChat?.conversationId && (
+                      {msg.role === 'assistant' && !isStreaming && msg.content && !msg.clarification && activeChat?.conversationId && (
                         <MessageActions
                           messageId={msg.id}
                           content={msg.content}
@@ -1553,7 +1737,7 @@ export default function App() {
                 return (
                   <div className="flex gap-3 items-start max-w-[var(--content-max)] mx-auto">
                     <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0">
-                      <Bot size={16} className="text-[var(--accent)]" />
+                      <Sparkles size={16} className="text-[var(--accent)]" />
                     </div>
                     {placeholderSnap && <AgentTimeline snapshot={placeholderSnap} />}
                   </div>
@@ -1762,15 +1946,21 @@ export default function App() {
                     >
                       <td className="px-6 py-4 w-40">
                         <Badge variant={doc.status === 'Ready' ? 'success' : doc.status === 'Error' ? 'danger' : 'warning'}>
-                          {doc.status === 'Processing' && doc.ingestionStage
-                            ? `${INGEST_STAGE_LABELS[doc.ingestionStage] ?? doc.ingestionStage.replace(/_/g, ' ')}${doc.ingestionStageIndex != null && doc.ingestionStageTotal != null ? ` ${doc.ingestionStageIndex}/${doc.ingestionStageTotal}` : ''}`
-                            : doc.status}
+                          {doc.status === 'Processing' ? ingestionLabel(doc) : doc.status}
                         </Badge>
                       </td>
                       <td className="px-6 py-4 font-medium text-[var(--text)]">
                         <div className="flex items-center gap-2">
                           <FileText size={16} className="text-[var(--text-faint)] shrink-0" />
                           <span className="truncate max-w-[280px]">{doc.title}</span>
+                          {doc.partialParse && (
+                            <span
+                              className="text-[var(--warning)] shrink-0 flex"
+                              title="Some pages failed to parse. Answers from this document may be missing content."
+                            >
+                              <AlertTriangle size={14} aria-label="Partial parse" />
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-6 py-4 text-[var(--text-muted)]">{doc.company || '—'}</td>
@@ -1944,6 +2134,7 @@ export default function App() {
                 onToggle={() => setIsControlPaneOpen(!isControlPaneOpen)}
                 params={modelParams}
                 onParamsChange={p => setModelParams(prev => ({ ...prev, ...p }))}
+                defaultParams={modelParamsFromDefaults(models.find(m => m.id === activeModel)?.default_params)}
                 capabilities={modelCapabilities}
                 stats={lastRequestStats}
                 statsHistory={statsHistory}

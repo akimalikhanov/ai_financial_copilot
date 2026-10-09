@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-app
+  namespace: copilot
+spec:
+  serviceName: redis-app-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis-app
+        app.kubernetes.io/component: redis
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+    spec:
+      containers:
+        - name: redis-app
+          image: redis:7.2.12-alpine
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-secret, key: REDIS_PASSWORD }
+          # K8s does not interpolate manifests the way compose interpolates ${REDIS_PASSWORD} on the
+          # host, so the password has to be expanded by a shell at container runtime instead. The
+          # `exec` matters: without it redis runs as PID 2 under sh and never receives SIGTERM on pod
+          # deletion, so every shutdown burns the full terminationGracePeriodSeconds.
+          # maxmemory is a backstop only — the leak is fixed at the write site (CHAT_EVENTS_TTL).
+          # allkeys-lru is safe here because everything in redis-app is now TTL'd or regenerable;
+          # never apply it to redis-broker, where evicting a task loses a user's question.
+          command:
+            - sh
+            - -c
+            - exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+              --maxmemory 768mb --maxmemory-policy allkeys-lru
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10     # compose: start_period 10s
+            periodSeconds: 5            # compose: interval 5s
+            timeoutSeconds: 3           # compose: timeout 3s
+            failureThreshold: 15        # compose: retries 15
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }    # compose: cpus 1.00 / mem_limit 1g
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.67.0
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: "redis://localhost:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-secret, key: REDIS_PASSWORD }
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

@@ -12,7 +12,14 @@ from __future__ import annotations
 from docling_core.transforms.chunker.doc_chunk import DocChunk, DocMeta
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.transforms.chunker.tokenizer.base import BaseTokenizer
-from docling_core.types.doc.document import TextItem
+from docling_core.types.doc.base import BoundingBox
+from docling_core.types.doc.document import (
+    DoclingDocument,
+    PictureItem,
+    ProvenanceItem,
+    SectionHeaderItem,
+    TextItem,
+)
 from docling_core.types.doc.labels import DocItemLabel
 
 from src.services.ingestion.chunker import AnnualReportSerializerProvider, CustomHybridChunker
@@ -55,7 +62,7 @@ def _run_chunk(
     chunker: CustomHybridChunker, docling_chunks: list[DocChunk], monkeypatch
 ) -> list[DocChunk]:
     monkeypatch.setattr(HybridChunker, "chunk", lambda *_a, **_kw: iter(docling_chunks))
-    return [DocChunk.model_validate(c) for c in chunker.chunk(dl_doc=object())]  # type: ignore[arg-type]
+    return [DocChunk.model_validate(c) for c in chunker.chunk(dl_doc=DoclingDocument(name="t"))]
 
 
 class TestMergeLimit:
@@ -120,6 +127,73 @@ class TestMergeLoop:
         assert "seven" in result[0].text
 
 
+def _doc(*entries: str) -> DoclingDocument:
+    """Build a document from entries; "# text" is a level-1 section header, else body text."""
+    doc = DoclingDocument(name="t")
+    for entry in entries:
+        if entry.startswith("# "):
+            doc.add_heading(text=entry[2:], level=1)
+        else:
+            doc.add_text(label=DocItemLabel.TEXT, text=entry)
+    return doc
+
+
+def _headings(doc: DoclingDocument) -> list[list[str]]:
+    # min_tokens=1 so no chunk is merged into a neighbour: each body item stays its own chunk.
+    chunker = _make_chunker(min_tokens=1, max_merge_multiplier=1.0)
+    return [DocChunk.model_validate(c).meta.headings or [] for c in chunker.chunk(dl_doc=doc)]
+
+
+class TestHeaderRuns:
+    def test_back_to_back_headers_kept_as_trail(self) -> None:
+        doc = _doc(
+            "# Aurora Innovation, Inc.",
+            "# Consolidated Statements of Operations",
+            "# (in millions, except per share data)",
+            "Collaboration revenue 68 82",
+        )
+        assert _headings(doc) == [
+            [
+                "Aurora Innovation, Inc.",
+                "Consolidated Statements of Operations",
+                "(in millions, except per share data)",
+            ]
+        ]
+
+    def test_header_after_content_starts_a_new_trail(self) -> None:
+        doc = _doc("# Note 1", "# Basis of Presentation", "body one", "# Revenue", "body two")
+        assert _headings(doc) == [["Note 1", "Basis of Presentation"], ["Revenue"]]
+
+    def test_repeated_header_in_run_is_not_duplicated(self) -> None:
+        doc = _doc("# SONIC", "# MD&A", "# SONIC", "# MD&A", "# Liquidity", "body")
+        assert _headings(doc) == [["SONIC", "MD&A", "Liquidity"]]
+
+    def test_page_break_ends_run(self) -> None:
+        # Reading order can put a header from the previous page right before this page's title.
+        def prov(page: int) -> ProvenanceItem:
+            return ProvenanceItem(
+                page_no=page, bbox=BoundingBox(l=0, t=1, r=1, b=0), charspan=(0, 1)
+            )
+
+        doc = DoclingDocument(name="t")
+        doc.add_heading(text="Auditor's Report", level=1, prov=prov(61))
+        doc.add_heading(text="Balance Sheets", level=1, prov=prov(62))
+        doc.add_text(label=DocItemLabel.TEXT, text="body", prov=prov(62))
+        assert _headings(doc) == [["Balance Sheets"]]
+
+    def test_run_deeper_than_cap_keeps_first_headers_and_last(self) -> None:
+        doc = _doc(*(f"# H{i}" for i in range(1, 8)), "body")
+        assert _headings(doc) == [["H1", "H2", "H3", "H4", "H7"]]
+
+    def test_header_levels_restored_after_chunking(self) -> None:
+        doc = _doc("# A", "# B", "# C", "body")
+        _headings(doc)
+        levels = [
+            item.level for item, _ in doc.iterate_items() if isinstance(item, SectionHeaderItem)
+        ]
+        assert levels == [1, 1, 1]
+
+
 class _FakeDocItem:
     """Minimal stand-in exposing only the `.label` attribute `_infer_chunk_type` reads."""
 
@@ -136,3 +210,114 @@ class TestInferChunkType:
         assert _infer_chunk_type([table, picture]) == "table"
         assert _infer_chunk_type([picture]) == "picture"
         assert _infer_chunk_type([]) == "text"
+
+    def test_prose_plus_picture_is_text_not_picture(self) -> None:
+        # A merged chunk holding a text item alongside a picture is prose that happens
+        # to contain a figure, not a "picture chunk" — it must not lose its prose.
+        from src.services.ingestion.chunker import _infer_chunk_type
+
+        text = _FakeDocItem(DocItemLabel.TEXT)
+        picture = _FakeDocItem(DocItemLabel.PICTURE)
+        assert _infer_chunk_type([text, picture]) == "text"
+
+
+def _picture_doc_chunk(text: str, ref: str, heading: str = "Section") -> DocChunk:
+    item = PictureItem(self_ref=ref, label=DocItemLabel.PICTURE)
+    meta = DocMeta(doc_items=[item], headings=[heading], origin=None)
+    return DocChunk(text=text, meta=meta)
+
+
+class TestPictureDescriptionSubstitution:
+    """Phase 2: the chunker substitutes descriptions into `<!-- image -->` placeholders
+    without destroying surrounding prose. See docs/stages/ingestion-optimization-implementation.md
+    Phase 2."""
+
+    def test_prose_plus_picture_keeps_the_prose(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=5, max_merge_multiplier=10.0)
+        prose = _doc_chunk("Revenue grew across all segments this year.", "#/texts/0")
+        picture = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        merged = _run_chunk(chunker, [prose, picture], monkeypatch)
+        assert len(merged) == 1
+
+        text = chunker.contextualize(
+            chunk=merged[0], pic_descriptions={"#/pictures/0": "Bar chart of revenue by segment."}
+        )
+        assert "Revenue grew across all segments this year." in text
+        assert "Bar chart of revenue by segment." in text
+        assert "<!-- image -->" not in text
+
+    def test_two_pictures_keep_both_descriptions(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=50, max_merge_multiplier=10.0)
+        pic1 = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        pic2 = _picture_doc_chunk("<!-- image -->", "#/pictures/1")
+        merged = _run_chunk(chunker, [pic1, pic2], monkeypatch)
+        assert len(merged) == 1
+
+        descriptions = {
+            "#/pictures/0": "Line chart of quarterly EPS.",
+            "#/pictures/1": "Pie chart of revenue by region.",
+        }
+        text = chunker.contextualize(chunk=merged[0], pic_descriptions=descriptions)
+        assert "Line chart of quarterly EPS." in text
+        assert "Pie chart of revenue by region." in text
+        assert "<!-- image -->" not in text
+
+    def test_picture_with_no_description_indexes_no_placeholder(self, monkeypatch) -> None:
+        chunker = _make_chunker(min_tokens=5, max_merge_multiplier=10.0)
+        picture = _picture_doc_chunk("<!-- image -->", "#/pictures/0")
+        result = _run_chunk(chunker, [picture], monkeypatch)
+        assert len(result) == 1
+
+        text = chunker.contextualize(chunk=result[0], pic_descriptions={})
+        assert "<!-- image -->" not in text
+        assert "Section" in text  # heading survives; only the placeholder is dropped
+
+
+class TestSerializerMetaSuppression:
+    """Phase 11: docling's MarkdownMetaSerializer renders every meta field straight into the
+    serialized text. Left alone that emits the enricher's description a second time (once as
+    meta, once via placeholder substitution) plus the classifier label as prose. These run the
+    real serializer over a real DoclingDocument — the stub DocChunks above cannot catch it."""
+
+    @staticmethod
+    def _doc_with_described_picture():
+        from docling_core.types.doc.document import (
+            DescriptionMetaField,
+            DoclingDocument,
+            PictureClassificationMetaField,
+            PictureClassificationPrediction,
+            PictureMeta,
+        )
+
+        doc = DoclingDocument(name="t")
+        doc.add_text(label=DocItemLabel.TEXT, text="GROUP ONLINE REVENUE $M")
+        picture = doc.add_picture()
+        picture.meta = PictureMeta(
+            description=DescriptionMetaField(
+                text="Combined column and line chart, RECORD SALES $223m.", created_by="gpt-5-mini"
+            ),
+            classification=PictureClassificationMetaField(
+                predictions=[
+                    PictureClassificationPrediction(class_name="line_chart", confidence=0.9)
+                ]
+            ),
+        )
+        return doc
+
+    def test_description_is_not_emitted_alongside_the_placeholder(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        # The placeholder survives so _substitute_placeholders can write the description exactly
+        # once, in the picture's position.
+        assert text.count("<!-- image -->") == 1
+        assert "RECORD SALES $223m" not in text
+
+    def test_classification_label_is_not_emitted_as_prose(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        assert "Line chart" not in text
+
+    def test_surrounding_text_is_untouched(self) -> None:
+        doc = self._doc_with_described_picture()
+        text = AnnualReportSerializerProvider().get_serializer(doc).serialize().text
+        assert "GROUP ONLINE REVENUE $M" in text

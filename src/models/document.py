@@ -35,6 +35,8 @@ class Document(Base):
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     extracted_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # metadata.company through normalize_company; the key entity resolution matches on.
+    company_norm: Mapped[str | None] = mapped_column(Text, nullable=True)
     ingest_time_seconds: Mapped[dict | None] = mapped_column(
         JSON,
         nullable=True,

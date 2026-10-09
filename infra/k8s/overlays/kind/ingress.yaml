@@ -1,0 +1,18 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: copilot
+  namespace: copilot
+  annotations:
+    # SSE: nginx must not buffer the chat stream. Mirrors `proxy_buffering off`
+    # in src/ui/nginx.k8s.conf and the 300s timeouts there.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"   # matches client_max_body_size
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - { path: /,   pathType: Prefix, backend: { service: { name: frontend, port: { number: 80 } } } }

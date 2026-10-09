@@ -1,0 +1,24 @@
+# Strategic-merge patch. The kustomization.yaml `target: { kind: StatefulSet }` selector matches
+# every StatefulSet by kind — metadata.name below is required for a well-formed object but not
+# used for matching. Shrinks each volumeClaimTemplates PVC to a size generous enough for local
+# dev data, well under a laptop's disk.
+#
+# accessModes must be repeated here even though it's not what we're changing: Kustomize's
+# strategic-merge on volumeClaimTemplates (a list) replaces the whole matched entry's `spec`,
+# it does not deep-merge individual fields the way it does for e.g. a container's env. Omitting
+# accessModes here silently drops it from the rendered manifest, and `kubectl apply` then rejects
+# the StatefulSet: "spec.volumeClaimTemplates[0].spec.accessModes: Required value: at least 1
+# access mode is required". `kustomize build` does NOT catch this — only server-side apply does.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: placeholder
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

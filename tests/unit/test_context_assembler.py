@@ -37,12 +37,22 @@ def _payload(chunk: RetrievedChunk, prompt_text: str | None = None) -> ChunkProm
 
 
 class TestMissingPayload:
-    def test_missing_payload_raises_value_error(self) -> None:
+    def test_unhydrated_chunk_is_skipped_not_raised(self) -> None:
+        """A chunk left in Qdrant/OpenSearch after its Postgres row is gone must not fail
+        the whole assembly — it is skipped so the surviving chunks still reach the model."""
         chunk = _chunk()
-        with pytest.raises(
-            ValueError, match=f"Missing ChunkPromptPayload for chunk_id={chunk.chunk_id}"
-        ):
-            assemble_rag_context([chunk], {})
+        ctx, _ = assemble_rag_context([chunk], {})
+
+        assert ctx.items == ()
+        assert ctx.chunk_count == 0
+        assert ctx.formatted_context == ""
+
+    def test_unhydrated_chunk_does_not_drop_its_siblings(self) -> None:
+        stale, good = _chunk(), _chunk()
+        ctx, _ = assemble_rag_context([stale, good], {good.chunk_id: _payload(good)})
+
+        assert [i.chunk_id for i in ctx.items] == [good.chunk_id]
+        assert ctx.chunk_count == 1
 
 
 class TestInjectionScanDisabled:

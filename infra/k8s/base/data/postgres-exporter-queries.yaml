@@ -1,0 +1,17 @@
+# Custom postgres_exporter queries (--extend.query-path, see postgres-statefulset.yaml).
+# backend_xmin is the oldest snapshot held by a live backend — what T6 needs. The built-in
+# database_wraparound collector measures datfrozenxid instead, which is not the same thing.
+pg_xmin_horizon:
+  master: true
+  cache_seconds: 0
+  query: >
+    SELECT coalesce(max(age(backend_xmin)), 0)::bigint AS oldest_backend_xmin_age,
+           count(backend_xmin)::bigint                AS backends_holding_xmin
+    FROM pg_stat_activity
+  metrics:
+    - oldest_backend_xmin_age:
+        usage: "GAUGE"
+        description: "Age in transactions of the oldest snapshot held by a live backend"
+    - backends_holding_xmin:
+        usage: "GAUGE"
+        description: "Number of live backends currently holding a snapshot"

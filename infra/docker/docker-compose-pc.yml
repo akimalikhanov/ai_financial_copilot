@@ -749,7 +749,7 @@ services:
       fluent-bit:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -798,7 +798,7 @@ services:
       fluent-bit:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5

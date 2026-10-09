@@ -57,6 +57,18 @@ class LLMRequest(Base):
         nullable=False,
         server_default=text("'chat'"),
     )
+    # Router's shape verdict, persisted so cost drift can be attributed to workload mix rather
+    # than being indistinguishable from a prompt or effort-budget change.
+    query_shape: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # How scope resolution ended for a retrieval request: resolved / unresolved / no_entities.
+    scope_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Caps acks_late redelivery loops: a SIGKILLed task is redelivered, and without a
+    # persistent counter the redelivery re-runs the agent loop and re-bills the provider.
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
 
     # LLM provider/model info
     provider: Mapped[str] = mapped_column(Text, nullable=False)
@@ -82,6 +94,8 @@ class LLMRequest(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Subset of prompt_tokens served from the provider's prompt cache.
+    cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Cost and performance

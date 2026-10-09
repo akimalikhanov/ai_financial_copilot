@@ -6,10 +6,15 @@ export interface Document {
   type: string;
   pages: number;
   status: 'Ready' | 'Processing' | 'Error';
+  // True when Docling reported partial_success: indexed, but some pages failed to parse.
+  partialParse?: boolean;
   tags: string[];
   ingestionStage?: string;
   ingestionStageIndex?: number;
   ingestionStageTotal?: number;
+  // Which attempt is about to run, when the previous one's worker died and the document was
+  // put back on the queue. Only meaningful while ingestionStage is 'retrying'.
+  ingestionAttempt?: number;
 }
 
 export interface BoundingBox {
@@ -57,6 +62,41 @@ export interface MessageMetadata {
   confidence?: 'low' | 'medium' | 'high' | 'none';
   ungrounded_claims?: boolean | null;
   route?: string | null;
+  /**
+   * Retrieval capabilities unavailable for at least one search ('dense' | 'keyword' |
+   * 'rerank'). Distinct from low confidence: that describes the answer's grounding,
+   * this describes a system fault that made the search weaker than it should be.
+   */
+  degraded_retrieval?: string[] | null;
+}
+
+export interface ClarificationCandidate {
+  company: string;
+  years: number[];
+  doc_count: number;
+}
+
+export interface ClarificationEntity {
+  raw_span: string;
+  outcome: 'ambiguous' | 'none' | 'outside_scope';
+  candidates: ClarificationCandidate[];
+}
+
+/** The `scope_clarification` event, also stored on the card's message metadata. */
+export interface ScopeClarification {
+  clarification_id: string;
+  outcome: 'entities' | 'too_broad';
+  named_companies: boolean;
+  unresolved: ClarificationEntity[];
+  resolved: string[];
+  covered_count: number | null;
+  max_companies: number;
+}
+
+export interface ClarificationPick {
+  raw_span: string;
+  company?: string;
+  include_outside_scope?: boolean;
 }
 
 export interface Message {
@@ -69,6 +109,9 @@ export interface Message {
   timestamp: number;
   feedback?: MessageFeedback | null;
   metadata?: MessageMetadata;
+  // Set when this assistant message is a clarification card instead of an answer.
+  clarification?: ScopeClarification;
+  clarificationAnswered?: boolean;
 }
 
 export interface Chat {

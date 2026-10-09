@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.llm_request import LLMRequest
@@ -19,6 +19,7 @@ def stats_to_request_kwargs(stats: LLMResponseStats | None) -> dict:
         "prompt_tokens": stats.input_tokens,
         "completion_tokens": stats.output_tokens,
         "reasoning_tokens": stats.reasoning_tokens,
+        "cached_input_tokens": stats.cached_input_tokens,
         "total_tokens": stats.total_tokens,
         "cost_usd": Decimal(str(stats.cost_usd)) if stats.cost_usd is not None else None,
         "latency_ms": int(stats.latency_ms) if stats.latency_ms is not None else None,
@@ -85,6 +86,21 @@ class LLMRequestRepository:
         llm_request.status = status
         await self.session.flush()
         return llm_request
+
+    async def increment_attempt_count(self, request_id: UUID) -> int:
+        """Atomically increment and return the new attempt count.
+
+        An UPDATE ... RETURNING rather than a read-modify-write: two workers racing on the
+        same redelivered task must not both observe attempt 1.
+        """
+        result = await self.session.execute(
+            update(LLMRequest)
+            .where(LLMRequest.id == request_id)
+            .values(attempt_count=LLMRequest.attempt_count + 1)
+            .returning(LLMRequest.attempt_count)
+        )
+        await self.session.flush()
+        return result.scalar_one()
 
     async def create_with_placeholder(
         self,
@@ -166,6 +182,7 @@ class LLMRequestRepository:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -187,6 +204,7 @@ class LLMRequestRepository:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             reasoning_tokens=reasoning_tokens,
+            cached_input_tokens=cached_input_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
             latency_ms=latency_ms,
@@ -206,6 +224,7 @@ class LLMRequestRepository:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
+        cached_input_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -224,6 +243,7 @@ class LLMRequestRepository:
         llm_request.prompt_tokens = prompt_tokens
         llm_request.completion_tokens = completion_tokens
         llm_request.reasoning_tokens = reasoning_tokens
+        llm_request.cached_input_tokens = cached_input_tokens
         llm_request.total_tokens = total_tokens
         llm_request.cost_usd = cost_usd
         llm_request.latency_ms = latency_ms
