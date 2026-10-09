@@ -17,9 +17,11 @@ template: |
   - Use the whole question. "Aurora's self-driving revenue" names a self-driving company, not a mobile app maker called Aurora.
   - Use what you know about companies: tickers ("MSFT"), former names ("Facebook" for Meta Platforms), short names ("the AA", "Poste" for Poste Italiane) and descriptions ("the Italian postal company").
   - Tolerate typos in the span ("auorra" for Aurora).
+  - Sharing letters is not a match. An abbreviation you don't recognize names no company, even if its letters appear in a listed name: "KTS" does not name "Kestrel Shipping".
+  - The companies listed for one entity may have been found for another. Decide each entity on its own.
   - A shared generic word is not a match. "energy" does not name "Elixir Energy Limited"; a person or product is not the company that employs or makes it unless the question says so.
   - A confident wrong pick is worse than asking. When unsure between companies, return **ambiguous**, never a guess.
   - Return exactly one entry per entity, using only the IDs listed.
 variables: []
 metadata:
-  purpose: "Entity → company disambiguation over pg_trgm candidates or the user's whole company catalogue"
+  purpose: "Entity → company disambiguation over the pg_trgm candidates of the entities' lookup strings"

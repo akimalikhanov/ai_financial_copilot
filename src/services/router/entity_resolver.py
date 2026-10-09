@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Literal
 from uuid import UUID
@@ -15,6 +16,8 @@ from src.services.llm_router import LLMRouter
 from src.services.router.company_name import normalize_company
 from src.services.router.disambiguator import Disambiguation, disambiguate
 from src.utils.config import get_router_config
+
+logger = logging.getLogger(__name__)
 
 
 class EntityResolution(Disambiguation):
@@ -39,6 +42,23 @@ def _merge(lists: Iterable[list[CompanyCandidate]]) -> list[CompanyCandidate]:
     return sorted(best.values(), key=lambda c: c.score, reverse=True)
 
 
+def _from_llm(d: Disambiguation, own: list[CompanyCandidate]) -> EntityResolution:
+    """The LLM's answer, kept to the entity's own trigram candidates.
+
+    The pool merges every pending entity's candidates, so the model can pick a company
+    that matched only another entity's keys. Such a pick matched none of this entity's
+    lookup strings: a guess, not a match. With nothing left the entity is "none".
+    """
+    norms = {c.company_norm for c in own}
+    kept = [c for c in d.candidates if c.company_norm in norms]
+    dropped = [c.display_name for c in d.candidates if c.company_norm not in norms]
+    if dropped:
+        logger.warning("entity_disambiguator_pick_outside_candidates", extra={"dropped": dropped})
+    if not kept:
+        return EntityResolution(decision="none", candidates=[], method="llm")
+    return EntityResolution(decision=d.decision, candidates=kept, method="llm")
+
+
 def _fallback(trigram: list[CompanyCandidate]) -> EntityResolution:
     """No usable LLM answer: the trigram candidates, best first, as an ambiguous result."""
     if not trigram:
@@ -59,9 +79,9 @@ async def resolve_entities(
     """Resolve each entity against all of the user's companies, in input order.
 
     Order: the conversation's binding from an earlier clarification, then a single exact
-    match on a lookup string, then one LLM disambiguator call for the rest. Candidates are
-    the user's whole catalogue when it is small, else the pg_trgm matches. A failed call
-    falls back to the trigram candidates.
+    match on a lookup string, then one LLM disambiguator call for the rest. The LLM picks
+    only among the pg_trgm matches of the entity's lookup strings; an entity with none is
+    "none" without a call. A failed call falls back to the trigram candidates.
     """
     if not entities:
         return []
@@ -114,16 +134,14 @@ async def resolve_entities(
                 results[i] = EntityResolution(
                     decision="resolved", candidates=exact, method="fast_path"
                 )
-            else:
+            elif trigram[i]:
                 pending.append(i)
+            else:
+                results[i] = EntityResolution(
+                    decision="none", candidates=[], method="no_candidates"
+                )
 
-        pool: list[CompanyCandidate] = []
-        use_catalogue = False
-        if pending:
-            inline_max = int(cfg["entity_catalogue_inline_max"])
-            catalogue = await repo.list_companies(user_id, limit=inline_max + 1)
-            use_catalogue = len(catalogue) <= inline_max
-            pool = catalogue if use_catalogue else _merge(trigram[i] for i in pending)
+        pool = _merge(trigram[i] for i in pending)
 
         if obs:
             obs.update(
@@ -133,15 +151,11 @@ async def resolve_entities(
                         for e, cs in zip(entities, trigram, strict=True)
                     },
                     "decided": {entities[i].name: r.method for i, r in enumerate(results) if r},
-                    "catalogue_shortcut": use_catalogue,
                     "llm_pool_size": len(pool),
                 }
             )
 
-    if pending and not pool:
-        for i in pending:
-            results[i] = EntityResolution(decision="none", candidates=[], method="no_candidates")
-    elif pending:
+    if pending:
         decisions = await disambiguate(
             query,
             [entities[i] for i in pending],
@@ -156,9 +170,6 @@ async def resolve_entities(
             if decisions is None:
                 results[i] = _fallback(trigram[i])
             else:
-                d = decisions[n]
-                results[i] = EntityResolution(
-                    decision=d.decision, candidates=d.candidates, method="llm"
-                )
+                results[i] = _from_llm(decisions[n], trigram[i])
 
     return [r for r in results if r is not None]

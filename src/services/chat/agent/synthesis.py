@@ -77,6 +77,7 @@ async def run_synthesis(
     agent_meta: AgentLoopMeta,
     requested_currency: str | None,
     fallback_max_chunks: int,
+    mentions: dict[str, str] | None = None,
 ) -> AgentRunResult:
     # Both pools are what the model could actually read: citing or falling back to excerpts
     # it never saw would let synthesis cite text no reasoning was ever grounded in.
@@ -138,7 +139,7 @@ async def run_synthesis(
     rag_context, _ = assemble_rag_context(synthesis_chunks, payloads, assume_unique=True)
 
     findings_block = (
-        _render_findings_block(processed, rag_context) if processed is not None else None
+        _render_findings_block(processed, rag_context, mentions) if processed is not None else None
     )
 
     excerpts = rag_context.formatted_context or ""

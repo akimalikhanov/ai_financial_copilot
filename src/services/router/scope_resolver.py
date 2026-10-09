@@ -16,6 +16,7 @@ from src.schemas.query_router import (
     ScopeSource,
 )
 from src.services.llm_router import LLMRouter
+from src.services.router.company_name import normalize_company
 from src.services.router.entity_resolver import resolve_entities
 from src.utils.config import get_scope_max_companies
 
@@ -101,6 +102,7 @@ async def resolve_scope(
                 obs.update(output={"doc_count": len(docs), "company_count": len(companies)})
 
         covered: dict[str, list[_Doc]] = {}
+        mentioned_as: dict[str, list[str]] = {}
         unresolved: list[str] = []
         clarifications: list[EntityClarification] = []
         if router_output.entities:
@@ -133,6 +135,8 @@ async def resolve_scope(
                         inside = await repo.get_scope_docs(user_id, pick.doc_ids)
                     if pick and inside:
                         covered[pick.display_name] = inside
+                        if normalize_company(entity.raw_span) != pick.company_norm:
+                            mentioned_as.setdefault(pick.display_name, []).append(entity.raw_span)
                         outcomes[entity.name] = f"{res.decision}: {pick.display_name}"
                         if res.decision == "resolved":
                             continue
@@ -184,6 +188,7 @@ async def resolve_scope(
                         doc_summaries=[
                             {"doc_id": str(d[0]), "name": d[2], "year": d[3]} for d in group
                         ],
+                        mentioned_as=mentioned_as.get(name, []),
                     )
                     for name, group in covered.items()
                 ]

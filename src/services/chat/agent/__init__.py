@@ -48,4 +48,5 @@ async def run_agent(
         meta,
         requested_currency,
         fallback_max_chunks=get_agent_fallback_max_chunks(),
+        mentions=state.scope_result.mentions() if state.scope_result else None,
     )

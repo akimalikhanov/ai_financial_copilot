@@ -43,7 +43,8 @@ CLAUDE.md
 # misc
 experiments/
 infra/docker/garage/secrets/*
-docs/
+docs/*
+!docs/prod_docs/
 /data/
 specs/
 

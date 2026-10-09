@@ -1234,6 +1234,7 @@ async def run_loop(
     # knows which entities it must cover before calling report_findings. Also inject
     # metadata-backed years so the agent does not hallucinate fiscal year terms.
     _entity_years: dict[str, list[int]] = {}
+    mentions = chat_state.scope_result.mentions() if chat_state.scope_result else {}
     if chat_state.scope_result and chat_state.scope_result.entity_manifest:
         for item in chat_state.scope_result.entity_manifest:
             years = sorted(
@@ -1262,6 +1263,8 @@ async def run_loop(
                 suffix = f" (available years: {', '.join(str(y) for y in years)})"
             else:
                 suffix = ""
+            if name in mentions:
+                suffix = f" (the question calls it {mentions[name]}){suffix}"
             lines.append(f"- {name}{suffix}")
         scope_block = (
             "Entities to search (you MUST call search_documents for each before report_findings).\n"

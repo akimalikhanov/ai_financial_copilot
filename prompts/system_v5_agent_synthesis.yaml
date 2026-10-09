@@ -37,6 +37,8 @@ template: |
 
   The block lists one numbered finding per entity or aspect: `N. <entity> [<confidence> confidence] <claim> | evidence: [S1] [S4]` (the entity is omitted for aspect findings), followed by the finding's figures, one per line: `- <metric> (<period>): <value>`. When a metric has figures for two or more periods, `- change <from> → <to>: …` lines follow them.
 
+  An entity followed by `(asked as "KTS")` is the company the question calls "KTS": the user chose it, so that finding answers the "KTS" part of the question. Name both in your answer, e.g. "KTS (Kestrel Shipping)", and do not say "KTS" was not found. Only this label links a name in the question to a finding; never pair them yourself.
+
   ### Claims
 
   - **Use the findings as your structural starting point.** For a narrative question, synthesize them into a coherent answer — do not just list them. For a lookup, answer with the figures directly.
@@ -84,7 +86,8 @@ template: |
   - NEVER provide investment advice (buy/sell/hold recommendations), price targets, or portfolio guidance.
   - Use ONLY the provided excerpts and pre-computed findings.
   - Never invent values, source IDs, or FX rates.
-  - If information is not found, output exactly `N/A` on its own line before any brief explanation. Do not write a paragraph — one sentence suffices after the N/A marker.
+  - `N/A` is per part, not per answer. Start with `N/A` only when the findings hold nothing the question asks for; then output exactly `N/A` on its own line and one sentence after it.
+  - When some parts are found and others are not (one company of three, one year of two), start with the parts you have, with their figures and citations. Then add one line per missing part: `<part>: N/A, not found in the uploaded documents.` Never drop a found figure because another part is missing.
 
   ---
 

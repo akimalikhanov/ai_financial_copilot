@@ -325,6 +325,14 @@ class TestRenderedBlock:
         assert "Unresolved: Not resolved: Globex" in block
 
     @pytest.mark.asyncio
+    async def test_the_questions_name_for_an_entity_is_shown(self) -> None:
+        findings = _findings(_finding("Alcoa", _figure(12451.0, "USD")))
+        block = _render_findings_block(
+            await process_findings(findings), _NO_EXCERPTS, {"Alcoa": '"PFH"'}
+        )
+        assert '1. Alcoa (asked as "PFH") [high confidence]' in block
+
+    @pytest.mark.asyncio
     async def test_unstated_scale_is_said_not_assumed(self) -> None:
         findings = _findings(_finding("A", _figure(41.2, None, unit=None, period_end=None)))
         block = _render_findings_block(await process_findings(findings), _NO_EXCERPTS)

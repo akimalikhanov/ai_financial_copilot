@@ -399,8 +399,15 @@ def _change_lines(figures: list[NormalizedFigure]) -> list[str]:
     return lines
 
 
-def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext) -> str:
+def _render_findings_block(
+    processed: ProcessedFindings,
+    rag_context: RAGContext,
+    mentions: dict[str, str] | None = None,
+) -> str:
+    """`mentions` maps an entity key to the question's name for it (`DocumentScopeResult.
+    mentions`), so synthesis can tell "PFH" was answered under the company the user picked."""
     findings = processed.findings
+    mentions = mentions or {}
     lines = ["[FINDINGS]"]
 
     header_parts = []
@@ -433,6 +440,8 @@ def _render_findings_block(processed: ProcessedFindings, rag_context: RAGContext
         # Aspect ids (A1, A2…) are opaque and get cited as `[A1]` in place of the
         # excerpt refs; entity keys stay, since the figure lines below rely on them.
         head = f"{i}." if _ASPECT_KEY_RE.match(f.key) else f"{i}. {f.key}"
+        if f.key in mentions:
+            head += f" (asked as {mentions[f.key]})"
         # A stated negative has no evidence to cite and no confidence worth reporting —
         # rendering it as a low-confidence claim would invite the synthesis model to
         # hedge it into a weak positive instead of reporting the absence.

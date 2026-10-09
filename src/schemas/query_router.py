@@ -50,6 +50,9 @@ class RouterOutput(BaseModel):
 class EntityManifestItem(BaseModel):
     entity_name: str
     doc_summaries: list[dict]  # [{doc_id, name, year}]
+    # What the question called the company when that isn't its name ("PFH" for a
+    # company the user picked on a clarification card).
+    mentioned_as: list[str] = []
 
 
 class CompanyCandidate(BaseModel):
@@ -94,3 +97,11 @@ class DocumentScopeResult(BaseModel):
     clarifications: list[EntityClarification] = []
     # Companies covered, set only when above SCOPE_MAX_COMPANIES: the run stops before the agent.
     too_broad_count: int | None = None
+
+    def mentions(self) -> dict[str, str]:
+        """Covered company → how the question named it, quoted, where that isn't its name."""
+        return {
+            item.entity_name: ", ".join(f'"{m}"' for m in item.mentioned_as)
+            for item in self.entity_manifest or []
+            if item.mentioned_as
+        }

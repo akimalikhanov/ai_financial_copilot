@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from uuid import UUID
 
 from redis.asyncio import Redis
@@ -19,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db import get_session_factory
 from src.eval.schemas import EvalQuestion
+from src.models.llm_request import LLMRequest
+from src.repository.conversation_repository import ConversationRepository
 from src.schemas.agent_findings import AgentFindings
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, RouterInput
@@ -30,7 +33,7 @@ from src.services.chat.agent.state import AgentLoopMeta, get_agent_settings
 from src.services.chat.citation_parser import BracketCitationParser
 from src.services.chat.events import too_broad_response
 from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponseStats, Role
-from src.services.llm_router import LLMRouter, get_router
+from src.services.llm_router import LLMRouter, RoutedLLM, get_router
 from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system_prompt
 from src.services.retrieval.reranker import get_reranker
 from src.services.router.router import route_query
@@ -67,6 +70,43 @@ def _make_redis() -> Redis:
     return Redis.from_url(get_redis_app_url(), decode_responses=True)
 
 
+async def _create_eval_request(
+    question: EvalQuestion,
+    user_id: UUID,
+    tool_llm: RoutedLLM,
+    query_shape: str | None,
+    tag: str,
+) -> tuple[UUID, UUID]:
+    """A conversation and a parent `llm_requests` row for one eval question.
+
+    Committed on its own session before the run starts: the loop writes each tool-model
+    call as a sub-request on a separate session, and that row's foreign key needs the
+    parent to exist already. `request_type="eval_agent"` keeps these runs out of the
+    dashboards, which read `chat_agent` parents. The conversation is created soft-deleted,
+    so it never shows in the eval user's sidebar.
+    """
+    async with get_session_factory()() as session:
+        conversation = await ConversationRepository(session).create(
+            user_id=user_id,
+            title=f"eval {tag} {question.qid}",
+            metadata={"source": "eval", "eval_run": tag},
+        )
+        conversation.deleted_at = datetime.now(UTC).replace(tzinfo=None)
+        parent = LLMRequest(
+            conversation_id=conversation.id,
+            user_id=user_id,
+            provider=tool_llm.provider,
+            model=tool_llm.model_id,
+            request_type="eval_agent",
+            query_shape=query_shape,
+            request_params={"eval_run": tag, "qid": question.qid, "question": question.question},
+        )
+        session.add(parent)
+        await session.flush()
+        await session.commit()
+        return parent.id, conversation.id
+
+
 async def run_one(
     question: EvalQuestion,
     session: AsyncSession,
@@ -79,6 +119,7 @@ async def run_one(
     llm_router: LLMRouter | None = None,
     retrieval_only: bool = False,
     redis: Redis | None = None,
+    persist_requests_tag: str | None = None,
 ) -> AgentPipelineResult:
     """Run a single eval question through the agentic pipeline.
 
@@ -87,6 +128,8 @@ async def run_one(
 
     redis: pass an existing Redis client to reuse connections across calls; if None
            a new client is created and closed after each call.
+    persist_requests_tag: when set, the agent run gets a real parent `llm_requests` row
+           tagged with it, so every tool-model call is saved as a sub-request row.
     """
     router = llm_router or get_router()
     reranker = get_reranker()
@@ -154,6 +197,15 @@ async def run_one(
 
     # Build a minimal ChatPipelineState for run_agent
     request_id = str(uuid.uuid4())
+    tool_llm, *fallbacks = tool_model_chain(router, settings.tool_model)
+
+    # Without a parent row the loop writes no per-call llm_requests rows.
+    _parent_id: UUID | None = None
+    _conversation_id: UUID | None = None
+    if persist_requests_tag is not None:
+        _parent_id, _conversation_id = await _create_eval_request(
+            question, user_id, tool_llm, query_shape, persist_requests_tag
+        )
 
     _owns_redis = redis is None
     _redis = redis or _make_redis()
@@ -162,9 +214,9 @@ async def run_one(
     _eval_user_id = user_id
 
     class _LLMRequestStub:
-        id = None
+        id = _parent_id
         user_id = _eval_user_id
-        conversation_id = None
+        conversation_id = _conversation_id
 
     state = ChatPipelineState(
         request_id=request_id,
@@ -178,8 +230,6 @@ async def run_one(
     state.llm_request = _LLMRequestStub()  # type: ignore[assignment]
 
     try:
-        tool_llm, *fallbacks = tool_model_chain(router, settings.tool_model)
-
         agent_result = await run_agent(
             state,
             tool_llm,

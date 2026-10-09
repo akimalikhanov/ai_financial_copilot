@@ -6,7 +6,7 @@ Usage:
         [--output data/eval/runs/<auto>.json] \
         [--retrieval-only] [--compare <prev.json>] [--compare-to-latest-db] \
         [--limit N] [--model <model_id>] [--judge-model <judge_id>] \
-        [--user-id <uuid>] [--k 5 10]
+        [--user-id <uuid>] [--k 5 10] [--persist-requests]
 
 """
 
@@ -158,6 +158,15 @@ def _build_args() -> argparse.Namespace:
         default=None,
         help="Optional free-text note stored on the run (e.g. what this run is testing).",
     )
+    p.add_argument(
+        "--persist-requests",
+        action="store_true",
+        default=False,
+        help=(
+            "Save every tool-model call to llm_requests, under an 'eval_agent' parent row per "
+            "question tagged '<run-kind>-<UTC timestamp>' in request_params.eval_run."
+        ),
+    )
     return p.parse_args()
 
 
@@ -178,6 +187,11 @@ async def _run(args: argparse.Namespace) -> RunOutput:
             raise RuntimeError(f"No questions matched --qid {args.qid}")
     elif args.limit:
         questions = questions[: args.limit]
+
+    requests_tag = None
+    if args.persist_requests:
+        requests_tag = f"{args.run_kind}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        logger.info("persisting llm_requests under eval_run=%s", requests_tag)
 
     await init_db()
     session_factory = get_session_factory()
@@ -236,6 +250,7 @@ async def _run(args: argparse.Namespace) -> RunOutput:
                         llm_router=llm_router,
                         retrieval_only=args.retrieval_only,
                         redis=redis,
+                        persist_requests_tag=requests_tag,
                     )
                 except Exception:
                     logger.exception("pipeline_error qid=%s", q.qid)

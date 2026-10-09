@@ -115,7 +115,7 @@ models:
       notes: "Paid tier (per 1M: $0.75 in, $3.75 out, caching $0.075) through 2026-12-31."
     capabilities:
       streaming: true
-      tool_calling: true
+      tool_calling: false # needs complete_with_tools implementation in GeminiAdapter first, then set to 'true'
       vision: true
     params_override: {}
     # If gemini-3.7-flash errors on a retryable condition (e.g. 503), fall back

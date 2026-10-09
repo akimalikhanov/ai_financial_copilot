@@ -34,15 +34,11 @@ RWE = _company("rwe", 1.0)
 
 
 class FakeRepo:
-    def __init__(self, by_key: dict[str, list[CompanyCandidate]], catalogue: list) -> None:
+    def __init__(self, by_key: dict[str, list[CompanyCandidate]]) -> None:
         self._by_key = by_key
-        self._catalogue = catalogue
 
     async def find_company_candidates(self, user_id, keys, **_kwargs):  # noqa: ARG002
         return {k: self._by_key.get(k, []) for k in keys}
-
-    async def list_companies(self, user_id, *, limit):  # noqa: ARG002
-        return self._catalogue[:limit]
 
 
 class FakeDisambiguator:
@@ -61,8 +57,8 @@ def _entity(name: str, span: str | None = None) -> ExtractedEntity:
 
 @pytest.fixture
 def setup(monkeypatch: pytest.MonkeyPatch):
-    def _make(by_key, catalogue=(), result=None) -> FakeDisambiguator:
-        repo = FakeRepo(by_key, list(catalogue))
+    def _make(by_key, result=None) -> FakeDisambiguator:
+        repo = FakeRepo(by_key)
         fake = FakeDisambiguator(result)
         monkeypatch.setattr(entity_resolver, "DocumentRepository", lambda _session: repo)
         monkeypatch.setattr(entity_resolver, "disambiguate", fake)
@@ -93,7 +89,6 @@ async def test_single_exact_match_makes_no_llm_call(setup) -> None:
 async def test_llm_decision_is_kept_with_its_ranking(setup) -> None:
     fake = setup(
         {"aurora": [INNOVATION, MOBILE]},
-        catalogue=[INNOVATION, MOBILE],
         result=[Disambiguation(decision="ambiguous", candidates=[MOBILE, INNOVATION])],
     )
     [res] = await _resolve([_entity("Aurora")])
@@ -103,39 +98,52 @@ async def test_llm_decision_is_kept_with_its_ranking(setup) -> None:
 
 @pytest.mark.asyncio
 async def test_failed_call_falls_back_to_trigram_candidates(setup) -> None:
-    setup({"aurora": [MOBILE, INNOVATION]}, catalogue=[INNOVATION, MOBILE], result=None)
+    setup({"aurora": [MOBILE, INNOVATION]}, result=None)
     [res] = await _resolve([_entity("Aurora")])
     assert (res.decision, res.method) == ("ambiguous", "fallback")
     assert res.candidates[0] == INNOVATION  # best trigram score first
 
 
 @pytest.mark.asyncio
-async def test_small_catalogue_is_the_candidate_pool(setup) -> None:
+async def test_pool_is_the_pending_entities_trigram_candidates(setup) -> None:
     fake = setup(
-        {}, catalogue=[INNOVATION, RWE], result=[Disambiguation(decision="none", candidates=[])]
+        {"aurora": [INNOVATION, MOBILE], "rwe": [RWE]},
+        result=[Disambiguation(decision="resolved", candidates=[INNOVATION])],
     )
-    [res] = await _resolve([_entity("Microsoft Corporation", "MSFT")])
-    assert fake.calls[0][2] == [INNOVATION, RWE]
-    assert res.decision == "none"
+    await _resolve([_entity("Aurora"), _entity("RWE")])
+    assert fake.calls[0][2] == [INNOVATION, MOBILE]  # RWE took the fast path
 
 
 @pytest.mark.asyncio
-async def test_large_catalogue_sends_only_trigram_candidates(
-    setup, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("ENTITY_CATALOGUE_INLINE_MAX", "1")
+async def test_entity_without_candidates_is_not_sent_to_the_llm(setup) -> None:
     fake = setup(
         {"aurora": [INNOVATION, MOBILE]},
-        catalogue=[INNOVATION, MOBILE, RWE],
-        result=[Disambiguation(decision="resolved", candidates=[INNOVATION])],
+        result=[Disambiguation(decision="ambiguous", candidates=[INNOVATION, MOBILE])],
     )
-    await _resolve([_entity("Aurora")])
-    assert fake.calls[0][2] == [INNOVATION, MOBILE]
+    aurora, pfh = await _resolve([_entity("Aurora"), _entity("PFH")])
+    assert [e.raw_span for e in fake.calls[0][1]] == ["Aurora"]
+    assert (aurora.decision, aurora.candidates) == ("ambiguous", [INNOVATION, MOBILE])
+    assert (pfh.decision, pfh.method) == ("none", "no_candidates")
+
+
+@pytest.mark.asyncio
+async def test_pick_outside_the_entitys_own_candidates_is_dropped(setup) -> None:
+    # The pool merges both entities' candidates, so the model can cross them over.
+    setup(
+        {"aurora": [INNOVATION, MOBILE], "rhine power": [RWE]},
+        result=[
+            Disambiguation(decision="resolved", candidates=[RWE]),
+            Disambiguation(decision="ambiguous", candidates=[RWE, MOBILE]),
+        ],
+    )
+    aurora, rwe = await _resolve([_entity("Aurora"), _entity("Rhine Power")])
+    assert (aurora.decision, aurora.method, aurora.candidates) == ("none", "llm", [])
+    assert (rwe.decision, rwe.candidates) == ("ambiguous", [RWE])
 
 
 @pytest.mark.asyncio
 async def test_binding_resolves_without_llm(setup, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = setup({"aurora innovation": [INNOVATION]}, catalogue=[INNOVATION, MOBILE])
+    fake = setup({"aurora innovation": [INNOVATION]})
 
     class FakeConversations:
         def __init__(self, _session) -> None:

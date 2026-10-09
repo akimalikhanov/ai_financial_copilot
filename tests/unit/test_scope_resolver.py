@@ -147,6 +147,12 @@ class TestCombine:
         assert result.clarifications == []
 
     @pytest.mark.asyncio
+    async def test_a_name_unlike_the_company_is_kept_as_its_mention(self, setup) -> None:
+        setup([AURORA, RWE], [_resolved(RWE), _resolved(AURORA)])
+        result = await _scope(None, _entity("RWE"), _entity("PFH"))
+        assert result.mentions() == {"Aurora Innovation, Inc.": '"PFH"'}
+
+    @pytest.mark.asyncio
     async def test_resolved_outside_universe_is_outside_scope(self, setup) -> None:
         setup([AURORA, RWE], [_resolved(RWE)])
         result = await _scope(ChatScope(mode="selectedDocs", doc_ids=[AURORA[0]]), _entity("RWE"))

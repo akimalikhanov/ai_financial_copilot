@@ -1235,8 +1235,7 @@ def get_router_config() -> dict[str, float | int]:
     Returns:
         Dict with keys: temperature, max_tokens, timeout, entity_max_candidates,
         entity_candidate_sim_threshold, entity_candidate_word_threshold,
-        entity_catalogue_inline_max, disambiguator_timeout, disambiguator_max_tokens,
-        disambiguator_max_titles.
+        disambiguator_timeout, disambiguator_max_tokens, disambiguator_max_titles.
     """
     return {
         "temperature": float(os.getenv("ROUTER_TEMPERATURE", "0.0")),
@@ -1244,13 +1243,12 @@ def get_router_config() -> dict[str, float | int]:
         "timeout": float(os.getenv("ROUTER_TIMEOUT", "10.0")),
         "entity_max_candidates": int(os.getenv("ENTITY_MAX_CANDIDATES", "20")),
         # Candidate generation is deliberately loose: pg_trgm `%` (similarity) and `<<%`
-        # (strict_word_similarity) thresholds. Precision is the disambiguator's job.
+        # (strict_word_similarity) thresholds. They bound recall: the disambiguator only
+        # picks among these matches. Precision is its job.
         "entity_candidate_sim_threshold": float(os.getenv("ENTITY_CANDIDATE_SIM_THRESHOLD", "0.2")),
         "entity_candidate_word_threshold": float(
             os.getenv("ENTITY_CANDIDATE_WORD_THRESHOLD", "0.25")
         ),
-        # Up to this many distinct companies, every company is a candidate (no trigrams).
-        "entity_catalogue_inline_max": int(os.getenv("ENTITY_CATALOGUE_INLINE_MAX", "50")),
         "disambiguator_timeout": float(os.getenv("ENTITY_DISAMBIGUATOR_TIMEOUT", "8.0")),
         "disambiguator_max_tokens": int(os.getenv("ENTITY_DISAMBIGUATOR_MAX_TOKENS", "400")),
         # Document titles shown per candidate company.
