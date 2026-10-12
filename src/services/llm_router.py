@@ -17,12 +17,14 @@ from src.services.llm_adapters.base_adapter import (
     LLMAdapter,
     LLMResponse,
     LLMStreamChunk,
+    ResponseMeta,
 )
 from src.services.llm_adapters.fake_adapter import FakeAdapter
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
+from src.services.llm_adapters.openai_responses_adapter import OpenAIResponsesAdapter
 from src.services.llm_runtime.exceptions import LLMError, LLMNotFoundError, LLMServerError
-from src.utils.config import load_models_config
+from src.utils.config import get_llm_reasoning_summary_max_chars, load_models_config
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,22 @@ def trace_usage(stats: Any) -> dict[str, Any]:
     return out
 
 
+def capped_summary(summary: str | None) -> str | None:
+    return summary[: get_llm_reasoning_summary_max_chars()] if summary else None
+
+
+def reasoning_metadata(summary: str | None, meta: ResponseMeta | None) -> dict[str, Any]:
+    """Generation metadata for a provider's reasoning facts; empty on Chat Completions."""
+    m = meta or ResponseMeta()
+    fields = {
+        "reasoning_summary": capped_summary(summary),
+        "reasoning_context": m.reasoning_context,
+        "service_tier": m.service_tier,
+        "response_id": m.response_id,
+    }
+    return {k: v for k, v in fields.items() if v}
+
+
 def _merge_params(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(defaults)
     for k, v in overrides.items():
@@ -128,6 +146,14 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             status_code=500,
         )
 
+    api = model_cfg.get("api") or "chat_completions"
+    if api == "responses" and provider != "openai":
+        raise LLMServerError(
+            f"api: responses is only supported for provider 'openai', not {provider!r}",
+            provider=provider,
+            status_code=500,
+        )
+
     if provider == "openai":
         model_name = model_cfg.get("model_name")
         if not model_name:
@@ -136,9 +162,10 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
                 provider=provider,
                 status_code=500,
             )
-        return OpenAIAdapter(
-            default_model=model_name, capabilities=model_cfg.get("capabilities") or {}
-        )
+        capabilities = model_cfg.get("capabilities") or {}
+        if api == "responses":
+            return OpenAIResponsesAdapter(default_model=model_name, capabilities=capabilities)
+        return OpenAIAdapter(default_model=model_name, capabilities=capabilities)
 
     if provider == "google":
         model_name = model_cfg.get("model_name")
@@ -224,7 +251,10 @@ class RoutedLLM:
                 raise
             gen.update(
                 output=response.text,
-                metadata={"finish_reason": response.finish_reason},
+                metadata={
+                    "finish_reason": response.finish_reason,
+                    **reasoning_metadata(response.reasoning_summary, response.meta),
+                },
                 **trace_usage(response.stats),
             )
             return response
@@ -267,7 +297,10 @@ class RoutedLLM:
                     {"name": tc.name, "arguments": tc.arguments} for tc in (result.tool_calls or [])
                 ]
                 or result.text,
-                metadata={"finish_reason": result.finish_reason},
+                metadata={
+                    "finish_reason": result.finish_reason,
+                    **reasoning_metadata(result.reasoning_summary, result.meta),
+                },
                 **trace_usage(result.stats),
             )
             return result

@@ -531,10 +531,68 @@
       "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     },
     {
+      "id": 34,
+      "title": "Reasoning Replay Size per Tool-Model Call (p50 / p95)",
+      "type": "timeseries",
+      "description": "Encrypted reasoning sent back to the model on each Responses API tool call. It's cached input, so it's cheap, but it adds to request size. Above ~100 kB at p95, check whether long runs are worth the carryover.",
+      "gridPos": { "x": 0, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(agent_reasoning_replay_bytes_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_reasoning_replay_bytes_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decbytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 35,
+      "title": "Effective Reasoning Context by Model",
+      "type": "timeseries",
+      "description": "Reasoning context mode the API reports per call. current_turn drops reasoning from before the last user message; all_turns keeps it. A model that moves to a different mode without a config change means the provider default changed.",
+      "gridPos": { "x": 8, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_reasoning_context_total[5m])) by (model, mode)",
+          "legendFormat": "{{model}} · {{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 36,
+      "title": "Degraded Retries by Reason",
+      "type": "timeseries",
+      "description": "Calls resent without a feature the API rejected. summary_unavailable: the account can't get reasoning summaries, so this process stops asking. reasoning_replay: a replayed reasoning item failed verification, so the call went out without carryover. Both should sit near zero.",
+      "gridPos": { "x": 16, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(llm_degraded_retries_total[1h])) by (model, reason)",
+          "legendFormat": "{{model}} · {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
       "id": 14,
       "type": "row",
       "title": "Quality Drill-Down (PostgreSQL)",
-      "gridPos": { "x": 0, "y": 77, "w": 24, "h": 1 },
+      "gridPos": { "x": 0, "y": 85, "w": 24, "h": 1 },
       "collapsed": false
     },
     {
@@ -542,7 +600,7 @@
       "title": "Per-Request Stage Breakdown (slowest in range)",
       "type": "table",
       "description": "Outlier drill-down: the slowest requests in the dashboard time range. Not possible from aggregate histograms — find the specific requests where a stage blew up.",
-      "gridPos": { "x": 0, "y": 78, "w": 12, "h": 10 },
+      "gridPos": { "x": 0, "y": 86, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {
@@ -565,7 +623,7 @@
       "title": "Response Quality — Thumbs Down Rate (hourly)",
       "type": "timeseries",
       "description": "Only user-perceived quality signal — catches fast-but-wrong regressions.",
-      "gridPos": { "x": 12, "y": 78, "w": 12, "h": 10 },
+      "gridPos": { "x": 12, "y": 86, "w": 12, "h": 10 },
       "datasource": { "type": "postgres", "uid": "postgres" },
       "targets": [
         {

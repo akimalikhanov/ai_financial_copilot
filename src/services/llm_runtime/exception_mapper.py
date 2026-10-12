@@ -10,10 +10,12 @@ from src.services.llm_runtime.exceptions import (
     LLMContentFilterError,
     LLMContextLengthError,
     LLMError,
+    LLMFeatureUnavailableError,
     LLMInvalidRequestError,
     LLMNotFoundError,
     LLMPermissionError,
     LLMRateLimitError,
+    LLMReasoningReplayError,
     LLMServerError,
     LLMServiceUnavailableError,
     LLMTimeoutError,
@@ -116,6 +118,18 @@ def map_openai_error(
     if isinstance(error, BadRequestError):
         # Check for specific error types
         msg = str(error).lower()
+        if error.code == "invalid_encrypted_content" or "without its required following" in msg:
+            return LLMReasoningReplayError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 400,
+            )
+        if error.param == "reasoning.summary" or ("verif" in msg and "summar" in msg):
+            return LLMFeatureUnavailableError(
+                str(error),
+                **common_kwargs,
+                status_code=status_code or 400,
+            )
         if "context_length" in msg or "maximum context" in msg or "too long" in msg:
             return LLMContextLengthError(
                 str(error),
@@ -176,6 +190,23 @@ def map_openai_error(
 
     # Unknown error - wrap as generic LLMError
     return LLMError(str(error), **common_kwargs, status_code=status_code)
+
+
+def map_openai_response_error(
+    code: str | None,
+    message: str,
+    *,
+    provider: str = "openai",
+    model: str | None = None,
+) -> LLMError:
+    """Map a Responses API `error` event or `response.failed` error code. These arrive in
+    a 200 stream body, so there is no SDK exception to map."""
+    common_kwargs = {"provider": provider, "model": model, "error_code": code}
+    if code == "rate_limit_exceeded":
+        return LLMRateLimitError(message, **common_kwargs, status_code=429)
+    if code == "invalid_prompt":
+        return LLMInvalidRequestError(message, **common_kwargs, status_code=400)
+    return LLMServerError(message, **common_kwargs, status_code=500)
 
 
 def map_google_error(

@@ -29,9 +29,11 @@ from src.services.llm_adapters.base_adapter import (
     LLMResponseStats,
     LLMStreamChunk,
     OpaqueItem,
+    ResponseMeta,
     Role,
     ToolCallRef,
 )
+from src.services.llm_adapters.openai_responses_adapter import OpenAIResponsesAdapter
 from src.services.llm_router import (
     FallbackStream,
     LLMRouter,
@@ -40,6 +42,7 @@ from src.services.llm_router import (
     _merge_params,
     _normalize_base_url,
     _trace_message,
+    reasoning_metadata,
     trace_usage,
 )
 from src.services.llm_runtime.exceptions import (
@@ -223,6 +226,18 @@ class TestBuildAdapter:
         adapter = _build_adapter("openai", cfg)
         assert isinstance(adapter, DummyOpenAIAdapter)
         assert adapter.capabilities == {"reasoning": True}
+
+    def test_api_responses_picks_responses_adapter(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "k")
+        cfg = {"model_name": "gpt-5-mini", "api": "responses", "capabilities": {"reasoning": True}}
+        adapter = _build_adapter("openai", cfg)
+        assert isinstance(adapter, OpenAIResponsesAdapter)
+        assert adapter.default_model == "gpt-5-mini" and adapter.api == "responses"
+
+    def test_api_responses_rejected_off_openai(self):
+        cfg = {"model_path": "llama-3", "server": {"host": "h", "port": "1"}, "api": "responses"}
+        with pytest.raises(LLMServerError, match="only supported for provider 'openai'"):
+            _build_adapter("vllm", cfg)
 
     def test_build_gemini_adapter(self):
         cfg = {"model_name": "gemini-pro"}
@@ -625,3 +640,19 @@ def test_trace_message_never_carries_opaque_payloads():
     traced = _trace_message(msg)
     assert blob not in str(traced)
     assert traced["reasoning"].startswith("[1 encrypted items")
+
+
+def test_reasoning_metadata_is_empty_on_chat_completions():
+    assert reasoning_metadata(None, None) == {}
+
+
+def test_reasoning_metadata_caps_the_summary_and_drops_unset_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LLM_REASONING_SUMMARY_MAX_CHARS", "5")
+    meta = ResponseMeta(response_id="resp_1", reasoning_context="all_turns")
+    assert reasoning_metadata("abcdefgh", meta) == {
+        "reasoning_summary": "abcde",
+        "reasoning_context": "all_turns",
+        "response_id": "resp_1",
+    }

@@ -243,8 +243,10 @@ class LLMRequestRepository:
         trace_id: str | None = None,
         reasoning_summary: str | None = None,
         llm_api: str | None = None,
+        request_params_updates: dict | None = None,
     ) -> LLMRequest | None:
-        """Update LLM request stats on stream completion."""
+        """Update LLM request stats on stream completion. `request_params_updates` merges
+        into the row's `request_params`."""
         result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
         llm_request = result.scalar_one_or_none()
         if not llm_request:
@@ -268,6 +270,12 @@ class LLMRequestRepository:
             llm_request.reasoning_summary = reasoning_summary
         if llm_api is not None:
             llm_request.llm_api = llm_api
+        if request_params_updates:
+            # A new dict, so SQLAlchemy sees the JSONB column change.
+            llm_request.request_params = {
+                **(llm_request.request_params or {}),
+                **request_params_updates,
+            }
 
         await self.session.flush()
         return llm_request

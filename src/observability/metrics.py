@@ -203,6 +203,12 @@ AGENT_TOOL_MODEL_OUTPUT_TOKENS = Counter(
     "Tool-model output tokens by turn kind",
     ["model", "turn_kind", "part"],
 )
+# Encrypted reasoning replayed per tool-model call on the Responses API: request bloat.
+AGENT_REASONING_REPLAY_BYTES = Histogram(
+    "agent_reasoning_replay_bytes",
+    "Opaque reasoning payload replayed per tool-model call",
+    buckets=(0, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 500_000),
+)
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
 # outcome: carried | none | dropped_hop_cap | dropped_scope
 FOLLOWUP_FINDINGS_CARRIED = Counter(
@@ -244,6 +250,16 @@ LLM_REASONING_TOKENS = Counter(
 # adding the label doesn't split that series' history.
 LLM_API_CALLS = Counter(
     "llm_api_calls_total", "LLM calls by wire API", ["model", "api", "request_type", "outcome"]
+)
+# mode: the effective reasoning context the API reports (auto | current_turn | all_turns).
+# Catches a default change that quietly turns carryover off.
+LLM_REASONING_CONTEXT = Counter(
+    "llm_reasoning_context_total", "Calls by effective reasoning context", ["model", "mode"]
+)
+# reason: summary_unavailable | reasoning_replay. A call resent without the rejected
+# feature; should sit near zero.
+LLM_DEGRADED_RETRIES = Counter(
+    "llm_degraded_retries_total", "LLM calls resent without a rejected feature", ["model", "reason"]
 )
 # request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
 # router | conversation_naming | entity_disambiguator. outcome: ok | length (answered, but

@@ -21,7 +21,7 @@ from src.services.chat.agent.tools import (
     SEARCH_ANALYTICAL_TOOL,
     SEARCH_TOOL,
 )
-from src.services.chat.agent.transcript import Transcript
+from src.services.chat.agent.transcript import Transcript, opaque_size
 
 if TYPE_CHECKING:
     from src.services.llm_adapters.base_adapter import LLMResponseStats
@@ -146,6 +146,8 @@ def get_agent_settings() -> AgentSettings:
 @dataclass
 class TokenSpend:
     input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
 
@@ -247,6 +249,8 @@ class AgentRunState:
             return
         ts = self.spend.setdefault(model_id, TokenSpend())
         ts.input_tokens += stats.input_tokens or 0
+        ts.cached_input_tokens += stats.cached_input_tokens or 0
+        ts.cache_write_tokens += stats.cache_write_tokens or 0
         ts.output_tokens += stats.output_tokens or 0
         ts.cost_usd += stats.cost_usd or 0.0
 
@@ -324,13 +328,12 @@ def unresolved_lines(state: AgentRunState) -> list[str]:
 
 
 def render_status(state: AgentRunState) -> str | None:
-    """Coverage status, computed per call and sent at the end of the request — never stored.
+    """Coverage status, computed per call and stored at the end of that call's request.
 
     Keys and sub-questions only, never claim bodies: the model has nothing to copy, so it
     cannot restate an earlier conclusion instead of reporting a new one. It is the only
-    place coverage is stated: nothing stored in the transcript states it, so nothing there
-    goes stale. The stall nudge lives here too rather than being appended once and never
-    removed.
+    place coverage is stated, and the newest copy is always the last message, so older
+    copies are visibly superseded. The stall nudge lives here too.
     """
     if not state.plan:
         return None
@@ -373,6 +376,7 @@ def snapshot(state: AgentRunState) -> dict:
     to the `agent_loop` span when the run ends. Run-level counters are not repeated here:
     they live on `AgentLoopMeta`, which the caller puts on the `agent_loop` span output.
     """
+    reasoning_items, reasoning_bytes = opaque_size(state.transcript.messages)
     return {
         "iteration": state.iteration,
         "plan": dict(state.plan),
@@ -388,6 +392,9 @@ def snapshot(state: AgentRunState) -> dict:
         "findings_screened": state.findings.screened(),
         "evidence_chunk_count": len(state.evidence),
         "transcript_message_count": len(state.transcript.messages),
+        # Counts only: the encrypted payloads never reach a trace.
+        "reasoning_items": reasoning_items,
+        "reasoning_bytes": reasoning_bytes,
     }
 
 

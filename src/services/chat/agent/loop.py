@@ -31,6 +31,7 @@ from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     AGENT_LAST_TURN_INPUT_TOKENS,
+    AGENT_REASONING_REPLAY_BYTES,
     AGENT_TOOL_ARG_ERRORS,
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
@@ -39,6 +40,7 @@ from src.observability.metrics import (
     LLM_CACHE_HIT_TOKENS,
     LLM_CACHE_WRITE_TOKENS,
     LLM_COST,
+    LLM_REASONING_CONTEXT,
     LLM_TOKENS,
     observe_llm_call,
     observe_llm_failure,
@@ -64,7 +66,7 @@ from src.services.chat.agent.state import (
     unresolved_lines,
 )
 from src.services.chat.agent.tools import REPORT_TOOL_NAME, SearchDocumentsArgs
-from src.services.chat.agent.transcript import Transcript, with_status
+from src.services.chat.agent.transcript import Transcript, opaque_size
 from src.services.chat.events import build_activity_event
 from src.services.context.turns import as_messages, cap_turns, tool_model_history
 from src.services.llm_adapters.base_adapter import (
@@ -77,7 +79,7 @@ from src.services.llm_runtime.exceptions import LLMError
 from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
-from src.utils.config import get_agent_trace_chunk_chars
+from src.utils.config import get_agent_trace_chunk_chars, get_llm_reasoning_summary_max_chars
 
 if TYPE_CHECKING:
     from src.schemas.chat import ChatPipelineState, Turn
@@ -410,9 +412,8 @@ def _render_report_result(
 ) -> str:
     """The tool result for one report: what landed and what didn't, nothing else.
 
-    It never states coverage. The transcript is append-only, so an open list here would
-    stay on screen and go stale; the status view (recomputed and sent on every call) is
-    the only view of what is still open.
+    It never states coverage: the status view, recomputed on every call and placed last,
+    is the only view of what is still open.
     """
     parts: list[str] = []
     # Split on what actually landed, not on what was claimed: with no mid-loop gap
@@ -645,7 +646,7 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
         if state.empty_rounds > state.settings.max_empty_rounds:
             return Stop("convergence")
         # The stall nudge lives in `render_status`, recomputed per call from
-        # `empty_rounds`, so it never accumulates in the transcript.
+        # `empty_rounds`.
     else:
         # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative.
         state.empty_rounds = 0
@@ -845,12 +846,19 @@ async def _record_turn_spend(
     llm: RoutedLLM,
     turn: AssistantTurnResult,
     allowed: list[str] | None,
+    replay_bytes: int = 0,
 ) -> None:
-    """Spend, metrics and the `llm_requests` sub-request row for one tool-model call."""
+    """Spend, metrics and the `llm_requests` sub-request row for one tool-model call.
+    `replay_bytes` is the opaque payload the request carried."""
     stats = turn.stats
     if stats is None:
         return
     turn_kind = _turn_kind(allowed, turn)
+    meta = turn.meta
+    if llm.api == "responses":
+        AGENT_REASONING_REPLAY_BYTES.observe(replay_bytes)
+    if meta and meta.reasoning_context:
+        LLM_REASONING_CONTEXT.labels(llm.model_id, meta.reasoning_context).inc()
     state.record_spend(llm.model_id, stats)
     state.last_turn_input_tokens = stats.input_tokens or 0
     if stats.input_tokens:
@@ -896,10 +904,24 @@ async def _record_turn_spend(
         state,
         deps,
         llm,
-        {"tool_calls_issued": len(turn.tool_calls or []), "turn_kind": turn_kind},
+        {
+            "tool_calls_issued": len(turn.tool_calls or []),
+            "turn_kind": turn_kind,
+            # Effective values the provider reports, for debugging.
+            **({"reasoning_context": meta.reasoning_context} if meta else {}),
+            **({"service_tier": meta.service_tier} if meta else {}),
+            **({"replay_bytes": replay_bytes} if llm.api == "responses" else {}),
+        },
         status="truncated" if truncated else "completed",
+        reasoning_summary=_capped_summary(turn),
         **stats_to_request_kwargs(stats),
     )
+
+
+def _capped_summary(turn: AssistantTurnResult | None) -> str | None:
+    if turn is None or not turn.reasoning_summary:
+        return None
+    return turn.reasoning_summary[: get_llm_reasoning_summary_max_chars()]
 
 
 async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) -> _SearchResult:
@@ -952,9 +974,9 @@ async def _run_turn(
     await add_event(deps.redis_app, request_id, "activity", round_data)
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
-    # The status view is computed per call and folded into the request's last tool result
-    # (`with_status`) — never stored, so it never accumulates. It is the single source of
-    # coverage truth: nothing permanent in the transcript states coverage. It also doubles
+    # The status view is computed per call and stored folded into the last tool result
+    # (`add_status`), so the next request starts with this one verbatim and hits the
+    # cache. Older statuses stay in history; the newest is always last. It also doubles
     # as this turn's trace input: the transcript up to here is what earlier turns' own
     # spans already recorded (Langfuse nests them under the same agent_loop chain), so
     # re-dumping all of `state.transcript.messages` on every turn would repeat turn 0's
@@ -973,9 +995,13 @@ async def _run_turn(
         },
     ) as obs:
         try:
-            prompt_messages = with_status(state.transcript.messages, status)
+            state.transcript.add_status(status)
+            prompt_messages = list(state.transcript.messages)
             served, turn = await _call_tool_model(state, deps, prompt_messages, tools, allowed)
-            await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn, allowed))
+            _, replay_bytes = opaque_size(prompt_messages)
+            await _finish_despite_cancel(
+                _record_turn_spend(state, deps, served, turn, allowed, replay_bytes)
+            )
 
             if not turn.tool_calls:
                 # Every key was already recorded and `decide` held the run open only so
@@ -1009,8 +1035,10 @@ async def _run_turn(
             # The assistant message is appended ONCE, verbatim, in emission order, and
             # (below) there is exactly one role=tool result per tool_call id. An assistant
             # tool_calls entry without a matching result — or vice versa — is a 400 on
-            # every OpenAI-compatible provider.
-            state.transcript.append_tool_calls(turn.tool_calls)
+            # every OpenAI-compatible provider. The turn's opaque items (encrypted
+            # reasoning) ride on the same message, in emission order; only the adapter
+            # reads them, so the model continues its own reasoning on the next call.
+            state.transcript.append_turn(turn)
             state.tool_calls_total += len(turn.tool_calls)
 
             # Key before execution, so the tool result can echo the key the model must cite.
@@ -1102,6 +1130,8 @@ async def _run_turn(
                         "token_spend_cumulative": state.input_tokens_total(),
                         "cost_usd_cumulative": state.cost_usd_total(),
                         "new_labels": new_labels,
+                        # The provider's readable "why" behind this turn's calls.
+                        **({"reasoning_summary": s} if (s := _capped_summary(turn)) else {}),
                     },
                 )
 

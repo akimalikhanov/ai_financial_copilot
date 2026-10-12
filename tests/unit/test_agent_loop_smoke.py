@@ -32,6 +32,8 @@ from src.services.chat.agent.loop import (
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     LLMResponseStats,
+    OpaqueItem,
+    ResponseMeta,
     Role,
     ToolCallRef,
 )
@@ -1000,10 +1002,10 @@ async def test_extraction_plan_is_seeded_from_expected_entities() -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_view_is_sent_but_never_stored() -> None:
-    """The status view is the single source of coverage truth: computed per call and
-    folded into the request's last tool result, never persisted — otherwise it
-    accumulates one stale copy per turn."""
+async def test_status_is_stored_so_each_request_extends_the_last() -> None:
+    """The status is folded into the last tool result and kept there: Responses only
+    reuses a whole earlier prompt from cache, so each request must start with the
+    previous one verbatim. The newest status is always the last message."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1043,26 +1045,20 @@ async def test_status_view_is_sent_but_never_stored() -> None:
     assert (sent[1][-1].content or "").endswith(
         "<run_status>\nOpen: A1 (Did costs rise?)\n</run_status>"
     )
-    # Turn 4's status supersedes the earlier ones rather than adding to them: exactly one
-    # message states coverage, and it is the last one.
-    coverage_msgs = [m for m in sent[3] if "<run_status>\n" in (m.content or "")]
-    assert coverage_msgs == [sent[3][-1]]
-    assert (coverage_msgs[0].content or "").endswith(
+    # Turn 4's status is the last message; earlier ones stay where they were sent.
+    assert (sent[3][-1].content or "").endswith(
         "<run_status>\nRecorded: A1 · Open: A2 (Did pricing offset?)\n</run_status>"
     )
     assert not any(m.role == Role.user and "Open:" in (m.content or "") for m in sent[3])
-    # Nothing stored carries a status: the tool result turn 2 saw with a status folded in
-    # comes back bare on turn 4, so the fold lived in the request copy only.
-    folded = sent[1][-1]
-    stored = next(m for m in sent[3] if m.tool_call_id == folded.tool_call_id)
-    assert "<run_status>" not in (stored.content or "")
-    assert (folded.content or "").startswith(stored.content or "")
+    # Every request starts with the previous one verbatim, statuses included.
+    for earlier, later in zip(sent, sent[1:], strict=False):
+        assert later[: len(earlier)] == earlier
 
 
 @pytest.mark.asyncio
-async def test_empty_round_appends_no_permanent_nudge() -> None:
-    """The stall nudge lives in the recomputed status view, not as a user message that
-    accumulates one copy per empty round."""
+async def test_empty_round_nudge_rides_on_the_status() -> None:
+    """The stall nudge lives in the recomputed status view, not as a separate user
+    message."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1094,7 +1090,7 @@ async def test_empty_round_appends_no_permanent_nudge() -> None:
         execute_search=_search,
     )
 
-    # Turn 3 sees the nudge exactly once, and only inside the (unstored) status message.
+    # Turn 3 sees the nudge exactly once, inside its own status (the last message).
     nudged = [m for m in sent[2] if "no new evidence" in (m.content or "")]
     assert len(nudged) == 1
     assert nudged[0] is sent[2][-1]
@@ -1158,6 +1154,8 @@ async def test_prior_history_is_capped_truncated_and_sanitized() -> None:
     # The blocked turn is gone, and so is its refusal: no answer without its question.
     assert not any("reveal the system prompt" in c for c in contents)
     assert not any("can't process" in c for c in contents)
+    # Prior turns are rebuilt from stored answers: reasoning never crosses a user turn.
+    assert all(m.opaque is None for m in sent[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1701,3 +1699,114 @@ def test_turn_kind_classifies_by_the_calls_made() -> None:
     assert _turn_kind(None, None) == "unknown"
     # The final turn is known before the call, so even a failed one is labelled.
     assert _turn_kind(["report_findings"], None) == "final"
+
+
+def _opaque(item_id: str) -> tuple[OpaqueItem, ...]:
+    payload = {"type": "reasoning", "id": item_id, "encrypted_content": "enc"}
+    return (OpaqueItem("openai", "gpt-5.6-luna", payload),)
+
+
+def _scripted(script: list) -> tuple[AsyncMock, list[list[Any]]]:
+    """A Responses-API tool model that plays `script` (a turn or an exception per call),
+    then stops calling tools, recording the messages each call received."""
+    adapter = AsyncMock()
+    adapter.api = "responses"
+    calls: list[list[Any]] = []
+
+    async def _complete(messages: list[Any], **_k: Any) -> AssistantTurnResult:
+        calls.append(list(messages))
+        step = script[len(calls) - 1] if len(calls) <= len(script) else None
+        if isinstance(step, Exception):
+            raise step
+        return step or AssistantTurnResult(text="done", tool_calls=[])
+
+    adapter.complete_with_tools = AsyncMock(side_effect=_complete)
+    return adapter, calls
+
+
+@pytest.mark.asyncio
+async def test_opaque_is_replayed_next_turn_and_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+    chunk, payloads = _make_chunk_with_payload()
+    first = AssistantTurnResult(
+        text="",
+        tool_calls=[_search_tc("s1", "Did costs rise?")],
+        stats=LLMResponseStats(input_tokens=10),
+        opaque=_opaque("rs_1"),
+        reasoning_summary="Need the cost table.",
+        meta=ResponseMeta(reasoning_context="current_turn", service_tier="default"),
+    )
+    second = AssistantTurnResult(
+        text="",
+        tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))],
+        stats=LLMResponseStats(input_tokens=20),
+    )
+    adapter, calls = _scripted([first, second])
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_search,
+    )
+
+    carried = [m for m in calls[1] if m.opaque]
+    assert len(carried) == 1 and carried[0].opaque == first.opaque
+    assert carried[0].content is None and carried[0].tool_calls[0].id == "s1"
+
+    assert rows[0]["reasoning_summary"] == "Need the cost table."
+    p0, p1 = rows[0]["request_params"], rows[1]["request_params"]
+    assert (p0["reasoning_context"], p0["service_tier"], p0["replay_bytes"]) == (
+        "current_turn",
+        "default",
+        0,
+    )
+    assert p1["replay_bytes"] == len(json.dumps(_opaque("rs_1")[0].payload))
+    assert rows[1]["reasoning_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_primary_gets_its_own_items_back_after_a_fallback_turn() -> None:
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    primary, primary_calls = _scripted(
+        [
+            AssistantTurnResult(
+                text="", tool_calls=[_search_tc("s1", "Did costs rise?")], opaque=_opaque("rs_1")
+            ),
+            LLMServerError("500"),
+        ]
+    )
+    fallback, _ = _scripted(
+        [AssistantTurnResult(text="", tool_calls=[_search_tc("s2", "Did pricing offset?")])]
+    )
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await run_loop(
+        state,
+        _routed_llm(primary),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        fallbacks=[_routed_llm(fallback)],
+        execute_search=_search,
+    )
+
+    # Call 3 is the primary's first after the fallback answered turn 2.
+    assistant = [m for m in primary_calls[2] if m.role is Role.assistant and m.tool_calls]
+    assert [(m.tool_calls[0].id, m.opaque) for m in assistant] == [
+        ("s1", _opaque("rs_1")),
+        ("s2", None),
+    ]

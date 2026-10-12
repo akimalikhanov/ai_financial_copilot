@@ -35,6 +35,21 @@ from .base_adapter import (
 )
 
 
+def make_openai_client(*, api_key: str | None = None, base_url: str | None = None) -> Any:
+    """AsyncOpenAI with the app's timeouts and retries, shared by both OpenAI adapters."""
+    import httpx
+    from openai import AsyncOpenAI
+
+    # Unset, these default to a 600s read timeout and 3 attempts — ten minutes inside a
+    # 900s task budget, and retries that multiply with the app-level parse retries.
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=httpx.Timeout(get_llm_timeout_seconds(), connect=get_llm_connect_timeout_seconds()),
+        max_retries=get_llm_max_retries(),
+    )
+
+
 @dataclass(frozen=True)
 class OpenAIChatRequest(ChatRequest):
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
@@ -66,20 +81,7 @@ class OpenAIAdapter(LLMAdapter):
         # Reasoning models take reasoning_effort/verbosity and max_completion_tokens, and
         # reject temperature.
         self._reasoning = bool((capabilities or {}).get("reasoning", False))
-
-        import httpx
-        from openai import AsyncOpenAI
-
-        # Unset, these default to a 600s read timeout and 3 attempts — ten minutes inside a
-        # 900s task budget, and retries that multiply with the app-level parse retries.
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=httpx.Timeout(
-                get_llm_timeout_seconds(), connect=get_llm_connect_timeout_seconds()
-            ),
-            max_retries=get_llm_max_retries(),
-        )
+        self._client = make_openai_client(api_key=api_key, base_url=base_url)
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

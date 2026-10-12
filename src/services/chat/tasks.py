@@ -39,6 +39,7 @@ from src.observability.metrics import (
     LLM_CACHE_HIT_TOKENS,
     LLM_CACHE_WRITE_TOKENS,
     LLM_COST,
+    LLM_REASONING_CONTEXT,
     LLM_TOKENS,
     PIPELINE_ERRORS,
     RAG_CITATIONS,
@@ -79,7 +80,9 @@ from src.services.context.turns import prior_turns
 from src.services.llm_router import (
     FallbackStream,
     LLMRouter,
+    capped_summary,
     get_router,
+    reasoning_metadata,
     trace_input,
     trace_usage,
 )
@@ -1435,11 +1438,21 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             )
                         if chunk.stats.cost_usd:
                             LLM_COST.labels(_model).inc(chunk.stats.cost_usd)
+                        meta = chunk.meta
+                        if meta and meta.reasoning_context:
+                            LLM_REASONING_CONTEXT.labels(_model, meta.reasoning_context).inc()
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),
                             trace_id=lf_trace_id,
                             llm_api=llm.api,
+                            reasoning_summary=capped_summary(chunk.reasoning_summary),
+                            request_params_updates={
+                                "reasoning_context": meta.reasoning_context,
+                                "service_tier": meta.service_tier,
+                            }
+                            if meta
+                            else None,
                         )
                     observe_llm_call(
                         llm_request.model,
@@ -1452,7 +1465,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         with contextlib.suppress(Exception):
                             _gen.update(  # type: ignore[union-attr]
                                 output=state.accumulated_content,
-                                metadata={"llm_api": llm.api, "finish_reason": finish_reason},
+                                metadata={
+                                    "llm_api": llm.api,
+                                    "finish_reason": finish_reason,
+                                    **reasoning_metadata(chunk.reasoning_summary, chunk.meta),
+                                },
                                 **trace_usage(chunk.stats),
                             )
                         if finish_outcome != "ok":

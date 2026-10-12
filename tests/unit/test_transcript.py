@@ -13,9 +13,16 @@ from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.transcript import (
     Transcript,
     assistant_msg_with_tool_calls,
+    opaque_size,
     with_status,
 )
-from src.services.llm_adapters.base_adapter import ChatMessage, Role, ToolCallRef
+from src.services.llm_adapters.base_adapter import (
+    AssistantTurnResult,
+    ChatMessage,
+    OpaqueItem,
+    Role,
+    ToolCallRef,
+)
 
 
 def _chunk() -> RetrievedChunk:
@@ -54,7 +61,7 @@ def _run_turn(
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue"}),
     )
-    transcript.append_tool_calls([tc])
+    transcript.append_turn(AssistantTurnResult(text="", tool_calls=[tc]))
     transcript.append(
         ChatMessage(role=Role.tool, tool_call_id=tc.id, content=ctx.formatted_context)
     )
@@ -144,3 +151,51 @@ class TestWithStatus:
         messages = self._messages()
         assert with_status(messages, None) == messages
         assert with_status(messages[:2], None) == messages[:2]
+
+    def test_add_status_stores_it_so_the_next_request_extends_this_one(self) -> None:
+        transcript = Transcript(self._messages())
+        transcript.add_status("Open: A1 (q)")
+        sent = list(transcript.messages)
+        assert sent == with_status(self._messages(), "Open: A1 (q)")
+        transcript.append(ChatMessage(role=Role.user, content="next"))
+        assert transcript.messages[: len(sent)] == sent
+
+    def test_earlier_opaque_is_untouched(self) -> None:
+        transcript = Transcript(self._messages()[:2])
+        transcript.append_turn(_turn_with_opaque())
+        transcript.append(ChatMessage(role=Role.tool, tool_call_id="c1", content="excerpts"))
+        sent = with_status(transcript.messages, "Open: A1 (q)")
+        assert sent[2] is transcript.messages[2]
+        assert sent[2].opaque == _turn_with_opaque().opaque
+
+
+REASONING = {"type": "reasoning", "id": "rs_1", "encrypted_content": "enc"}
+
+
+def _turn_with_opaque() -> AssistantTurnResult:
+    return AssistantTurnResult(
+        text="ignored prose",
+        tool_calls=[ToolCallRef(id="c1", name="t", arguments="{}")],
+        opaque=(OpaqueItem("openai", "gpt-5.6-luna", REASONING),),
+    )
+
+
+class TestAppendTurn:
+    def test_stores_calls_and_opaque_without_prose(self) -> None:
+        transcript = Transcript([])
+        transcript.append_turn(_turn_with_opaque())
+        (msg,) = transcript.messages
+        assert msg.role is Role.assistant and msg.content is None
+        assert msg.tool_calls == (ToolCallRef(id="c1", name="t", arguments="{}"),)
+        assert msg.opaque == _turn_with_opaque().opaque
+
+    def test_no_opaque_is_none(self) -> None:
+        transcript = Transcript([])
+        transcript.append_turn(AssistantTurnResult(text="", tool_calls=[], opaque=()))
+        assert transcript.messages[0].opaque is None
+
+    def test_opaque_size(self) -> None:
+        transcript = Transcript([])
+        transcript.append_turn(_turn_with_opaque())
+        transcript.append_turn(_turn_with_opaque())
+        assert opaque_size(transcript.messages) == (2, 2 * len(json.dumps(REASONING)))

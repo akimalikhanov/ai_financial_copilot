@@ -308,6 +308,12 @@ def get_llm_prompt_cache_key_enabled() -> bool:
     return _parse_bool(os.getenv("LLM_PROMPT_CACHE_KEY_ENABLED"), True)
 
 
+def get_llm_reasoning_summary_max_chars() -> int:
+    """LLM_REASONING_SUMMARY_MAX_CHARS (default 4000). Cap on the reasoning summary kept per
+    call, on the `llm_requests` row and on trace spans."""
+    return int(os.getenv("LLM_REASONING_SUMMARY_MAX_CHARS", "4000"))
+
+
 def get_max_open_streams() -> int:
     """SSE streams one API pod serves before /readyz sheds traffic (MAX_OPEN_STREAMS,
     default 200).
