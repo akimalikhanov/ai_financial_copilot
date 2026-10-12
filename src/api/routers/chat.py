@@ -249,6 +249,11 @@ async def _apply_clarification_reply(
         if entity is None:
             raise HTTPException(422, f"{pick.raw_span!r} is not on this clarification")
         binding: dict[str, str] = {}
+        if pick.skip:
+            if entity["outcome"] == "outside_scope":
+                raise HTTPException(422, f"{pick.raw_span!r} is outside the scope, not unmatched")
+            bindings[normalize_company(pick.raw_span)] = {"skip": True}
+            continue
         if pick.include_outside_scope is not None:
             if entity["outcome"] != "outside_scope" or not entity["candidates"]:
                 raise HTTPException(422, f"{pick.raw_span!r} is not outside the scope")

@@ -234,6 +234,8 @@ class ClarificationPick(BaseModel):
     company: str | None = None
     # For an entity outside the UI scope: search that company anyway, or leave it out.
     include_outside_scope: bool | None = None
+    # For an ambiguous or unmatched entity: search the other companies without it.
+    skip: bool = False
 
 
 class ClarificationReply(BaseModel):

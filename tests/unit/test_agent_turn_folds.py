@@ -200,8 +200,17 @@ class TestDecide:
         state = _state(plan={"A1": "q"})
         state.findings.record("A1", _neg("A1"), state.evidence)
 
-        assert decide(state, _facts()) == Stop("covered")
+        assert decide(state, _facts(new_labels=0)) == Stop("covered")
         assert state.sealed_by_coverage
+
+    def test_covered_plan_with_unread_results_continues(self) -> None:
+        # The turn reported the last key and searched too; the model has not read those
+        # results yet, so stopping would discard a follow-up it paid for.
+        state = _state(plan={"A1": "q"})
+        state.findings.record("A1", _neg("A1"), state.evidence)
+
+        assert decide(state, _facts(new_labels=2)) == Continue()
+        assert not state.sealed_by_coverage
 
     def test_every_search_failing_stops(self) -> None:
         state = _state(plan={"A1": "q"})

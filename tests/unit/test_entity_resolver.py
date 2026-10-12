@@ -160,6 +160,43 @@ async def test_binding_resolves_without_llm(setup, monkeypatch: pytest.MonkeyPat
     assert fake.calls == []
 
 
+def _with_bindings(monkeypatch: pytest.MonkeyPatch, bindings: dict[str, dict]) -> None:
+    class FakeConversations:
+        def __init__(self, _session) -> None:
+            pass
+
+        async def get_entity_bindings(self, _conversation_id):
+            return bindings
+
+    monkeypatch.setattr(entity_resolver, "ConversationRepository", FakeConversations)
+
+
+@pytest.mark.asyncio
+async def test_skip_binding_leaves_the_entity_out_without_llm(
+    setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = setup({"aurora": [INNOVATION, MOBILE]})
+    _with_bindings(monkeypatch, {"aurora": {"skip": True}})
+    [res] = await entity_resolver.resolve_entities(
+        _FAKE_SESSION, uuid4(), "q", [_entity("Aurora")], conversation_id=uuid4()
+    )
+    assert (res.decision, res.method, res.candidates) == ("none", "skipped", [])
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_skip_binding_ends_once_a_company_matches_exactly(
+    setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bth = _company("bth", 1.0)
+    setup({"bth": [bth]})
+    _with_bindings(monkeypatch, {"bth": {"skip": True}})
+    [res] = await entity_resolver.resolve_entities(
+        _FAKE_SESSION, uuid4(), "q", [_entity("BTH")], conversation_id=uuid4()
+    )
+    assert (res.decision, res.method, res.candidates) == ("resolved", "fast_path", [bth])
+
+
 @pytest.mark.asyncio
 async def test_no_candidates_at_all_skips_the_llm(setup) -> None:
     fake = setup({})

@@ -4,7 +4,7 @@ How the agent path ties the numbers in an answer to the documents: what it check
 computes for the answering model, and what it measures after the answer is written. The code
 lives in `src/services/chat/agent/number_grounding.py`, `src/services/chat/agent/processor.py`
 and `src/services/chat/confidence.py`. Everything here was checked against that code as of
-2026-10-07. If the code and this doc disagree, the code wins, so fix the doc.
+2026-10-11. If the code and this doc disagree, the code wins, so fix the doc.
 
 It assumes you know the findings block and the synthesis step from
 [agent_design.md](agent_design.md#15-synthesis-turning-loop-output-into-answer-context).
@@ -25,19 +25,20 @@ It assumes you know the findings block and the synthesis step from
 ## 1. The short version
 
 A number reaches the answer in two hops. The tool model reads an excerpt and reports the
-number as a figure in a finding. The answering model reads the findings block and writes the
-figure into prose. Either hop can go wrong. Three mechanisms cover them:
+number in a finding. On extraction runs it's a typed figure. On analytical runs it's part of
+the claim, marked `<n>…</n>`. The answering model reads the findings block and writes the
+number into prose. Either hop can go wrong. Three mechanisms cover them:
 
 | Mechanism | Hop | What it does | Effect |
 |---|---|---|---|
-| Figure check | excerpt → finding | Looks for each figure's amount in its cited excerpts and marks a miss `⚠ UNVERIFIED` | Changes what the answering model reads |
+| Figure check | excerpt → finding | Looks for each figure's amount, or each marked claim number, in its cited excerpts and marks a miss `⚠ UNVERIFIED` | Changes what the answering model reads |
 | Change lines | finding → answer | Computes the change between periods in code and lists it under the figures | Changes what the answering model reads |
 | Uncited-fact share | the answer | Counts fact sentences that carry no citation marker | Trace and Langfuse only |
 
 ```mermaid
 flowchart LR
-    E["Cited excerpts"] --> T["Tool model<br/>reports figures"]
-    T --> C["Figure check<br/>verify_value"]
+    E["Cited excerpts"] --> T["Tool model<br/>reports figures or<br/>marked claim numbers"]
+    T --> C["Figure check<br/>verify_value, verify_marked"]
     E --> C
     C --> B["Findings block<br/>figures, ⚠ UNVERIFIED,<br/>change lines"]
     B --> A["Answering model"]
@@ -95,6 +96,31 @@ follows this hasn't been measured.
 Formats it doesn't read: numbers written in words, numbers inside charts, space thousands
 (`6 976`) and comma decimals (`1.234,5`). Each gives a false `UNVERIFIED`. The last two
 appear in under 1% of chunks.
+
+### Claim numbers on the analytical path
+
+Analytical findings carry no figures. Asking for both a claim and figures got every number
+written twice and added about 10 s to each report turn. Instead the v6 prompt has the model
+wrap each number in its claim as the excerpt prints it, scale word included:
+
+```text
+Input costs rose <n>12%</n> YoY in H2 2023, a <n>$1.5 billion</n> headwind (Note 14).
+```
+
+`verify_marked(claim, texts)` checks each marked span. It parses the first number inside the
+mark and takes the scale from the word right after it ("billion", "bn", "m"). With no scale
+word, the number must appear as printed, which is how `12%` and `4pp` work. Then it runs the
+same `verify_value` as for figures. A mark holding no number is `unverifiable`.
+
+Only marked numbers are checked. "2023" and "Note 14" above are prose, so nobody has to
+guess which digits in a sentence are claims. The other side of this is that a number the
+model forgets to mark goes unchecked.
+
+`process_findings` stores the results per finding key in `ProcessedFindings.claim_numbers`.
+The renderer strips the marks from claims and the conclusion. When a marked number is not
+found, the finding's line ends with `⚠ UNVERIFIED: $1.5 billion not located in cited
+excerpt`. The synthesis prompt applies the figure rule to that one number. The results also
+go to Langfuse under `findings_processor.claim_numbers`.
 
 ---
 
@@ -198,7 +224,10 @@ share doesn't mean the numbers are right.
 | Citation to the wrong excerpt | `[S2]` on a number only S5 states | No | No | No |
 | Unsupported qualitative claim | "the filings disclose no acquisitions" | No | No | No |
 
-The catch rates come from errors injected into real cells of 1,321 table chunks.
+The catch rates come from errors injected into real cells of 1,321 table chunks. They were
+measured on figures. Marked claim numbers go through the same matcher, so a misread amount
+should be caught at a similar rate when it is marked, but nobody has measured it. How often
+the tool model marks its numbers hasn't been measured either.
 
 Known looseness: a number matches anywhere in the cited excerpt, and a zero matches any nil dash
 in it (about 40% of table chunks have a dash cell). Known false alarms: the formats listed in
@@ -256,8 +285,11 @@ to show users.
 | Question | Where to look |
 |---|---|
 | How a figure is checked | `number_grounding.py::verify_value` |
+| How a marked claim number is checked | `number_grounding.py::verify_marked`, marks removed by `strip_marks` |
 | Where the check is called | `processor.py::process_findings` (texts from `synthesis.py::run_synthesis`) |
 | The `UNVERIFIED` marker on a figure | `processor.py::_render_figure` |
+| The `UNVERIFIED` marker on a claim number | `processor.py::_render_findings_block` |
+| How the tool model is told to mark numbers | `prompts/system_v6_agent_analytical.yaml`, "Building findings" |
 | How change lines are built | `processor.py::_change_lines`, `_render_change` |
 | How the answering model is told to use them | `prompts/system_v5_agent_synthesis.yaml`, "Figures" |
 | The uncited-fact share | `confidence.py::uncited_fact_share`, called from `tasks.py` |
@@ -267,6 +299,6 @@ to show users.
 
 | Area | File in `tests/unit/` |
 |---|---|
-| Figure check: scale, nil cells, formats | `test_number_grounding.py` |
-| Change lines and the findings block | `test_findings_processor.py` |
+| Figure check: scale, nil cells, formats; marked claim numbers | `test_number_grounding.py` |
+| Change lines, claim-number markers and the findings block | `test_findings_processor.py` |
 | Uncited-fact share | `test_confidence.py` |

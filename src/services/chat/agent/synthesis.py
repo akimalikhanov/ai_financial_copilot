@@ -123,6 +123,10 @@ async def run_synthesis(
                                 }
                                 for n in processed.figures
                             ],
+                            "claim_numbers": {
+                                key: [(span, g.value) for span, g in checks]
+                                for key, checks in processed.claim_numbers.items()
+                            },
                         }
                     }
                 )

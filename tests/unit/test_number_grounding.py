@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from src.services.chat.agent.number_grounding import NumberGrounding, verify_value
+from src.services.chat.agent.number_grounding import (
+    NumberGrounding,
+    strip_marks,
+    verify_marked,
+    verify_value,
+)
 
 
 class TestVerifyValue:
@@ -68,3 +73,29 @@ class TestVerifyValue:
         assert verify_value(0, "M", ["a loss of $-5 million and $ -0.4 million"]) == (
             NumberGrounding.NOT_FOUND
         )
+
+
+class TestVerifyMarked:
+    def test_only_marked_numbers_are_checked(self) -> None:
+        # The unmarked year and note number are prose, not asserted magnitudes.
+        claim = "In 2022 margin fell <n>4pp</n> (Note 14)."
+        assert verify_marked(claim, ["margin down 4 percentage points"]) == [
+            ("4pp", NumberGrounding.GROUNDED)
+        ]
+
+    def test_scale_word_in_the_mark_is_applied(self) -> None:
+        texts = ["(in millions) | Cost of sales | 1,500 |"]
+        assert verify_marked("a <n>$1.5 billion</n> rise", texts) == [
+            ("$1.5 billion", NumberGrounding.GROUNDED)
+        ]
+
+    def test_unlocated_number_is_not_found(self) -> None:
+        assert verify_marked("rose <n>12%</n>", ["rose 9%"]) == [("12%", NumberGrounding.NOT_FOUND)]
+
+    def test_mark_without_a_number_is_unverifiable(self) -> None:
+        assert verify_marked("<n>several</n>", ["text"]) == [
+            ("several", NumberGrounding.UNVERIFIABLE)
+        ]
+
+    def test_strip_marks_keeps_the_numbers(self) -> None:
+        assert strip_marks("rose <n>12%</n> to <n>$3m</n>") == "rose 12% to $3m"

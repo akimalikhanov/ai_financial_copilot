@@ -389,3 +389,76 @@ async def test_clarification_card_reply_and_binding(
     events = await _chat(async_client, headers, conversation_id, content="and aurora's debt?")
     assert not [d for t, d in events if t == "scope_clarification"]
     assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+
+
+_MERGER_ROUTER_JSON = json.dumps(
+    {
+        "route": "retrieval",
+        "entities": [
+            {"name": "Origin Bancorp", "entity_type": "company", "raw_span": "Origin Bancorp"},
+            {"name": "BTH", "entity_type": "company", "raw_span": "BTH"},
+        ],
+        "user_intent": "single_lookup",
+        "reasoning": "names two companies",
+        "query_shape": "extraction",
+    }
+)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clarification_skip_searches_without_the_entity(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BTH matches nothing: "Search without it" answers from Origin alone, and stays answered."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.document import Document
+    from src.models.user import User
+    from src.services.router.company_name import normalize_company
+
+    router = create_agentic_router(MockStreamingLLM(router_json=_MERGER_ROUTER_JSON))
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"skip-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    async with get_session_factory()() as s:
+        user_id = (await s.execute(select(User.id).where(User.email == email))).scalar_one()
+        s.add(
+            Document(
+                user_id=user_id,
+                original_filename="origin.pdf",
+                storage_key=f"uploads/{uuid4()}.pdf",
+                status="ready",
+                document_metadata={"company": "Origin Bancorp", "year": "2022"},
+                company_norm=normalize_company("Origin Bancorp"),
+            )
+        )
+        await s.commit()
+    conv = await async_client.post("/v1/conversations", json={"title": "c"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+    question = "How did the merger with BTH affect Origin Bancorp's provision?"
+
+    events = await _chat(async_client, headers, conversation_id, content=question)
+    [card] = [d for t, d in events if t == "scope_clarification"]
+    assert card["resolved"] == ["Origin Bancorp"]
+    assert [(u["raw_span"], u["outcome"]) for u in card["unresolved"]] == [("BTH", "none")]
+
+    reply = {
+        "clarification_id": card["clarification_id"],
+        "picks": [{"raw_span": "BTH", "skip": True}],
+    }
+    events = await _chat(
+        async_client, headers, conversation_id, content=question, clarification_reply=reply
+    )
+    assert not [d for t, d in events if t == "scope_clarification"]
+    assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+
+    events = await _chat(async_client, headers, conversation_id, content=question)
+    assert not [d for t, d in events if t == "scope_clarification"]

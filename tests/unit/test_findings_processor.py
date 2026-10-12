@@ -338,6 +338,24 @@ class TestRenderedBlock:
         block = _render_findings_block(await process_findings(findings), _NO_EXCERPTS)
         assert "   - revenue (FY2023): 41.2 (scale not stated)" in block
 
+    @pytest.mark.asyncio
+    async def test_marked_claim_numbers_are_stripped_and_unlocated_ones_flagged(self) -> None:
+        finding = _finding("A1", evidence=["c1"]).model_copy(
+            update={"claim": "Costs rose <n>12%</n>, a <n>$1.5 billion</n> hit."}
+        )
+        processed = await process_findings(
+            _findings(finding), chunk_texts={"c1": "Input costs increased 12% in 2023."}
+        )
+        block = _render_findings_block(processed, _NO_EXCERPTS)
+
+        assert processed.claim_numbers == {
+            "A1": [("12%", NumberGrounding.GROUNDED), ("$1.5 billion", NumberGrounding.NOT_FOUND)]
+        }
+        assert (
+            "1. [high confidence] Costs rose 12%, a $1.5 billion hit. | evidence: —"
+            " | ⚠ UNVERIFIED: $1.5 billion not located in cited excerpt"
+        ) in block
+
 
 def _year(amount: float, year: int, **overrides: Any) -> Figure:
     fields: dict[str, Any] = {

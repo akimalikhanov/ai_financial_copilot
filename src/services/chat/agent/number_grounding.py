@@ -118,3 +118,33 @@ def verify_value(
             if any(_matches(target, c) for c in _candidates(raw, trailing, text_unit)):
                 return NumberGrounding.GROUNDED
     return NumberGrounding.NOT_FOUND
+
+
+# A number a claim asserts, marked by the model as printed: `<n>$1.5 billion</n>`.
+_MARKED_RE = re.compile(r"<n>(.*?)</n>")
+_UNIT_BY_SCALE = {scale: unit for unit, scale in UNIT_TO_MILLIONS.items()}
+
+
+def strip_marks(text: str) -> str:
+    """`text` without the `<n>` marks, keeping the numbers they wrap."""
+    return _MARKED_RE.sub(r"\1", text)
+
+
+def verify_marked(claim: str, texts: Sequence[str]) -> list[tuple[str, NumberGrounding]]:
+    """Each number `claim` marks with `<n>…</n>`, with its grounding in `texts`.
+
+    Only marked spans are checked: the model says which digits are asserted magnitudes,
+    so years and note numbers in the prose are never read as claims. The scale is the
+    word right after the number; without one the value must appear as printed."""
+    checks: list[tuple[str, NumberGrounding]] = []
+    for span in _MARKED_RE.findall(claim):
+        m = _NUMBER_RE.search(span)
+        value = _parse_number(m.group()) if m else None
+        if m is None or value is None:
+            checks.append((span, NumberGrounding.UNVERIFIABLE))
+            continue
+        word = re.match(r"\s*([a-zA-Z]+)", span[m.end() :])
+        scale = _SCALE_WORDS.get(word.group(1).lower()) if word else None
+        unit = _UNIT_BY_SCALE[scale] if scale is not None else ""
+        checks.append((span, verify_value(value, unit, texts)))
+    return checks

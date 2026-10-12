@@ -8,7 +8,7 @@ import logging
 import os
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from uuid import UUID
 
@@ -21,7 +21,9 @@ from src.schemas.retrieval import RAGContext
 from src.services.chat.agent.number_grounding import (
     UNIT_TO_MILLIONS,
     NumberGrounding,
+    strip_marks,
     to_millions,
+    verify_marked,
     verify_value,
 )
 
@@ -67,6 +69,8 @@ class ProcessedFindings:
     currency_converted: bool
     answer_note: str | None
     target_currency: str | None = None
+    # Per key: each number its claim marks with `<n>`, with its grounding.
+    claim_numbers: dict[str, list[tuple[str, NumberGrounding]]] = field(default_factory=dict)
 
     def figures_for(self, key: str) -> list[NormalizedFigure]:
         return [n for n in self.figures if n.key == key]
@@ -285,11 +289,17 @@ async def process_findings(
     ):
         answer_note = "only one entity had available data"
 
+    claim_numbers: dict[str, list[tuple[str, NumberGrounding]]] = {}
     if chunk_texts is not None:
         # Verify the native amount — the chunk states what the filing states, never our FX
         # arithmetic. Checking the converted amount would make every converted figure
         # read as a false "not_found".
         evidence = {f.key: f.evidence for f in findings.findings if f.supported}
+        for f in findings.findings:
+            if f.supported:
+                texts = [chunk_texts[c] for c in f.evidence if c in chunk_texts]
+                if checks := verify_marked(f.claim, texts):
+                    claim_numbers[f.key] = checks
         normalized = [
             dc_replace(
                 n,
@@ -310,6 +320,7 @@ async def process_findings(
         currency_converted=currency_converted,
         answer_note=answer_note,
         target_currency=resolved_target,
+        claim_numbers=claim_numbers,
     )
 
 
@@ -445,19 +456,30 @@ def _render_findings_block(
         # A stated negative has no evidence to cite and no confidence worth reporting —
         # rendering it as a low-confidence claim would invite the synthesis model to
         # hedge it into a weak positive instead of reporting the absence.
+        claim = strip_marks(f.claim)
         if not f.supported:
-            lines.append(f"{head} [not disclosed] {f.claim}")
+            lines.append(f"{head} [not disclosed] {claim}")
             continue
         # Drop refs with no excerpt in the synthesis context — leaking a raw ref here
         # would let the model cite an ID the citation pipeline can't resolve.
         refs = _map_refs(f.evidence, rag_context)
-        lines.append(f"{head} [{f.confidence} confidence] {f.claim} | evidence: {refs}")
+        unverified = [
+            span
+            for span, grounding in processed.claim_numbers.get(f.key, [])
+            if grounding is NumberGrounding.NOT_FOUND
+        ]
+        flag = (
+            f" | ⚠ UNVERIFIED: {', '.join(unverified)} not located in cited excerpt"
+            if unverified
+            else ""
+        )
+        lines.append(f"{head} [{f.confidence} confidence] {claim} | evidence: {refs}{flag}")
         figures = processed.figures_for(f.key)
         lines.extend(_render_figure(n, processed.target_currency) for n in figures)
         lines.extend(_change_lines(figures))
 
     if findings.conclusion:
-        lines.append(f"\nConclusion: {findings.conclusion}")
+        lines.append(f"\nConclusion: {strip_marks(findings.conclusion)}")
 
     if findings.unresolved:
         lines.append(f"Unresolved: {'; '.join(findings.unresolved)}")

@@ -263,6 +263,23 @@ class TestClarificationTriggers:
         assert result.unresolved_entities == ["RWE"]
         assert result.clarifications == []
 
+    @pytest.mark.asyncio
+    async def test_skipped_entity_is_left_out_entirely(self, setup) -> None:
+        setup([AURORA, RWE], [_resolved(RWE), _SKIPPED])
+        result = await _scope(None, _entity("RWE"), _entity("BTH"))
+        assert result.per_entity_doc_ids == {"RWE AG": [RWE[0]]}
+        assert result.unresolved_entities == [] and result.clarifications == []
+
+    @pytest.mark.asyncio
+    async def test_skipping_every_entity_asks_again(self, setup) -> None:
+        setup([AURORA, RWE], [_SKIPPED])
+        result = await _scope(None, _entity("BTH"))
+        assert result.unresolved_entities == ["BTH"]
+        assert [c.outcome for c in result.clarifications] == ["none"]
+
+
+_SKIPPED = EntityResolution(decision="none", candidates=[], method="skipped")
+
 
 def _bound(doc: Doc, outside_scope: Literal["include", "exclude"]) -> EntityResolution:
     return EntityResolution(

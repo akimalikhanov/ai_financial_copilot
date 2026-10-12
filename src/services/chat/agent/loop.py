@@ -63,7 +63,7 @@ from src.services.chat.agent.state import (
     unresolved_lines,
 )
 from src.services.chat.agent.tools import REPORT_TOOL_NAME, SearchDocumentsArgs
-from src.services.chat.agent.transcript import Transcript
+from src.services.chat.agent.transcript import Transcript, with_status
 from src.services.chat.events import build_activity_event
 from src.services.context.turns import as_messages, cap_turns, tool_model_history
 from src.services.llm_adapters.base_adapter import (
@@ -410,8 +410,8 @@ def _render_report_result(
     """The tool result for one report: what landed and what didn't, nothing else.
 
     It never states coverage. The transcript is append-only, so an open list here would
-    stay on screen and go stale; the status view (appended last on every call) is the
-    only view of what is still open.
+    stay on screen and go stale; the status view (recomputed and sent on every call) is
+    the only view of what is still open.
     """
     parts: list[str] = []
     # Split on what actually landed, not on what was claimed: with no mid-loop gap
@@ -624,7 +624,10 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
     """
     # Ordering is load-bearing: minting happened before this, so a turn that closes the
     # last open key *and* opens a new thread continues rather than stopping.
-    if state.plan and not open_aspects(state):
+    # Reports fold before the same turn's searches run, so a turn that reports every key
+    # and also searches has results the model has not read yet. Stopping there would pay
+    # for a follow-up and discard it; the next turn reads it, then re-reports or stops.
+    if state.plan and not open_aspects(state) and facts.new_labels == 0:
         state.sealed_by_coverage = True
         return Stop("covered")
 
@@ -943,8 +946,8 @@ async def _run_turn(
     await add_event(deps.redis_app, request_id, "activity", round_data)
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
-    # The status view is computed per call and appended last — never stored, so it never
-    # invalidates the cached prefix and never accumulates. It is the single source of
+    # The status view is computed per call and folded into the request's last tool result
+    # (`with_status`) — never stored, so it never accumulates. It is the single source of
     # coverage truth: nothing permanent in the transcript states coverage. It also doubles
     # as this turn's trace input: the transcript up to here is what earlier turns' own
     # spans already recorded (Langfuse nests them under the same agent_loop chain), so
@@ -964,14 +967,17 @@ async def _run_turn(
         },
     ) as obs:
         try:
-            prompt_messages = [
-                *state.transcript.messages,
-                *([ChatMessage(role=Role.user, content=status)] if status else []),
-            ]
+            prompt_messages = with_status(state.transcript.messages, status)
             served, turn = await _call_tool_model(state, deps, prompt_messages, tools, allowed)
             await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn, allowed))
 
             if not turn.tool_calls:
+                # Every key was already recorded and `decide` held the run open only so
+                # the model could read its last results: declining to act on them is the
+                # covered stop it deferred.
+                if state.plan and not open_aspects(state):
+                    state.sealed_by_coverage = True
+                    return Stop("covered")
                 # With no terminal tool this is a normal exit, not a rare one: the model
                 # emitted prose instead of a call. projection() still serves whatever the
                 # ledger accumulated (None only if nothing was ever reported). A turn cut

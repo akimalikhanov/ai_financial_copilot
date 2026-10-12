@@ -213,7 +213,7 @@ src/services/chat/agent/
 │                        open_aspects(), render_status(), snapshot(), build_meta()
 ├── evidence.py          EvidenceLedger: every retrieved chunk, S-label allocation
 ├── findings.py          FindingsLedger: keyed conclusions, grounding filter, projection
-├── transcript.py        Transcript: the model's append-only message list
+├── transcript.py        Transcript: the model's append-only message list; with_status()
 ├── tools.py             tool JSON schemas, generated from Pydantic models; the analytical
 │                        report schema is the same one with `figures` removed
 ├── synthesis.py         run_synthesis(): loop output -> AgentRunResult
@@ -305,7 +305,7 @@ makes it `analytical`.
 | Example question | "What was Acme's FY2023 revenue?" / "Which of Acme and Globex had higher revenue?" / "How did Acme's revenue change from FY2022 to FY2023?" | "Why did Acme's operating margin fall in FY2023?" |
 | Tool-model prompt | `v4_agent` | `v6_agent_analytical` |
 | Search tool args | `entity`, `query`, `keywords` | `entity`, `query`, `keywords`, `sub_question` |
-| Report tool schema | `REPORT_FINDINGS_TOOL`: each finding has `figures` | `REPORT_ANALYTICAL_TOOL`: no `figures`, numbers go in `claim` |
+| Report tool schema | `REPORT_FINDINGS_TOOL`: each finding has `figures` | `REPORT_ANALYTICAL_TOOL`: no `figures`, numbers go in `claim`, each wrapped in `<n>…</n>` |
 | Plan keys | Entity names, seeded before turn 1 | `A1`, `A2`, …, minted from `sub_question`s |
 | A search's key | The seeded entity it names | The aspect its `sub_question` mints |
 | Turn cap | `AGENT_MAX_ITERATIONS` (5) | `AGENT_MAX_ITERATIONS_ANALYTICAL` (7) |
@@ -319,7 +319,7 @@ And what both share:
 | Report tool | `report_findings(findings, comparison_op, conclusion)`, parsed by `FindingsReport` |
 | Finding schema | `Finding`, with optional `figures` (always empty on analytical runs) |
 | Unreported plan key | One "Not searched" / "Not resolved" / "Could not be checked" line |
-| Synthesis | FX, ranking, number grounding and change lines on rows with figures |
+| Synthesis | FX, ranking, number grounding and change lines on rows with figures; number grounding on `<n>`-marked claim numbers |
 | Findings block | `[FINDINGS]` |
 
 Analytical runs get a report schema without `figures`. `tools.py::_without_figures` copies
@@ -328,6 +328,13 @@ Offered both, the analytical model wrote every number twice, once in `claim` and
 figure. The same `FindingsReport` still parses every call, so an analytical finding arrives
 with `figures=[]`. Nothing downstream depends on the shape. A yes/no extraction answer is a
 `Finding` with no figures too, and the renderer prints no figure rows for either.
+
+The analytical prompt has the model wrap each number in its claim as printed, scale word
+included: `Input costs rose <n>12%</n>, a <n>$19 million</n> headwind.` The number is written
+once, and code still knows which digits are asserted magnitudes. Years and note numbers stay
+unmarked, so they are never checked. Synthesis checks the marked numbers against the cited
+excerpts and strips the marks
+([number_grounding.md](number_grounding.md#claim-numbers-on-the-analytical-path)).
 
 Every other limit is the same for both modes. The loop reads limits from one frozen
 `AgentSettings` object on `state.settings`, and keeps the shape's turn cap on
@@ -537,15 +544,19 @@ searched the key. Nothing else closes a key, so coverage (`addressed`, and `plan
 any point in the run and gives the same answer.
 
 `open_aspects(state)` returns plan keys that are not addressed, in mint order. After each
-turn's reports are folded in, the loop checks:
+turn's results are in, the loop checks:
 
 ```python
-if state.plan and not open_aspects(state):
+if state.plan and not open_aspects(state) and facts.new_labels == 0:
     state.sealed_by_coverage = True
     return Stop("covered")
 ```
 
-This is the normal, successful end of a run.
+This is the normal, successful end of a run. The `new_labels` condition exists because
+reports fold before the same turn's searches run. A turn that reports the last open key and
+also searches has results the model hasn't read. Stopping there would pay for the search and
+throw the result away. The run continues instead. If the next turn makes no tool calls and
+nothing is open, the loop stops with `covered`, not `natural`.
 
 "Reported" is not the same as "addressed". A report can name `A2` and still record nothing,
 because every citation failed to resolve, or because the finding claimed support but cited
@@ -593,12 +604,32 @@ should get a "did not converge" caveat.
 
 ### What the model sees about coverage: `render_status`
 
-Before every LLM call the loop computes a status line and appends it as the last user
-message. It is never stored in the transcript, so it can't go stale or pile up:
+Before every LLM call the loop computes a status line and `with_status` (`transcript.py`)
+adds it to the end of the request's last tool result, wrapped in a `<run_status>` tag. It
+goes only into the copy sent to the model, never into the stored transcript, so it can't go
+stale or pile up:
 
 ```
+<run_status>
 Recorded: A1, A3 · Open: A2 (Did pricing actions offset the cost increases?), A4 (Did FX movements affect gross margin?)
+</run_status>
 ```
+
+Why a tool result and not a user message of its own:
+
+- **Turn boundaries.** Providers start a new turn at each user message. On the Responses
+  API, `current_turn` reasoning models (gpt-5-mini) drop every reasoning item from before
+  the latest user message. A trailing status message would throw away the reasoning the
+  loop carries between calls. A tool result keeps it in the current turn.
+- **Cache.** The status goes at the end of the result, so the next call's cached prefix
+  still covers the result's content. Only the status tokens miss the cache, the same as
+  with a trailing user message.
+- **Call 0.** There is no tool result yet. If the plan is seeded from router entities, the
+  status goes as a user message. There is no reasoning to lose at that point.
+
+Both agent prompts say the block at the very end of the last tool result comes from the
+system. A filing can't fake one: `wrap_excerpt` escapes any `<run_status` tag inside
+excerpt text.
 
 It can add two more parts:
 
@@ -608,7 +639,7 @@ It can add two more parts:
   model to report every open key, using `supported: false` where the evidence doesn't
   support one
 
-`render_status` returns `None` when the plan is empty, so no status message is sent.
+`render_status` returns `None` when the plan is empty, so no status is sent.
 
 It shows keys and sub-questions only, never claim text. An earlier design re-injected full
 claims every turn. The only effect was giving the model text to copy, so it was removed.
@@ -692,7 +723,7 @@ sequenceDiagram
 
     RL->>Turn: tools (+ allowed = report tool only, on the final turn)
     Turn->>LLM: transcript + status line
-    LLM-->>Turn: tool_calls (or none, then Stop("natural") or Stop("truncated"))
+    LLM-->>Turn: tool_calls (or none, then Stop("covered") if nothing is open, else Stop("natural") or Stop("truncated"))
     Turn->>TR: append assistant message with all tool_calls, once
     Turn->>Turn: answer calls outside this turn's pool "not available"
     Turn->>Turn: key each search (mint from sub_question, or its seeded entity)
@@ -768,7 +799,7 @@ which plan keys closed.
 
 ```mermaid
 flowchart TD
-    A["turn's tool results appended"] --> C{"plan non-empty and<br/>no open items?"}
+    A["turn's tool results appended"] --> C{"plan non-empty,<br/>no open items and<br/>no new label shown?"}
     C -->|yes| COV["sealed_by_coverage = True<br/>Stop('covered')"]
     C -->|no| D{"there were searches and<br/>every one had backend_failed?"}
     D -->|yes| UNAV["Stop('search_unavailable')"]
@@ -783,10 +814,13 @@ flowchart TD
     H -->|no| CMP["Continue()"]
 ```
 
-Order matters in two places:
+Order matters in these places:
 
 - The coverage check runs after minting. So a turn that closes the last open item and opens
   a new one keeps going, rather than stopping and throwing the new thread away.
+- The coverage check also waits for this turn's search results to be read. Reports fold
+  before searches, so a turn that closes the last item and re-searches one shows new labels
+  the model hasn't seen. The run continues for one more turn.
 - "Progress" means a new label shown **or** a newly closed plan key. A turn that settles an
   aspect from evidence already in hand, with no new search, is real progress. Without this
   rule the loop would often stop one turn before it finished covering the plan.
@@ -828,7 +862,9 @@ grounding, close its key, and mark a budget-capped run as fully covered.
 
 ### When the model returns no tool calls
 
-`Stop("natural")`. This is a normal exit. The findings recorded so far still get served,
+If every plan key is already addressed, the stop is `covered` and the run is sealed. This
+happens after the coverage check waited for unread search results and the model had nothing
+to add. Otherwise it's `Stop("natural")`. This is a normal exit. The findings recorded so far still get served,
 with one line per key still open. If the call hit its token cap instead, the stop is
 `truncated` (see [token cap](#token-cap)). It serves the same way but counts as a failed
 stop. Only when nothing was ever reported and no key is open is
@@ -999,7 +1035,8 @@ payload. Synthesis filters it out.
 ## 11. Transcript: history and the append-only run
 
 `transcript.py`. A thin wrapper around `list[ChatMessage]` with `append` and
-`append_tool_calls`. Nothing in it rewrites or removes a message.
+`append_tool_calls`. Nothing in it rewrites or removes a message. `with_status` builds each
+call's request from it, a copy with the status added, and leaves the stored list alone.
 
 ### What the transcript starts with
 
@@ -1176,7 +1213,7 @@ user        task: scope + "Question: …"
 assistant   turn 0 tool calls
 tool        results, each chunk rendered once
 ...         appended, never rewritten
-user        status line   (added to each call, never stored)
+            + <run_status> at the end of the last tool result (added to each call, never stored)
 ```
 
 Each turn appends one assistant message carrying all the turn's tool calls (with
@@ -1185,7 +1222,7 @@ Each turn appends one assistant message carrying all the turn's tool calls (with
 only when the search maps to a plan key), followed by an `Already shown above: …` line when the search re-returned
 chunks from earlier ([section 10](#10-evidenceledger-chunks-and-s-labels)). Report results
 are plain text; see [section 12](#12-handling-a-report-call). The status line is added to
-each LLM call but never stored.
+the last tool result of each LLM call but never stored.
 
 The transcript is **append-only**:
 
@@ -1255,8 +1292,8 @@ user    User query: analyze the main factors influencing the revenue changes of 
 
 **Tool model (calls 2–4).** One transcript, appended to on every turn. A turn's output
 (its tool calls) and their results enter the transcript after that turn, so they appear in
-the *next* turn's input. The status line goes last on each call once the plan has items,
-and is never stored.
+the *next* turn's input. Once the plan has items, the status line goes at the end of the
+last tool result on each call, and is never stored.
 
 ```text
 INPUT of each call                                                turn 0    turn 1    turn 2
@@ -1269,7 +1306,8 @@ tool ×6    their results: excerpts S1–S21 (≈81k chars)                     
 assistant  turn 1's calls: 3 × search_documents (A4–A6 again)                           ✓
 tool ×3    their results: new excerpts S22–S28, the rest                                ✓
            as "Already shown above: …"
-user       status: "Open: A1 (…), A2 (…), … A6 (…)"                           ✓         ✓
+  + status at the end of the last tool result:                                ✓         ✓
+           "<run_status> Open: A1 (…), A2 (…), … A6 (…)"
            (+ final-turn notice, on the last allowed turn only)
                                                     input tokens  3,620     18,953    23,744
 
@@ -1394,7 +1432,8 @@ user       task: "Available document years …                        ✓       
            Question: Which of these factors had the biggest …"
 assistant  turn 0's calls: 5 × search_documents (A1–A5)                       ✓
 tool ×5    their results: excerpts S1–S20                                     ✓
-user       status: "Open: A1 (How much did changes in average                 ✓
+  + status at the end of the last tool result:                                ✓
+           "<run_status> Open: A1 (How much did changes in average
            realized prices contribute …), A2 (…), … A5 (…)"
                                                     input tokens  4,088     16,717
 
@@ -1672,8 +1711,8 @@ ConvergenceReason = Literal[
 
 | Reason | Trigger | Typical meaning | `sealed`? |
 |---|---|---|---|
-| `covered` | Every plan key addressed after a turn | Normal success | yes |
-| `natural` | Model returned no tool calls | Model thinks it's done, or ignored the report-only final turn | only if plan is empty |
+| `covered` | Every plan key addressed after a turn that showed no new labels, or a turn with no tool calls once every key is addressed | Normal success | yes |
+| `natural` | Model returned no tool calls with keys still open (or no plan) | Model thinks it's done, or ignored the report-only final turn | only if plan is empty |
 | `convergence` | No new label shown and nothing closed, `max_empty_rounds + 1` times in a row | Searches keep returning what's already known | only if plan is empty |
 | `search_unavailable` | Every search in a turn had `backend_failed` | Retrieval infrastructure is down | only if plan is empty |
 | `budget_cap` | Run cost across all models > `AGENT_COST_BUDGET_USD` | Long, expensive run | only if plan is empty |
@@ -1766,7 +1805,7 @@ flowchart TD
     IN["EvidenceLedger + findings + meta"] --> O["labelled = evidence.labelled_chunks()<br/>fallback = evidence.fallback_chunks(AGENT_FALLBACK_MAX_CHUNKS)"]
     O --> F{"findings?"}
     F -->|None| FB["synthesis chunks = fallback"]
-    F -->|AgentFindings| PF["process_findings():<br/>FX, ranking, number check<br/>on rows with figures"]
+    F -->|AgentFindings| PF["process_findings():<br/>FX, ranking, number check<br/>on figures and marked claim numbers"]
     PF --> SEL["synthesis chunks = chunks the findings cite<br/>(or fallback if they cite none)"]
     FB --> ASM
     SEL --> ASM["assemble_rag_context() on cached payloads<br/>fresh labels S1..Sk, no DB read"]
@@ -1828,6 +1867,10 @@ check has false negatives (numbers in charts, numbers in words, European formats
 can't tell a right number from a right number in the wrong row or year. See
 [number_grounding.md](number_grounding.md) for what it catches and what it misses.
 
+Analytical findings have no figures, so the same check runs on the numbers their claims
+mark with `<n>…</n>` (`verify_marked`). It reads the scale from the word after the number
+inside the mark. Results go to `ProcessedFindings.claim_numbers`, keyed by finding.
+
 **4. Select evidence.** Keep only the chunks the findings cite. If they cite nothing, use
 the [fallback pool](#the-fallback-pool).
 
@@ -1838,7 +1881,9 @@ stored when each chunk was first rendered. No second DB read. `assemble_rag_cont
 
 **6. Render the block** against the new context, mapping each finding's UUIDs to the new
 labels with `RAGContext.ref_for(chunk_id)`. A UUID with no excerpt in the new context is
-dropped and counts toward `CITATION_REFS_DROPPED`. Under each finding's figures,
+dropped and counts toward `CITATION_REFS_DROPPED`. Claims and the conclusion lose their
+`<n>` marks here. A marked number that wasn't found ends its finding's line with
+`⚠ UNVERIFIED: <number> not located in cited excerpt`. Under each finding's figures,
 `_change_lines` adds the change between consecutive periods of a metric (plus first to last
 for three or more), computed in code, so the answering model copies a change instead of
 working one out.
@@ -1948,7 +1993,9 @@ Note: no target currency specified — compared in USD (findings span EUR, USD)
 ```
 
 An analytical question. Aspect ids (`A1`, `A4`) are left out: the answering model cited them
-as `[A1]` in place of the excerpt refs, which the citation parser can't resolve.
+as `[A1]` in place of the excerpt refs, which the citation parser can't resolve. The tool
+model wrote finding 1 as `Input costs rose <n>12%</n> YoY …`. The marks are gone, and `12%`
+and `$19M` both grounded, so the line carries no marker.
 
 ```text
 [FINDINGS]
@@ -2293,7 +2340,7 @@ search_documents(entity="Acme Corp", query="cost bridge reconciling raw material
                  keywords="MD&A cost bridge raw material inflation reconciliation H2 2023",
                  sub_question="Did input costs rise in H2 2023?")        # same wording → A1
 report_findings(comparison_op=null, conclusion=null, findings=[
-    {key: "A3", claim: "Mix shifted toward lower-margin hardware (35% → 41% of revenue).",
+    {key: "A3", claim: "Mix shifted toward lower-margin hardware (<n>35%</n> → <n>41%</n> of revenue).",
      supported: true, evidence: ["S6", "S8"], confidence: "medium"}])
 search_documents(entity="Acme Corp", query="foreign exchange impact on gross margin 2023",
                  keywords="foreign exchange currency translation FX gross margin 2023",
@@ -2333,9 +2380,9 @@ search_documents(entity="Acme Corp", query="average selling price realization by
                  keywords="ASP average selling price pricing realization product line 2023",
                  sub_question="Did pricing actions offset the cost increases?")   # A2
 report_findings(comparison_op=null, findings=[
-    {key: "A1", claim: "Input costs rose 12% YoY in H2 2023, a net $19M headwind.",
+    {key: "A1", claim: "Input costs rose <n>12%</n> YoY in H2 2023, a net <n>$19M</n> headwind.",
      evidence: ["S10", "S11"], confidence: "high", ...},
-    {key: "A4", claim: "FX translation cut reported revenue by about $6M in H2 2023.",
+    {key: "A4", claim: "FX translation cut reported revenue by about <n>$6M</n> in H2 2023.",
      evidence: ["S12"], confidence: "medium", ...}],
   conclusion="Margin fell mainly on input-cost inflation, plus a mix shift and a small FX headwind.")
 ```
@@ -2359,8 +2406,8 @@ continues.
 
 ```text
 report_findings(comparison_op=null, conclusion=null, findings=[
-    {key: "A2", claim: "Pricing only partly offset costs: software prices rose 4.8% but
-     hardware, the larger segment, rose 1.2%.", evidence: ["S13"], confidence: "medium", ...}])
+    {key: "A2", claim: "Pricing only partly offset costs: software prices rose <n>4.8%</n> but
+     hardware, the larger segment, rose <n>1.2%</n>.", evidence: ["S13"], confidence: "medium", ...}])
 ```
 
 No searches this turn. `A2` grounds. Every plan key is addressed, so `Stop("covered")`.
@@ -2506,7 +2553,8 @@ turn searched, since a negative has no citation to check.
 
 **Status is computed, not stored.** Recomputed on every call, it can't go stale, doesn't pile
 up across turns, and doesn't change earlier messages (which keeps the provider's prompt
-cache valid).
+cache valid). It rides at the end of the last tool result, not in a user message of its
+own, so it doesn't end the provider's turn and drop carried reasoning.
 
 **Append-only transcript.** No earlier message is rewritten and nothing is evicted. Every
 label the model can cite stays readable, the prompt cache holds across turns, and each chunk
@@ -2575,13 +2623,13 @@ a misrouted question lands in the same schema either way.
 | How a search is executed | `loop.py::_execute_search` |
 | How S-labels are allocated | `evidence.py::EvidenceLedger.assign_labels` |
 | Why a search result says "Already shown above" | `loop.py::fold_searches`, `evidence.py::EvidenceLedger.shown_before` |
-| When the run stops | `loop.py::decide`, `run_loop` |
+| When the run stops | `loop.py::decide`, `_run_turn` (no tool calls), `run_loop` |
 | Why a report didn't record everything | `loop.py::_apply_report`, `findings.py::FindingsLedger.record` |
 | What's recorded so far | `findings.py::FindingsLedger` |
 | How unresolved lines get their text | `state.py::unresolved_lines` |
 | What the answering model gets | `synthesis.py::run_synthesis` |
 | FX and ranking | `processor.py::process_findings` |
-| The "UNVERIFIED" marker | `number_grounding.py::verify_value`, `processor.py::_render_figure` |
+| The "UNVERIFIED" marker | `number_grounding.py::verify_value`, `processor.py::_render_figure`; for claim numbers `verify_marked`, `processor.py::_render_findings_block` |
 | Change lines in the findings block | `processor.py::_change_lines`, `_render_change` |
 | Why a finding says "(asked as …)" | `scope_resolver.py::resolve_scope` (`mentioned_as`), `DocumentScopeResult.mentions`, `processor.py::_render_findings_block` |
 | The uncited-fact share | `confidence.py::uncited_fact_share`, called from `tasks.py` |
@@ -2601,7 +2649,7 @@ a misrouted question lands in the same schema either way.
 | Tool schemas | `test_agent_tools.py` |
 | EvidenceLedger, render cap, already-shown names | `test_evidence.py`, `test_evidence_cap.py` |
 | FindingsLedger, grounding | `test_findings.py` |
-| Append-only transcript | `test_transcript.py` |
+| Append-only transcript, status placement | `test_transcript.py` |
 | Prior turns, budgets, stepped window, session index | `test_turns.py` |
 | Synthesis boundary | `test_agent_synthesis.py`, `test_findings_block_isolation.py` |
 | FX, rendering and change lines | `test_findings_processor.py` |

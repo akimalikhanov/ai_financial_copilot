@@ -680,6 +680,38 @@ async def test_turn_closing_last_aspect_while_opening_new_one_continues() -> Non
 
 
 @pytest.mark.asyncio
+async def test_follow_up_beside_the_last_report_is_read_before_stopping() -> None:
+    """Reports fold before the same turn's searches run. A turn that reports the last key
+    and also re-searches it must not stop before the model has read that search; a next
+    turn with no calls is still a covered stop."""
+    state = _analytical_state()
+    first, p_first = _make_chunk_with_payload()
+    follow_up, p_follow_up = _make_chunk_with_payload()
+    results = iter(
+        [
+            _SearchResult(entity="Acme", chunks=[first], payloads=p_first),
+            _SearchResult(entity="Acme", chunks=[follow_up], payloads=p_follow_up),
+        ]
+    )
+
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "first?")]),
+        AssistantTurnResult(
+            text="",
+            tool_calls=[_report_tc("r1", "A1", str(first.chunk_id)), _search_tc("s2", "first?")],
+        ),
+        AssistantTurnResult(text="", tool_calls=[]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return next(results)
+
+    _ev, _f, meta = await _run(state, turns, _search)
+    assert meta.iterations == 3
+    assert meta.convergence_reason == "covered"
+
+
+@pytest.mark.asyncio
 async def test_all_errored_turn_stops_search_unavailable() -> None:
     """A dead backend is not an empty corpus — it must not burn budget on 'reformulate'."""
     state = _analytical_state()
@@ -970,7 +1002,8 @@ async def test_extraction_plan_is_seeded_from_expected_entities() -> None:
 @pytest.mark.asyncio
 async def test_status_view_is_sent_but_never_stored() -> None:
     """The status view is the single source of coverage truth: computed per call and
-    appended last, never persisted — otherwise it accumulates one stale copy per turn."""
+    folded into the request's last tool result, never persisted — otherwise it
+    accumulates one stale copy per turn."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1003,17 +1036,27 @@ async def test_status_view_is_sent_but_never_stored() -> None:
         execute_search=_search,
     )
 
-    # Turn 1 has no plan yet, so no status. Turn 2 sees A1 open, as the *last* message.
+    # Turn 1 has no plan yet, so no status. Turn 2 sees A1 open, at the end of the last
+    # tool result: a trailing user message would end the provider's turn.
     assert not any("Open: A1" in (m.content or "") for m in sent[0])
-    assert "Open: A1 (Did costs rise?)" in (sent[1][-1].content or "")
+    assert sent[1][-1].role == Role.tool
+    assert (sent[1][-1].content or "").endswith(
+        "<run_status>\nOpen: A1 (Did costs rise?)\n</run_status>"
+    )
     # Turn 4's status supersedes the earlier ones rather than adding to them: exactly one
-    # *user* message states coverage, and it is the last message.
-    coverage_msgs = [m for m in sent[3] if m.role == Role.user and "Open:" in (m.content or "")]
-    assert len(coverage_msgs) == 1
-    assert coverage_msgs[0] is sent[3][-1]
-    assert coverage_msgs[0].content == "Recorded: A1 · Open: A2 (Did pricing offset?)"
-    # Report results state only what landed: a stored open list would go stale on screen.
-    assert not any("Open:" in (m.content or "") for m in sent[3] if m.role == Role.tool)
+    # message states coverage, and it is the last one.
+    coverage_msgs = [m for m in sent[3] if "<run_status>\n" in (m.content or "")]
+    assert coverage_msgs == [sent[3][-1]]
+    assert (coverage_msgs[0].content or "").endswith(
+        "<run_status>\nRecorded: A1 · Open: A2 (Did pricing offset?)\n</run_status>"
+    )
+    assert not any(m.role == Role.user and "Open:" in (m.content or "") for m in sent[3])
+    # Nothing stored carries a status: the tool result turn 2 saw with a status folded in
+    # comes back bare on turn 4, so the fold lived in the request copy only.
+    folded = sent[1][-1]
+    stored = next(m for m in sent[3] if m.tool_call_id == folded.tool_call_id)
+    assert "<run_status>" not in (stored.content or "")
+    assert (folded.content or "").startswith(stored.content or "")
 
 
 @pytest.mark.asyncio

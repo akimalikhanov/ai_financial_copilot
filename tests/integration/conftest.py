@@ -114,8 +114,10 @@ def create_agentic_router(
         "models": [],
     }
     router = LLMRouter(config)
-    router._models["gpt-4o-mini"] = chat_routed
-    router._models[TOOL_MODEL_ID] = tool_routed
+    for routed in (chat_routed, tool_routed):
+        router._models[routed.model_id] = routed
+        # get_with_fallback reads the config for a fallback_model; the mocks have none.
+        router._model_cfgs[routed.model_id] = {}
     return router
 
 

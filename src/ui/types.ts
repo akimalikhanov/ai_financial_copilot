@@ -97,6 +97,7 @@ export interface ClarificationPick {
   raw_span: string;
   company?: string;
   include_outside_scope?: boolean;
+  skip?: boolean;
 }
 
 export interface Message {

@@ -324,7 +324,7 @@ def unresolved_lines(state: AgentRunState) -> list[str]:
 
 
 def render_status(state: AgentRunState) -> str | None:
-    """Coverage status, computed per call and appended last — never stored.
+    """Coverage status, computed per call and sent at the end of the request — never stored.
 
     Keys and sub-questions only, never claim bodies: the model has nothing to copy, so it
     cannot restate an earlier conclusion instead of reporting a new one. It is the only
