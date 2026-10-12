@@ -37,10 +37,11 @@ from src.observability.metrics import (
     AGENT_TOOL_MODEL_DURATION,
     AGENT_TOOL_MODEL_OUTPUT_TOKENS,
     LLM_CACHE_HIT_TOKENS,
+    LLM_CACHE_WRITE_TOKENS,
     LLM_COST,
     LLM_TOKENS,
+    observe_llm_call,
     observe_llm_failure,
-    observe_llm_latency,
 )
 from src.observability.trace_payload import cap_list
 from src.redis_client import add_event
@@ -677,16 +678,18 @@ async def _call_tool_model(
     via `allowed_tools` where the model supports it (keeps the cached prefix), otherwise by
     dropping the other tools from the request."""
 
+    # The prefix shared across requests is the system prompt plus tools, both keyed by the
+    # shape's prompt version.
+    params = {"temperature": 0.0, "prompt_cache_key": f"agent:{deps.shape.prompt}"}
+
     async def complete(llm: RoutedLLM) -> AssistantTurnResult:
         if allowed is None:
-            call = llm.complete_with_tools(messages, tools=tools, temperature=0.0)
+            call = llm.complete_with_tools(messages, tools=tools, **params)
         elif llm.capabilities.get("allowed_tools", False):
-            call = llm.complete_with_tools(
-                messages, tools=tools, allowed_tools=allowed, temperature=0.0
-            )
+            call = llm.complete_with_tools(messages, tools=tools, allowed_tools=allowed, **params)
         else:
             subset = [t for t in tools if t["function"]["name"] in allowed]
-            call = llm.complete_with_tools(messages, tools=subset, temperature=0.0)
+            call = llm.complete_with_tools(messages, tools=subset, **params)
         # Recomputed per call: a fallback gets only what the failed attempt left.
         budget = _call_budget(state)
         started = perf_counter()
@@ -784,6 +787,7 @@ async def _write_tool_call_row(
                 model=llm.model_id,
                 request_type="agent_tool_call",
                 request_params={"iteration": state.iteration, **request_params},
+                llm_api=llm.api,
                 **row,
             )
             await session.commit()
@@ -809,7 +813,7 @@ async def _record_failed_call(
     The tokens a timed-out call was billed for are unknown, so the row has none."""
     elapsed = perf_counter() - started
     turn_kind = _turn_kind(allowed, None)
-    observe_llm_failure(llm.model_id, "agent_tool_call", outcome, elapsed)
+    observe_llm_failure(llm.model_id, llm.api, "agent_tool_call", outcome, elapsed)
     AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(elapsed)
     if outcome == "timeout":
         logger.warning(
@@ -855,6 +859,8 @@ async def _record_turn_spend(
         LLM_TOKENS.labels("output", llm.model_id).inc(stats.output_tokens)
     if stats.cached_input_tokens:
         LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(stats.cached_input_tokens)
+    if stats.cache_write_tokens:
+        LLM_CACHE_WRITE_TOKENS.labels(llm.model_id).inc(stats.cache_write_tokens)
     if stats.cost_usd:
         LLM_COST.labels(llm.model_id).inc(stats.cost_usd)
     # Hitting the completion-token cap is its own failure: reasoning can spend the whole
@@ -874,7 +880,7 @@ async def _record_turn_spend(
             },
         )
         lf_mark_current("WARNING", f"tool model hit its token cap ({stats.output_tokens} out)")
-    observe_llm_latency(llm.model_id, "agent_tool_call", stats, outcome)
+    observe_llm_call(llm.model_id, llm.api, "agent_tool_call", stats, outcome)
     if stats.latency_ms is not None:
         AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(
             stats.latency_ms / 1000.0

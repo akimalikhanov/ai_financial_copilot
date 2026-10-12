@@ -79,8 +79,9 @@ def _calc_llm_cost_shared(
     Shared token cost calculator.
 
     Args:
-        stats: object with fields: input_tokens, output_tokens, reasoning_tokens, cached_input_tokens
-        pricing: dict with keys: input, output, optional cached_input
+        stats: object with fields: input_tokens, output_tokens, reasoning_tokens,
+            cached_input_tokens, cache_write_tokens
+        pricing: dict with keys: input, output, optional cached_input, cache_write_input
         reasoning_in_output:
             - True  => reasoning already included in output_tokens (OpenAI)
             - False => reasoning separate, must add (Gemini)
@@ -106,11 +107,13 @@ def _calc_llm_cost_shared(
     out_tokens = int(getattr(stats, "output_tokens", 0) or 0)
     reasoning = int(getattr(stats, "reasoning_tokens", 0) or 0)
     cached_in = int(getattr(stats, "cached_input_tokens", 0) or 0)
+    written_in = int(getattr(stats, "cache_write_tokens", 0) or 0)
 
-    # Clamp cached input to sane range
+    # Clamp cached reads and writes to sane ranges; both are subsets of input_tokens.
     cached_in = max(min(cached_in, in_tokens), 0)
+    written_in = max(min(written_in, in_tokens - cached_in), 0)
 
-    billable_in = max(in_tokens - cached_in, 0)
+    billable_in = max(in_tokens - cached_in - written_in, 0)
     billable_cached_in = cached_in
 
     billable_out = out_tokens if reasoning_in_output else (out_tokens + reasoning)
@@ -126,11 +129,17 @@ def _calc_llm_cost_shared(
     else:
         pcached = 0.0
 
+    # Cache writes: surcharged where cache_write_input is priced (gpt-5.6+), else plain input.
+    pwrite = (
+        float(pricing["cache_write_input"]) if pricing.get("cache_write_input") is not None else pin
+    )
+
     denom = float(tokens_per_unit)
 
     cost = (
         (billable_in / denom) * pin
         + (billable_cached_in / denom) * pcached
+        + (written_in / denom) * pwrite
         + (billable_out / denom) * pout
     )
     return cost

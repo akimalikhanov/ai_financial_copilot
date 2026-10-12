@@ -273,15 +273,15 @@ async def _describe_batch(
         ChatMessage(role=Role.system, content=system_prompt),
         _build_message(batch, detail),
     ]
-    # On GPT-5 models max_tokens maps to max_completion_tokens, which counts reasoning tokens
+    # On reasoning models max_tokens maps to max_completion_tokens, which counts reasoning tokens
     # too, and reasoning does not shrink with the batch — hence the floor, and the low effort.
     max_tokens = max(get_picture_enricher_min_completion_tokens(), _TOKENS_PER_PICTURE * len(batch))
     reasoning_effort = get_picture_enricher_reasoning_effort()
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         started = perf_counter()
         try:
-            # temperature is not dead code: the adapter discards it only for GPT-5 models
-            # (openai_adapter._is_gpt_5_model). The chart lane ignores it; the caption lane —
+            # temperature is not dead code: the adapter discards it only for reasoning models
+            # (models.yaml capabilities.reasoning). The chart lane ignores it; the caption lane —
             # gpt-4o-mini by default — genuinely runs at 0.0. Both lanes share this call site.
             resp = await llm.complete(
                 messages,

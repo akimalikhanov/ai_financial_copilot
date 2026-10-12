@@ -1,6 +1,7 @@
 # llm_router_runtime.py
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
@@ -58,6 +59,10 @@ def _trace_message(m: ChatMessage) -> dict[str, Any]:
         out["tool_calls"] = [
             {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls
         ]
+    if m.opaque:
+        # Encrypted, unreadable, and large: a count and size, never the payload.
+        size_kb = sum(len(json.dumps(o.payload)) for o in m.opaque) / 1000
+        out["reasoning"] = f"[{len(m.opaque)} encrypted items, {size_kb:.1f} kB]"
     return out
 
 
@@ -77,6 +82,8 @@ def trace_usage(stats: Any) -> dict[str, Any]:
                 "input": stats.input_tokens,
                 "output": stats.output_tokens,
                 "cache_read_input_tokens": stats.cached_input_tokens,
+                "cache_creation_input_tokens": stats.cache_write_tokens,
+                "output_reasoning_tokens": stats.reasoning_tokens,
                 "total": stats.total_tokens,
             }.items()
             if v is not None
@@ -129,7 +136,9 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
                 provider=provider,
                 status_code=500,
             )
-        return OpenAIAdapter(default_model=model_name)
+        return OpenAIAdapter(
+            default_model=model_name, capabilities=model_cfg.get("capabilities") or {}
+        )
 
     if provider == "google":
         model_name = model_cfg.get("model_name")
@@ -171,6 +180,7 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             base_url=base_url,
             include_usage=include_usage,
             provider_name="vllm",
+            capabilities=model_cfg.get("capabilities") or {},
         )
 
     if provider == "fake":
@@ -188,6 +198,10 @@ class RoutedLLM:
     default_stream: bool
     capabilities: dict[str, Any]
 
+    @property
+    def api(self) -> str:
+        return self.adapter.api
+
     async def complete(
         self, messages: Sequence[ChatMessage], *, _lf_name: str = "llm.complete", **params: Any
     ) -> LLMResponse:
@@ -201,13 +215,18 @@ class RoutedLLM:
             model=self.model_id,
             model_parameters=trace_params(merged),
             input=trace_input(messages, _lf_name),
+            metadata={"llm_api": self.api},
         ) as gen:
             try:
                 response = await self.adapter.complete(messages=messages, **merged)
             except BaseException as exc:
                 _lf_mod.mark(gen, "ERROR", _lf_mod.describe_error(exc))
                 raise
-            gen.update(output=response.text, **trace_usage(response.stats))
+            gen.update(
+                output=response.text,
+                metadata={"finish_reason": response.finish_reason},
+                **trace_usage(response.stats),
+            )
             return response
 
     async def complete_with_tools(
@@ -230,6 +249,7 @@ class RoutedLLM:
             model_parameters=trace_params(merged),
             input=trace_input(messages, name),
             metadata={
+                "llm_api": self.api,
                 "tools": [t["function"]["name"] for t in tools if "function" in t],
                 # Callable subset when the request restricts `tools` via allowed_tools.
                 **({"allowed_tools": allowed} if (allowed := merged.get("allowed_tools")) else {}),
@@ -247,6 +267,7 @@ class RoutedLLM:
                     {"name": tc.name, "arguments": tc.arguments} for tc in (result.tool_calls or [])
                 ]
                 or result.text,
+                metadata={"finish_reason": result.finish_reason},
                 **trace_usage(result.stats),
             )
             return result

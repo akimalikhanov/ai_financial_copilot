@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.observability.langfuse import describe_error
 from src.observability.langfuse import mark_current as lf_mark_current
-from src.observability.metrics import observe_llm_latency
+from src.observability.metrics import observe_llm_call
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_router import DocumentScopeResult, RouterInput, RouterOutput
 from src.services.context.turns import cap_turns, router_history, session_index
@@ -183,6 +183,7 @@ async def route_query(
                     temperature=cfg["temperature"],
                     max_tokens=int(cfg["max_tokens"]),
                     response_format=response_format,
+                    prompt_cache_key=f"router:{get_query_router_prompt_version()}",
                 ),
                 timeout=float(cfg["timeout"]),
             )
@@ -191,7 +192,7 @@ async def route_query(
             lf_mark_current("WARNING", f"router call failed ({describe_error(e)}); fallback route")
             return await scoped(_FALLBACK)
 
-        observe_llm_latency(model_id, "router", resp.stats)
+        observe_llm_call(model_id, llm.api, "router", resp.stats)
 
         if should_log_subrequest:
             # Best effort, in a SAVEPOINT: a failed INSERT rolls back only the savepoint.
@@ -207,6 +208,7 @@ async def route_query(
                         request_type="router",
                         request_params=request_params,
                         status="completed",
+                        llm_api=llm.api,
                         **stats_to_request_kwargs(resp.stats),
                     )
             except Exception:

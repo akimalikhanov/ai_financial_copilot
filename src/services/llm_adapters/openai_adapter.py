@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from src.services.llm_runtime.exception_mapper import map_openai_error
+from src.services.llm_runtime.exceptions import LLMConnectionError
 from src.utils.config import (
     get_llm_connect_timeout_seconds,
     get_llm_max_retries,
+    get_llm_prompt_cache_key_enabled,
     get_llm_timeout_seconds,
 )
 from src.utils.llm_utils import (
@@ -43,6 +45,7 @@ class OpenAIAdapter(LLMAdapter):
     """Uses openai-python AsyncOpenAI + Chat Completions (non-streaming)."""
 
     provider_name: str = "openai"
+    api: str = "chat_completions"
 
     def __init__(
         self,
@@ -52,11 +55,17 @@ class OpenAIAdapter(LLMAdapter):
         base_url: str | None = None,  # useful for OpenAI-compatible servers
         include_usage: bool = True,
         provider_name: str | None = None,  # override for vLLM or other compatible servers
+        capabilities: Mapping[str, Any] | None = None,  # models.yaml `capabilities`
     ):
         super().__init__(default_model=default_model)
         self.include_usage = include_usage
         if provider_name is not None:
             self.provider_name = provider_name
+            if provider_name == "vllm":
+                self.api = "vllm"
+        # Reasoning models take reasoning_effort/verbosity and max_completion_tokens, and
+        # reject temperature.
+        self._reasoning = bool((capabilities or {}).get("reasoning", False))
 
         import httpx
         from openai import AsyncOpenAI
@@ -77,11 +86,6 @@ class OpenAIAdapter(LLMAdapter):
         await self._client.close()
 
     @staticmethod
-    def _is_gpt_5_model(model: str) -> bool:
-        """Check if model is a GPT-5 model (supports reasoning_effort/verbosity, but not temperature)."""
-        return model.startswith("gpt-5")
-
-    @staticmethod
     def _build_stats_from_usage(
         usage: object | None,
         *,
@@ -95,6 +99,7 @@ class OpenAIAdapter(LLMAdapter):
 
         reasoning_tokens = None
         cached_input_tokens = None
+        cache_write_tokens = None
         if usage is not None:
             completion_details = getattr(usage, "completion_tokens_details", None)
             if completion_details is not None:
@@ -102,10 +107,12 @@ class OpenAIAdapter(LLMAdapter):
             prompt_details = getattr(usage, "prompt_tokens_details", None)
             if prompt_details is not None:
                 cached_input_tokens = getattr(prompt_details, "cached_tokens", None)
+                cache_write_tokens = getattr(prompt_details, "cache_write_tokens", None)
 
         stats = LLMResponseStats(
             input_tokens=input_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,
             total_tokens=total_tokens,
@@ -185,23 +192,20 @@ class OpenAIAdapter(LLMAdapter):
 
     def _build_kwargs(self, req: ChatRequest) -> dict[str, Any]:
         messages = [self._serialize_msg(m) for m in req.messages]
-        is_gpt_5 = self._is_gpt_5_model(req.model)
 
         kwargs: dict[str, Any] = {
             "model": req.model,
             "messages": messages,
         }
-        # GPT-5 models don't accept temperature
-        if req.temperature is not None and not is_gpt_5:
+        if req.temperature is not None and not self._reasoning:
             kwargs["temperature"] = req.temperature
         if req.max_tokens is not None:
-            if is_gpt_5:
+            if self._reasoning:
                 kwargs["max_completion_tokens"] = req.max_tokens
             else:
                 kwargs["max_tokens"] = req.max_tokens
 
-        # reasoning_effort and verbosity are only supported by GPT-5 models
-        if isinstance(req, OpenAIChatRequest) and is_gpt_5:
+        if isinstance(req, OpenAIChatRequest) and self._reasoning:
             if req.reasoning_effort is not None:
                 kwargs["reasoning_effort"] = req.reasoning_effort
             if req.verbosity is not None:
@@ -219,6 +223,9 @@ class OpenAIAdapter(LLMAdapter):
                     ] = extra.pop("enable_thinking")
                 else:
                     extra.pop("enable_thinking")  # silently drop for non-Qwen models
+            # OpenAI-only cache routing hint; vLLM has no use for it.
+            if self.provider_name != "openai" or not get_llm_prompt_cache_key_enabled():
+                extra.pop("prompt_cache_key", None)
             kwargs.update(extra)
 
         return kwargs
@@ -278,14 +285,15 @@ class OpenAIAdapter(LLMAdapter):
             raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
         latency_ms = elapsed_ms(start_ms)
 
-        text = (resp.choices[0].message.content or "").strip()
+        choice = resp.choices[0]
+        text = (choice.message.content or "").strip()
         stats = self._build_stats_from_usage(
             getattr(resp, "usage", None),
             model=req.model,
             latency_ms=latency_ms,
         )
 
-        return LLMResponse(text=text, raw=resp, stats=stats)
+        return LLMResponse(text=text, raw=resp, stats=stats, finish_reason=choice.finish_reason)
 
     async def complete_with_tools(
         self,
@@ -340,6 +348,9 @@ class OpenAIAdapter(LLMAdapter):
 
         start_ms = now_ms()
         first_token_ms: float | None = None
+        # Arrives on the last choices chunk, before the usage-only chunk.
+        finish_reason: str | None = None
+        final_sent = False
 
         try:
             stream = await self._client.chat.completions.create(
@@ -351,8 +362,10 @@ class OpenAIAdapter(LLMAdapter):
 
         try:
             async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                text = getattr(delta, "content", None) or ""
+                choice = chunk.choices[0] if chunk.choices else None
+                text = (getattr(choice.delta, "content", None) or "") if choice else ""
+                if choice is not None and choice.finish_reason:
+                    finish_reason = choice.finish_reason
                 usage = getattr(chunk, "usage", None)
 
                 # Track first token time
@@ -370,8 +383,28 @@ class OpenAIAdapter(LLMAdapter):
                         ttft_ms=ttft_ms,
                     )
 
-                    yield LLMStreamChunk(text=text, raw=chunk, is_final=True, stats=stats)
+                    final_sent = True
+                    yield LLMStreamChunk(
+                        text=text,
+                        raw=chunk,
+                        is_final=True,
+                        stats=stats,
+                        finish_reason=finish_reason,
+                    )
                 elif text:
                     yield LLMStreamChunk(text=text, raw=chunk, is_final=False)
         except Exception as e:
             raise map_openai_error(e, provider=self.provider_name, model=req.model) from e
+
+        # A stream that ends without a finish_reason was cut off mid-answer (connection
+        # drop); persisting what arrived as a complete answer would be wrong.
+        if finish_reason is None:
+            raise LLMConnectionError(
+                "stream ended without a finish_reason",
+                provider=self.provider_name,
+                model=req.model,
+            )
+        # No usage chunk (include_usage off, as on vLLM): the stop reason still needs a
+        # final chunk to ride on.
+        if not final_sent:
+            yield LLMStreamChunk(text="", is_final=True, finish_reason=finish_reason)

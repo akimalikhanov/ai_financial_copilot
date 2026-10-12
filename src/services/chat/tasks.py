@@ -37,13 +37,14 @@ from src.observability.metrics import (
     FOLLOWUP_FINDINGS_CARRIED,
     GUARDRAIL_BLOCKS,
     LLM_CACHE_HIT_TOKENS,
+    LLM_CACHE_WRITE_TOKENS,
     LLM_COST,
     LLM_TOKENS,
     PIPELINE_ERRORS,
     RAG_CITATIONS,
     RAG_CONTEXT_TOKENS,
     ROUTER_DECISIONS,
-    observe_llm_latency,
+    observe_llm_call,
 )
 from src.observability.trace_payload import cap_list, trace_params
 from src.observability.trace_payload import dedup_scope as trace_dedup_scope
@@ -122,6 +123,9 @@ def _observe_ttft(enqueued_at: datetime, query_shape: str) -> float:
 
 
 _QUERY_SHAPES = ("extraction", "comparison", "analytical")
+# Stream stop reasons that mean the answer is not a normal completion. Each is also the
+# llm_request_duration_seconds outcome label.
+_ABNORMAL_FINISH = frozenset({"length", "content_filter", "refusal"})
 
 
 def _init_metric_series() -> None:
@@ -1153,6 +1157,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 state.adapter_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                prompt_cache_key=f"synthesis:{prompt_version}",
                 **extra,
             )
 
@@ -1239,6 +1244,21 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         ]
                     if ref_items:
                         citation_meta["references"] = ref_items
+
+                    # A cut-off or filtered answer is still persisted — it is what the user
+                    # saw — but flagged, instead of passing as a normal completion.
+                    finish_reason = chunk.finish_reason
+                    finish_outcome = finish_reason if finish_reason in _ABNORMAL_FINISH else "ok"
+                    if finish_outcome != "ok":
+                        citation_meta["finish_reason"] = finish_reason
+                        logger.warning(
+                            "llm_stream_abnormal_finish",
+                            extra={
+                                "request_id": request_id,
+                                "model": llm.model_id,
+                                "finish_reason": finish_reason,
+                            },
+                        )
 
                     if state.rag_context and state.rag_context.items:
                         citation_meta["retrieved_chunks"] = [
@@ -1409,19 +1429,34 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                             LLM_TOKENS.labels("output", _model).inc(chunk.stats.output_tokens)
                         if chunk.stats.cached_input_tokens:
                             LLM_CACHE_HIT_TOKENS.labels(_model).inc(chunk.stats.cached_input_tokens)
+                        if chunk.stats.cache_write_tokens:
+                            LLM_CACHE_WRITE_TOKENS.labels(_model).inc(
+                                chunk.stats.cache_write_tokens
+                            )
                         if chunk.stats.cost_usd:
                             LLM_COST.labels(_model).inc(chunk.stats.cost_usd)
-                        observe_llm_latency(_model, llm_request.request_type, chunk.stats)
                         await llm_request_repo.update_on_final(
                             request_id=UUID(request_id),
                             **stats_to_request_kwargs(chunk.stats),
                             trace_id=lf_trace_id,
+                            llm_api=llm.api,
                         )
+                    observe_llm_call(
+                        llm_request.model,
+                        llm.api,
+                        llm_request.request_type,
+                        chunk.stats,
+                        finish_outcome,
+                    )
                     if _gen is not None:
                         with contextlib.suppress(Exception):
                             _gen.update(  # type: ignore[union-attr]
-                                output=state.accumulated_content, **trace_usage(chunk.stats)
+                                output=state.accumulated_content,
+                                metadata={"llm_api": llm.api, "finish_reason": finish_reason},
+                                **trace_usage(chunk.stats),
                             )
+                        if finish_outcome != "ok":
+                            lf_mark(_gen, "WARNING", f"answer ended with {finish_reason}")
                     _trace_io(
                         output={
                             "answer": state.clean_content,
@@ -1479,6 +1514,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         chunk.stats,
                         citation_spans=parser.all_spans,
                         references=ref_items,
+                        finish_reason=finish_reason,
                     )
                     await session.commit()
 

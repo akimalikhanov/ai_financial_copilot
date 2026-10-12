@@ -301,6 +301,13 @@ def get_llm_max_retries() -> int:
     return int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 
+def get_llm_prompt_cache_key_enabled() -> bool:
+    """LLM_PROMPT_CACHE_KEY_ENABLED (default: true). Send `prompt_cache_key` to OpenAI, so
+    requests sharing a long prefix are routed to the same cache. Off is the escape hatch if
+    the routing hurts hit rates."""
+    return _parse_bool(os.getenv("LLM_PROMPT_CACHE_KEY_ENABLED"), True)
+
+
 def get_max_open_streams() -> int:
     """SSE streams one API pod serves before /readyz sheds traffic (MAX_OPEN_STREAMS,
     default 200).

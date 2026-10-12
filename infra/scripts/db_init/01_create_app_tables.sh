@@ -828,6 +828,21 @@ ALTER TABLE llm_requests
 COMMENT ON COLUMN llm_requests.cached_input_tokens IS
   'Prompt tokens served from the provider prompt cache (subset of prompt_tokens). NULL: not reported.';
 
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS cache_write_tokens integer;
+COMMENT ON COLUMN llm_requests.cache_write_tokens IS
+  'Prompt tokens written to the provider prompt cache (subset of prompt_tokens). NULL: not reported.';
+
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS reasoning_summary text;
+COMMENT ON COLUMN llm_requests.reasoning_summary IS
+  'Provider-written summary of hidden reasoning, capped. Same access rules as messages.content. NULL: not requested.';
+
+ALTER TABLE llm_requests
+  ADD COLUMN IF NOT EXISTS llm_api text;
+COMMENT ON COLUMN llm_requests.llm_api IS
+  'Wire API that served the call: chat_completions/responses/gemini/vllm/fake.';
+
 -- ============================================================================
 -- Add user_id FKs to users (conversations, messages, llm_requests)
 -- ============================================================================

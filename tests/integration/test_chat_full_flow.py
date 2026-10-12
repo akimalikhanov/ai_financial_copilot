@@ -15,7 +15,7 @@ from uuid import uuid4
 import pytest
 
 from src.redis_client import get_chat_tail
-from src.services.llm_adapters.base_adapter import LLMStreamChunk
+from src.services.llm_adapters.base_adapter import LLMResponseStats, LLMStreamChunk
 from tests.integration.conftest import MOCK_RESPONSE, MockStreamingLLM, create_agentic_router
 
 
@@ -462,3 +462,71 @@ async def test_clarification_skip_searches_without_the_entity(
 
     events = await _chat(async_client, headers, conversation_id, content=question)
     assert not [d for t, d in events if t == "scope_clarification"]
+
+
+class _MockTruncatedLLM(MockStreamingLLM):
+    """Streams an answer that stops at the token cap."""
+
+    def stream(self, *_args: Any, **_kwargs: Any) -> AsyncGenerator[LLMStreamChunk, None]:
+        async def _gen() -> AsyncGenerator[LLMStreamChunk, None]:
+            yield LLMStreamChunk(text=self._response_text)
+            yield LLMStreamChunk(
+                text="",
+                is_final=True,
+                finish_reason="length",
+                stats=LLMResponseStats(
+                    input_tokens=100, cached_input_tokens=40, cache_write_tokens=60, output_tokens=5
+                ),
+            )
+
+        return _gen()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_truncated_answer_is_persisted_and_flagged(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cut-off answer is kept and shown, but flagged — not a silent normal completion."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.llm_request import LLMRequest
+
+    router = create_agentic_router(chat_adapter=_MockTruncatedLLM())
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"truncated-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    conv = await async_client.post("/v1/conversations", json={"title": "t"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+
+    events = await _chat(async_client, headers, conversation_id, content="Hello")
+    [usage] = [d for t, d in events if t == "usage" and d.get("persisted")]
+    assert usage["finish_reason"] == "length"
+    assert usage["stats"]["cache_write_tokens"] == 60
+
+    msgs = (
+        await async_client.get(f"/v1/conversations/{conversation_id}/messages", headers=headers)
+    ).json()["messages"]
+    assert MOCK_RESPONSE in msgs[-1]["content"]
+    assert msgs[-1]["metadata"]["finish_reason"] == "length"
+
+    async with get_session_factory()() as s:
+        row = (
+            await s.execute(
+                select(LLMRequest).where(
+                    LLMRequest.conversation_id == conversation_id,
+                    LLMRequest.parent_request_id.is_(None),
+                )
+            )
+        ).scalar_one()
+    # Stays "completed": redelivery, SSE liveness and history all key on it.
+    assert row.status == "completed"
+    assert row.llm_api == "mock"
+    assert row.cache_write_tokens == 60

@@ -96,7 +96,14 @@ class LLMRequest(Base):
     reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Subset of prompt_tokens served from the provider's prompt cache.
     cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Subset of prompt_tokens written to the provider's prompt cache.
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Provider-written summary of hidden reasoning. Model output about user documents:
+    # same access rules as messages.content, never exposed through the chat API.
+    reasoning_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Wire API: chat_completions | responses | gemini | vllm | fake.
+    llm_api: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Cost and performance
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)

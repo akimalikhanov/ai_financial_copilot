@@ -23,7 +23,15 @@ from typing import Any
 import pytest
 
 import src.services.llm_router as llm_router_mod
-from src.services.llm_adapters.base_adapter import ChatMessage, LLMResponse, LLMStreamChunk, Role
+from src.services.llm_adapters.base_adapter import (
+    ChatMessage,
+    LLMResponse,
+    LLMResponseStats,
+    LLMStreamChunk,
+    OpaqueItem,
+    Role,
+    ToolCallRef,
+)
 from src.services.llm_router import (
     FallbackStream,
     LLMRouter,
@@ -31,6 +39,8 @@ from src.services.llm_router import (
     _build_adapter,
     _merge_params,
     _normalize_base_url,
+    _trace_message,
+    trace_usage,
 )
 from src.services.llm_runtime.exceptions import (
     LLMInvalidRequestError,
@@ -52,11 +62,13 @@ class DummyOpenAIAdapter:
         base_url: str | None = None,
         include_usage: bool = False,
         provider_name: str | None = None,
+        capabilities: dict | None = None,
     ):
         self.default_model = default_model
         self.base_url = base_url
         self.include_usage = include_usage
         self.provider_name = provider_name
+        self.capabilities = capabilities
 
     async def complete(self, messages, **params):
         return {"type": "complete", "messages": messages, "params": params}
@@ -205,6 +217,12 @@ class TestBuildAdapter:
         assert adapter.default_model == "gpt-4"
         assert adapter.base_url is None
         assert adapter.include_usage is False
+
+    def test_openai_adapter_gets_capabilities(self):
+        cfg = {"model_name": "gpt-5-mini", "capabilities": {"reasoning": True}}
+        adapter = _build_adapter("openai", cfg)
+        assert isinstance(adapter, DummyOpenAIAdapter)
+        assert adapter.capabilities == {"reasoning": True}
 
     def test_build_gemini_adapter(self):
         cfg = {"model_name": "gemini-pro"}
@@ -574,3 +592,36 @@ class TestFallbackStream:
             [c async for c in stream]
 
         assert stream.served is primary
+
+
+# -------------------------
+# Langfuse payloads
+# -------------------------
+
+
+def test_trace_usage_reports_cache_writes_and_reasoning():
+    stats = LLMResponseStats(
+        input_tokens=100,
+        cached_input_tokens=40,
+        cache_write_tokens=60,
+        output_tokens=30,
+        reasoning_tokens=20,
+    )
+    usage = trace_usage(stats)["usage_details"]
+    assert usage["cache_read_input_tokens"] == 40
+    assert usage["cache_creation_input_tokens"] == 60
+    assert usage["output_reasoning_tokens"] == 20
+
+
+def test_trace_message_never_carries_opaque_payloads():
+    blob = "x" * 5000
+    msg = ChatMessage(
+        role=Role.assistant,
+        tool_calls=(ToolCallRef(id="c1", name="search_documents", arguments="{}"),),
+        opaque=(
+            OpaqueItem("openai", "gpt-5-mini", {"type": "reasoning", "encrypted_content": blob}),
+        ),
+    )
+    traced = _trace_message(msg)
+    assert blob not in str(traced)
+    assert traced["reasoning"].startswith("[1 encrypted items")

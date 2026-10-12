@@ -255,6 +255,92 @@
         ]
       },
       "options": { "sortBy": [{ "displayName": "mean_service_s", "desc": true }] }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Cache Writes, Reasoning & Wire API (Prometheus)",
+      "gridPos": { "x": 0, "y": 45, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 15,
+      "title": "Cache Write Token Rate by Model",
+      "type": "timeseries",
+      "description": "Input tokens written to the prompt cache, against all input. Writes cost 1.25x input from gpt-5.6 on; before that they are billed as plain input.",
+      "gridPos": { "x": 0, "y": 46, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_cache_write_tokens_total{model=~\"$model\"}[1h])) by (model)",
+          "legendFormat": "written {{model}}"
+        },
+        {
+          "expr": "sum(rate(llm_tokens_total{direction=\"input\",model=~\"$model\"}[1h])) by (model)",
+          "legendFormat": "input {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 16,
+      "title": "Reasoning Token Rate by Request Type",
+      "type": "timeseries",
+      "description": "Hidden reasoning tokens, billed as output. Shows which workload the reasoning spend comes from.",
+      "gridPos": { "x": 12, "y": 46, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_reasoning_tokens_total{model=~\"$model\"}[1h])) by (request_type)",
+          "legendFormat": "{{request_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 17,
+      "title": "Calls per Hour by Wire API",
+      "type": "timeseries",
+      "description": "Traffic share per endpoint (chat_completions, responses, gemini, vllm). Tracks a model's move from one API to another.",
+      "gridPos": { "x": 0, "y": 54, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_api_calls_total{model=~\"$model\"}[1h])) by (api) * 3600",
+          "legendFormat": "{{api}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 30, "stacking": { "mode": "normal" } }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 18,
+      "title": "Answers Cut Short (per hour)",
+      "type": "timeseries",
+      "description": "Synthesis answers that ended on the token cap (length), a content filter, or a refusal. They are persisted and shown, flagged with finish_reason in the message metadata.",
+      "gridPos": { "x": 12, "y": 54, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(llm_api_calls_total{model=~\"$model\",request_type=~\"chat|chat_agent\",outcome=~\"length|content_filter|refusal\"}[1h])) by (model, outcome)",
+          "legendFormat": "{{outcome}} {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
     }
   ]
 }

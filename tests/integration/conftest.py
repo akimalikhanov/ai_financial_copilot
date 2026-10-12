@@ -56,6 +56,7 @@ class MockStreamingLLM:
         self, response_text: str = MOCK_RESPONSE, router_json: str = RETRIEVAL_ROUTER_JSON
     ) -> None:
         self.provider = "mock"
+        self.api = "mock"
         self.model_id = "mock-model"
         self._response_text = response_text
         self._router_json = router_json
@@ -80,6 +81,7 @@ class MockToolLLM:
 
     def __init__(self) -> None:
         self.provider = "mock"
+        self.api = "mock"
         self.model_id = TOOL_MODEL_ID
 
     async def close(self) -> None:

@@ -23,13 +23,40 @@ class ToolCallRef:
 
 
 @dataclass(frozen=True, slots=True)
+class OpaqueItem:
+    """A provider-native output item replayed verbatim on later calls (an encrypted
+    reasoning item, say). Only the adapter that produced it reads it; tagged so an adapter
+    can skip items from another provider or model."""
+
+    provider: str
+    model: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ResponseMeta:
+    """Per-response facts for debugging, not usage."""
+
+    response_id: str | None = None
+    served_model: str | None = None
+    reasoning_context: str | None = None  # effective mode the provider reports
+    service_tier: str | None = None
+    status: str | None = None
+    incomplete_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantTurnResult:
     text: str
     tool_calls: list[ToolCallRef]
     stats: LLMResponseStats | None = None
     # The provider's stop reason, normalised to OpenAI's names: "stop", "tool_calls",
-    # "length" (hit the completion-token cap), ... None when the adapter does not report it.
+    # "length" (hit the completion-token cap), "content_filter", "refusal". None when the
+    # adapter does not report it.
     finish_reason: str | None = None
+    opaque: tuple[OpaqueItem, ...] | None = None
+    reasoning_summary: str | None = None
+    meta: ResponseMeta | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +81,9 @@ class ChatMessage:
     # Images ride alongside content rather than widening it to a parts union, so the six
     # existing `m.content or ""` consumers keep working unchanged. complete() only.
     images: tuple[ImagePart, ...] | None = None
+    # Assistant tool-call turns only: the provider items that produced the calls, in
+    # emission order. Read only by the adapter; never traced, never crosses a user turn.
+    opaque: tuple[OpaqueItem, ...] | None = None
 
 
 def reject_images(messages: Sequence[ChatMessage], surface: str) -> None:
@@ -76,6 +106,8 @@ class ChatRequest:
 class LLMResponseStats:
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
+    # Subset of input_tokens written to the provider's prompt cache.
+    cache_write_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
     total_tokens: int | None = None
@@ -90,6 +122,9 @@ class LLMResponse:
     text: str
     raw: Any = None  # provider-native response object (optional)
     stats: LLMResponseStats | None = None
+    finish_reason: str | None = None  # as on AssistantTurnResult
+    reasoning_summary: str | None = None
+    meta: ResponseMeta | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +133,10 @@ class LLMStreamChunk:
     raw: Any = None  # provider-native chunk object (optional)
     is_final: bool = False
     stats: LLMResponseStats | None = None
+    # Final chunk only.
+    finish_reason: str | None = None
+    reasoning_summary: str | None = None
+    meta: ResponseMeta | None = None
 
 
 class LLMAdapter(ABC):
@@ -105,6 +144,8 @@ class LLMAdapter(ABC):
 
     # Subclasses should override this to identify the provider for error mapping
     provider_name: str = "unknown"
+    # Wire API, recorded per call (llm_requests.llm_api, llm_api_calls_total).
+    api: str = "unknown"
 
     def __init__(self, *, default_model: str):
         self.default_model = default_model

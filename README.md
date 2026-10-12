@@ -19,7 +19,7 @@ model then writes the reply from those conclusions and only the excerpts they ci
 | Scope resolution: pg_trgm finds candidate companies for each name in the question, and an LLM disambiguator picks among them from a per-request enum of company IDs. When the match is unclear, the chat shows a clarification card instead of guessing | `src/services/router/scope_resolver.py`, `entity_resolver.py`, `disambiguator.py` |
 | Agent loop with plan-based termination, a dollar budget, a run deadline and a tool-model fallback chain | `src/services/chat/agent/loop.py`, `state.py` |
 | Grounded synthesis: only cited excerpts reach the answering model. Code converts figures to a common currency, checks each one against its excerpt, and computes period-over-period changes so the model doesn't do the arithmetic | `src/services/chat/agent/synthesis.py`, `processor.py`, `number_grounding.py` |
-| Streaming answers over SSE with citation spans, an evidence panel and a confidence badge | `src/services/chat/tasks.py`, `citation_parser.py`, `confidence.py`, `src/ui/components/EvidencePanel.tsx` |
+| Streaming answers over SSE with citation spans, an evidence panel and a confidence badge. An answer that hits the token cap is saved with `finish_reason` instead of passing as complete, and a stream that drops mid-answer fails the request | `src/services/chat/tasks.py`, `citation_parser.py`, `confidence.py`, `src/ui/components/EvidencePanel.tsx` |
 | Follow-up questions ("show that in EUR") answered from the previous run's findings without searching again | `tasks.py`, `prompts/system_v5_agent_synthesis.yaml` |
 | Pattern-based prompt-injection scanning on user input, retrieved excerpts, and text the tool model writes into findings | `src/services/security/injection_detector.py` |
 | Thumbs up/down feedback, stored as `MessageFeedback` and posted to Langfuse as a score | `src/api/routers/feedback.py` |
@@ -123,7 +123,7 @@ The full walkthrough, with worked examples and every stop reason, is in
 |---|---|
 | App tier | FastAPI, Uvicorn, Celery (Redis broker, `chat` and `ingestion` queues), SQLAlchemy 2.0 async with asyncpg, Pydantic v2, PyJWT |
 | Frontend | React 19, TypeScript, Vite, Tailwind CSS, react-pdf-viewer; served by nginx in the container image |
-| LLM providers | OpenAI and Gemini adapters, vLLM through the OpenAI-compatible API; models, prices, capabilities and fallbacks in `infra/config/models.yaml` |
+| LLM providers | OpenAI (Chat Completions, `openai` SDK 2.x) and Gemini adapters, vLLM through the OpenAI-compatible API; models, prices (including cache reads and writes), capabilities and fallbacks in `infra/config/models.yaml`. `capabilities.reasoning` decides which parameters a model gets |
 | Ingestion | Docling 2.111.0 (pinned), EasyOCR |
 | Retrieval | Qdrant 1.16 (dense), OpenSearch 2.19 (BM25), RRF fusion, Hugging Face Text Embeddings Inference serving `BAAI/bge-m3` and `BAAI/bge-reranker-v2-m3` |
 | Storage | PostgreSQL 16 with pg_trgm, pgBouncer, Redis 7.2 (separate app and broker instances), Garage (S3-compatible) |
@@ -189,10 +189,10 @@ the comparison finds a regression. The Grafana "Eval / Canary" dashboard reads t
 | Signal | Where | What it shows |
 |---|---|---|
 | LLM traces | Langfuse (`localhost:3003`) | One trace per chat request: `route_query` with `resolve_scope` and its candidate and disambiguator spans, then `agent_loop` with an `agent_turn_N` span per turn (status line in, tool calls and results out, state after), each search's retrieval spans, and every LLM generation with tokens and cost. Scores: `agent_plan_coverage`, `agent_uncited_claim_rate`, `uncited_fact_share`, `ungrounded_claims`, and user feedback |
-| Metrics | Prometheus (`localhost:9090`) | Scrapes `api:8000/metrics`, `worker-chat:9100` and `worker-ingestion:9101`. Agent iterations, tool-call counts and latency, tool-model latency by turn kind, LLM tokens, cache hits and cost, dropped citation refs. Metric definitions are in `src/observability/metrics.py` |
+| Metrics | Prometheus (`localhost:9090`) | Scrapes `api:8000/metrics`, `worker-chat:9100` and `worker-ingestion:9101`. Agent iterations, tool-call counts and latency, tool-model latency by turn kind, LLM tokens, reasoning tokens, cache reads and writes, cost, calls by wire API, answers cut short, dropped citation refs. Metric definitions are in `src/observability/metrics.py` |
 | Dashboards | Grafana (`localhost:3004`) | Six provisioned dashboards: API Overview, Agentic RAG, Cost & Tokens, Worker Health, Logs Explorer, Eval / Canary. Data sources: Prometheus, the app Postgres database, Elasticsearch |
 | Logs | Fluent Bit → Elasticsearch (`copilot-logs` index) | App containers write JSON to stdout; Docker's fluentd log driver ships it to Fluent Bit, which parses and forwards it |
-| Request records | Postgres `llm_requests` | One row per LLM call, including every tool-model turn and disambiguator call, with tokens, cost, latency, status and `scope_outcome` |
+| Request records | Postgres `llm_requests` | One row per LLM call, including every tool-model turn and disambiguator call, with tokens (cache reads and writes included), cost, latency, status, `scope_outcome` and `llm_api` |
 
 **Correlating logs with traces.** The Langfuse trace ID is the request UUID in hex
 (`UUID(request_id).hex`). The chat worker stamps the same value as `trace_id` on every log line
@@ -411,3 +411,9 @@ src/services/chat/agent/
   the ingestion worker.
 - **Gemini has no tool calling yet.** `gemini-3.7-flash` can answer but cannot run the agent
   loop (`tool_calling: false` in `models.yaml`).
+- **The tool model is stuck on gpt-5-mini.** OpenAI calls go through Chat Completions, where
+  gpt-5.4-mini and newer reject tool calls with any `reasoning_effort` except `none`, and the
+  GPT-6 models reject function calling outright. The model's hidden reasoning is also
+  discarded between agent turns. A Responses API adapter, selected per model in
+  `models.yaml`, is the next step. The token, cost and cache tracking it needs is already in
+  place.

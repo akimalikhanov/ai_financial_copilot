@@ -22,6 +22,7 @@ class FakeLLM:
         self._responses = responses or []
         self._raises = raises
         self.provider = "fake"
+        self.api = "fake"
         self.calls: list[dict] = []
 
     async def complete(self, **kwargs):

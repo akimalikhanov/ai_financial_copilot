@@ -124,6 +124,7 @@ class LLMResponseStats(BaseModel):
 
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
     total_tokens: int | None = None

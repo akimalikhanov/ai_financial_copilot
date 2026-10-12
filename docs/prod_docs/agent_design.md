@@ -620,7 +620,11 @@ Why a tool result and not a user message of its own:
 - **Turn boundaries.** Providers start a new turn at each user message. On the Responses
   API, `current_turn` reasoning models (gpt-5-mini) drop every reasoning item from before
   the latest user message. A trailing status message would throw away the reasoning the
-  loop carries between calls. A tool result keeps it in the current turn.
+  loop replays between calls. A tool result keeps it in the current turn. A live probe on
+  gpt-5-mini showed both: with a trailing user message the replayed reasoning item stopped
+  counting toward input tokens, and with the status folded into the tool result it kept
+  counting. A `developer` message also kept it. Today's Chat Completions path replays no
+  reasoning, so the fold matters once the tool model moves to Responses.
 - **Cache.** The status goes at the end of the result, so the next call's cached prefix
   still covers the result's content. Only the status tokens miss the cache, the same as
   with a trailing user message.
@@ -709,6 +713,14 @@ as `truncated`, not `natural`. The loop logs `agent_tool_model_truncated` with t
 and reasoning token counts, marks the turn span WARNING in Langfuse, and writes the
 sub-request row with `status="truncated"`. A truncated turn that still emitted tool calls
 carries on, but its row and latency sample are tagged `length` too.
+
+<a id="cache-key"></a>**Cache key.** Every tool-model call sends
+`prompt_cache_key="agent:{prompt version}"`, for example `agent:v6_agent_analytical`.
+OpenAI uses the key to send requests with the same prefix to the same cache machine, and
+the prefix every run shares is the system prompt plus the tools. The key is per prompt
+version, not per user or run, so all runs of one shape share that cache. The adapter sends
+it to OpenAI only. vLLM never gets it, and `LLM_PROMPT_CACHE_KEY_ENABLED=false` turns it
+off everywhere.
 
 ```mermaid
 sequenceDiagram
@@ -1724,8 +1736,11 @@ ConvergenceReason = Literal[
 
 The budget is in dollars, summed over every tool-model call in the run, fallback models
 included (`state.cost_usd_total()`). Each call's `cost_usd` comes from the adapter's pricing in
-`models.yaml`: input at the input rate, cached input at the cached rate, and output, reasoning
-included, at the output rate. Reasoning is what makes a token budget wrong here: on
+`models.yaml`. Input is billed at the input rate and cached input at the cached rate. Input
+written to the prompt cache is billed at `cache_write_input` where a model sets it (1.25x
+input on gpt-5.6 and later), and at the plain input rate otherwise. Output, reasoning
+included, is billed at the output rate. Cached and written tokens are both subsets of
+`input_tokens`, so no token is billed twice. Reasoning is what makes a token budget wrong here: on
 gpt-5-mini a turn with 8k input and 4k reasoning spends $0.002 on input and $0.008 on output.
 Dollars also track the prompt cache, so a long run whose earlier messages are cached is
 charged for what it actually costs. A model with no pricing entry adds $0, so for it only the
@@ -2119,9 +2134,25 @@ flowchart TD
 | metadata | `citation_spans`, `references` | parsed citations and evidence-panel entries |
 | metadata | `findings_block`, `findings_block_hops`, `findings_block_doc_ids` | saved for follow-ups, only when the run was sealed |
 | metadata | `confidence`, `ungrounded_claims`, `degraded_retrieval`, `route` | sent to the UI; `ungrounded_claims` (uncited-fact share above 0) is not shown |
+| metadata | `finish_reason` | present only when the answer stopped early: `length` (token cap), `content_filter` or `refusal`. Absent on a normal answer |
 | `trace.guardrails` | | `confidence`, `top_reranker_score`, `num_chunks`, `degraded_retrieval`, `ungrounded_claims`, `uncited_fact_share`, injection signal |
 | metadata | `turn_summary` | route, query shape, resolved entities and document count: this turn's line in later turns' [session index](#session-index-router) |
 | `trace.agent` | | `iterations`, `tool_calls_total`, `convergence_reason`, `sealed`, FX results, `plan_seeded`, `plan_covered`, `report_calls_total`, `turns_to_first_report`, `unknown_aspect_keys`, `unsearched_negatives`, `uncited_claim_rate`, `search_arg_errors`, `report_parse_failures`, `last_turn_input_tokens` |
+
+### When the answer stops early
+
+The adapter puts the provider's stop reason on the stream's final chunk. If it is `length`,
+`content_filter` or `refusal`, `tasks.py` still saves and shows the answer, since it is what
+the user already read. It adds `finish_reason` to the message metadata and to the SSE
+`usage` event, records the latency sample under that outcome, logs
+`llm_stream_abnormal_finish`, and marks the `chat_model` generation WARNING. The parent
+`llm_requests` row stays `completed`. The redelivery guard, SSE liveness, conversation
+history and the service-time dashboard all treat `completed` as a finished answer, and a
+new status would break each of them.
+
+A stream that ends with no stop reason at all lost its connection mid-answer. The adapter
+raises `LLMConnectionError`, and the request fails instead of saving the partial text as a
+complete answer.
 
 Nothing inside the run (`AgentRunState`, ledgers, transcript) is serialized. If a worker dies
 mid-loop, Celery's `acks_late` redelivers the task and the loop starts again from scratch.
@@ -2196,9 +2227,11 @@ through these spans turn by turn.
 | `AGENT_TOOL_DURATION` | histogram | `tool` | search latency |
 | `AGENT_TOOL_MODEL_DURATION` | histogram | `model`, `turn_kind`, `outcome` | tool-model call latency. `turn_kind` is `search`, `report`, `mixed`, `final`, `none` (prose), or `unknown` for a non-final call that failed before answering. Search and report turns differ 3-5x in latency, so they get separate percentiles |
 | `AGENT_TOOL_MODEL_OUTPUT_TOKENS` | counter | `model`, `turn_kind`, `part` (`reasoning`/`visible`) | tool-model output tokens. Reasoning is most of a report turn's latency |
-| `LLM_DURATION` | histogram | `model`, `request_type`, `outcome` | LLM call latency. `outcome` is `ok`, `length`, `timeout`, `cancelled` or `error`. Only `agent_tool_call` records the failure outcomes, so calls that never answered still show up in its percentiles |
+| `LLM_DURATION` | histogram | `model`, `request_type`, `outcome` | LLM call latency. `outcome` is `ok`, `length`, `content_filter`, `refusal`, `timeout`, `cancelled` or `error`. `agent_tool_call` records the failure outcomes, so calls that never answered still show up in its percentiles. The synthesis stream (`chat`, `chat_agent`) records the early-stop outcomes |
+| `LLM_API_CALLS` | counter | `model`, `api`, `request_type`, `outcome` | LLM calls by wire API (`chat_completions`, `responses`, `gemini`, `vllm`, `fake`). A separate series so the `api` label doesn't split `LLM_DURATION`'s history |
 | `LLM_TOKENS` | counter | `direction`, `model` | tool-model tokens (plus other LLM calls) |
-| `LLM_CACHE_HIT_TOKENS`, `LLM_COST` | counter | `model` | cache hits, spend |
+| `LLM_CACHE_HIT_TOKENS`, `LLM_CACHE_WRITE_TOKENS`, `LLM_COST` | counter | `model` | cache reads, cache writes, spend |
+| `LLM_REASONING_TOKENS` | counter | `model`, `request_type` | reasoning tokens for every call type. Its own series because reasoning is already inside `LLM_TOKENS{direction="output"}` |
 | `AGENT_LAST_TURN_INPUT_TOKENS` | histogram | | tool-model input tokens on a run's last call: how large the append-only transcript got |
 | `CITATION_REFS_DROPPED` | counter | | finding citations with no excerpt in the synthesis context |
 
@@ -2211,6 +2244,14 @@ linked to the parent request, on its own session. A call that answered has token
 `cancelled` or `failed`, the elapsed `latency_ms`, the error for `failed`, and `budget_s`
 in `request_params`. Its tokens are unknown, so the row has none. The parent request is
 marked `request_type="chat_agent"`.
+
+Every `llm_requests` row, parent or sub-request, records `llm_api` (the wire API that served
+it) and `cache_write_tokens` next to `cached_input_tokens`. `reasoning_summary` exists for the
+Responses path and stays NULL on Chat Completions.
+
+Each Langfuse generation (`llm.complete`, `llm.complete_with_tools`, `chat_model`) carries
+`llm_api` and `finish_reason` in its metadata, plus cache-write and reasoning tokens in its
+usage.
 
 ### Live UI activity
 
@@ -2280,6 +2321,13 @@ Related settings outside the agent package:
 | `INJECTION_SCAN_CHUNKS` | true | Injection scan on every excerpt before it is rendered |
 | `INJECTION_SCAN_USER_INPUT` | true | Injection scan on the current message and, in `prior_turns`, on every prior question |
 | `CHAT_MAX_ATTEMPTS` | 2 | Celery redeliveries of one chat task before it is failed |
+| `LLM_PROMPT_CACHE_KEY_ENABLED` | true | Sends `prompt_cache_key` to OpenAI: `agent:`, `synthesis:` and `router:` plus the prompt version ([cache key](#cache-key)) |
+
+Per-model settings in `infra/config/models.yaml`: `capabilities.reasoning: true` marks a
+reasoning model. The adapter then sends `reasoning_effort`, `verbosity` and
+`max_completion_tokens`, and drops `temperature`, which those models reject. Without the
+flag the model gets `temperature` and `max_tokens`. The model name plays no part.
+`pricing.cache_write_input` prices cache writes (see [section 14](#14-why-a-run-stops)).
 
 ---
 
@@ -2512,6 +2560,8 @@ under the two figures, and the answering model would copy it.
 | Reranker skipped | `scores_are_rerank = False` | Confidence badge computed on the fusion-score scale |
 | Tool-model call hangs | `Stop("timeout")` once the call's budget runs out (at most `AGENT_TURN_TIMEOUT_CAP_SECONDS`) | Partial findings, marked degraded if the plan was open |
 | Tool model spends its token cap on reasoning | No tool calls and `finish_reason == "length"`, `Stop("truncated")` | Same as above |
+| Answering model hits its token cap, a content filter, or refuses | The answer is saved with `finish_reason` in its metadata; latency recorded under that outcome | The answer as streamed, cut short. The `usage` event carries `finish_reason` |
+| Answer stream drops mid-answer | Adapter raises `LLMConnectionError`; the request fails | An error event, not a partial answer passed off as complete |
 | Tool model returns a provider error | Same turn retried on the fallback model; if the whole chain fails, `Stop("llm_error")` | Nothing if the fallback answers; otherwise partial findings, marked degraded. A failure before anything was gathered fails the request |
 | Everything slow | The next turn has no call budget left, or the run deadline cancels a search in flight; stop reason `deadline` | Same as above |
 | Excerpt contains an injection attempt | Blocked chunks never rendered; flagged ones rendered with `flagged="true"` | Answering model told to be sceptical of flagged excerpts |
@@ -2637,6 +2687,7 @@ a misrouted question lands in the same schema either way.
 | Follow-up reuse of findings | `tasks.py::_latest_findings_block`, `loop.py::agent_history` |
 | What prior conversation each model sees | `context/turns.py::prior_turns`, `cap_turns`, and `router_history()` / `tool_model_history()` / `answer_history()` |
 | What's persisted | `tasks.py`, the `citation_meta` / `trace_payload` block |
+| Why an answer is flagged as cut short | `tasks.py::_ABNORMAL_FINISH`, `openai_adapter.py::_stream` |
 | Debugging a single run | Langfuse `agent_loop` span, or the `trace-analysis` skill |
 
 ### Tests
@@ -2656,6 +2707,11 @@ a misrouted question lands in the same schema either way.
 | Number grounding | `test_number_grounding.py` |
 | Uncited-fact share | `test_confidence.py` |
 | Follow-up carryover | `test_followup_hop_cap.py`, `test_router_findings_digest.py` |
+| Stop reasons, dropped streams, reasoning params, cache key | `test_openai_adapter.py` |
+| Cost with cache reads and writes | `test_llm_cost.py` |
+
+A cut-off answer end to end (metadata, `usage` event, `llm_requests` row) is covered by
+`tests/integration/test_chat_full_flow.py::test_truncated_answer_is_persisted_and_flagged`.
 
 `run_loop` takes an `execute_search=` keyword argument, so tests can swap in a fake search
 function without touching retrieval.

@@ -27,6 +27,8 @@ models:
       streaming: true
       tool_calling: true
       vision: true
+      # Takes reasoning_effort/verbosity and max_completion_tokens; rejects temperature.
+      reasoning: true
     params_override: {temperature: 1.0, max_tokens: 6000, verbosity: high, reasoning_effort: high}
     # Same-provider fallback: smallest quality drop, still a reasoning-tier model.
     # Covers capacity/rollout issues on the gpt-5.2 SKU specifically, not a full
@@ -53,7 +55,8 @@ models:
       # Accepts tool_choice={"type": "allowed_tools"} on chat/completions.
       allowed_tools: true
       vision: true
-    # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
+      reasoning: true
+    # max_tokens maps to max_completion_tokens for reasoning models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
     # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
     #
