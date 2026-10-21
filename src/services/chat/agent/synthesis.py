@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from src.observability.langfuse import get_client as lf_get_client
@@ -36,6 +37,8 @@ class AgentRunResult:
     # The rendered block alone, without the excerpts — carried to a follow-up turn so it
     # can be answered without re-retrieving (see followup_direct_answer_plan.md).
     findings_block: str | None = None
+    # Set when no finding cited an excerpt and synthesis served the shown excerpts instead.
+    synthesis_fallback: Literal["no_findings", "no_citations"] | None = None
 
 
 # Prepended to the synthesis context when every search errored. Without it a dead
@@ -147,6 +150,7 @@ async def run_synthesis(
     )
 
     excerpts = rag_context.formatted_context or ""
+    reason: Literal["no_findings", "no_citations"] | None = None
     if not cited_ids and rag_context.items:
         excerpts = UNCITED_EXCERPTS_NOTICE + "\n\n" + excerpts
         reason = "no_findings" if findings is None else "no_citations"
@@ -183,4 +187,5 @@ async def run_synthesis(
         processed=processed,
         meta=agent_meta,
         findings_block=findings_block,
+        synthesis_fallback=reason,
     )

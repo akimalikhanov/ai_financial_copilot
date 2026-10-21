@@ -120,7 +120,21 @@ export type ActivityKind =
   | 'stage_ended'
   | 'tool_call_started'
   | 'tool_call_ended'
-  | 'round_started';
+  | 'round_started'
+  | 'note'
+  | 'outcome';
+
+/** Row and outcome status. Never 'running' on the wire: a started row without an end is running. */
+export type ActivityStatus = 'ok' | 'skipped' | 'warn' | 'fail';
+
+/** `detail` of the single `outcome` event: the pill text and the closing lines of the expanded view. */
+export interface OutcomeDetail {
+  status: ActivityStatus;
+  text: string;
+  lines: string[];
+  /** True when no pill is shown (a clarification card is the response). */
+  hidden: boolean;
+}
 
 export interface ActivityEvent {
   kind: ActivityKind;

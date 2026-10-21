@@ -311,8 +311,8 @@ async def test_concurrent_searches_each_open_a_distinct_session(
 
 @pytest.mark.asyncio
 async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The analytical agent passes entity="" — the result and both SSE events must carry
-    the resolved primary entity, not a blank string."""
+    """The analytical agent passes entity="" — the result must carry the resolved primary
+    entity, not a blank string. The timeline row belongs to `_guarded_search`, not here."""
     from src.services.chat.agent import loop as loop_module
 
     state = _make_state()
@@ -338,14 +338,10 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
         name="search_documents",
         arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.entity == "Acme"
-    started = [p for n, p in events if n == "activity" and p["kind"] == "tool_call_started"]
-    assert started and started[0]["label"] == "Acme"
-    assert result.activity_id == started[0]["id"]
+    assert not [n for n, _ in events if n == "activity"]
 
 
 @pytest.mark.asyncio
@@ -370,9 +366,7 @@ async def test_unresolved_entity_returns_not_found_without_retrieval(
         name="search_documents",
         arguments=json.dumps({"entity": "Aurora", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.not_found is True
     assert result.chunks == []
@@ -409,9 +403,7 @@ async def test_empty_entity_searches_every_resolved_entity(
         name="search_documents",
         arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
     )
-    await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert seen == [union]
 
@@ -441,9 +433,7 @@ async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.Monk
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.backend_failed is True
     assert result.chunks == []
@@ -481,9 +471,7 @@ async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.backend_failed is False
     assert result.chunks == []
@@ -515,9 +503,7 @@ async def _search_queries_for(
     monkeypatch.setattr(loop_module, "add_event", AsyncMock())
 
     tc = ToolCallRef(id="call_1", name="search_documents", arguments=json.dumps(arguments))
-    await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
     return seen[0]
 
 
@@ -618,6 +604,111 @@ async def _run(
         session_factory=_fake_session_factory(),
         execute_search=search,
     )
+
+
+def _capture_activity(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    from src.services.chat.agent import loop as loop_module
+
+    events: list[dict] = []
+
+    async def _add_event(_redis: Any, _rid: str, name: str, payload: dict) -> None:
+        if name == "activity":
+            events.append(payload)
+
+    monkeypatch.setattr(loop_module, "add_event", _add_event)
+    return events
+
+
+def _search_rows(events: list[dict]) -> list[tuple[dict, dict]]:
+    """(start, end) per search row; fails if any row was started without an end."""
+    starts = [
+        e for e in events if e["kind"] == "tool_call_started" and e["detail"]["tool"] == "search"
+    ]
+    ends = [e for e in events if e["kind"] == "tool_call_ended"]
+    assert len(ends) == len({e["id"] for e in ends})
+    by_id = {e["id"]: e for e in ends}
+    return [(s, by_id[s["id"]]) for s in starts]
+
+
+@pytest.mark.asyncio
+async def test_every_search_row_ends_on_a_full_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _capture_activity(monkeypatch)
+    state = _make_state()
+    chunk, payloads = _make_chunk_with_payload()
+    search = ToolCallRef(
+        id="s1", name="search_documents", arguments=json.dumps({"entity": "Acme", "query": "q"})
+    )
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[search, dc_replace(search, id="s2")]),
+        AssistantTurnResult(text="", tool_calls=[_report_tc("r1", "Acme", str(chunk.chunk_id))]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await _run(state, turns, _search)
+
+    starts = [e for e in events if e["kind"] == "tool_call_started"]
+    ends = [e for e in events if e["kind"] == "tool_call_ended"]
+    assert len(starts) == len(ends)
+    assert [s["label"] for s, _ in _search_rows(events)] == ['"q"', '"q"']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "label"),
+    [
+        # Aurora matched nothing, so Acme is the only company in scope: no prefix.
+        (json.dumps({"entity": "Aurora", "query": "revenue"}), '"revenue"'),
+        ("{not json", "malformed search"),
+    ],
+    ids=["not_in_library", "invalid_arguments"],
+)
+async def test_early_return_search_still_gets_one_row(
+    monkeypatch: pytest.MonkeyPatch, arguments: str, label: str
+) -> None:
+    from src.services.chat.agent import loop as loop_module
+
+    events = _capture_activity(monkeypatch)
+    state = _make_state()
+    state.scope_result = DocumentScopeResult(
+        doc_ids=None, source="all", per_entity_doc_ids={"Aurora": [], "Acme": [uuid4()]}
+    )
+    turns = [
+        AssistantTurnResult(
+            text="", tool_calls=[ToolCallRef(id="s1", name="search_documents", arguments=arguments)]
+        ),
+        AssistantTurnResult(text="done", tool_calls=[]),
+    ]
+
+    await _run(state, turns, loop_module._execute_search)
+
+    [(start, _end)] = _search_rows(events)
+    assert start["label"] == label
+
+
+@pytest.mark.asyncio
+async def test_final_pass_search_gets_a_skipped_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "2")
+    events = _capture_activity(monkeypatch)
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s2", "Did pricing offset?")]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await _run(state, turns, _search)
+
+    rows = _search_rows(events)
+    assert len(rows) == 2
+    assert rows[1][1]["detail"] == {
+        "status": "skipped",
+        "note": "not run — final pass records findings only",
+    }
 
 
 @pytest.mark.asyncio

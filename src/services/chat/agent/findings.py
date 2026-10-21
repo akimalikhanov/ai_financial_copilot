@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 # Prefixed to model-written text the injection scan flags; the synthesis prompt names it.
 FLAGGED_MARKER = "[flagged] "
 
+RecordOutcome = Literal["accepted", "blocked", "uncited"]
+
 _DEGRADED_CAVEAT = (
     "The search did not fully converge; these findings are partial and may be incomplete."
 )
@@ -111,26 +113,29 @@ class FindingsLedger:
             figures.append(fig.model_copy(update={"metric": metric, "fiscal_label": label}))
         return finding.model_copy(update={"claim": claim, "figures": figures})
 
-    def record(self, key: str, finding: Finding, evidence: EvidenceLedger) -> bool:
-        """Insert or update-in-place. Returns False (and leaves any prior entry intact)
-        when the injection scan blocks the item's text or the grounding filter drops it."""
+    def record(self, key: str, finding: Finding, evidence: EvidenceLedger) -> RecordOutcome:
+        """Insert or update-in-place. Returns "blocked" or "uncited" (and leaves any prior
+        entry intact) when the injection scan blocks the item's text or the grounding
+        filter drops it."""
         self._reported = True
         screened = self._screen_finding(finding)
         if screened is None:
-            return False
+            return "blocked"
         finding = screened
         if finding.supported:
             self._claims += 1
             if not _resolves(finding.evidence, evidence):
                 self._uncited += 1
-                return False
+                return "uncited"
             prior = self._entries.get(key)
             if prior is not None and prior.supported:
                 finding = _merge(prior, finding)
         self._entries[key] = finding
-        return True
+        return "accepted"
 
-    def ingest(self, report: FindingsReport, evidence: EvidenceLedger) -> None:
+    def ingest(
+        self, report: FindingsReport, evidence: EvidenceLedger
+    ) -> list[tuple[RecordOutcome, Finding | None]]:
         """Fold one report into the ledger. Accumulates; never prunes.
 
         Restated keys update in place; keys this report omits are left alone. Reports are
@@ -141,12 +146,19 @@ class FindingsLedger:
         Envelope fields are last-write-wins but null-guarded: a later report that omits a
         field must not erase what an earlier one established. A field the injection scan
         blocks counts as omitted.
+
+        Returns, per finding in report order, its outcome and the finding as stored
+        (screened, merged) when accepted, else None.
         """
         self._reported = True
         self._comparison_op = report.comparison_op or self._comparison_op
         self._conclusion = self._screen(report.conclusion) or self._conclusion
+        outcomes: list[tuple[RecordOutcome, Finding | None]] = []
         for finding in report.findings:
-            self.record(finding.key, finding, evidence)
+            outcome = self.record(finding.key, finding, evidence)
+            stored = self._entries[finding.key] if outcome == "accepted" else None
+            outcomes.append((outcome, stored))
+        return outcomes
 
     def keys(self) -> set[str]:
         return set(self._entries)

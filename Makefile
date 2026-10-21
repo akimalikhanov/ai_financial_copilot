@@ -97,6 +97,9 @@ GIT_SHA ?= $(shell echo "$$(git rev-parse --short HEAD)-$$( \
 	  git ls-files -o --exclude-standard -z | xargs -0 -I{} cat {} 2>/dev/null; \
 	} | sha256sum | cut -c1-8)")
 REGISTRY := localhost:5001
+# Newest tags kept per image by k8s-prune (tags a pod still references are always kept too).
+K8S_KEEP_TAGS ?= 3
+K8S_NODE := copilot-control-plane
 
 .PHONY: k8s-registry
 k8s-registry:
@@ -175,6 +178,16 @@ k8s-build-push: docker-build-api docker-build-frontend docker-build-worker
 k8s-deploy: k8s-build-push
 	kubectl delete job model-preload es-bootstrap garage-bootstrap -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
+	$(MAKE) k8s-prune
+
+# Drops old content-hashed image tags from the registry, the kind node and the host docker
+# store, so repeated k8s-deploy runs don't accumulate ~17GB per tag in each. Dry run:
+# `make k8s-prune PRUNE_ARGS=--dry-run`.
+.PHONY: k8s-prune
+k8s-prune:
+	.venv/bin/python -m scripts.k8s_prune --registry $(REGISTRY) \
+	  --repos copilot/api copilot/worker copilot/frontend --keep $(K8S_KEEP_TAGS) \
+	  --node $(K8S_NODE) --registry-container kind-registry $(PRUNE_ARGS)
 
 # Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run
 # after editing the Dockerfile; tag must match kind-cluster.yaml's `image:`.

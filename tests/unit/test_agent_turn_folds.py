@@ -5,9 +5,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace as dc_replace
+from typing import Any
+from uuid import uuid4
 
 import pytest
 
+from src.schemas.agent_findings import Finding
+from src.services.chat.activity import (
+    NoteRow,
+    SearchSources,
+    search_result_row,
+    search_sources,
+)
+from src.services.chat.agent.findings import FLAGGED_MARKER
 from src.services.chat.agent.loop import (
     Continue,
     Stop,
@@ -17,10 +27,20 @@ from src.services.chat.agent.loop import (
     fold_reports,
     fold_searches,
 )
-from src.services.llm_adapters.base_adapter import LLMResponseStats, ToolCallRef
-from tests.unit.test_agent_loop_smoke import _make_chunk_with_payload
-from tests.unit.test_agent_state import _settings, _state
-from tests.unit.test_findings import _neg
+from src.services.chat.agent.state import AgentRunState, AspectStats
+from src.services.llm_adapters.base_adapter import (
+    AssistantTurnResult,
+    LLMResponseStats,
+    ToolCallRef,
+)
+from tests.unit.test_agent_loop_smoke import (
+    _capture_activity,
+    _make_chunk_with_payload,
+    _make_state,
+    _run,
+)
+from tests.unit.test_agent_state import _report_call, _settings, _state
+from tests.unit.test_findings import _BLOCKED, _FLAGGED, _f, _neg, _seed_evidence
 
 
 def _search(call_id: str) -> ToolCallRef:
@@ -68,7 +88,7 @@ class TestFoldSearches:
             _SearchResult(entity="Acme", chunks=[c2], payloads=p2),
         ]
 
-        texts, new, traces = fold_searches(
+        texts, new, traces, _ = fold_searches(
             state, [_search("s1"), _search("s2")], results, {"s1": "A1", "s2": None}
         )
 
@@ -85,7 +105,7 @@ class TestFoldSearches:
         state = _state(plan={"A1": "q"})
         c, p = _make_chunk_with_payload()
 
-        texts, _, traces = fold_searches(
+        texts, _, traces, _ = fold_searches(
             state, [_search("s1")], [_SearchResult("Acme", [c], p)], {"s1": "A1"}
         )
 
@@ -98,7 +118,7 @@ class TestFoldSearches:
             entity="Acme", chunks=[], payloads={}, error_str="down", backend_failed=True
         )
 
-        texts, new, traces = fold_searches(state, [_search("s1")], [failed], {"s1": "A1"})
+        texts, new, traces, _ = fold_searches(state, [_search("s1")], [failed], {"s1": "A1"})
 
         assert texts == traces == {"s1": "down"}
         assert new == [0]
@@ -110,7 +130,7 @@ class TestFoldSearches:
             entity="Aurora", chunks=[], payloads={}, error_str="no match", not_found=True
         )
 
-        texts, _, _ = fold_searches(state, [_search("s1")], [missing], {"s1": "Aurora"})
+        texts, _, _, _ = fold_searches(state, [_search("s1")], [missing], {"s1": "Aurora"})
 
         assert texts["s1"] == "no match"
         finding = state.findings.get("Aurora")
@@ -126,7 +146,7 @@ class TestFoldSearches:
         new, p_new = _make_chunk_with_payload()
         fold_searches(state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"})
 
-        texts, labels, _ = fold_searches(
+        texts, labels, _, _ = fold_searches(
             state,
             [_search("s2")],
             [_SearchResult("Acme", [old, new], p_old | p_new)],
@@ -144,7 +164,7 @@ class TestFoldSearches:
         old, p_old = _make_chunk_with_payload()
         fold_searches(state, [_search("s1")], [_SearchResult("Acme", [old], p_old)], {"s1": "A1"})
 
-        texts, labels, _ = fold_searches(
+        texts, labels, _, _ = fold_searches(
             state, [_search("s2")], [_SearchResult("Acme", [old], p_old)], {"s2": "A1"}
         )
 
@@ -157,7 +177,7 @@ class TestFoldSearches:
         below, p_below = _make_chunk_with_payload()
         fold_searches(state, [_search("s1")], [_SearchResult("Acme", [top], p_top)], {"s1": "A1"})
 
-        _texts, labels, _ = fold_searches(
+        _texts, labels, _, _ = fold_searches(
             state,
             [_search("s2")],
             [_SearchResult("Acme", [top, below], p_top | p_below)],
@@ -169,10 +189,73 @@ class TestFoldSearches:
 
     def test_an_empty_search_says_no_results(self) -> None:
         state = _state(plan={"A1": "q"})
-        texts, _, _ = fold_searches(
+        texts, _, _, _ = fold_searches(
             state, [_search("s1")], [_SearchResult("Acme", [], {})], {"s1": "A1"}
         )
         assert texts["s1"] == "[A1] (no results)"
+
+    def test_sources_group_shown_pages_by_document(self) -> None:
+        state = _state(plan={"A1": "q"})
+        c1, p1 = _make_chunk_with_payload()
+        c2, p2 = _make_chunk_with_payload()
+        p2 = {c2.chunk_id: dc_replace(p2[c2.chunk_id], page_numbers=(42, 1))}
+
+        *_, sources = fold_searches(
+            state, [_search("s1")], [_SearchResult("Acme", [c1, c2], p1 | p2)], {"s1": "A1"}
+        )
+
+        assert sources == [[("Acme 10-K", [1, 42])]]
+
+
+def _row(new: int = 0, **result: Any) -> tuple[str, str]:
+    chunks = result.pop("chunks", [])
+    return search_result_row(
+        _SearchResult(entity="Acme", chunks=chunks, payloads={}, **result), new, timeout_s=60
+    )
+
+
+class TestSearchResultRow:
+    def test_new_excerpts(self) -> None:
+        chunk, _ = _make_chunk_with_payload()
+        assert _row(8, chunks=[chunk]) == ("ok", "+8 new")
+
+    def test_sources_list_up_to_max(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AGENT_ACTIVITY_MAX_SOURCES", "2")
+        sources: SearchSources = [("RBA 10-K 2023", [42, 88]), ("RBA 10-K 2022", [49]), ("X", [])]
+        assert search_sources(sources) == "RBA 10-K 2023 p.42, p.88 · RBA 10-K 2022 p.49"
+        assert search_sources([]) is None
+
+    def test_chunks_returned_none_new(self) -> None:
+        chunk, _ = _make_chunk_with_payload()
+        assert _row(0, chunks=[chunk]) == ("skipped", "nothing new")
+
+    def test_no_chunks(self) -> None:
+        assert _row(0) == ("skipped", "no results")
+
+    def test_degraded(self) -> None:
+        chunk, _ = _make_chunk_with_payload()
+        assert _row(8, chunks=[chunk], degraded=frozenset({"rerank"})) == (
+            "warn",
+            "+8 new · reranking unavailable",
+        )
+
+    def test_not_in_library(self) -> None:
+        assert _row(not_found=True, error_str="x") == (
+            "skipped",
+            "Acme is not in your documents",
+        )
+
+    def test_timed_out(self) -> None:
+        assert _row(timed_out=True, backend_failed=True, error_str="x") == (
+            "warn",
+            "timed out after 60s",
+        )
+
+    def test_backend_failed(self) -> None:
+        assert _row(backend_failed=True, error_str="x") == ("warn", "search failed")
+
+    def test_invalid_arguments(self) -> None:
+        assert _row(args_invalid=True, error_str="x") == ("skipped", "malformed search, skipped")
 
 
 class TestFoldReports:
@@ -182,7 +265,7 @@ class TestFoldReports:
         state.evidence.admit([chunk])
         state.evidence.assign_labels([chunk], payloads)
 
-        texts, closed = fold_reports(state, [_report("r1", "A1", "S1")], "req")
+        texts, closed, _ = fold_reports(state, [_report("r1", "A1", "S1")], "req")
 
         assert closed == frozenset({"A1"})
         assert texts["r1"].startswith("Recorded A1.")
@@ -190,9 +273,110 @@ class TestFoldReports:
     def test_an_ungrounded_report_closes_nothing(self) -> None:
         state = _state(plan={"A1": "q"})
 
-        _texts, closed = fold_reports(state, [_report("r1", "A1", "S9")], "req")
+        _texts, closed, _ = fold_reports(state, [_report("r1", "A1", "S9")], "req")
 
         assert closed == frozenset()
+
+
+def _note_rows(state: AgentRunState, *findings: Finding) -> list[NoteRow]:
+    _, _, rows = fold_reports(state, [_report_call(*findings)], "req")
+    return rows
+
+
+class TestNoteRows:
+    def test_kept_supported_finding(self) -> None:
+        state = _state(plan={"A1": "Revenue 2023?"})
+        state.evidence, ids = _seed_evidence(1)
+        claim = "Revenue was <n>$1.73B</n>."
+        rows = _note_rows(state, _f("A1", claim=claim, evidence=[ids[0]]))
+        assert rows == [NoteRow("ok", "Noted: Revenue 2023?", claim="Revenue was $1.73B.")]
+
+    def test_kept_negative(self) -> None:
+        state = _state(plan={"A1": "FX impact?"}, aspect_stats={"A1": AspectStats(searches=1)})
+        rows = _note_rows(state, _neg("A1", "No FX impact is disclosed."))
+        assert rows == [
+            NoteRow("skipped", "Not in documents: FX impact?", claim="No FX impact is disclosed.")
+        ]
+
+    def test_flagged_claim_shows_cleaned_text(self) -> None:
+        state = _state(plan={"A1": "q"})
+        state.evidence, ids = _seed_evidence(1)
+        [row] = _note_rows(state, _f("A1", claim=_FLAGGED, evidence=[ids[0]]))
+        stored = state.findings.get("A1")
+        assert stored is not None
+        assert row == NoteRow(
+            "ok", "Noted: q", "text cleaned", stored.claim.removeprefix(FLAGGED_MARKER)
+        )
+        assert row.claim is not None and FLAGGED_MARKER not in row.claim
+
+    def test_unknown_key(self) -> None:
+        state = _state(plan={"A1": "q"})
+        assert _note_rows(state, _neg("A9")) == [
+            NoteRow("warn", "Note not recorded — wrong key, retried")
+        ]
+
+    def test_negative_without_a_prior_search(self) -> None:
+        state = _state(plan={"A1": "q"})
+        assert _note_rows(state, _neg("A1")) == [
+            NoteRow("warn", "Note not recorded — not searched yet")
+        ]
+
+    def test_claim_citing_no_retrieved_excerpt(self) -> None:
+        state = _state(plan={"A1": "q"})
+        assert _note_rows(state, _f("A1", evidence=[str(uuid4())])) == [
+            NoteRow("warn", "Note not recorded — no supporting excerpt")
+        ]
+
+    def test_blocked_claim(self) -> None:
+        state = _state(plan={"A1": "q"})
+        state.evidence, ids = _seed_evidence(1)
+        assert _note_rows(state, _f("A1", claim=_BLOCKED, evidence=[ids[0]])) == [
+            NoteRow("warn", "Note not recorded — blocked by safety check")
+        ]
+
+    def test_arguments_did_not_parse(self) -> None:
+        state = _state(plan={"A1": "q"})
+        malformed = ToolCallRef(id="r1", name="report_findings", arguments="{")
+        _, _, rows = fold_reports(state, [malformed], "req")
+        assert rows == [NoteRow("warn", "Note not recorded — malformed")]
+
+    def test_rows_follow_report_order_across_rejections(self) -> None:
+        state = _state(plan={"A1": "q", "A2": "r"}, aspect_stats={"A2": AspectStats(searches=1)})
+        state.evidence, ids = _seed_evidence(1)
+        rows = _note_rows(
+            state, _neg("A9"), _f("A1", claim="x", evidence=[ids[0]]), _neg("A2", "y")
+        )
+        assert [r.label for r in rows] == [
+            "Note not recorded — wrong key, retried",
+            "Noted: q",
+            "Not in documents: r",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_blocked_claim_text_reaches_no_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_COST_BUDGET_USD", "100")
+    events = _capture_activity(monkeypatch)
+    state = _make_state()
+    chunk, payloads = _make_chunk_with_payload()
+    search = ToolCallRef(
+        id="s1", name="search_documents", arguments=json.dumps({"entity": "Acme", "query": "q"})
+    )
+    blocked = _f("Acme", claim=_BLOCKED, evidence=["S1"])
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[search]),
+        AssistantTurnResult(text="", tool_calls=[_report_call(blocked)]),
+        AssistantTurnResult(text="done", tool_calls=[]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await _run(state, turns, _search)
+
+    notes = [e for e in events if e["kind"] == "note"]
+    assert [n["label"] for n in notes] == ["Note not recorded — blocked by safety check"]
+    assert _BLOCKED not in json.dumps(events)
 
 
 class TestDecide:

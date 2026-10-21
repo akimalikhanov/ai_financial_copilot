@@ -55,6 +55,15 @@ from src.repository.llm_request_repository import stats_to_request_kwargs
 from src.schemas import chat as schemas
 from src.schemas.chat import ChatPipelineState
 from src.schemas.query_router import ChatScope, DocumentScopeResult, RouterInput, RouterOutput
+from src.services.chat.activity import (
+    STAGE_FAILED,
+    OutcomeInputs,
+    StageResult,
+    agent_stage,
+    build_outcome,
+    route_stage,
+    scan_stage,
+)
 from src.services.chat.agent import run_agent
 from src.services.chat.agent import tools as agent_tools
 from src.services.chat.agent.loop import tool_model_chain
@@ -158,16 +167,30 @@ _STAGE_OBS_TYPES: dict[str, str] = {
     "agent_loop": "chain",
 }
 
-_STAGE_LABELS: dict[str, str] = {
-    "load_and_validate_request": "Loading request",
-    "build_conversation_context": "Building context",
-    "scan_user_input": "Scanning input",
-    "route_query": "Routing query",
-    "agent_loop": "Searching documents",
-    "render_prompt": "Rendering prompt",
-    "stream_llm_response": "Generating answer",
-    "persist_and_emit": "Finalizing",
+
+class _StageText(NamedTuple):
+    label: str
+    running_label: str
+    # Hidden stages still count toward the total; one un-hides on warn or fail.
+    hidden: bool
+
+
+_STAGES: dict[str, _StageText] = {
+    "load_and_validate_request": _StageText("Loaded request", "Loading request", True),
+    "build_conversation_context": _StageText("Built context", "Building context", True),
+    "scan_user_input": _StageText("Checked input", "Checking input", True),
+    "route_query": _StageText("Understood question", "Understanding question", False),
+    "agent_loop": _StageText("Searched documents", "Searching documents", False),
+    "render_prompt": _StageText("Prepared prompt", "Preparing prompt", True),
+    "stream_llm_response": _StageText("Wrote answer", "Writing answer", False),
+    "persist_and_emit": _StageText("Saved answer", "Saving answer", True),
 }
+
+
+def _stage_text(stage_name: str) -> _StageText:
+    label = stage_name.replace("_", " ")
+    return _STAGES.get(stage_name, _StageText(label, label, True))
+
 
 _worker_loop: asyncio.AbstractEventLoop | None = None
 _redis_app: Redis | None = None
@@ -415,6 +438,21 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
     agent_findings_json: str | None = None  # set by agent branch; used in persist
     current_stage = "initializing"
     current_stage_event_id: str | None = None
+    # How the current stage went, set by the code that knows before the next _log_stage
+    # (which emits the stage's `stage_ended`) moves on. None means ok, default visibility.
+    stage_result: StageResult | None = None
+    # What the timeline's outcome is built from; set where the answer path is decided.
+    outcome_inputs = OutcomeInputs("direct")
+
+    async def _emit_outcome(inputs: OutcomeInputs) -> None:
+        _, data = build_activity_event("outcome", detail=build_outcome(inputs).to_detail())
+        await add_event(redis_app, request_id, "activity", data)
+
+    def _stage_end_detail() -> dict:
+        nonlocal stage_result
+        detail = (stage_result or StageResult()).to_detail(_stage_text(current_stage).hidden)
+        stage_result = None
+        return detail
 
     async def _log_stage(stage_name: str, **extra_fields: Any) -> None:
         nonlocal current_stage, current_stage_event_id, stage_start, _stage_stack
@@ -423,7 +461,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             stage_times[current_stage] = round(elapsed, 3)
             CHAT_STAGE_DURATION.labels(current_stage).observe(elapsed)
             _stage_stack.close()
-            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            _, end_data = build_activity_event(
+                "stage_ended", event_id=current_stage_event_id, detail=_stage_end_detail()
+            )
             await add_event(redis_app, request_id, "activity", end_data)
         current_stage = stage_name
         stage_start = perf_counter()
@@ -431,8 +471,11 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             f"pipeline.stage {stage_name}",
             extra={"request_id": request_id, "stage": stage_name, **extra_fields},
         )
+        text = _stage_text(stage_name)
         current_stage_event_id, start_data = build_activity_event(
-            "stage_started", label=_STAGE_LABELS.get(stage_name, stage_name.replace("_", " "))
+            "stage_started",
+            label=text.label,
+            detail={"running_label": text.running_label, "hidden": text.hidden},
         )
         await add_event(redis_app, request_id, "activity", start_data)
         _stage_stack = contextlib.ExitStack()
@@ -642,6 +685,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 await _log_stage("scan_user_input")
                 injection_signal = scan_user_input(state.user_query_raw)
                 state.user_query_raw = injection_signal.sanitized_text
+                stage_result = scan_stage(injection_signal.severity)
 
                 logger.info(
                     "pipeline.injection_scan",
@@ -670,12 +714,14 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                         f"blocked by injection guardrail: {injection_signal.matched_rules}",
                     )
                     await add_event(redis_app, request_id, "delta", {"text": refusal_text})
+                    await _emit_outcome(OutcomeInputs("blocked"))
                     await message_repo.update_on_final(
                         message_id=state.assistant_message_id,
                         content=refusal_text,
                         raw_content=refusal_text,
                         request_id=UUID(request_id),
                         trace={
+                            "activity": await get_activity_log(redis_app, request_id),
                             "guardrails": {
                                 "injection": {
                                     "score": injection_signal.score,
@@ -683,7 +729,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                                     "matched_rules": injection_signal.matched_rules,
                                     "stripped_chars": injection_signal.stripped_chars,
                                 }
-                            }
+                            },
                         },
                     )
                     await llm_request_repo.update_status(UUID(request_id), "completed")
@@ -755,6 +801,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 conversation_id=state.conversation_id,
             )
             ROUTER_DECISIONS.labels(state.router_output.route).inc()
+            stage_result = route_stage(state.router_output, state.scope_result)
             # Flushed by the commits below; expire_on_commit=False keeps the object usable.
             llm_request.query_shape = state.router_output.query_shape
             # The clarification card, when the client can show one: the question covers too
@@ -865,11 +912,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 if card is not None:
                     await add_event(redis_app, request_id, "scope_clarification", card)
                 await add_event(redis_app, request_id, "delta", {"text": redirect_text})
+                await _emit_outcome(
+                    OutcomeInputs(
+                        exit_reason,
+                        too_broad_count=too_broad,
+                        max_companies=get_scope_max_companies(),
+                    )
+                )
                 await message_repo.update_on_final(
                     message_id=state.assistant_message_id,
                     content=redirect_text,
                     raw_content=redirect_text,
                     request_id=UUID(request_id),
+                    trace={"v": 1, "activity": await get_activity_log(redis_app, request_id)},
                     # The card re-renders from here after a reload, and a reply re-runs
                     # this user message.
                     metadata_updates={
@@ -1016,6 +1071,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     getattr(state.router_output, "query_shape", None) or "none",
                 ).inc()
                 state.agent_meta = agent_meta
+                stage_result = agent_stage(agent_meta)
+                outcome_inputs = OutcomeInputs(
+                    "agent",
+                    scope=state.scope_result,
+                    query_shape=state.router_output.query_shape,
+                    meta=agent_meta,
+                    unresolved=agent_result.findings.unresolved if agent_result.findings else (),
+                    synthesis_fallback=agent_result.synthesis_fallback,
+                )
 
                 state.rag_context = agent_result.rag_context
                 state.rag_context_str = agent_result.synthesis_context
@@ -1055,6 +1119,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     state.context_messages, _scope_doc_ids, check_scope=True
                 )
                 FOLLOWUP_FINDINGS_CARRIED.labels(carried.outcome).inc()
+                outcome_inputs = OutcomeInputs("direct", carried_outcome=carried.outcome)
                 if carried.block:
                     state.rag_context_str = carried.block
                     state.findings_block = carried.block
@@ -1095,7 +1160,9 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 lf_mark_current("ERROR", describe_error(e))
                 lf_mark(_root_span, "ERROR", f"render_prompt: {describe_error(e)}")
                 _trace_io(output={"error": describe_error(e)})
+                stage_result = STAGE_FAILED
                 await llm_request_repo.update_status(UUID(request_id), "failed")
+                await _emit_outcome(OutcomeInputs("error"))
                 await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
                 return
@@ -1319,6 +1386,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                     )
                     ungrounded = bool(uncited_share)
 
+                    # Before the log is read back, so the pill survives a reload.
+                    await _emit_outcome(outcome_inputs)
                     # Build pipeline trace
                     trace_payload: dict = {
                         "v": 1,
@@ -1609,6 +1678,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 lf_mark_current("ERROR", describe_error(e))
                 lf_mark(_root_span, "ERROR", f"{current_stage}: {describe_error(e)}")
                 _trace_io(output={"error": describe_error(e)})
+                stage_result = STAGE_FAILED
                 await llm_request_repo.update_status(UUID(request_id), "failed")
                 await llm_request_repo.update_on_final(
                     request_id=UUID(request_id),
@@ -1621,6 +1691,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 msg = result.scalar_one_or_none()
                 if msg:
                     msg.status = MessageStatus.error
+                await _emit_outcome(OutcomeInputs("error"))
                 await add_event(redis_app, request_id, "error", error_event(e))
                 await session.commit()
 
@@ -1634,6 +1705,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
         )
 
     except Exception as exc:
+        stage_result = STAGE_FAILED
         PIPELINE_ERRORS.labels(current_stage).inc()
         logger.exception(
             "pipeline.failed_at_stage",
@@ -1650,11 +1722,15 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 await session.commit()
         except Exception:
             logger.exception("pipeline.set_failed_error", extra={"request_id": request_id})
+        # Live only: a failed request saves no trace.
+        await _emit_outcome(OutcomeInputs("error"))
         await add_event(redis_app, request_id, "error", error_event(exc))
         raise
     finally:
         if current_stage != "initializing" and current_stage_event_id is not None:
-            _, end_data = build_activity_event("stage_ended", event_id=current_stage_event_id)
+            _, end_data = build_activity_event(
+                "stage_ended", event_id=current_stage_event_id, detail=_stage_end_detail()
+            )
             await add_event(redis_app, request_id, "activity", end_data)
         # After the last add_event above — an XADD on an expired/expiring key recreates it
         # without a TTL, so this must be the final write to the stream.

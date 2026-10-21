@@ -165,7 +165,12 @@ ActivityKind = Literal[
     "tool_call_started",
     "tool_call_ended",
     "round_started",
+    "note",
+    "outcome",
 ]
+
+# A row with a `_started` event and no `_ended` yet is running; that state is never sent.
+ActivityStatus = Literal["ok", "skipped", "warn", "fail"]
 
 
 def build_activity_event(

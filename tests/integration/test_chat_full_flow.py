@@ -362,6 +362,8 @@ async def test_clarification_card_reply_and_binding(
     assert card["outcome"] == "entities"
     [entity] = card["unresolved"]
     assert entity["outcome"] == "ambiguous"
+    live = [d["detail"] for t, d in events if t == "activity" and d["kind"] == "outcome"]
+    assert live == [{"status": "ok", "text": "", "lines": [], "hidden": True}]
     assert {c["company"] for c in entity["candidates"]} == {
         "Aurora Innovation, Inc.",
         "Aurora Mobile Limited",
@@ -387,6 +389,9 @@ async def test_clarification_card_reply_and_binding(
     assert [m["role"] for m in msgs] == ["user", "assistant", "assistant"]
     assert msgs[1]["metadata"]["kind"] == "clarification"
     assert msgs[1]["metadata"]["answered"] is True
+    # The card's timeline survives a reload, ending in the same outcome.
+    persisted = [e["detail"] for e in msgs[1]["trace"]["activity"] if e["kind"] == "outcome"]
+    assert persisted == live
 
     # 3. A later mention of "aurora" uses the binding: no second card.
     events = await _chat(async_client, headers, conversation_id, content="and aurora's debt?")

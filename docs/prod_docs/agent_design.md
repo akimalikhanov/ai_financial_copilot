@@ -713,8 +713,8 @@ they can be unit-tested without an event loop or an LLM (`test_agent_turn_folds.
 
 | Function | Does | Returns |
 |---|---|---|
-| `fold_searches(state, searches, results, keys)` | admits chunks, assigns S-labels in call order, names chunks already shown, updates `aspect_stats` and spend | tool-result text per call id, new labels per search |
-| `fold_reports(state, reports, request_id)` | runs `_apply_report` per report, in call order, before this turn's searches | tool-result text per call id, plan keys closed this turn |
+| `fold_searches(state, searches, results, keys)` | admits chunks, assigns S-labels in call order, names chunks already shown, updates `aspect_stats` and spend | tool-result text per call id, new labels per search, trace view per call id, documents and pages per search (for the timeline) |
+| `fold_reports(state, reports, request_id)` | runs `_apply_report` per report, in call order, before this turn's searches | tool-result text per call id, plan keys closed this turn, timeline note rows |
 | `decide(state, facts)` | the termination checks below; writes only `sealed_by_coverage` and `empty_rounds` | `Continue()` or `Stop(reason)` |
 
 `_run_turn` does the async work around them: the LLM call (`_call_tool_model`) and its spend
@@ -923,10 +923,10 @@ flowchart TD
     B -->|"in per_entity_doc_ids"| D1["doc_ids = that entity's docs"]
     B -->|"empty string"| D2["doc_ids = whole resolved scope<br/>(every resolved entity)"]
     B -->|"unknown name"| D3["doc_ids = whole resolved scope"]
-    D1 --> E
-    D2 --> E
-    D3 --> E
-    E["emit SSE activity: tool_call_started"] --> F{"keywords present?"}
+    D1 --> F
+    D2 --> F
+    D3 --> F
+    F{"keywords present?"}
     F -->|yes| G1["semantic query = query<br/>keyword query = keywords"]
     F -->|no| G2["query on both legs,<br/>log agent_search_keywords_missing"]
     G1 --> H["run_chat_rag_pipeline()<br/>Qdrant + OpenSearch → RRF → rerank"]
@@ -962,8 +962,8 @@ A few details worth knowing:
   order of magnitude smaller than cross-encoder scores. `state.scores_are_rerank` flips to
   `False` so the confidence badge doesn't apply rerank thresholds to fusion scores.
 - **`entity=""`** searches the resolved scope (`scope_result.doc_ids`), the union of every
-  resolved entity's documents. The SSE label and trace span carry the entity name only when
-  exactly one entity is in scope. The analytical prompt still asks the model to pass an
+  resolved entity's documents. The trace span carries the entity name only when exactly one
+  entity is in scope. The analytical prompt still asks the model to pass an
   explicit company name.
 - **An unmatched entity never reaches retrieval.** Its list in `per_entity_doc_ids` is
   empty, so the search returns the error "'Tesla' did not match any document in your
@@ -1287,36 +1287,93 @@ in it belongs only to keys already addressed. Elision is one-way, with no reviva
 
 ### Reasoning items on the Responses API
 
+A reasoning model thinks before it calls tools. On Chat Completions that thinking is
+thrown away after each call, so on the next call the model sees its earlier tool calls and
+their results but not why it made them. The Responses API can hand the thinking back, so
+the model continues its own chain of reasoning across the turns of a run.
+
 A model with `api: responses` in `models.yaml` (today `gpt-5.6-luna`) runs through
-`OpenAIResponsesAdapter`. The adapter sends `store=false`, so OpenAI keeps no conversation
-state and the transcript stays the only record. It asks for
-`reasoning.encrypted_content` on tool calls, and the response's reasoning and function-call
-items come back as `AssistantTurnResult.opaque`. `append_turn` stores them on the turn's
-assistant message, and on the next call the adapter sends them back in place of plain
-function calls. The loop never reads them. `opaque_size` only counts their number and
-bytes for the trace and metrics.
+`OpenAIResponsesAdapter`. Other models, including luna's fallback `gpt-5-mini`, run on
+Chat Completions and never see reasoning items.
 
-Each item is tagged with the provider and model that produced it, and the adapter replays
-an item only to that exact model. When a turn falls back to another model, the fallback gets
-the earlier calls as plain function calls, and the tool model gets its own items back on
-the next turn. Reasoning never crosses questions either, because the chat tail stores only
-questions and final answers.
+**What comes back from a tool call.** The response's `output` is a list of items, in the
+order the model produced them:
 
-The reasoning context mode (`reasoning.context`) decides which replayed items the model
-actually reads. We don't send it unless `GPT5_6_LUNA_REASONING_CONTEXT` is set. The gpt-5.6
-family then defaults to `all_turns`, and each response reports the mode it used, which the
-loop records. Every user message comes before the first reasoning item
-([status placement](#what-the-model-sees-about-coverage-render_status)), so a whole run is
-one turn, and `current_turn` would keep the same items.
+| Item | Content | Kept? |
+|---|---|---|
+| `reasoning` | The model's thinking as an encrypted blob (`encrypted_content`) we can't read, plus an optional readable summary | Yes, in `opaque` |
+| `function_call` (completed) | One tool call: `call_id`, `name`, `arguments` | Yes, in `opaque`, and also parsed into `tool_calls` |
+| `function_call` (cut off) | A call the response was truncated during | No |
+| `message` | Prose the model wrote alongside its calls | No. The transcript holds no model prose |
 
-Two errors trigger one resend with a feature removed. If the API rejects a replayed item,
-the adapter resends the call without any replayed items. If the account isn't allowed
-reasoning summaries, it resends without the summary and stops asking for one for the rest
-of the process. Both count in `llm_degraded_retries_total{reason}`. When the model returns a reasoning
-summary, it goes on the turn span and the `llm_requests` row, capped at
-`LLM_REASONING_SUMMARY_MAX_CHARS`. The summary is OpenAI's paraphrase of the reasoning, and
-`summary: "auto"` returns none when the model barely reasoned. At `medium` effort that is
-common on easy questions.
+The adapter sends `store=false`, so OpenAI keeps nothing between calls, and
+`include=["reasoning.encrypted_content"]`, which is what makes the API return the blob.
+The kept items, in their original order, become `AssistantTurnResult.opaque`. Each is
+tagged with the provider and the model that produced it.
+
+**How they are stored.** `append_turn` stores the turn as one assistant message, as on
+Chat Completions: `content=None`, the parsed `tool_calls`, and `opaque` alongside. The
+assistant message is only the transcript's provider-neutral wrapper. The Responses API
+never receives it in that form.
+
+**How they are sent back ("replayed").** When the adapter builds the next request, each
+assistant message is turned back into items:
+
+- If the message has `opaque` items from the model being called, they are sent verbatim
+  and in order. The model sees `reasoning → function_call → …` exactly as it produced it.
+- Otherwise the adapter builds plain `function_call` items from `tool_calls`.
+
+Tool results are sent as `function_call_output` items either way, matched to their call by
+`call_id`. Function calls are kept in `opaque` next to the reasoning because the API
+rejects a reasoning item that isn't followed by the call it led to. The two are always
+replayed together.
+
+The loop never reads `opaque`. `opaque_size` counts the items and their bytes for the
+trace and metrics, and nothing else.
+
+**On fallback.** When the tool model errors and a turn falls back to another model, only
+the hidden reasoning is lost. The fallback receives the full visible transcript: the
+question, every earlier tool call and its arguments, every result with its S-labels, and
+the status line. It works out what to do next from those, as a Chat Completions model
+always does. Two smaller costs come with it:
+
+- The fallback has no cached prefix, so it pays the full input rate for the transcript.
+- Its own turn carries no reasoning items, so if the next turn returns to the tool model,
+  the tool model gets back the reasoning for its own turns but has a gap where the
+  fallback ran.
+
+Sending the reasoning to a different model would not help. The API accepts reasoning items
+from another model family without an error, but it silently leaves them out of the
+model's context. Only models in the same family share reasoning (for example
+`gpt-5.6-sol`, `-terra` and `-luna`). The adapter therefore replays items only to the
+exact model that produced them.
+
+Reasoning never crosses questions either. The chat tail stores only questions and final
+answers ([section 11](#conversation-history-for-all-three-models)).
+
+**Which replayed items the model reads.** `reasoning.context` controls this:
+`current_turn` keeps reasoning only since the last user message, and `all_turns` keeps it
+all. We don't send the parameter unless `GPT5_6_LUNA_REASONING_CONTEXT` is set, so the
+gpt-5.6 family uses its default, `all_turns`. Each response reports the mode it used, and
+the loop records it. In practice the two modes keep the same items: the status line is
+folded into the last tool result rather than sent as a user message
+([status placement](#what-the-model-sees-about-coverage-render_status)), so no user
+message falls after the first reasoning item, and the whole run counts as one turn.
+
+**When something fails, the adapter retries once with a feature off:**
+
+- **The API rejects a replayed item** (for example, the encrypted blob fails
+  verification). The adapter resends the call with all `opaque` items dropped and plain
+  `function_call` items in their place. The run continues without reasoning carryover.
+- **The account isn't allowed reasoning summaries.** The adapter resends without asking
+  for a summary, and stops asking for the rest of the process.
+
+Both count in `llm_degraded_retries_total{reason}`, which should sit near zero.
+
+**Reasoning summaries.** When the model returns a summary, it goes on the turn span and
+the `llm_requests` row, capped at `LLM_REASONING_SUMMARY_MAX_CHARS`. It's OpenAI's
+paraphrase of the reasoning, not the reasoning itself. With `summary: "auto"`, a model
+that barely reasoned returns none, which is common on easy questions at `medium` effort.
 
 ### Worked example: what each model sees
 
@@ -2328,14 +2385,25 @@ usage. On Responses the metadata also has `reasoning_summary` (capped), `reasoni
 ### Live UI activity
 
 The loop pushes `activity` events on the request's Redis stream, which the SSE endpoint
-forwards to the UI:
+forwards to the UI. Every label and note is worded by templates in
+`src/services/chat/activity.py`; the UI only renders them.
 
-- `round_started` per turn (`id="round-N"`, label "Round N+1")
-- `tool_call_started` / `tool_call_ended` per search (label = entity, `detail` has chunk
-  counts) and per report (label "Recording findings")
+- `round_started` per turn (`id="round-N"`); the UI counts passes from it.
+- `tool_call_started` / `tool_call_ended` per search, emitted by `_guarded_search` and
+  `_run_turn` so every search gets exactly one row, including timeouts. The label is the
+  model's `query` in quotes, prefixed with the company when more than one company in scope
+  has documents. The end event carries `status`, a `note` from `search_result_row` (`+N new`,
+  `nothing new`, `no results`, `timed out after …`, `search failed`, …), `sources` (documents
+  and pages, shown on hover) and chunk counts. A tool the final pass does not offer gets a
+  `skipped` row.
+- `note` per finding a report produced, from `report_rows`: `Noted: {plan item}` or
+  `Not in documents: {plan item}` with the stored claim in `detail.claim`, or a fixed
+  `Note not recorded — …` warn row naming why it was rejected.
 
 `_ended` events refer to the `_started` event's id, so concurrent searches for the same entity
-don't get mixed up.
+don't get mixed up. Stage rows and the closing `outcome` event (the pill) come from
+`tasks.py`; the outcome is emitted before `get_activity_log`, so the timeline survives a
+reload.
 
 ### Reading the instrumentation fields
 

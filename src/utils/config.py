@@ -433,6 +433,12 @@ def get_agent_trace_chunk_chars() -> int:
     return int(os.getenv("AGENT_TRACE_CHUNK_CHARS", "200"))
 
 
+def get_agent_activity_max_sources() -> int:
+    """Documents listed on one search row of the agent timeline
+    (AGENT_ACTIVITY_MAX_SOURCES, default 2)."""
+    return int(os.getenv("AGENT_ACTIVITY_MAX_SOURCES", "2"))
+
+
 # --- Redis ---
 def get_chat_queue_stream() -> str:
     """Redis stream key for chat queue (CHAT_QUEUE_STREAM, default chat:queue)."""

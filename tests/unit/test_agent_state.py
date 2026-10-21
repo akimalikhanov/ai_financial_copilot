@@ -270,7 +270,7 @@ class TestUnresolvedLines:
         one must stay open rather than closing silently."""
         state = _state(plan={"A1": "q1"})
         ungrounded = _f("A1", evidence=[str(uuid4())])
-        assert state.findings.record("A1", ungrounded, state.evidence) is False
+        assert state.findings.record("A1", ungrounded, state.evidence) == "uncited"
         assert open_aspects(state) == ["A1"]
         assert state.addressed == set()
 
@@ -280,7 +280,7 @@ class TestUnresolvedLines:
         run's trust level. Projection renders it as unresolved instead."""
         state = _state(plan={"A1": "Why did gross margin fall?"})
 
-        result = _apply_report(_report_call(_f("A1", evidence=[str(uuid4())])), state, "req-1")
+        result, _ = _apply_report(_report_call(_f("A1", evidence=[str(uuid4())])), state, "req-1")
 
         assert open_aspects(state) == ["A1"]
         assert state.addressed == set()
@@ -296,7 +296,7 @@ class TestUnresolvedLines:
             plan={"A1": "Why did gross margin fall?"}, aspect_stats={"A1": AspectStats(searches=1)}
         )
 
-        result = _apply_report(_report_call(_neg("A1")), state, "req-1")
+        result, _ = _apply_report(_report_call(_neg("A1")), state, "req-1")
 
         assert open_aspects(state) == []
         assert state.addressed == {"A1"}
@@ -377,7 +377,7 @@ class TestStatedNegatives:
     def test_negative_for_an_unsearched_aspect_is_refused(self) -> None:
         state = _state(plan=self._PLAN)
 
-        result = _apply_report(_report_call(_neg("A4")), state, "req")
+        result, _ = _apply_report(_report_call(_neg("A4")), state, "req")
 
         assert open_aspects(state) == ["A4"]
         assert state.unsearched_negatives == 1
