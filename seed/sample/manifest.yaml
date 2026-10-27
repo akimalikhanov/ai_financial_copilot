@@ -1,0 +1,19 @@
+# Sample corpus owned by the demo user (DEMO_USER_ID). Replace a document by giving it a new id.
+documents:
+  - id: 75548ae0-bc6f-4171-bf1b-e8355a21944e
+    file: inmune_bio_2022_10k.pdf
+    sha256: 13904c77f4e75d80f756e42c721ad23b2a5a94e166417958e728d5e607eb6289
+    title: INmune Bio 2022 Annual Report (10-K)
+    metadata:
+      company: INMUNE BIO INC.
+      year: "2022"
+
+questions:
+  - id: net-loss
+    text: What was INmune Bio's net loss in 2022, and how did it compare with 2021?
+  - id: rnd-expenses
+    text: How did INmune Bio's R&D expenses change from 2021 to 2022, and what drove the change?
+  - id: xpro-alzheimers
+    text: Where does INmune Bio's XPro program for Alzheimer's disease stand, and what setbacks has it faced?
+  - id: cash-runway
+    text: How long does INmune Bio expect its current cash to fund operations?

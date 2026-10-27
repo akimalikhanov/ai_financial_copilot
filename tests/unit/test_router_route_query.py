@@ -209,3 +209,41 @@ class TestHappyPath:
         output, scope = await route_query(RouterInput(query="What was revenue?"), llm_router=router)
         assert output.route == "retrieval"
         assert len(llm.calls) == 2
+
+
+class TestCorpusOwner:
+    @pytest.mark.parametrize("separate_owner", [True, False], ids=["sample", "default"])
+    @pytest.mark.asyncio
+    async def test_scope_uses_corpus_owner_logging_uses_requester(
+        self, monkeypatch: pytest.MonkeyPatch, separate_owner: bool
+    ) -> None:
+        from src.services.router import router as router_module
+
+        requester, demo = uuid4(), uuid4()
+        logged: list[object] = []
+        scoped: list[object] = []
+
+        class FakeRepo:
+            def __init__(self, _session) -> None:
+                pass
+
+            async def create_subrequest(self, **kwargs) -> None:
+                logged.append(kwargs["user_id"])
+
+        async def fake_resolve_scope(_session, owner_id, *_a, **_k):
+            scoped.append(owner_id)
+            return None
+
+        monkeypatch.setattr(router_module, "LLMRequestRepository", FakeRepo)
+        monkeypatch.setattr(router_module, "resolve_scope", fake_resolve_scope)
+        await route_query(
+            RouterInput(query="What was revenue?"),
+            user_id=requester,
+            corpus_owner_id=demo if separate_owner else None,
+            llm_router=FakeRouter(FakeLLM(responses=[LLMResponse(text=_valid_json())])),
+            session=cast(AsyncSession, _fake_session()),
+            parent_request_id=uuid4(),
+            conversation_id=uuid4(),
+        )
+        assert logged == [requester]
+        assert scoped == [demo if separate_owner else requester]

@@ -122,6 +122,7 @@ async def route_query(
     inp: RouterInput,
     *,
     user_id: UUID | None = None,
+    corpus_owner_id: UUID | None = None,
     llm_router: LLMRouter | None = None,
     session: AsyncSession | None = None,
     parent_request_id: UUID | None = None,
@@ -131,6 +132,9 @@ async def route_query(
 
     Returns (RouterOutput, DocumentScopeResult | None).
     scope_result is None when route != 'retrieval' or session is not provided.
+
+    `user_id` is the requester (sub-request logging); scope resolves against
+    `corpus_owner_id`, which defaults to `user_id`.
 
     When `parent_request_id`, `conversation_id`, and `session` are provided, the
     router's LLM call(s) are logged to llm_requests as a sub-request of the parent
@@ -144,10 +148,11 @@ async def route_query(
     should_log_subrequest = (
         session is not None and parent_request_id is not None and conversation_id is not None
     )
+    owner_id = corpus_owner_id if corpus_owner_id is not None else user_id
 
     async def scoped(output: RouterOutput) -> tuple[RouterOutput, DocumentScopeResult | None]:
         return await _with_scope(
-            output, inp, session, user_id, router, parent_request_id, conversation_id
+            output, inp, session, owner_id, router, parent_request_id, conversation_id
         )
 
     try:

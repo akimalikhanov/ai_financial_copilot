@@ -50,6 +50,7 @@ from src.schemas import chat as schemas
 from src.services.chat.tasks import process_chat
 from src.services.context import ConversationHistory
 from src.services.router.company_name import normalize_company
+from src.services.sample.corpus import corpus_owner_id
 
 # The liveness rule is shared with the ingestion stream, which faces the same dead-worker
 # case; these names are re-exported here because this is where both were written.
@@ -242,7 +243,8 @@ async def _apply_clarification_reply(
         raise HTTPException(status.HTTP_409_CONFLICT, "The conversation has moved on")
 
     asked = {u["raw_span"]: u for u in meta["clarification"]["unresolved"]}
-    companies = {c.company_norm for c in await DocumentRepository(session).list_companies(user_id)}
+    owner_id = corpus_owner_id(conversation, user_id)
+    companies = {c.company_norm for c in await DocumentRepository(session).list_companies(owner_id)}
     bindings: dict[str, dict] = {}
     for pick in reply.picks:
         entity = asked.get(pick.raw_span)

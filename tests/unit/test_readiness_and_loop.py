@@ -68,11 +68,11 @@ def test_delete_document_wraps_sync_clients_in_to_thread() -> None:
     """Guards the call site itself: the two deletes must go through to_thread.
 
     The timing test above passes even if the handler regresses, because it exercises the
-    pattern rather than the handler. This one reads the handler.
+    pattern rather than the handler. This one reads the purge the handler calls.
     """
-    from src.api.routers.documents import delete_document
+    from src.services.ingestion.purge import purge_document
 
-    source = inspect.getsource(delete_document)
+    source = inspect.getsource(purge_document)
     cleanup = source.split("s3_keys")[0]  # only the index-cleanup block
 
     assert cleanup.count("asyncio.to_thread") == 2

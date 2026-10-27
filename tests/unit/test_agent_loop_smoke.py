@@ -415,9 +415,6 @@ async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.Monk
     from src.services.chat.agent import loop as loop_module
 
     state = _make_state()
-    # run_chat_rag_pipeline reads llm_request.user_id — without it the call raises before
-    # reaching the pipeline stub, and the generic except would mask the real result.
-    state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
 
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
         return None, RetrievalTrace(all_backends_failed=True), []

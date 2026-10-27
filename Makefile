@@ -22,6 +22,11 @@ worker-ingestion:
 	rm -rf /tmp/prom_ingestion && mkdir -p /tmp/prom_ingestion && \
 	PROMETHEUS_MULTIPROC_DIR=/tmp/prom_ingestion .venv/bin/python -m src.workers.ingestion_worker
 
+# Ingest the sample corpus (idempotent). Needs `make worker-ingestion` running.
+.PHONY: seed-sample
+seed-sample:
+	.venv/bin/python -m src.services.sample.seed
+
 # Run only the frontend
 .PHONY: ui
 ui:
@@ -159,11 +164,11 @@ k8s-set-images:
 # Full build+push+deploy loop; use individual docker-build-*/k8s-push-* targets to iterate on one service.
 #
 # Every Job the overlay applies is deleted first, because a Job's spec.template is immutable:
-# applying over an existing Job is a hard error that fails the whole deploy. Each of the three
-# has a template that changes on its own schedule — model-preload's image tag on every rebuild,
-# and the two bootstraps' configMapGenerator hash suffix whenever their scripts change — so any
-# of them can wedge a deploy. Recreating all three is cheap: each is a no-op that exits in
-# seconds once its PVC/bucket/index already exists.
+# applying over an existing Job is a hard error that fails the whole deploy. Each one
+# has a template that changes on its own schedule — model-preload's and seed-sample's image tag
+# on every rebuild, and the two bootstraps' configMapGenerator hash suffix whenever their
+# scripts change — so any of them can wedge a deploy. Recreating them all is cheap: each is a
+# no-op that exits in seconds once its PVC/bucket/index/sample corpus already exists.
 #
 # Leaving one out is not merely a failed deploy. A Job created against a since-renamed
 # ConfigMap can never be repaired by apply, and its pod sits in ContainerCreating on
@@ -176,7 +181,7 @@ k8s-build-push: docker-build-api docker-build-frontend docker-build-worker
 
 .PHONY: k8s-deploy
 k8s-deploy: k8s-build-push
-	kubectl delete job model-preload es-bootstrap garage-bootstrap -n copilot --ignore-not-found
+	kubectl delete job model-preload es-bootstrap garage-bootstrap seed-sample -n copilot --ignore-not-found
 	kubectl apply -k $(K8S_OVERLAY)
 	$(MAKE) k8s-prune
 

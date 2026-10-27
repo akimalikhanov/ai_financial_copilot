@@ -834,6 +834,34 @@ services:
     <<: *app-logging
     networks: [backend]
 
+  # One-off, idempotent: ingest the sample corpus.
+  # Run: docker compose --env-file ../../.env run --rm seed-sample
+  seed-sample:
+    profiles:
+      - seed-sample
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    env_file:
+      - ../../.env
+    environment:
+      <<: *app-env
+      LOG_FILE: ""
+    command: ["python", "-m", "src.services.sample.seed"]
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-app:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+      garage:
+        condition: service_started
+      worker-ingestion:
+        condition: service_started
+    restart: "no"
+    networks: [backend]
+
   frontend:
     build:
       context: ../..

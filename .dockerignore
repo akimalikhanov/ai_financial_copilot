@@ -28,6 +28,7 @@ infra/langfuse/secrets/
 # Data / large assets
 data/
 *.pdf
+!seed/sample/*.pdf
 
 # Docs and experiments
 docs/

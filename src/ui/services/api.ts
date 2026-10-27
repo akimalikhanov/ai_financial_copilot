@@ -631,6 +631,7 @@ export interface ConversationListItem {
   title: string | null;
   created_at: string;
   last_message_at: string | null;
+  is_sample: boolean;
 }
 
 export interface ListConversationsResponse {
@@ -676,6 +677,32 @@ export const createConversation = async (
   }
 
   return (await response.json()) as CreateConversationResponse;
+};
+
+// --- Samples API ---
+
+// Empty lists when the sample corpus isn't ready.
+export interface SamplesResponse {
+  documents: { id: string; title: string }[];
+  questions: { id: string; text: string }[];
+}
+
+export const fetchSamples = async (): Promise<SamplesResponse> => {
+  const res = await fetchApi(joinUrl(API_BASE_URL, '/v1/samples'), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as SamplesResponse;
+};
+
+export const createSampleConversation = async (): Promise<CreateConversationResponse> => {
+  const res = await fetchApi(joinUrl(API_BASE_URL, '/v1/samples/conversations'), {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as CreateConversationResponse;
 };
 
 export interface UpdateConversationRequest {

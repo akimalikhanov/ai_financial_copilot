@@ -1350,6 +1350,30 @@ def get_eval_user_id() -> UUID | None:
     return UUID(raw)
 
 
+def get_demo_user_id() -> UUID | None:
+    """DEMO_USER_ID: owner of the sample corpus. Unset disables the sample feature."""
+    raw = os.getenv("DEMO_USER_ID")
+    return UUID(raw) if raw else None
+
+
+def get_demo_user_email() -> str:
+    return os.getenv("DEMO_USER_EMAIL", "demo@sample.invalid")
+
+
+def get_sample_manifest_path() -> Path:
+    raw = os.getenv("SAMPLE_MANIFEST_PATH")
+    return Path(raw) if raw else get_project_root() / "seed" / "sample" / "manifest.yaml"
+
+
+def get_sample_seed_timeout_seconds() -> float:
+    """How long the seed command waits for ingestion to finish (default 900)."""
+    return float(os.getenv("SAMPLE_SEED_TIMEOUT_SECONDS", "900"))
+
+
+def get_sample_seed_poll_seconds() -> float:
+    return float(os.getenv("SAMPLE_SEED_POLL_SECONDS", "5"))
+
+
 def get_eval_judge_model() -> str:
     return os.getenv("EVAL_JUDGE_MODEL", "gpt-4o-mini")
 

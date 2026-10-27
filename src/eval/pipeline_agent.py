@@ -222,6 +222,7 @@ async def run_one(
         request_id=request_id,
         redis_app=_redis,
         session=session,
+        corpus_owner_id=_eval_user_id,
         user_query_raw=question.question,
         router_output=router_out,
         scope_result=scope_result,

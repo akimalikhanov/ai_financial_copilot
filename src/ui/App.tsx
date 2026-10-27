@@ -19,6 +19,8 @@ import {
   listDocuments,
   fetchFilterOptions,
   createConversation,
+  createSampleConversation,
+  fetchSamples,
   fetchMessages,
   updateConversation,
   fetchConversations,
@@ -31,6 +33,7 @@ import {
   type RequestStatsItem,
   type UserInfo,
   type DocumentListItemResponse,
+  type SamplesResponse,
 } from './services/api';
 import { AgentTimeline, type Timeline, applyActivityEvent, closeTimeline, emptyTimeline, timelinesFromMessages } from './components/AgentTimeline';
 import { useAuth } from './context/AuthContext';
@@ -366,6 +369,9 @@ export default function App() {
   // Data
   const [docs, setDocs] = useState<Document[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
+  const [samples, setSamples] = useState<SamplesResponse | null>(null);
+  const [startingSample, setStartingSample] = useState(false);
+  const [pendingSample, setPendingSample] = useState<{ chatId: string; text: string } | null>(null);
   const [filterOptions, setFilterOptions] = useState<{ companies: string[]; years: number[] }>({ companies: [], years: [] });
 
   // Messages (fetched from backend, keyed by conversationId)
@@ -621,10 +627,20 @@ export default function App() {
           title: c.title ?? 'Untitled',
           createdAt: new Date(c.created_at).getTime(),
           conversationId: c.id,
+          isSample: c.is_sample,
         }));
         setChats(mapped);
       })
       .catch(err => console.error('Failed to load conversations:', err));
+    return () => { cancelled = true; };
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    fetchSamples()
+      .then(res => { if (!cancelled) setSamples(res); })
+      .catch(err => console.error('Failed to load samples:', err));
     return () => { cancelled = true; };
   }, [isAuthenticated]);
 
@@ -894,16 +910,20 @@ export default function App() {
     }
   };
 
-  const handleCitationClick = (citation: Citation) => {
-    const doc = docs.find(d => d.id === citation.docId);
-    if (!doc) return;
+  const openPdfTab = (doc: Document, page: number) => {
     setIsEvidenceOpen(true); setMobileTab('EVIDENCE');
     setOpenPdfTabs(prev => {
       const exists = prev.find(p => p.doc.id === doc.id);
-      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page: citation.page } : p);
-      return [...prev, { doc, page: citation.page }];
+      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page } : p);
+      return [...prev, { doc, page }];
     });
     setActivePdfDocId(doc.id);
+  };
+
+  const handleCitationClick = (citation: Citation) => {
+    const doc = docs.find(d => d.id === citation.docId);
+    if (!doc) return;
+    openPdfTab(doc, citation.page);
     setActiveHighlight(citation.bboxHints?.length ? { bboxes: citation.bboxHints, label: '' } : undefined);
   };
 
@@ -918,14 +938,7 @@ export default function App() {
       status: 'Ready' as const,
       tags: [],
     };
-    setIsEvidenceOpen(true); setMobileTab('EVIDENCE');
-    const page = ref.pageNumbers[0] || 1;
-    setOpenPdfTabs(prev => {
-      const exists = prev.find(p => p.doc.id === doc.id);
-      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page } : p);
-      return [...prev, { doc, page }];
-    });
-    setActivePdfDocId(doc.id);
+    openPdfTab(doc, ref.pageNumbers[0] || 1);
     setActiveHighlight(
       ref.bboxHints?.length
         ? { bboxes: ref.bboxHints, label: ref.displayLabel, chunkId: ref.chunkId }
@@ -950,6 +963,49 @@ export default function App() {
       console.error('Failed to create conversation:', error);
       alert('Failed to create conversation. Please try again.');
     }
+  };
+
+  const sampleDoc = samples?.documents[0];
+
+  const handleSampleQuestion = async (text: string) => {
+    if (startingSample) return;
+    setStartingSample(true);
+    try {
+      const { conversation_id } = await createSampleConversation();
+      const chat: Chat = {
+        id: conversation_id,
+        title: `Sample: ${sampleDoc?.title ?? 'document'}`,
+        createdAt: Date.now(),
+        conversationId: conversation_id,
+        isSample: true,
+      };
+      setChats(prev => [chat, ...prev]);
+      setActiveChatId(chat.id);
+      setMessagesByConversation(prev => ({ ...prev, [conversation_id]: [] }));
+      setPendingSample({ chatId: chat.id, text });
+      if (window.innerWidth < 768) setIsSidebarOpen(false);
+    } catch (error) {
+      console.error('Failed to start sample chat:', error);
+      alert('Failed to start the sample chat. Please try again.');
+    } finally {
+      setStartingSample(false);
+    }
+  };
+
+  // handleSendMessage reads the active chat, so the question goes once the new chat is active.
+  useEffect(() => {
+    if (!pendingSample || activeChat?.id !== pendingSample.chatId) return;
+    setPendingSample(null);
+    void handleSendMessage(pendingSample.text);
+  }, [pendingSample, activeChat?.id]);
+
+  const openSampleDoc = () => {
+    if (!sampleDoc) return;
+    openPdfTab(
+      { id: sampleDoc.id, title: sampleDoc.title, company: '', year: 0, type: '', pages: 0, status: 'Ready', tags: [] },
+      1,
+    );
+    setActiveHighlight(undefined);
   };
 
   const handleDeleteRequest = (e: React.MouseEvent, id: string) => {
@@ -1026,7 +1082,10 @@ export default function App() {
             onClick={e => e.stopPropagation()}
           />
         ) : (
-          <div className="truncate text-sm font-medium pr-1 flex-1 min-w-0">{chat.title}</div>
+          <div className="flex items-center gap-1.5 pr-1 flex-1 min-w-0">
+            {chat.isSample && <Badge variant="accent" className="shrink-0">Sample</Badge>}
+            <div className="truncate text-sm font-medium">{chat.title}</div>
+          </div>
         )}
         {editingChatId !== chat.id && (
           <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1168,6 +1227,25 @@ export default function App() {
           <Button onClick={handleNewChat} className="mb-6">
             <Plus size={16} className="mr-2" /> Start New Chat
           </Button>
+          {sampleDoc && samples && samples.questions.length > 0 && (
+            <div className="w-full max-w-xl">
+              <p className="text-xs text-[var(--text-faint)] mb-3">
+                Or try a sample document: {sampleDoc.title}
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {samples.questions.map(q => (
+                  <button
+                    key={q.id}
+                    onClick={() => handleSampleQuestion(q.text)}
+                    disabled={startingSample}
+                    className="text-left text-sm p-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)] transition-colors disabled:opacity-50"
+                  >
+                    {q.text}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       );
     }
@@ -1179,14 +1257,31 @@ export default function App() {
 
     return (
       <div className="flex-1 flex flex-col min-w-0 h-full pb-14 md:pb-0">
-        <ScopeBar
-          scope={scope}
-          docCount={activeDocsCount}
-          onModeChange={m => setScope(s => ({ ...s, mode: m }))}
-          onFilterChange={f => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
-          onAddFiles={() => setIsDocPickerOpen(true)}
-          filterOptions={filterOptions}
-        />
+        {activeChat?.isSample ? (
+          <div className="flex items-center gap-3 px-4 h-14 border-b border-[var(--border)] bg-[var(--surface-1)] shrink-0 min-w-0">
+            <Badge variant="accent" className="shrink-0">Sample</Badge>
+            <span className="text-sm text-[var(--text-muted)] truncate">
+              {sampleDoc?.title ?? 'Sample document'}
+            </span>
+            {sampleDoc && (
+              <button
+                onClick={openSampleDoc}
+                className="ml-auto flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--accent)] shrink-0"
+              >
+                <FileText size={14} /> View PDF
+              </button>
+            )}
+          </div>
+        ) : (
+          <ScopeBar
+            scope={scope}
+            docCount={activeDocsCount}
+            onModeChange={m => setScope(s => ({ ...s, mode: m }))}
+            onFilterChange={f => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
+            onAddFiles={() => setIsDocPickerOpen(true)}
+            filterOptions={filterOptions}
+          />
+        )}
 
         {/* Messages */}
         <div ref={messagesContainerRef} className="flex-1 overflow-y-auto min-h-0 p-4 md:p-8 pb-32 md:pb-8">

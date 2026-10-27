@@ -89,6 +89,8 @@ class ChatPipelineState:
     session: AsyncSession
     llm_request: LLMRequest | None = None
     conversation_id: UUID | None = None
+    # Whose documents are searched: the requester, or the demo user in a sample chat.
+    corpus_owner_id: UUID | None = None
     assistant_message_id: UUID | None = None
     assistant_seq: int = 0
     history: ConversationHistory | None = None
@@ -185,6 +187,7 @@ class ConversationListItem(BaseModel):
     title: str | None
     created_at: datetime
     last_message_at: datetime | None
+    is_sample: bool = False
 
 
 class ListConversationsResponse(BaseModel):

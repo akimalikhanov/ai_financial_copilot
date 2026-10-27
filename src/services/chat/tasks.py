@@ -99,6 +99,7 @@ from src.services.prompts.prompt_renderer import get_prompt_renderer, get_system
 from src.services.retrieval.reranker import Reranker, get_reranker
 from src.services.router.router import route_query
 from src.services.router.scope_resolver import scope_outcome
+from src.services.sample.corpus import corpus_owner_id, is_sample
 from src.services.security.injection_detector import InjectionSignal, scan_user_input
 from src.utils.config import (
     get_chat_max_request_age_seconds,
@@ -774,7 +775,19 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
                 else None
             )
             raw_scope = (user_db_msg.message_metadata or {}).get("scope") if user_db_msg else None
-            chat_scope = _parse_scope(raw_scope)
+            conversation = (
+                await conversation_repo.get_by_id(state.conversation_id)
+                if state.conversation_id
+                else None
+            )
+            sample = conversation is not None and is_sample(conversation)
+            state.corpus_owner_id = (
+                corpus_owner_id(conversation, llm_request.user_id)
+                if conversation is not None and llm_request.user_id is not None
+                else llm_request.user_id
+            )
+            # A sample chat searches the whole demo corpus; the client's scope doesn't apply.
+            chat_scope = None if sample else _parse_scope(raw_scope)
 
             # Scope isn't resolved yet, so the staleness check runs later, on the
             # synthesis path — the router only needs to know the data exists.
@@ -795,6 +808,7 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
             state.router_output, state.scope_result = await route_query(
                 router_input,
                 user_id=llm_request.user_id,
+                corpus_owner_id=state.corpus_owner_id,
                 llm_router=router,
                 session=session,
                 parent_request_id=llm_request.id,
@@ -970,8 +984,8 @@ async def _run_chat_pipeline_inner(request_id: str) -> None:
 
             agent_settings = get_agent_settings()
             # `user_id` is nullable on LLMRequest, and the agent loop cannot search
-            # without one — route that case to the no-context path explicitly.
-            if state.router_output.route == "retrieval" and llm_request.user_id is not None:
+            # without a corpus owner — route that case to the no-context path explicitly.
+            if state.router_output.route == "retrieval" and state.corpus_owner_id is not None:
                 _tool_model_id: str = agent_settings.tool_model
                 _tool_llm, *_tool_fallbacks = tool_model_chain(router, _tool_model_id)
 

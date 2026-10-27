@@ -300,7 +300,7 @@ async def _execute_search(
                 session,
                 semantic_query=raw_query,
                 keyword_query=keyword_query,
-                user_id=state.llm_request.user_id,  # type: ignore[union-attr]
+                user_id=state.corpus_owner_id,  # type: ignore[arg-type]
                 doc_ids=doc_ids,
                 reranker=reranker,
                 # Always hybrid; top_k reads from VECTOR_SEARCH_TOP_K / KEYWORD_SEARCH_TOP_K env vars

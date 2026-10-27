@@ -37,6 +37,7 @@ COPY --from=builder /build/.venv /app/.venv
 COPY src/ ./src/
 COPY prompts/ ./prompts/
 COPY infra/config/ ./infra/config/
+COPY seed/ ./seed/
 
 # Prometheus multiprocess dir (workers share it via emptyDir in K8s)
 ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prom_api
