@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class EntityResolution(Disambiguation):
     """How an entity resolved. Unless the decision is "none", the first candidate is the pick."""
 
-    method: Literal["binding", "fast_path", "llm", "fallback", "no_candidates"]
+    method: Literal["binding", "skipped", "fast_path", "llm", "fallback", "no_candidates"]
     # From a binding: the user's answer when the company was outside the UI scope.
     outside_scope: Literal["include", "exclude"] | None = None
 
@@ -78,8 +78,9 @@ async def resolve_entities(
 ) -> list[EntityResolution]:
     """Resolve each entity against all of the user's companies, in input order.
 
-    Order: the conversation's binding from an earlier clarification, then a single exact
-    match on a lookup string, then one LLM disambiguator call for the rest. The LLM picks
+    Order: the conversation's binding from an earlier clarification (a company, or "skip"
+    until a company matches the entity exactly), then a single exact match on a lookup
+    string, then one LLM disambiguator call for the rest. The LLM picks
     only among the pg_trgm matches of the entity's lookup strings; an entity with none is
     "none" without a call. A failed call falls back to the trigram candidates.
     """
@@ -104,7 +105,8 @@ async def resolve_entities(
         # A bound company is looked up by its own company_norm, which matches exactly.
         found = await repo.find_company_candidates(
             user_id,
-            [k for ks in keys for k in ks] + [b["company_norm"] for b in bound if b],
+            [k for ks in keys for k in ks]
+            + [b["company_norm"] for b in bound if b and not b.get("skip")],
             limit=int(cfg["entity_max_candidates"]),
             sim_threshold=float(cfg["entity_candidate_sim_threshold"]),
             word_threshold=float(cfg["entity_candidate_word_threshold"]),
@@ -119,11 +121,14 @@ async def resolve_entities(
                     (c for c in found[b["company_norm"]] if c.company_norm == b["company_norm"]),
                     None,
                 )
-                if b
+                if b and not b.get("skip")
                 else None
             )
             exact = [c for c in trigram[i] if c.company_norm in ks]
-            if b and company:
+            if b and b.get("skip") and len(exact) != 1:
+                # The user searched without it; a company named exactly like it ends that.
+                results[i] = EntityResolution(decision="none", candidates=[], method="skipped")
+            elif b and company:
                 results[i] = EntityResolution(
                     decision="resolved",
                     candidates=[company],

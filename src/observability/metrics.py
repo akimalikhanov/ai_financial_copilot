@@ -203,6 +203,12 @@ AGENT_TOOL_MODEL_OUTPUT_TOKENS = Counter(
     "Tool-model output tokens by turn kind",
     ["model", "turn_kind", "part"],
 )
+# Encrypted reasoning replayed per tool-model call on the Responses API: request bloat.
+AGENT_REASONING_REPLAY_BYTES = Histogram(
+    "agent_reasoning_replay_bytes",
+    "Opaque reasoning payload replayed per tool-model call",
+    buckets=(0, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000, 500_000),
+)
 ROUTER_DECISIONS = Counter("query_router_decisions_total", "Router decisions", ["decision"])
 # outcome: carried | none | dropped_hop_cap | dropped_scope
 FOLLOWUP_FINDINGS_CARRIED = Counter(
@@ -232,9 +238,33 @@ CHAT_STAGE_DURATION = Histogram(
 LLM_TOKENS = Counter("llm_tokens_total", "Tokens", ["direction", "model"])
 LLM_COST = Counter("llm_cost_usd_total", "Cost USD", ["model"])
 LLM_CACHE_HIT_TOKENS = Counter("llm_cache_hit_tokens_total", "Cached input tokens", ["model"])
+LLM_CACHE_WRITE_TOKENS = Counter(
+    "llm_cache_write_tokens_total", "Input tokens written to the prompt cache", ["model"]
+)
+# Its own series, not a direction on llm_tokens_total: reasoning is already inside output,
+# so a third direction would double-count every sum by (direction).
+LLM_REASONING_TOKENS = Counter(
+    "llm_reasoning_tokens_total", "Reasoning tokens (subset of output)", ["model", "request_type"]
+)
+# api: chat_completions | responses | gemini | vllm | fake. Separate from LLM_DURATION so
+# adding the label doesn't split that series' history.
+LLM_API_CALLS = Counter(
+    "llm_api_calls_total", "LLM calls by wire API", ["model", "api", "request_type", "outcome"]
+)
+# mode: the effective reasoning context the API reports (auto | current_turn | all_turns).
+# Catches a default change that quietly turns carryover off.
+LLM_REASONING_CONTEXT = Counter(
+    "llm_reasoning_context_total", "Calls by effective reasoning context", ["model", "mode"]
+)
+# reason: summary_unavailable | reasoning_replay. A call resent without the rejected
+# feature; should sit near zero.
+LLM_DEGRADED_RETRIES = Counter(
+    "llm_degraded_retries_total", "LLM calls resent without a rejected feature", ["model", "reason"]
+)
 # request_type mirrors the llm_requests column: chat | chat_agent | agent_tool_call |
-# router | conversation_naming. outcome: ok | length (answered, but hit its token cap) |
-# timeout | cancelled | error — only agent_tool_call observes the non-ok outcomes so far.
+# router | conversation_naming | entity_disambiguator. outcome: ok | length (answered, but
+# hit its token cap) | content_filter | timeout | cancelled | error. Non-ok outcomes come
+# from agent_tool_call and the chat/chat_agent synthesis stream.
 LLM_DURATION = Histogram(
     "llm_request_duration_seconds",
     "LLM call latency, first byte to last",
@@ -249,21 +279,31 @@ LLM_TTFT = Histogram(
 )
 
 
-def observe_llm_latency(
-    model: str, request_type: str, stats: LLMResponseStats | None, outcome: str = "ok"
+def observe_llm_call(
+    model: str,
+    api: str,
+    request_type: str,
+    stats: LLMResponseStats | None,
+    outcome: str = "ok",
 ) -> None:
-    """Record one LLM call's latency histograms."""
+    """Record one answered LLM call: call count, latency histograms, reasoning tokens."""
+    LLM_API_CALLS.labels(model, api, request_type, outcome).inc()
     if stats is None:
         return
     if stats.latency_ms is not None:
         LLM_DURATION.labels(model, request_type, outcome).observe(stats.latency_ms / 1000.0)
     if stats.ttft_ms is not None:
         LLM_TTFT.labels(model, request_type).observe(stats.ttft_ms / 1000.0)
+    if stats.reasoning_tokens:
+        LLM_REASONING_TOKENS.labels(model, request_type).inc(stats.reasoning_tokens)
 
 
-def observe_llm_failure(model: str, request_type: str, outcome: str, seconds: float) -> None:
+def observe_llm_failure(
+    model: str, api: str, request_type: str, outcome: str, seconds: float
+) -> None:
     """Record how long a call that never answered ran before it timed out, was cancelled or
     errored. Without it the latency histogram only ever sees the calls that finished."""
+    LLM_API_CALLS.labels(model, api, request_type, outcome).inc()
     LLM_DURATION.labels(model, request_type, outcome).observe(seconds)
 
 

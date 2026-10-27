@@ -14,6 +14,7 @@ from src.repository.conversation_repository import ConversationRepository
 from src.repository.message_repository import MessageRepository
 from src.schemas import chat as schemas
 from src.services.chat.events import hydrate_bbox_hints
+from src.services.sample.corpus import is_sample
 
 router = APIRouter(prefix="/v1/conversations", tags=["conversations"])
 
@@ -61,6 +62,7 @@ async def list_conversations(
                 title=c.title,
                 created_at=c.created_at,
                 last_message_at=c.last_message_at,
+                is_sample=is_sample(c),
             )
             for c in conversations
         ],

@@ -165,7 +165,12 @@ ActivityKind = Literal[
     "tool_call_started",
     "tool_call_ended",
     "round_started",
+    "note",
+    "outcome",
 ]
+
+# A row with a `_started` event and no `_ended` yet is running; that state is never sent.
+ActivityStatus = Literal["ok", "skipped", "warn", "fail"]
 
 
 def build_activity_event(
@@ -304,16 +309,21 @@ def build_usage_event(
     stats: LLMResponseStats | None,
     citation_spans: list[AnswerCitationSpan] | None = None,
     references: list[dict] | None = None,
+    finish_reason: str | None = None,
 ) -> dict:
     """Build usage_data dict for the usage event."""
     usage_data: dict = {
         "persisted": True,
         "assistant_message_id": str(assistant_message_id),
         "assistant_seq": assistant_seq,
+        # "length" means the answer was cut off at the token cap.
+        "finish_reason": finish_reason,
     }
     if stats:
         usage_data["stats"] = {
             "input_tokens": stats.input_tokens,
+            "cached_input_tokens": stats.cached_input_tokens,
+            "cache_write_tokens": stats.cache_write_tokens,
             "output_tokens": stats.output_tokens,
             "reasoning_tokens": stats.reasoning_tokens,
             "total_tokens": stats.total_tokens,

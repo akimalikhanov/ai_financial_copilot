@@ -197,6 +197,11 @@ flowchart TD
 - The **answering model** is whatever model the user picked in the UI. It never sees the
   agent's transcript. It sees only the synthesis context.
 
+On the Responses API the tool model's reasoning carries from turn to turn within a run, and
+the reasoning summaries end up on each turn's trace span and `llm_requests` row
+([section 11](#reasoning-items-on-the-responses-api)). On Chat Completions each call
+reasons from scratch.
+
 No other model sits between the tool model and retrieval. Each `search_documents` call
 carries a `query` for semantic search and `keywords` for BM25, and the loop passes both to
 retrieval as written. See [section 9](#9-executing-a-search).
@@ -213,7 +218,7 @@ src/services/chat/agent/
 │                        open_aspects(), render_status(), snapshot(), build_meta()
 ├── evidence.py          EvidenceLedger: every retrieved chunk, S-label allocation
 ├── findings.py          FindingsLedger: keyed conclusions, grounding filter, projection
-├── transcript.py        Transcript: the model's append-only message list
+├── transcript.py        Transcript: the model's append-only message list; add_status()
 ├── tools.py             tool JSON schemas, generated from Pydantic models; the analytical
 │                        report schema is the same one with `figures` removed
 ├── synthesis.py         run_synthesis(): loop output -> AgentRunResult
@@ -305,7 +310,7 @@ makes it `analytical`.
 | Example question | "What was Acme's FY2023 revenue?" / "Which of Acme and Globex had higher revenue?" / "How did Acme's revenue change from FY2022 to FY2023?" | "Why did Acme's operating margin fall in FY2023?" |
 | Tool-model prompt | `v4_agent` | `v6_agent_analytical` |
 | Search tool args | `entity`, `query`, `keywords` | `entity`, `query`, `keywords`, `sub_question` |
-| Report tool schema | `REPORT_FINDINGS_TOOL`: each finding has `figures` | `REPORT_ANALYTICAL_TOOL`: no `figures`, numbers go in `claim` |
+| Report tool schema | `REPORT_FINDINGS_TOOL`: each finding has `figures` | `REPORT_ANALYTICAL_TOOL`: no `figures`, numbers go in `claim`, each wrapped in `<n>…</n>` |
 | Plan keys | Entity names, seeded before turn 1 | `A1`, `A2`, …, minted from `sub_question`s |
 | A search's key | The seeded entity it names | The aspect its `sub_question` mints |
 | Turn cap | `AGENT_MAX_ITERATIONS` (5) | `AGENT_MAX_ITERATIONS_ANALYTICAL` (7) |
@@ -319,7 +324,7 @@ And what both share:
 | Report tool | `report_findings(findings, comparison_op, conclusion)`, parsed by `FindingsReport` |
 | Finding schema | `Finding`, with optional `figures` (always empty on analytical runs) |
 | Unreported plan key | One "Not searched" / "Not resolved" / "Could not be checked" line |
-| Synthesis | FX, ranking, number grounding and change lines on rows with figures |
+| Synthesis | FX, ranking, number grounding and change lines on rows with figures; number grounding on `<n>`-marked claim numbers |
 | Findings block | `[FINDINGS]` |
 
 Analytical runs get a report schema without `figures`. `tools.py::_without_figures` copies
@@ -328,6 +333,13 @@ Offered both, the analytical model wrote every number twice, once in `claim` and
 figure. The same `FindingsReport` still parses every call, so an analytical finding arrives
 with `figures=[]`. Nothing downstream depends on the shape. A yes/no extraction answer is a
 `Finding` with no figures too, and the renderer prints no figure rows for either.
+
+The analytical prompt has the model wrap each number in its claim as printed, scale word
+included: `Input costs rose <n>12%</n>, a <n>$19 million</n> headwind.` The number is written
+once, and code still knows which digits are asserted magnitudes. Years and note numbers stay
+unmarked, so they are never checked. Synthesis checks the marked numbers against the cited
+excerpts and strips the marks
+([number_grounding.md](number_grounding.md#claim-numbers-on-the-analytical-path)).
 
 Every other limit is the same for both modes. The loop reads limits from one frozen
 `AgentSettings` object on `state.settings`, and keeps the shape's turn cap on
@@ -537,15 +549,19 @@ searched the key. Nothing else closes a key, so coverage (`addressed`, and `plan
 any point in the run and gives the same answer.
 
 `open_aspects(state)` returns plan keys that are not addressed, in mint order. After each
-turn's reports are folded in, the loop checks:
+turn's results are in, the loop checks:
 
 ```python
-if state.plan and not open_aspects(state):
+if state.plan and not open_aspects(state) and facts.new_labels == 0:
     state.sealed_by_coverage = True
     return Stop("covered")
 ```
 
-This is the normal, successful end of a run.
+This is the normal, successful end of a run. The `new_labels` condition exists because
+reports fold before the same turn's searches run. A turn that reports the last open key and
+also searches has results the model hasn't read. Stopping there would pay for the search and
+throw the result away. The run continues instead. If the next turn makes no tool calls and
+nothing is open, the loop stops with `covered`, not `natural`.
 
 "Reported" is not the same as "addressed". A report can name `A2` and still record nothing,
 because every citation failed to resolve, or because the finding claimed support but cited
@@ -593,12 +609,55 @@ should get a "did not converge" caveat.
 
 ### What the model sees about coverage: `render_status`
 
-Before every LLM call the loop computes a status line and appends it as the last user
-message. It is never stored in the transcript, so it can't go stale or pile up:
+Before every LLM call the loop computes a status line, and `Transcript.add_status`
+(`transcript.py`) appends it to the last tool result, wrapped in a `<run_status>` tag:
 
 ```
+<run_status>
 Recorded: A1, A3 · Open: A2 (Did pricing actions offset the cost increases?), A4 (Did FX movements affect gross margin?)
+</run_status>
 ```
+
+The status is stored, not just sent. The next request then starts with this one word for
+word, which is what the Responses prompt cache needs (see below). Older statuses stay in
+the history, one per turn. The newest is always the last message, and every older one is
+followed by the results that changed it.
+
+Why a tool result and not a user message of its own:
+
+- **Turn boundaries.** Providers start a new turn at each user message. On the Responses
+  API, `current_turn` reasoning models (gpt-5-mini) drop every reasoning item from before
+  the latest user message. A trailing status message would throw away the reasoning the
+  loop replays between calls. A tool result keeps it in the current turn. A live probe on
+  gpt-5-mini showed both: with a trailing user message the replayed reasoning item stopped
+  counting toward input tokens, and with the status folded into the tool result it kept
+  counting. A `developer` message also kept it. The gpt-5.6 family defaults to
+  `all_turns` and keeps the reasoning either way, but the fold costs nothing there.
+- **Call 0.** There is no tool result yet. If the plan is seeded from router entities, the
+  status goes as a user message. It comes before any reasoning item, so there is nothing
+  to lose.
+
+**Why it's stored.** Chat Completions caches any matching prefix, so a status sent on one
+call and dropped on the next cost only its own tokens. Responses reuses an earlier
+request's prompt only as a whole. A status that was sent but not stored made every call
+after call 1 read only call 0's prefix from cache, and rewrite the rest at the cache-write
+price, which is higher than plain input. A probe (`experiments/responses_cache_probe.py`)
+ran a 4-call loop on gpt-5.6-luna with the status in different places:
+
+| Status | Cache hit, call 1 | Cache hit, calls 2 and 3 |
+|---|---|---|
+| sent, not stored (the old behaviour) | 1.00 | 0.68, then 0.51 |
+| trailing user message, not stored | 1.00 | 0.68, then 0.51 |
+| none | 1.00 | 1.00 |
+| stored in the tool result | 1.00 | 1.00 |
+
+Hit is cached tokens over the previous call's input. Replayed reasoning items made no
+difference. Two production runs of the same 4-turn analytical question cost $0.0075 in
+the loop before the change and $0.0054 after.
+
+Both agent prompts say the block at the very end of the last tool result comes from the
+system. A filing can't fake one: `wrap_excerpt` escapes any `<run_status` tag inside
+excerpt text.
 
 It can add two more parts:
 
@@ -608,7 +667,7 @@ It can add two more parts:
   model to report every open key, using `supported: false` where the evidence doesn't
   support one
 
-`render_status` returns `None` when the plan is empty, so no status message is sent.
+`render_status` returns `None` when the plan is empty, so no status is sent.
 
 It shows keys and sub-questions only, never claim text. An earlier design re-injected full
 claims every turn. The only effect was giving the model text to copy, so it was removed.
@@ -654,8 +713,8 @@ they can be unit-tested without an event loop or an LLM (`test_agent_turn_folds.
 
 | Function | Does | Returns |
 |---|---|---|
-| `fold_searches(state, searches, results, keys)` | admits chunks, assigns S-labels in call order, names chunks already shown, updates `aspect_stats` and spend | tool-result text per call id, new labels per search |
-| `fold_reports(state, reports, request_id)` | runs `_apply_report` per report, in call order, before this turn's searches | tool-result text per call id, plan keys closed this turn |
+| `fold_searches(state, searches, results, keys)` | admits chunks, assigns S-labels in call order, names chunks already shown, updates `aspect_stats` and spend | tool-result text per call id, new labels per search, trace view per call id, documents and pages per search (for the timeline) |
+| `fold_reports(state, reports, request_id)` | runs `_apply_report` per report, in call order, before this turn's searches | tool-result text per call id, plan keys closed this turn, timeline note rows |
 | `decide(state, facts)` | the termination checks below; writes only `sealed_by_coverage` and `empty_rounds` | `Continue()` or `Stop(reason)` |
 
 `_run_turn` does the async work around them: the LLM call (`_call_tool_model`) and its spend
@@ -679,6 +738,15 @@ and reasoning token counts, marks the turn span WARNING in Langfuse, and writes 
 sub-request row with `status="truncated"`. A truncated turn that still emitted tool calls
 carries on, but its row and latency sample are tagged `length` too.
 
+<a id="cache-key"></a>**Cache key.** Every tool-model call sends
+`prompt_cache_key="agent:{prompt version}"`, for example `agent:v6_agent_analytical`.
+OpenAI uses the key to send requests with the same prefix to the same cache machine, and
+the prefix every run shares is the system prompt plus the tools. The key is per prompt
+version, not per user or run, so all runs of one shape share that cache. The adapter sends
+it to OpenAI only. vLLM never gets it, and `LLM_PROMPT_CACHE_KEY_ENABLED=false` turns it
+off everywhere. Within a run, later calls hit the cache only because each request starts
+with the previous one word for word ([why the status is stored](#what-the-model-sees-about-coverage-render_status)).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -692,7 +760,7 @@ sequenceDiagram
 
     RL->>Turn: tools (+ allowed = report tool only, on the final turn)
     Turn->>LLM: transcript + status line
-    LLM-->>Turn: tool_calls (or none, then Stop("natural") or Stop("truncated"))
+    LLM-->>Turn: tool_calls (or none, then Stop("covered") if nothing is open, else Stop("natural") or Stop("truncated"))
     Turn->>TR: append assistant message with all tool_calls, once
     Turn->>Turn: answer calls outside this turn's pool "not available"
     Turn->>Turn: key each search (mint from sub_question, or its seeded entity)
@@ -768,7 +836,7 @@ which plan keys closed.
 
 ```mermaid
 flowchart TD
-    A["turn's tool results appended"] --> C{"plan non-empty and<br/>no open items?"}
+    A["turn's tool results appended"] --> C{"plan non-empty,<br/>no open items and<br/>no new label shown?"}
     C -->|yes| COV["sealed_by_coverage = True<br/>Stop('covered')"]
     C -->|no| D{"there were searches and<br/>every one had backend_failed?"}
     D -->|yes| UNAV["Stop('search_unavailable')"]
@@ -783,10 +851,13 @@ flowchart TD
     H -->|no| CMP["Continue()"]
 ```
 
-Order matters in two places:
+Order matters in these places:
 
 - The coverage check runs after minting. So a turn that closes the last open item and opens
   a new one keeps going, rather than stopping and throwing the new thread away.
+- The coverage check also waits for this turn's search results to be read. Reports fold
+  before searches, so a turn that closes the last item and re-searches one shows new labels
+  the model hasn't seen. The run continues for one more turn.
 - "Progress" means a new label shown **or** a newly closed plan key. A turn that settles an
   aspect from evidence already in hand, with no new search, is real progress. Without this
   rule the loop would often stop one turn before it finished covering the plan.
@@ -828,7 +899,9 @@ grounding, close its key, and mark a budget-capped run as fully covered.
 
 ### When the model returns no tool calls
 
-`Stop("natural")`. This is a normal exit. The findings recorded so far still get served,
+If every plan key is already addressed, the stop is `covered` and the run is sealed. This
+happens after the coverage check waited for unread search results and the model had nothing
+to add. Otherwise it's `Stop("natural")`. This is a normal exit. The findings recorded so far still get served,
 with one line per key still open. If the call hit its token cap instead, the stop is
 `truncated` (see [token cap](#token-cap)). It serves the same way but counts as a failed
 stop. Only when nothing was ever reported and no key is open is
@@ -850,10 +923,10 @@ flowchart TD
     B -->|"in per_entity_doc_ids"| D1["doc_ids = that entity's docs"]
     B -->|"empty string"| D2["doc_ids = whole resolved scope<br/>(every resolved entity)"]
     B -->|"unknown name"| D3["doc_ids = whole resolved scope"]
-    D1 --> E
-    D2 --> E
-    D3 --> E
-    E["emit SSE activity: tool_call_started"] --> F{"keywords present?"}
+    D1 --> F
+    D2 --> F
+    D3 --> F
+    F{"keywords present?"}
     F -->|yes| G1["semantic query = query<br/>keyword query = keywords"]
     F -->|no| G2["query on both legs,<br/>log agent_search_keywords_missing"]
     G1 --> H["run_chat_rag_pipeline()<br/>Qdrant + OpenSearch → RRF → rerank"]
@@ -889,8 +962,8 @@ A few details worth knowing:
   order of magnitude smaller than cross-encoder scores. `state.scores_are_rerank` flips to
   `False` so the confidence badge doesn't apply rerank thresholds to fusion scores.
 - **`entity=""`** searches the resolved scope (`scope_result.doc_ids`), the union of every
-  resolved entity's documents. The SSE label and trace span carry the entity name only when
-  exactly one entity is in scope. The analytical prompt still asks the model to pass an
+  resolved entity's documents. The trace span carries the entity name only when exactly one
+  entity is in scope. The analytical prompt still asks the model to pass an
   explicit company name.
 - **An unmatched entity never reaches retrieval.** Its list in `per_entity_doc_ids` is
   empty, so the search returns the error "'Tesla' did not match any document in your
@@ -998,8 +1071,9 @@ payload. Synthesis filters it out.
 
 ## 11. Transcript: history and the append-only run
 
-`transcript.py`. A thin wrapper around `list[ChatMessage]` with `append` and
-`append_tool_calls`. Nothing in it rewrites or removes a message.
+`transcript.py`. A thin wrapper around `list[ChatMessage]` with `append`, `append_turn` and
+`add_status`. Nothing in it removes a message or rewrites one a request has carried.
+`add_status` changes only the last tool result, before the call that first sends it.
 
 ### What the transcript starts with
 
@@ -1173,10 +1247,10 @@ rewrites numbers and loses their provenance.
 system      v4_agent | v6_agent_analytical
 ...         prior turns, as messages
 user        task: scope + "Question: …"
-assistant   turn 0 tool calls
+assistant   turn 0 tool calls (+ encrypted reasoning items on Responses)
 tool        results, each chunk rendered once
+            + <run_status> at the end of the last one, stored before the next call
 ...         appended, never rewritten
-user        status line   (added to each call, never stored)
 ```
 
 Each turn appends one assistant message carrying all the turn's tool calls (with
@@ -1184,18 +1258,20 @@ Each turn appends one assistant message carrying all the turn's tool calls (with
 `[A2] <retrieved_excerpt ...>...` or `[Acme Corp] <retrieved_excerpt ...>...` (the prefix
 only when the search maps to a plan key), followed by an `Already shown above: …` line when the search re-returned
 chunks from earlier ([section 10](#10-evidenceledger-chunks-and-s-labels)). Report results
-are plain text; see [section 12](#12-handling-a-report-call). The status line is added to
-each LLM call but never stored.
+are plain text; see [section 12](#12-handling-a-report-call). The status line is appended
+to the last tool result before each LLM call, and stays there.
 
 The transcript is **append-only**:
 
-- **No earlier message is rewritten.** The provider caches the whole prefix, so each turn
-  pays the cached-input rate for everything before its own new messages.
+- **No message a request has carried is rewritten.** Each request starts with the previous
+  one word for word, so each turn pays the cached-input rate for everything before its own
+  new messages.
 - **Every label the model can cite stays on screen.** A claim can only be grounded on text
   the model can still read, and there is no state where a label resolves but its text is
   gone.
 - **Nothing states coverage except the status line.** Report results say only what landed
-  ([section 12](#12-handling-a-report-call)), so nothing stored can go stale.
+  ([section 12](#12-handling-a-report-call)). Older status lines stay in the history, and
+  the newest one is always last.
 
 Nothing is evicted. The USD budget (`AGENT_COST_BUDGET_USD`) and the iteration cap bound
 the run. Input per call grows with each turn: the longest run on record (7 turns, 14
@@ -1208,6 +1284,96 @@ histogram, record how large the last call's input got. They are the signal for a
 overflow valve. That valve is not built. If runs approach a size limit, the planned rule is:
 above a soft limit, replace a search result with a label-plus-heading line when every label
 in it belongs only to keys already addressed. Elision is one-way, with no revival.
+
+### Reasoning items on the Responses API
+
+A reasoning model thinks before it calls tools. On Chat Completions that thinking is
+thrown away after each call, so on the next call the model sees its earlier tool calls and
+their results but not why it made them. The Responses API can hand the thinking back, so
+the model continues its own chain of reasoning across the turns of a run.
+
+A model with `api: responses` in `models.yaml` (today `gpt-5.6-luna`) runs through
+`OpenAIResponsesAdapter`. Other models, including luna's fallback `gpt-5-mini`, run on
+Chat Completions and never see reasoning items.
+
+**What comes back from a tool call.** The response's `output` is a list of items, in the
+order the model produced them:
+
+| Item | Content | Kept? |
+|---|---|---|
+| `reasoning` | The model's thinking as an encrypted blob (`encrypted_content`) we can't read, plus an optional readable summary | Yes, in `opaque` |
+| `function_call` (completed) | One tool call: `call_id`, `name`, `arguments` | Yes, in `opaque`, and also parsed into `tool_calls` |
+| `function_call` (cut off) | A call the response was truncated during | No |
+| `message` | Prose the model wrote alongside its calls | No. The transcript holds no model prose |
+
+The adapter sends `store=false`, so OpenAI keeps nothing between calls, and
+`include=["reasoning.encrypted_content"]`, which is what makes the API return the blob.
+The kept items, in their original order, become `AssistantTurnResult.opaque`. Each is
+tagged with the provider and the model that produced it.
+
+**How they are stored.** `append_turn` stores the turn as one assistant message, as on
+Chat Completions: `content=None`, the parsed `tool_calls`, and `opaque` alongside. The
+assistant message is only the transcript's provider-neutral wrapper. The Responses API
+never receives it in that form.
+
+**How they are sent back ("replayed").** When the adapter builds the next request, each
+assistant message is turned back into items:
+
+- If the message has `opaque` items from the model being called, they are sent verbatim
+  and in order. The model sees `reasoning → function_call → …` exactly as it produced it.
+- Otherwise the adapter builds plain `function_call` items from `tool_calls`.
+
+Tool results are sent as `function_call_output` items either way, matched to their call by
+`call_id`. Function calls are kept in `opaque` next to the reasoning because the API
+rejects a reasoning item that isn't followed by the call it led to. The two are always
+replayed together.
+
+The loop never reads `opaque`. `opaque_size` counts the items and their bytes for the
+trace and metrics, and nothing else.
+
+**On fallback.** When the tool model errors and a turn falls back to another model, only
+the hidden reasoning is lost. The fallback receives the full visible transcript: the
+question, every earlier tool call and its arguments, every result with its S-labels, and
+the status line. It works out what to do next from those, as a Chat Completions model
+always does. Two smaller costs come with it:
+
+- The fallback has no cached prefix, so it pays the full input rate for the transcript.
+- Its own turn carries no reasoning items, so if the next turn returns to the tool model,
+  the tool model gets back the reasoning for its own turns but has a gap where the
+  fallback ran.
+
+Sending the reasoning to a different model would not help. The API accepts reasoning items
+from another model family without an error, but it silently leaves them out of the
+model's context. Only models in the same family share reasoning (for example
+`gpt-5.6-sol`, `-terra` and `-luna`). The adapter therefore replays items only to the
+exact model that produced them.
+
+Reasoning never crosses questions either. The chat tail stores only questions and final
+answers ([section 11](#conversation-history-for-all-three-models)).
+
+**Which replayed items the model reads.** `reasoning.context` controls this:
+`current_turn` keeps reasoning only since the last user message, and `all_turns` keeps it
+all. We don't send the parameter unless `GPT5_6_LUNA_REASONING_CONTEXT` is set, so the
+gpt-5.6 family uses its default, `all_turns`. Each response reports the mode it used, and
+the loop records it. In practice the two modes keep the same items: the status line is
+folded into the last tool result rather than sent as a user message
+([status placement](#what-the-model-sees-about-coverage-render_status)), so no user
+message falls after the first reasoning item, and the whole run counts as one turn.
+
+**When something fails, the adapter retries once with a feature off:**
+
+- **The API rejects a replayed item** (for example, the encrypted blob fails
+  verification). The adapter resends the call with all `opaque` items dropped and plain
+  `function_call` items in their place. The run continues without reasoning carryover.
+- **The account isn't allowed reasoning summaries.** The adapter resends without asking
+  for a summary, and stops asking for the rest of the process.
+
+Both count in `llm_degraded_retries_total{reason}`, which should sit near zero.
+
+**Reasoning summaries.** When the model returns a summary, it goes on the turn span and
+the `llm_requests` row, capped at `LLM_REASONING_SUMMARY_MAX_CHARS`. It's OpenAI's
+paraphrase of the reasoning, not the reasoning itself. With `summary: "auto"`, a model
+that barely reasoned returns none, which is common on easy questions at `medium` effort.
 
 ### Worked example: what each model sees
 
@@ -1255,8 +1421,9 @@ user    User query: analyze the main factors influencing the revenue changes of 
 
 **Tool model (calls 2–4).** One transcript, appended to on every turn. A turn's output
 (its tool calls) and their results enter the transcript after that turn, so they appear in
-the *next* turn's input. The status line goes last on each call once the plan has items,
-and is never stored.
+the *next* turn's input. Once the plan has items, the status line goes at the end of the
+last tool result on each call. This run predates storing it. On Chat Completions that
+didn't matter, as turn 2's cache hit shows.
 
 ```text
 INPUT of each call                                                turn 0    turn 1    turn 2
@@ -1269,7 +1436,8 @@ tool ×6    their results: excerpts S1–S21 (≈81k chars)                     
 assistant  turn 1's calls: 3 × search_documents (A4–A6 again)                           ✓
 tool ×3    their results: new excerpts S22–S28, the rest                                ✓
            as "Already shown above: …"
-user       status: "Open: A1 (…), A2 (…), … A6 (…)"                           ✓         ✓
+  + status at the end of the last tool result:                                ✓         ✓
+           "<run_status> Open: A1 (…), A2 (…), … A6 (…)"
            (+ final-turn notice, on the last allowed turn only)
                                                     input tokens  3,620     18,953    23,744
 
@@ -1394,7 +1562,8 @@ user       task: "Available document years …                        ✓       
            Question: Which of these factors had the biggest …"
 assistant  turn 0's calls: 5 × search_documents (A1–A5)                       ✓
 tool ×5    their results: excerpts S1–S20                                     ✓
-user       status: "Open: A1 (How much did changes in average                 ✓
+  + status at the end of the last tool result:                                ✓
+           "<run_status> Open: A1 (How much did changes in average
            realized prices contribute …), A2 (…), … A5 (…)"
                                                     input tokens  4,088     16,717
 
@@ -1672,8 +1841,8 @@ ConvergenceReason = Literal[
 
 | Reason | Trigger | Typical meaning | `sealed`? |
 |---|---|---|---|
-| `covered` | Every plan key addressed after a turn | Normal success | yes |
-| `natural` | Model returned no tool calls | Model thinks it's done, or ignored the report-only final turn | only if plan is empty |
+| `covered` | Every plan key addressed after a turn that showed no new labels, or a turn with no tool calls once every key is addressed | Normal success | yes |
+| `natural` | Model returned no tool calls with keys still open (or no plan) | Model thinks it's done, or ignored the report-only final turn | only if plan is empty |
 | `convergence` | No new label shown and nothing closed, `max_empty_rounds + 1` times in a row | Searches keep returning what's already known | only if plan is empty |
 | `search_unavailable` | Every search in a turn had `backend_failed` | Retrieval infrastructure is down | only if plan is empty |
 | `budget_cap` | Run cost across all models > `AGENT_COST_BUDGET_USD` | Long, expensive run | only if plan is empty |
@@ -1685,8 +1854,11 @@ ConvergenceReason = Literal[
 
 The budget is in dollars, summed over every tool-model call in the run, fallback models
 included (`state.cost_usd_total()`). Each call's `cost_usd` comes from the adapter's pricing in
-`models.yaml`: input at the input rate, cached input at the cached rate, and output, reasoning
-included, at the output rate. Reasoning is what makes a token budget wrong here: on
+`models.yaml`. Input is billed at the input rate and cached input at the cached rate. Input
+written to the prompt cache is billed at `cache_write_input` where a model sets it (1.25x
+input on gpt-5.6 and later), and at the plain input rate otherwise. Output, reasoning
+included, is billed at the output rate. Cached and written tokens are both subsets of
+`input_tokens`, so no token is billed twice. Reasoning is what makes a token budget wrong here: on
 gpt-5-mini a turn with 8k input and 4k reasoning spends $0.002 on input and $0.008 on output.
 Dollars also track the prompt cache, so a long run whose earlier messages are cached is
 charged for what it actually costs. A model with no pricing entry adds $0, so for it only the
@@ -1766,7 +1938,7 @@ flowchart TD
     IN["EvidenceLedger + findings + meta"] --> O["labelled = evidence.labelled_chunks()<br/>fallback = evidence.fallback_chunks(AGENT_FALLBACK_MAX_CHUNKS)"]
     O --> F{"findings?"}
     F -->|None| FB["synthesis chunks = fallback"]
-    F -->|AgentFindings| PF["process_findings():<br/>FX, ranking, number check<br/>on rows with figures"]
+    F -->|AgentFindings| PF["process_findings():<br/>FX, ranking, number check<br/>on figures and marked claim numbers"]
     PF --> SEL["synthesis chunks = chunks the findings cite<br/>(or fallback if they cite none)"]
     FB --> ASM
     SEL --> ASM["assemble_rag_context() on cached payloads<br/>fresh labels S1..Sk, no DB read"]
@@ -1828,6 +2000,10 @@ check has false negatives (numbers in charts, numbers in words, European formats
 can't tell a right number from a right number in the wrong row or year. See
 [number_grounding.md](number_grounding.md) for what it catches and what it misses.
 
+Analytical findings have no figures, so the same check runs on the numbers their claims
+mark with `<n>…</n>` (`verify_marked`). It reads the scale from the word after the number
+inside the mark. Results go to `ProcessedFindings.claim_numbers`, keyed by finding.
+
 **4. Select evidence.** Keep only the chunks the findings cite. If they cite nothing, use
 the [fallback pool](#the-fallback-pool).
 
@@ -1838,7 +2014,9 @@ stored when each chunk was first rendered. No second DB read. `assemble_rag_cont
 
 **6. Render the block** against the new context, mapping each finding's UUIDs to the new
 labels with `RAGContext.ref_for(chunk_id)`. A UUID with no excerpt in the new context is
-dropped and counts toward `CITATION_REFS_DROPPED`. Under each finding's figures,
+dropped and counts toward `CITATION_REFS_DROPPED`. Claims and the conclusion lose their
+`<n>` marks here. A marked number that wasn't found ends its finding's line with
+`⚠ UNVERIFIED: <number> not located in cited excerpt`. Under each finding's figures,
 `_change_lines` adds the change between consecutive periods of a metric (plus first to last
 for three or more), computed in code, so the answering model copies a change instead of
 working one out.
@@ -1948,7 +2126,9 @@ Note: no target currency specified — compared in USD (findings span EUR, USD)
 ```
 
 An analytical question. Aspect ids (`A1`, `A4`) are left out: the answering model cited them
-as `[A1]` in place of the excerpt refs, which the citation parser can't resolve.
+as `[A1]` in place of the excerpt refs, which the citation parser can't resolve. The tool
+model wrote finding 1 as `Input costs rose <n>12%</n> YoY …`. The marks are gone, and `12%`
+and `$19M` both grounded, so the line carries no marker.
 
 ```text
 [FINDINGS]
@@ -2072,9 +2252,25 @@ flowchart TD
 | metadata | `citation_spans`, `references` | parsed citations and evidence-panel entries |
 | metadata | `findings_block`, `findings_block_hops`, `findings_block_doc_ids` | saved for follow-ups, only when the run was sealed |
 | metadata | `confidence`, `ungrounded_claims`, `degraded_retrieval`, `route` | sent to the UI; `ungrounded_claims` (uncited-fact share above 0) is not shown |
+| metadata | `finish_reason` | present only when the answer stopped early: `length` (token cap), `content_filter` or `refusal`. Absent on a normal answer |
 | `trace.guardrails` | | `confidence`, `top_reranker_score`, `num_chunks`, `degraded_retrieval`, `ungrounded_claims`, `uncited_fact_share`, injection signal |
 | metadata | `turn_summary` | route, query shape, resolved entities and document count: this turn's line in later turns' [session index](#session-index-router) |
 | `trace.agent` | | `iterations`, `tool_calls_total`, `convergence_reason`, `sealed`, FX results, `plan_seeded`, `plan_covered`, `report_calls_total`, `turns_to_first_report`, `unknown_aspect_keys`, `unsearched_negatives`, `uncited_claim_rate`, `search_arg_errors`, `report_parse_failures`, `last_turn_input_tokens` |
+
+### When the answer stops early
+
+The adapter puts the provider's stop reason on the stream's final chunk. If it is `length`,
+`content_filter` or `refusal`, `tasks.py` still saves and shows the answer, since it is what
+the user already read. It adds `finish_reason` to the message metadata and to the SSE
+`usage` event, records the latency sample under that outcome, logs
+`llm_stream_abnormal_finish`, and marks the `chat_model` generation WARNING. The parent
+`llm_requests` row stays `completed`. The redelivery guard, SSE liveness, conversation
+history and the service-time dashboard all treat `completed` as a finished answer, and a
+new status would break each of them.
+
+A stream that ends with no stop reason at all lost its connection mid-answer. The adapter
+raises `LLMConnectionError`, and the request fails instead of saving the partial text as a
+complete answer.
 
 Nothing inside the run (`AgentRunState`, ledgers, transcript) is serialized. If a worker dies
 mid-loop, Celery's `acks_late` redelivers the task and the loop starts again from scratch.
@@ -2125,12 +2321,15 @@ flowchart TD
   turn). Its **output** has the turn's tool calls, the tool results it appended, and
   `state_after`. You can follow coverage turn by turn without reading raw LLM inputs. Its
   metadata carries the run's spend so far, `token_spend_cumulative` (input tokens) and
-  `cost_usd_cumulative` (what the budget checks), and the turn's `new_labels`.
+  `cost_usd_cumulative` (what the budget checks), the turn's `new_labels`, and
+  `reasoning_summary` when the model returned one. The generation under it has the same
+  summary.
 - `final_state` on `agent_loop` is the same view, attached once when the loop exits.
 - Both come from one function, `snapshot(state)`: iteration, plan, addressed, open aspects,
   aspect_stats, empty_rounds, `findings` (each recorded key mapped to its finding),
   `findings_screened` (injection-scan flag and block counts), evidence and transcript sizes,
-  searched and expected entities. Run-level counters are not repeated
+  `reasoning_items` and `reasoning_bytes` (replayed items stored so far), searched and
+  expected entities. Run-level counters are not repeated
   there; they are on `AgentLoopMeta`, which `tasks.py` puts on the `agent_loop` output.
 - Two Langfuse scores per run: `agent_plan_coverage` (`plan_covered / plan_seeded`, only if
   the plan was non-empty) and `agent_uncited_claim_rate`. The request trace also gets
@@ -2149,10 +2348,15 @@ through these spans turn by turn.
 | `AGENT_TOOL_DURATION` | histogram | `tool` | search latency |
 | `AGENT_TOOL_MODEL_DURATION` | histogram | `model`, `turn_kind`, `outcome` | tool-model call latency. `turn_kind` is `search`, `report`, `mixed`, `final`, `none` (prose), or `unknown` for a non-final call that failed before answering. Search and report turns differ 3-5x in latency, so they get separate percentiles |
 | `AGENT_TOOL_MODEL_OUTPUT_TOKENS` | counter | `model`, `turn_kind`, `part` (`reasoning`/`visible`) | tool-model output tokens. Reasoning is most of a report turn's latency |
-| `LLM_DURATION` | histogram | `model`, `request_type`, `outcome` | LLM call latency. `outcome` is `ok`, `length`, `timeout`, `cancelled` or `error`. Only `agent_tool_call` records the failure outcomes, so calls that never answered still show up in its percentiles |
+| `LLM_DURATION` | histogram | `model`, `request_type`, `outcome` | LLM call latency. `outcome` is `ok`, `length`, `content_filter`, `refusal`, `timeout`, `cancelled` or `error`. `agent_tool_call` records the failure outcomes, so calls that never answered still show up in its percentiles. The synthesis stream (`chat`, `chat_agent`) records the early-stop outcomes |
+| `LLM_API_CALLS` | counter | `model`, `api`, `request_type`, `outcome` | LLM calls by wire API (`chat_completions`, `responses`, `gemini`, `vllm`, `fake`). A separate series so the `api` label doesn't split `LLM_DURATION`'s history |
 | `LLM_TOKENS` | counter | `direction`, `model` | tool-model tokens (plus other LLM calls) |
-| `LLM_CACHE_HIT_TOKENS`, `LLM_COST` | counter | `model` | cache hits, spend |
+| `LLM_CACHE_HIT_TOKENS`, `LLM_CACHE_WRITE_TOKENS`, `LLM_COST` | counter | `model` | cache reads, cache writes, spend |
+| `LLM_REASONING_TOKENS` | counter | `model`, `request_type` | reasoning tokens for every call type. Its own series because reasoning is already inside `LLM_TOKENS{direction="output"}` |
 | `AGENT_LAST_TURN_INPUT_TOKENS` | histogram | | tool-model input tokens on a run's last call: how large the append-only transcript got |
+| `AGENT_REASONING_REPLAY_BYTES` | histogram | | bytes of reasoning items replayed on one Responses tool-model call |
+| `LLM_REASONING_CONTEXT` | counter | `model`, `mode` | reasoning context mode each Responses call reported using |
+| `LLM_DEGRADED_RETRIES` | counter | `model`, `reason` (`summary_unavailable`/`reasoning_replay`) | resends with a feature removed ([reasoning items](#reasoning-items-on-the-responses-api)) |
 | `CITATION_REFS_DROPPED` | counter | | finding citations with no excerpt in the synthesis context |
 
 ### Database
@@ -2160,22 +2364,46 @@ through these spans turn by turn.
 Each tool-model call writes an `llm_requests` sub-request row (`request_type="agent_tool_call"`)
 linked to the parent request, on its own session. A call that answered has tokens and cost,
 `status` `completed` or `truncated`, and `request_params` holding `iteration`,
-`tool_calls_issued` and `turn_kind`. A call that never answered has `status` `timeout`,
+`tool_calls_issued` and `turn_kind`. On Responses, `request_params` also has
+`reasoning_context` and `service_tier` as the response reported them, and `replay_bytes`.
+A call that never answered has `status` `timeout`,
 `cancelled` or `failed`, the elapsed `latency_ms`, the error for `failed`, and `budget_s`
 in `request_params`. Its tokens are unknown, so the row has none. The parent request is
 marked `request_type="chat_agent"`.
 
+Every `llm_requests` row, parent or sub-request, records `llm_api` (the wire API that served
+it) and `cache_write_tokens` next to `cached_input_tokens`. `reasoning_summary` is filled
+on Responses rows, tool-model and answering model alike, when the model returned one. It
+stays NULL on Chat Completions. The answering model's row also gets the response's
+`reasoning_context` and `service_tier` in `request_params`.
+
+Each Langfuse generation (`llm.complete`, `llm.complete_with_tools`, `chat_model`) carries
+`llm_api` and `finish_reason` in its metadata, plus cache-write and reasoning tokens in its
+usage. On Responses the metadata also has `reasoning_summary` (capped), `reasoning_context`,
+`service_tier` and `response_id`.
+
 ### Live UI activity
 
 The loop pushes `activity` events on the request's Redis stream, which the SSE endpoint
-forwards to the UI:
+forwards to the UI. Every label and note is worded by templates in
+`src/services/chat/activity.py`; the UI only renders them.
 
-- `round_started` per turn (`id="round-N"`, label "Round N+1")
-- `tool_call_started` / `tool_call_ended` per search (label = entity, `detail` has chunk
-  counts) and per report (label "Recording findings")
+- `round_started` per turn (`id="round-N"`); the UI counts passes from it.
+- `tool_call_started` / `tool_call_ended` per search, emitted by `_guarded_search` and
+  `_run_turn` so every search gets exactly one row, including timeouts. The label is the
+  model's `query` in quotes, prefixed with the company when more than one company in scope
+  has documents. The end event carries `status`, a `note` from `search_result_row` (`+N new`,
+  `nothing new`, `no results`, `timed out after …`, `search failed`, …), `sources` (documents
+  and pages, shown on hover) and chunk counts. A tool the final pass does not offer gets a
+  `skipped` row.
+- `note` per finding a report produced, from `report_rows`: `Noted: {plan item}` or
+  `Not in documents: {plan item}` with the stored claim in `detail.claim`, or a fixed
+  `Note not recorded — …` warn row naming why it was rejected.
 
 `_ended` events refer to the `_started` event's id, so concurrent searches for the same entity
-don't get mixed up.
+don't get mixed up. Stage rows and the closing `outcome` event (the pill) come from
+`tasks.py`; the outcome is emitted before `get_activity_log`, so the timeline survives a
+reload.
 
 ### Reading the instrumentation fields
 
@@ -2233,6 +2461,23 @@ Related settings outside the agent package:
 | `INJECTION_SCAN_CHUNKS` | true | Injection scan on every excerpt before it is rendered |
 | `INJECTION_SCAN_USER_INPUT` | true | Injection scan on the current message and, in `prior_turns`, on every prior question |
 | `CHAT_MAX_ATTEMPTS` | 2 | Celery redeliveries of one chat task before it is failed |
+| `LLM_PROMPT_CACHE_KEY_ENABLED` | true | Sends `prompt_cache_key` to OpenAI: `agent:`, `synthesis:` and `router:` plus the prompt version ([cache key](#cache-key)) |
+| `LLM_REASONING_SUMMARY_MAX_CHARS` | 4000 | Cap on a reasoning summary stored on the turn span and the `llm_requests` row |
+
+Per-model settings in `infra/config/models.yaml`: `capabilities.reasoning: true` marks a
+reasoning model. The adapter then sends `reasoning_effort`, `verbosity` and
+`max_completion_tokens`, and drops `temperature`, which those models reject. Without the
+flag the model gets `temperature` and `max_tokens`. The model name plays no part.
+`pricing.cache_write_input` prices cache writes (see [section 14](#14-why-a-run-stops)).
+
+`api: responses` sends an OpenAI model through `OpenAIResponsesAdapter` instead of Chat
+Completions. On any other provider, `llm_router.py` refuses to build the adapter. The same parameters go out in
+Responses form (`reasoning.effort`, `text.verbosity`, `max_output_tokens`), plus two more
+from `params_override`. `reasoning_summary` (`auto`, `concise` or `detailed`) asks for a
+reasoning summary, and `reasoning_context` sets the context mode. An empty value means the
+field isn't sent. For `gpt-5.6-luna` both come from env vars,
+`GPT5_6_LUNA_REASONING_SUMMARY` (default `auto`) and `GPT5_6_LUNA_REASONING_CONTEXT`
+(default empty, so the API's `all_turns` applies).
 
 ---
 
@@ -2293,7 +2538,7 @@ search_documents(entity="Acme Corp", query="cost bridge reconciling raw material
                  keywords="MD&A cost bridge raw material inflation reconciliation H2 2023",
                  sub_question="Did input costs rise in H2 2023?")        # same wording → A1
 report_findings(comparison_op=null, conclusion=null, findings=[
-    {key: "A3", claim: "Mix shifted toward lower-margin hardware (35% → 41% of revenue).",
+    {key: "A3", claim: "Mix shifted toward lower-margin hardware (<n>35%</n> → <n>41%</n> of revenue).",
      supported: true, evidence: ["S6", "S8"], confidence: "medium"}])
 search_documents(entity="Acme Corp", query="foreign exchange impact on gross margin 2023",
                  keywords="foreign exchange currency translation FX gross margin 2023",
@@ -2333,9 +2578,9 @@ search_documents(entity="Acme Corp", query="average selling price realization by
                  keywords="ASP average selling price pricing realization product line 2023",
                  sub_question="Did pricing actions offset the cost increases?")   # A2
 report_findings(comparison_op=null, findings=[
-    {key: "A1", claim: "Input costs rose 12% YoY in H2 2023, a net $19M headwind.",
+    {key: "A1", claim: "Input costs rose <n>12%</n> YoY in H2 2023, a net <n>$19M</n> headwind.",
      evidence: ["S10", "S11"], confidence: "high", ...},
-    {key: "A4", claim: "FX translation cut reported revenue by about $6M in H2 2023.",
+    {key: "A4", claim: "FX translation cut reported revenue by about <n>$6M</n> in H2 2023.",
      evidence: ["S12"], confidence: "medium", ...}],
   conclusion="Margin fell mainly on input-cost inflation, plus a mix shift and a small FX headwind.")
 ```
@@ -2359,8 +2604,8 @@ continues.
 
 ```text
 report_findings(comparison_op=null, conclusion=null, findings=[
-    {key: "A2", claim: "Pricing only partly offset costs: software prices rose 4.8% but
-     hardware, the larger segment, rose 1.2%.", evidence: ["S13"], confidence: "medium", ...}])
+    {key: "A2", claim: "Pricing only partly offset costs: software prices rose <n>4.8%</n> but
+     hardware, the larger segment, rose <n>1.2%</n>.", evidence: ["S13"], confidence: "medium", ...}])
 ```
 
 No searches this turn. `A2` grounds. Every plan key is addressed, so `Stop("covered")`.
@@ -2465,6 +2710,10 @@ under the two figures, and the answering model would copy it.
 | Reranker skipped | `scores_are_rerank = False` | Confidence badge computed on the fusion-score scale |
 | Tool-model call hangs | `Stop("timeout")` once the call's budget runs out (at most `AGENT_TURN_TIMEOUT_CAP_SECONDS`) | Partial findings, marked degraded if the plan was open |
 | Tool model spends its token cap on reasoning | No tool calls and `finish_reason == "length"`, `Stop("truncated")` | Same as above |
+| Answering model hits its token cap, a content filter, or refuses | The answer is saved with `finish_reason` in its metadata; latency recorded under that outcome | The answer as streamed, cut short. The `usage` event carries `finish_reason` |
+| Answer stream drops mid-answer | Adapter raises `LLMConnectionError`; the request fails | An error event, not a partial answer passed off as complete |
+| API rejects a replayed reasoning item | The adapter resends the call once without replayed items; `llm_degraded_retries_total{reason="reasoning_replay"}` | Nothing. That call reasons from scratch |
+| Account isn't allowed reasoning summaries | The adapter resends without the summary and stops asking for the rest of the process; `reason="summary_unavailable"` | Nothing. Traces and rows have no summary |
 | Tool model returns a provider error | Same turn retried on the fallback model; if the whole chain fails, `Stop("llm_error")` | Nothing if the fallback answers; otherwise partial findings, marked degraded. A failure before anything was gathered fails the request |
 | Everything slow | The next turn has no call budget left, or the run deadline cancels a search in flight; stop reason `deadline` | Same as above |
 | Excerpt contains an injection attempt | Blocked chunks never rendered; flagged ones rendered with `flagged="true"` | Answering model told to be sceptical of flagged excerpts |
@@ -2504,9 +2753,12 @@ when you read it.
 by later evidence. Free-text gaps did neither. They are accepted only for a key an earlier
 turn searched, since a negative has no citation to check.
 
-**Status is computed, not stored.** Recomputed on every call, it can't go stale, doesn't pile
-up across turns, and doesn't change earlier messages (which keeps the provider's prompt
-cache valid).
+**Status is recomputed every call, then stored.** It's derived from the ledgers each
+time, so the newest copy is always right. It's stored so the next request starts with this
+one word for word. An earlier design sent it without storing it, to keep stale copies out
+of the history. That worked on Chat Completions, but on Responses it made every call after
+call 1 miss the cache. It rides at the end of the last tool result, not in a user message
+of its own, so it doesn't end the provider's turn and drop carried reasoning.
 
 **Append-only transcript.** No earlier message is rewritten and nothing is evicted. Every
 label the model can cite stays readable, the prompt cache holds across turns, and each chunk
@@ -2575,13 +2827,13 @@ a misrouted question lands in the same schema either way.
 | How a search is executed | `loop.py::_execute_search` |
 | How S-labels are allocated | `evidence.py::EvidenceLedger.assign_labels` |
 | Why a search result says "Already shown above" | `loop.py::fold_searches`, `evidence.py::EvidenceLedger.shown_before` |
-| When the run stops | `loop.py::decide`, `run_loop` |
+| When the run stops | `loop.py::decide`, `_run_turn` (no tool calls), `run_loop` |
 | Why a report didn't record everything | `loop.py::_apply_report`, `findings.py::FindingsLedger.record` |
 | What's recorded so far | `findings.py::FindingsLedger` |
 | How unresolved lines get their text | `state.py::unresolved_lines` |
 | What the answering model gets | `synthesis.py::run_synthesis` |
 | FX and ranking | `processor.py::process_findings` |
-| The "UNVERIFIED" marker | `number_grounding.py::verify_value`, `processor.py::_render_figure` |
+| The "UNVERIFIED" marker | `number_grounding.py::verify_value`, `processor.py::_render_figure`; for claim numbers `verify_marked`, `processor.py::_render_findings_block` |
 | Change lines in the findings block | `processor.py::_change_lines`, `_render_change` |
 | Why a finding says "(asked as …)" | `scope_resolver.py::resolve_scope` (`mentioned_as`), `DocumentScopeResult.mentions`, `processor.py::_render_findings_block` |
 | The uncited-fact share | `confidence.py::uncited_fact_share`, called from `tasks.py` |
@@ -2589,6 +2841,7 @@ a misrouted question lands in the same schema either way.
 | Follow-up reuse of findings | `tasks.py::_latest_findings_block`, `loop.py::agent_history` |
 | What prior conversation each model sees | `context/turns.py::prior_turns`, `cap_turns`, and `router_history()` / `tool_model_history()` / `answer_history()` |
 | What's persisted | `tasks.py`, the `citation_meta` / `trace_payload` block |
+| Why an answer is flagged as cut short | `tasks.py::_ABNORMAL_FINISH`, `openai_adapter.py::_stream` |
 | Debugging a single run | Langfuse `agent_loop` span, or the `trace-analysis` skill |
 
 ### Tests
@@ -2601,13 +2854,19 @@ a misrouted question lands in the same schema either way.
 | Tool schemas | `test_agent_tools.py` |
 | EvidenceLedger, render cap, already-shown names | `test_evidence.py`, `test_evidence_cap.py` |
 | FindingsLedger, grounding | `test_findings.py` |
-| Append-only transcript | `test_transcript.py` |
+| Append-only transcript, status placement | `test_transcript.py` |
 | Prior turns, budgets, stepped window, session index | `test_turns.py` |
 | Synthesis boundary | `test_agent_synthesis.py`, `test_findings_block_isolation.py` |
 | FX, rendering and change lines | `test_findings_processor.py` |
 | Number grounding | `test_number_grounding.py` |
 | Uncited-fact share | `test_confidence.py` |
 | Follow-up carryover | `test_followup_hop_cap.py`, `test_router_findings_digest.py` |
+| Stop reasons, dropped streams, reasoning params, cache key | `test_openai_adapter.py` |
+| Responses adapter: input serialization, reasoning replay, degraded retries | `test_openai_responses_adapter.py` |
+| Cost with cache reads and writes | `test_llm_cost.py` |
+
+A cut-off answer end to end (metadata, `usage` event, `llm_requests` row) is covered by
+`tests/integration/test_chat_full_flow.py::test_truncated_answer_is_persisted_and_flagged`.
 
 `run_loop` takes an `execute_search=` keyword argument, so tests can swap in a fake search
 function without touching retrieval.

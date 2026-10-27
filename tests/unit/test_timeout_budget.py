@@ -152,3 +152,59 @@ async def test_hung_search_does_not_run_past_the_search_timeout(
     assert elapsed < 10.0, f"fan-out was not bounded (took {elapsed:.1f}s)"
     # Fail-open, not fail-closed: the run completes and reports, rather than raising.
     assert meta.iterations >= 1
+
+
+@pytest.mark.asyncio
+async def test_timed_out_search_row_gets_its_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout result is built in `_guarded_search`, after the row opened: it must
+    carry the row's id so the row closes instead of running until the answer ends."""
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS", "2")
+    monkeypatch.setenv("AGENT_COST_BUDGET_USD", "100")
+    monkeypatch.setenv("AGENT_SEARCH_TIMEOUT_SECONDS", "0.05")
+    from src.services.chat.agent import loop as loop_module
+    from src.services.llm_router import RoutedLLM
+
+    events: list[dict] = []
+
+    async def _add_event(_redis: Any, _rid: str, name: str, payload: dict) -> None:
+        if name == "activity":
+            events.append(payload)
+
+    monkeypatch.setattr(loop_module, "add_event", _add_event)
+
+    async def _hanging_search(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(30)
+
+    search = ToolCallRef(
+        id="call_1", name="search_documents", arguments=json.dumps({"entity": "Acme", "query": "q"})
+    )
+    adapter = AsyncMock()
+    adapter.complete_with_tools = AsyncMock(
+        side_effect=[
+            AssistantTurnResult(text="", tool_calls=[search]),
+            AssistantTurnResult(text="done", tool_calls=[]),
+        ]
+    )
+    state = _make_state()
+    await loop_module.run_loop(
+        state,
+        RoutedLLM(
+            adapter=adapter,
+            provider="mock",
+            model_id="mock-tool-model",
+            default_params={},
+            default_stream=False,
+            capabilities={"tool_calling": True},
+        ),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_hanging_search,
+    )
+
+    [start] = [e for e in events if e["kind"] == "tool_call_started"]
+    [end] = [e for e in events if e["kind"] == "tool_call_ended"]
+    assert start["label"] == '"q"'
+    assert end["id"] == start["id"]

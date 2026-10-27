@@ -1,6 +1,7 @@
 # llm_router_runtime.py
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import AsyncGenerator, Coroutine, Mapping, Sequence
@@ -16,12 +17,14 @@ from src.services.llm_adapters.base_adapter import (
     LLMAdapter,
     LLMResponse,
     LLMStreamChunk,
+    ResponseMeta,
 )
 from src.services.llm_adapters.fake_adapter import FakeAdapter
 from src.services.llm_adapters.gemini_adapter import GeminiAdapter
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
+from src.services.llm_adapters.openai_responses_adapter import OpenAIResponsesAdapter
 from src.services.llm_runtime.exceptions import LLMError, LLMNotFoundError, LLMServerError
-from src.utils.config import load_models_config
+from src.utils.config import get_llm_reasoning_summary_max_chars, load_models_config
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,10 @@ def _trace_message(m: ChatMessage) -> dict[str, Any]:
         out["tool_calls"] = [
             {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls
         ]
+    if m.opaque:
+        # Encrypted, unreadable, and large: a count and size, never the payload.
+        size_kb = sum(len(json.dumps(o.payload)) for o in m.opaque) / 1000
+        out["reasoning"] = f"[{len(m.opaque)} encrypted items, {size_kb:.1f} kB]"
     return out
 
 
@@ -77,6 +84,8 @@ def trace_usage(stats: Any) -> dict[str, Any]:
                 "input": stats.input_tokens,
                 "output": stats.output_tokens,
                 "cache_read_input_tokens": stats.cached_input_tokens,
+                "cache_creation_input_tokens": stats.cache_write_tokens,
+                "output_reasoning_tokens": stats.reasoning_tokens,
                 "total": stats.total_tokens,
             }.items()
             if v is not None
@@ -85,6 +94,22 @@ def trace_usage(stats: Any) -> dict[str, Any]:
     if stats.cost_usd is not None:
         out["cost_details"] = {"total": stats.cost_usd}
     return out
+
+
+def capped_summary(summary: str | None) -> str | None:
+    return summary[: get_llm_reasoning_summary_max_chars()] if summary else None
+
+
+def reasoning_metadata(summary: str | None, meta: ResponseMeta | None) -> dict[str, Any]:
+    """Generation metadata for a provider's reasoning facts; empty on Chat Completions."""
+    m = meta or ResponseMeta()
+    fields = {
+        "reasoning_summary": capped_summary(summary),
+        "reasoning_context": m.reasoning_context,
+        "service_tier": m.service_tier,
+        "response_id": m.response_id,
+    }
+    return {k: v for k, v in fields.items() if v}
 
 
 def _merge_params(defaults: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -121,6 +146,14 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             status_code=500,
         )
 
+    api = model_cfg.get("api") or "chat_completions"
+    if api == "responses" and provider != "openai":
+        raise LLMServerError(
+            f"api: responses is only supported for provider 'openai', not {provider!r}",
+            provider=provider,
+            status_code=500,
+        )
+
     if provider == "openai":
         model_name = model_cfg.get("model_name")
         if not model_name:
@@ -129,7 +162,10 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
                 provider=provider,
                 status_code=500,
             )
-        return OpenAIAdapter(default_model=model_name)
+        capabilities = model_cfg.get("capabilities") or {}
+        if api == "responses":
+            return OpenAIResponsesAdapter(default_model=model_name, capabilities=capabilities)
+        return OpenAIAdapter(default_model=model_name, capabilities=capabilities)
 
     if provider == "google":
         model_name = model_cfg.get("model_name")
@@ -171,6 +207,7 @@ def _build_adapter(provider: str, model_cfg: Mapping[str, Any]) -> LLMAdapter:
             base_url=base_url,
             include_usage=include_usage,
             provider_name="vllm",
+            capabilities=model_cfg.get("capabilities") or {},
         )
 
     if provider == "fake":
@@ -188,6 +225,10 @@ class RoutedLLM:
     default_stream: bool
     capabilities: dict[str, Any]
 
+    @property
+    def api(self) -> str:
+        return self.adapter.api
+
     async def complete(
         self, messages: Sequence[ChatMessage], *, _lf_name: str = "llm.complete", **params: Any
     ) -> LLMResponse:
@@ -201,13 +242,21 @@ class RoutedLLM:
             model=self.model_id,
             model_parameters=trace_params(merged),
             input=trace_input(messages, _lf_name),
+            metadata={"llm_api": self.api},
         ) as gen:
             try:
                 response = await self.adapter.complete(messages=messages, **merged)
             except BaseException as exc:
                 _lf_mod.mark(gen, "ERROR", _lf_mod.describe_error(exc))
                 raise
-            gen.update(output=response.text, **trace_usage(response.stats))
+            gen.update(
+                output=response.text,
+                metadata={
+                    "finish_reason": response.finish_reason,
+                    **reasoning_metadata(response.reasoning_summary, response.meta),
+                },
+                **trace_usage(response.stats),
+            )
             return response
 
     async def complete_with_tools(
@@ -230,6 +279,7 @@ class RoutedLLM:
             model_parameters=trace_params(merged),
             input=trace_input(messages, name),
             metadata={
+                "llm_api": self.api,
                 "tools": [t["function"]["name"] for t in tools if "function" in t],
                 # Callable subset when the request restricts `tools` via allowed_tools.
                 **({"allowed_tools": allowed} if (allowed := merged.get("allowed_tools")) else {}),
@@ -247,6 +297,10 @@ class RoutedLLM:
                     {"name": tc.name, "arguments": tc.arguments} for tc in (result.tool_calls or [])
                 ]
                 or result.text,
+                metadata={
+                    "finish_reason": result.finish_reason,
+                    **reasoning_metadata(result.reasoning_summary, result.meta),
+                },
                 **trace_usage(result.stats),
             )
             return result

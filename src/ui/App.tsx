@@ -19,6 +19,8 @@ import {
   listDocuments,
   fetchFilterOptions,
   createConversation,
+  createSampleConversation,
+  fetchSamples,
   fetchMessages,
   updateConversation,
   fetchConversations,
@@ -31,8 +33,9 @@ import {
   type RequestStatsItem,
   type UserInfo,
   type DocumentListItemResponse,
-  type ActivityEvent,
+  type SamplesResponse,
 } from './services/api';
+import { AgentTimeline, type Timeline, applyActivityEvent, closeTimeline, emptyTimeline, timelinesFromMessages } from './components/AgentTimeline';
 import { useAuth } from './context/AuthContext';
 import { LoginPage } from './components/LoginPage';
 import { Button, Input, Badge, Card, ChatBubble, Toggle } from './components/ui';
@@ -350,358 +353,6 @@ const ingestionLabel = (doc: Document): string => {
   }
   return name;
 };
-// One *_started event plus its matching *_ended data, once it arrives.
-interface ActivityRecord {
-  event: ActivityEvent;
-  endedAt?: number;
-  endDetail?: Record<string, unknown>;
-}
-
-interface StageSnapshot {
-  stages: ActivityRecord[]; // stage_started records, in arrival order — no fixed reference list
-  rounds: ActivityRecord[]; // round_started records, in arrival order — no _ended kind exists
-  toolCalls: ActivityRecord[]; // tool_call_started records; event.parent_id groups them under a round
-  done: boolean;
-}
-
-// Applies one activity event to a snapshot. Used both live (SSE) and when replaying a
-// persisted `trace.activity` log on load — same fold, two sources.
-function applyActivityEvent(snap: StageSnapshot, ev: ActivityEvent): StageSnapshot {
-  switch (ev.kind) {
-    case 'stage_started':
-      if (snap.stages.some(r => r.event.id === ev.id)) return snap;
-      return { ...snap, stages: [...snap.stages, { event: ev }] };
-    case 'stage_ended':
-      return {
-        ...snap,
-        stages: snap.stages.map(r =>
-          r.event.id === ev.id ? { ...r, endedAt: ev.ts * 1000, endDetail: ev.detail } : r
-        ),
-      };
-    case 'round_started':
-      if (snap.rounds.some(r => r.event.id === ev.id)) return snap;
-      return { ...snap, rounds: [...snap.rounds, { event: ev }] };
-    case 'tool_call_started':
-      if (snap.toolCalls.some(r => r.event.id === ev.id)) return snap;
-      return { ...snap, toolCalls: [...snap.toolCalls, { event: ev }] };
-    case 'tool_call_ended':
-      return {
-        ...snap,
-        toolCalls: snap.toolCalls.map(r =>
-          r.event.id === ev.id ? { ...r, endedAt: ev.ts * 1000, endDetail: ev.detail } : r
-        ),
-      };
-    default:
-      return snap;
-  }
-}
-
-function snapshotFromActivityLog(events: ActivityEvent[]): StageSnapshot {
-  const folded = events.reduce(applyActivityEvent, { stages: [], rounds: [], toolCalls: [], done: true });
-  // The pipeline's final stage_ended fires after the trace snapshot used to persist
-  // `trace.activity` is taken (see tasks.py), so it's never in this log — close any
-  // still-open record here the same way the live SSE path does on completion.
-  const lastTs = events.length > 0 ? events[events.length - 1].ts * 1000 : Date.now();
-  const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: lastTs } : r);
-  return { ...folded, stages: folded.stages.map(closeOpen), toolCalls: folded.toolCalls.map(closeOpen) };
-}
-
-// Rehydrates agent-step snapshots for messages loaded from history, so they survive a
-// page reload instead of only existing for the duration of the live SSE stream.
-function stageSnapshotsFromMessages(
-  messages: { id: string; trace?: { activity?: ActivityEvent[] } | null }[]
-): Record<string, StageSnapshot> {
-  const result: Record<string, StageSnapshot> = {};
-  for (const m of messages) {
-    if (m.trace?.activity?.length) result[m.id] = snapshotFromActivityLog(m.trace.activity);
-  }
-  return result;
-}
-
-// Rounds of tool calls that occurred during one stage's time window, grouped by
-// parent_id rather than flattened — a repeat search on the same entity in a later
-// round reads as a second pass, not a duplicate row.
-function RoundsList({ rounds, toolCalls }: { rounds: ActivityRecord[]; toolCalls: ActivityRecord[] }) {
-  if (rounds.length === 0) return null;
-  return (
-    <div className="ml-8 mb-1 flex flex-col gap-2">
-      {rounds.map((round, ri) => {
-        const calls = toolCalls.filter(tc => tc.event.parent_id === round.event.id);
-        const lookups = calls.filter(tc => tc.event.detail?.tool !== 'report');
-        const reports = calls.filter(tc => tc.event.detail?.tool === 'report');
-        const allDone = calls.length > 0 && calls.every(tc => !!tc.endedAt);
-        const roundDur = allDone
-          ? ((Math.max(...calls.map(tc => tc.endedAt!)) - round.event.ts * 1000) / 1000).toFixed(1) + 's'
-          : null;
-        const summary = [
-          lookups.length > 0 ? `${lookups.length} lookup${lookups.length === 1 ? '' : 's'}` : null,
-          reports.length > 0 ? `${reports.length} report${reports.length === 1 ? '' : 's'}` : null,
-        ].filter(Boolean).join(', ') || '0 lookups';
-        return (
-          <div key={round.event.id}>
-            <div
-              className="inline-flex items-center gap-1 text-[9px] font-mono px-1.5 py-0.5 rounded mb-1"
-              style={{ background: 'var(--surface-2)', color: 'var(--text-faint)', border: '1px solid var(--border)' }}
-            >
-              round {ri + 1} · {summary}
-              {roundDur ? ` · ${roundDur}` : calls.length > 0 ? ' · running' : ''}
-            </div>
-            <div className="flex flex-col gap-1">
-              {calls.map((tc, ti) => {
-                const tcStartedAt = tc.event.ts * 1000;
-                const tcDone = !!tc.endedAt;
-                const tcDur = tc.endedAt
-                  ? ((tc.endedAt - tcStartedAt) / 1000).toFixed(2) + 's'
-                  : ((Date.now() - tcStartedAt) / 1000).toFixed(1) + 's';
-                const chunksReturned = tc.endDetail?.chunks_returned as number | undefined;
-                return (
-                  <div
-                    key={tc.event.id}
-                    className="tc-row-enter flex items-center gap-2"
-                    style={{ animationDelay: `${ti * 40}ms` }}
-                  >
-                    {/* Status dot */}
-                    <span
-                      className={tcDone ? 'tc-dot-pop' : ''}
-                      style={{
-                        display: 'inline-block',
-                        width: 6, height: 6,
-                        borderRadius: '50%',
-                        flexShrink: 0,
-                        background: tcDone ? 'var(--accent)' : 'var(--text-faint)',
-                        opacity: tcDone ? 0.8 : 0.35,
-                        transition: 'background 0.3s ease, opacity 0.3s ease',
-                      }}
-                    />
-
-                    {/* Entity name — shimmer while running, solid when done */}
-                    <span
-                      className={`text-[10px] leading-none ${!tcDone ? 'tc-shimmer' : ''}`}
-                      style={tcDone ? { color: 'var(--text-faint)' } : {}}
-                    >
-                      {tc.event.label}
-                    </span>
-
-                    {/* Chunk count badge — fades in on completion */}
-                    {chunksReturned !== undefined && (
-                      <span
-                        className="text-[9px] px-1 py-px rounded-full"
-                        style={{
-                          background: 'var(--surface-2)',
-                          color: 'var(--text-faint)',
-                          border: '1px solid var(--border)',
-                          opacity: tcDone ? 0.75 : 0,
-                          transition: 'opacity 0.4s ease',
-                        }}
-                      >
-                        {chunksReturned} chunks
-                      </span>
-                    )}
-
-                    {/* Elapsed time */}
-                    <span
-                      className="text-[9px] font-mono ml-1"
-                      style={{
-                        color: 'var(--text-faint)',
-                        opacity: tcDone ? 0.45 : 0.3,
-                        transition: 'opacity 0.3s ease',
-                      }}
-                    >
-                      {tcDur}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function AgentTimeline({ snapshot }: { snapshot: StageSnapshot }) {
-  const [expanded, setExpanded] = React.useState(false);
-  const [tick, setTick] = React.useState(0);
-  const activeStage = snapshot.done ? undefined : snapshot.stages[snapshot.stages.length - 1];
-  const prevStageIdRef = React.useRef(activeStage?.event.id);
-  const [labelKey, setLabelKey] = React.useState(0);
-
-  React.useEffect(() => {
-    if (activeStage?.event.id !== prevStageIdRef.current) {
-      prevStageIdRef.current = activeStage?.event.id;
-      setLabelKey(k => k + 1);
-    }
-  }, [activeStage?.event.id]);
-
-  React.useEffect(() => {
-    if (snapshot.done) return;
-    const id = setInterval(() => setTick(t => t + 1), 100);
-    return () => clearInterval(id);
-  }, [snapshot.done]);
-
-  void tick;
-
-  const first = snapshot.stages[0]?.event.ts;
-  const last = snapshot.stages[snapshot.stages.length - 1]?.endedAt;
-  const totalElapsed = snapshot.done
-    ? (first && last ? (last / 1000 - first).toFixed(1) : null)
-    : (first ? (Date.now() / 1000 - first).toFixed(1) : null);
-
-  const label = snapshot.done ? 'Done' : activeStage?.event.label ?? '…';
-
-  const activeRound = snapshot.done ? undefined : snapshot.rounds[snapshot.rounds.length - 1];
-  const activeRoundCalls = activeRound
-    ? snapshot.toolCalls.filter(tc => tc.event.parent_id === activeRound.event.id)
-    : [];
-  const activeRoundLookups = activeRoundCalls.filter(tc => tc.event.detail?.tool !== 'report').length;
-  const activeRoundReports = activeRoundCalls.filter(tc => tc.event.detail?.tool === 'report').length;
-
-  return (
-    <div className="pl-4 py-1">
-      {/* Collapsed pill */}
-      <button
-        onClick={() => setExpanded(e => !e)}
-        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[var(--border)] bg-[var(--surface-1)] hover:bg-[var(--surface-2)] text-xs"
-        style={{ transition: 'background 0.2s, border-color 0.2s' }}
-      >
-        {snapshot.done ? (
-          <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] opacity-60 flex-shrink-0" />
-        ) : (
-          <span className="relative flex h-2 w-2 flex-shrink-0">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[var(--accent)] opacity-40" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-[var(--accent)]" />
-          </span>
-        )}
-
-        <span
-          key={labelKey}
-          className="stage-label-change font-medium text-[var(--text)]"
-          style={{ minWidth: '7rem', textAlign: 'left' }}
-        >
-          {label}
-        </span>
-
-        {activeRound && (activeRoundLookups > 0 || activeRoundReports > 0) && (
-          <span className="text-[var(--text-faint)]">
-            round {snapshot.rounds.length}
-            {activeRoundLookups > 0 && ` · ${activeRoundLookups} lookup${activeRoundLookups === 1 ? '' : 's'}`}
-            {activeRoundReports > 0 && ' · recording findings'}
-          </span>
-        )}
-
-        {totalElapsed !== null && (
-          <span className="text-[var(--text-faint)]">· {totalElapsed}s</span>
-        )}
-
-        <ChevronDown
-          size={11}
-          className="text-[var(--text-faint)] ml-0.5"
-          style={{ transition: 'transform 0.25s ease', transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)' }}
-        />
-      </button>
-
-      {/* Expanded stepper */}
-      <div
-        className="grid"
-        style={{
-          gridTemplateRows: expanded ? '1fr' : '0fr',
-          opacity: expanded ? 1 : 0,
-          transition: 'grid-template-rows 0.3s ease, opacity 0.25s ease',
-        }}
-      >
-        <div className="overflow-hidden">
-          <div className="mt-2.5 ml-1 flex flex-col">
-            {snapshot.stages.map((rec, i) => {
-              const isDone = !!rec.endedAt;
-              const isActive = rec.event.id === activeStage?.event.id;
-              const startedAt = rec.event.ts * 1000;
-              const stageEnd = rec.endedAt ?? Infinity;
-              // Rounds that happened while THIS stage was open — not a flat trailing
-              // list, so they render under the stage that actually produced them.
-              const stageRounds = snapshot.rounds.filter(r => {
-                const t = r.event.ts * 1000;
-                return t >= startedAt && t < stageEnd;
-              });
-
-              const dur = rec.endedAt
-                ? ((rec.endedAt - startedAt) / 1000).toFixed(2) + 's'
-                : isActive
-                  ? ((Date.now() - startedAt) / 1000).toFixed(1) + 's'
-                  : null;
-
-              return (
-                <React.Fragment key={rec.event.id}>
-                  <div className="flex items-stretch gap-3">
-                    {/* Track column */}
-                    <div className="flex flex-col items-center flex-shrink-0" style={{ width: 14 }}>
-                      <div
-                        className="w-px flex-1"
-                        style={{
-                          minHeight: i === 0 ? 0 : 6,
-                          background: isDone || isActive ? 'var(--accent)' : 'var(--border)',
-                          transition: 'background 0.4s ease',
-                          visibility: i === 0 ? 'hidden' : 'visible',
-                        }}
-                      />
-                      <div
-                        style={{
-                          width: 12, height: 12,
-                          borderRadius: '50%',
-                          flexShrink: 0,
-                          border: `2px solid ${isDone || isActive ? 'var(--accent)' : 'var(--border)'}`,
-                          background: isDone ? 'var(--accent)' : 'transparent',
-                          transition: 'border-color 0.4s ease, background 0.4s ease',
-                          animation: isActive ? 'pulse 1.4s ease-in-out infinite' : undefined,
-                        }}
-                      />
-                      <div
-                        className="w-px flex-1"
-                        style={{
-                          minHeight: i === snapshot.stages.length - 1 ? 0 : 6,
-                          background: isDone ? 'var(--accent)' : 'var(--border)',
-                          transition: 'background 0.4s ease',
-                          visibility: i === snapshot.stages.length - 1 ? 'hidden' : 'visible',
-                        }}
-                      />
-                    </div>
-
-                    <div className="flex items-center gap-2 py-1" style={{ minHeight: 28 }}>
-                      <span
-                        className={`text-xs leading-tight ${isActive ? 'stage-label-change' : ''}`}
-                        style={{
-                          color: isActive ? 'var(--text)' : 'var(--text-faint)',
-                          fontWeight: isActive ? 500 : 400,
-                          transition: 'color 0.3s',
-                        }}
-                      >
-                        {rec.event.label}
-                      </span>
-                      {dur && (
-                        <span
-                          className="text-[10px] font-mono flex-shrink-0 ml-1"
-                          style={{
-                            color: 'var(--text-faint)',
-                            opacity: isActive ? 0.65 : 0.45,
-                            transition: 'opacity 0.3s',
-                          }}
-                        >
-                          {dur}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <RoundsList rounds={stageRounds} toolCalls={snapshot.toolCalls} />
-                </React.Fragment>
-              );
-            })}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function App() {
   const { authChecked, isAuthenticated, setAccessToken, logout } = useAuth();
 
@@ -718,6 +369,9 @@ export default function App() {
   // Data
   const [docs, setDocs] = useState<Document[]>([]);
   const [chats, setChats] = useState<Chat[]>([]);
+  const [samples, setSamples] = useState<SamplesResponse | null>(null);
+  const [startingSample, setStartingSample] = useState(false);
+  const [pendingSample, setPendingSample] = useState<{ chatId: string; text: string } | null>(null);
   const [filterOptions, setFilterOptions] = useState<{ companies: string[]; years: number[] }>({ companies: [], years: [] });
 
   // Messages (fetched from backend, keyed by conversationId)
@@ -754,8 +408,8 @@ export default function App() {
   const [inputMessage, setInputMessage] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
-  // keyed by assistant message id — persists the snapshot after streaming ends
-  const [stageSnapshots, setStageSnapshots] = useState<Record<string, StageSnapshot>>({});
+  // keyed by assistant message id — persists the timeline after streaming ends
+  const [timelines, setTimelines] = useState<Record<string, Timeline>>({});
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [isDocPickerOpen, setIsDocPickerOpen] = useState(false);
 
@@ -973,10 +627,20 @@ export default function App() {
           title: c.title ?? 'Untitled',
           createdAt: new Date(c.created_at).getTime(),
           conversationId: c.id,
+          isSample: c.is_sample,
         }));
         setChats(mapped);
       })
       .catch(err => console.error('Failed to load conversations:', err));
+    return () => { cancelled = true; };
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    fetchSamples()
+      .then(res => { if (!cancelled) setSamples(res); })
+      .catch(err => console.error('Failed to load samples:', err));
     return () => { cancelled = true; };
   }, [isAuthenticated]);
 
@@ -1008,7 +672,7 @@ export default function App() {
         const response = await fetchMessages(conversationId, { limit: 50 });
         if (!cancelled) {
           setMessagesByConversation(prev => ({ ...prev, [conversationId]: response.messages.map(toUiMessage) }));
-          setStageSnapshots(prev => ({ ...stageSnapshotsFromMessages(response.messages), ...prev }));
+          setTimelines(prev => ({ ...timelinesFromMessages(response.messages), ...prev }));
           setMessagesHasMore(prev => ({ ...prev, [conversationId]: response.has_more }));
           if (response.messages.length > 0) {
             const minSeq = Math.min(...response.messages.map(m => m.seq));
@@ -1051,7 +715,7 @@ export default function App() {
                   uniqueMessages.sort((a, b) => a.timestamp - b.timestamp);
                   return { ...prev, [conversationId]: uniqueMessages };
                 });
-                setStageSnapshots(prev => ({ ...stageSnapshotsFromMessages(response.messages), ...prev }));
+                setTimelines(prev => ({ ...timelinesFromMessages(response.messages), ...prev }));
                 setMessagesHasMore(prev => ({ ...prev, [conversationId]: response.has_more }));
                 if (response.messages.length > 0) {
                   const newMinSeq = Math.min(...response.messages.map(m => m.seq));
@@ -1124,6 +788,11 @@ export default function App() {
       });
     }, []
   );
+
+  // Stream ended or failed: no further activity events will arrive.
+  const closeLiveTimeline = useCallback((msgId: string) => {
+    setTimelines(tls => (tls[msgId] ? { ...tls, [msgId]: closeTimeline(tls[msgId]) } : tls));
+  }, []);
 
   const appendMessage = useCallback(
     (conversationId: string, msg: Message) => {
@@ -1200,44 +869,13 @@ export default function App() {
           if (chunk.stats) fetchStats(conversationId);
           setIsTyping(false);
           setIsAwaitingResponse(false);
-          // Mark snapshot done and close any still-open stage/tool-call rows
-          setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId];
-            if (!prev) return snaps;
-            const now = Date.now();
-            const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: now } : r);
-            return {
-              ...snaps,
-              [placeholderId]: {
-                stages: prev.stages.map(closeOpen),
-                rounds: prev.rounds,
-                toolCalls: prev.toolCalls.map(closeOpen),
-                done: true,
-              },
-            };
-          });
+          closeLiveTimeline(placeholderId);
         },
         (error) => {
           updateMessage(conversationId, placeholderId, m => ({ ...m, content: m.content || `Error: ${error.message}` }));
           setIsTyping(false);
           setIsAwaitingResponse(false);
-          // Mark snapshot done and close any still-open stage/tool-call rows so the
-          // agent timeline stops ticking — no further activity events will arrive.
-          setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId];
-            if (!prev) return snaps;
-            const now = Date.now();
-            const closeOpen = (r: ActivityRecord) => (r.endedAt === undefined ? { ...r, endedAt: now } : r);
-            return {
-              ...snaps,
-              [placeholderId]: {
-                stages: prev.stages.map(closeOpen),
-                rounds: prev.rounds,
-                toolCalls: prev.toolCalls.map(closeOpen),
-                done: true,
-              },
-            };
-          });
+          closeLiveTimeline(placeholderId);
         },
         undefined,
         (meta) => {
@@ -1247,10 +885,7 @@ export default function App() {
           }));
         },
         (ev) => {
-          setStageSnapshots(snaps => {
-            const prev = snaps[placeholderId] ?? { stages: [], rounds: [], toolCalls: [], done: false };
-            return { ...snaps, [placeholderId]: applyActivityEvent(prev, ev) };
-          });
+          setTimelines(tls => ({ ...tls, [placeholderId]: applyActivityEvent(tls[placeholderId] ?? emptyTimeline(), ev) }));
         },
         (ev) => {
           setChats(prev => prev.map(c =>
@@ -1275,16 +910,20 @@ export default function App() {
     }
   };
 
-  const handleCitationClick = (citation: Citation) => {
-    const doc = docs.find(d => d.id === citation.docId);
-    if (!doc) return;
+  const openPdfTab = (doc: Document, page: number) => {
     setIsEvidenceOpen(true); setMobileTab('EVIDENCE');
     setOpenPdfTabs(prev => {
       const exists = prev.find(p => p.doc.id === doc.id);
-      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page: citation.page } : p);
-      return [...prev, { doc, page: citation.page }];
+      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page } : p);
+      return [...prev, { doc, page }];
     });
     setActivePdfDocId(doc.id);
+  };
+
+  const handleCitationClick = (citation: Citation) => {
+    const doc = docs.find(d => d.id === citation.docId);
+    if (!doc) return;
+    openPdfTab(doc, citation.page);
     setActiveHighlight(citation.bboxHints?.length ? { bboxes: citation.bboxHints, label: '' } : undefined);
   };
 
@@ -1299,14 +938,7 @@ export default function App() {
       status: 'Ready' as const,
       tags: [],
     };
-    setIsEvidenceOpen(true); setMobileTab('EVIDENCE');
-    const page = ref.pageNumbers[0] || 1;
-    setOpenPdfTabs(prev => {
-      const exists = prev.find(p => p.doc.id === doc.id);
-      if (exists) return prev.map(p => p.doc.id === doc.id ? { ...p, page } : p);
-      return [...prev, { doc, page }];
-    });
-    setActivePdfDocId(doc.id);
+    openPdfTab(doc, ref.pageNumbers[0] || 1);
     setActiveHighlight(
       ref.bboxHints?.length
         ? { bboxes: ref.bboxHints, label: ref.displayLabel, chunkId: ref.chunkId }
@@ -1331,6 +963,49 @@ export default function App() {
       console.error('Failed to create conversation:', error);
       alert('Failed to create conversation. Please try again.');
     }
+  };
+
+  const sampleDoc = samples?.documents[0];
+
+  const handleSampleQuestion = async (text: string) => {
+    if (startingSample) return;
+    setStartingSample(true);
+    try {
+      const { conversation_id } = await createSampleConversation();
+      const chat: Chat = {
+        id: conversation_id,
+        title: `Sample: ${sampleDoc?.title ?? 'document'}`,
+        createdAt: Date.now(),
+        conversationId: conversation_id,
+        isSample: true,
+      };
+      setChats(prev => [chat, ...prev]);
+      setActiveChatId(chat.id);
+      setMessagesByConversation(prev => ({ ...prev, [conversation_id]: [] }));
+      setPendingSample({ chatId: chat.id, text });
+      if (window.innerWidth < 768) setIsSidebarOpen(false);
+    } catch (error) {
+      console.error('Failed to start sample chat:', error);
+      alert('Failed to start the sample chat. Please try again.');
+    } finally {
+      setStartingSample(false);
+    }
+  };
+
+  // handleSendMessage reads the active chat, so the question goes once the new chat is active.
+  useEffect(() => {
+    if (!pendingSample || activeChat?.id !== pendingSample.chatId) return;
+    setPendingSample(null);
+    void handleSendMessage(pendingSample.text);
+  }, [pendingSample, activeChat?.id]);
+
+  const openSampleDoc = () => {
+    if (!sampleDoc) return;
+    openPdfTab(
+      { id: sampleDoc.id, title: sampleDoc.title, company: '', year: 0, type: '', pages: 0, status: 'Ready', tags: [] },
+      1,
+    );
+    setActiveHighlight(undefined);
   };
 
   const handleDeleteRequest = (e: React.MouseEvent, id: string) => {
@@ -1407,7 +1082,10 @@ export default function App() {
             onClick={e => e.stopPropagation()}
           />
         ) : (
-          <div className="truncate text-sm font-medium pr-1 flex-1 min-w-0">{chat.title}</div>
+          <div className="flex items-center gap-1.5 pr-1 flex-1 min-w-0">
+            {chat.isSample && <Badge variant="accent" className="shrink-0">Sample</Badge>}
+            <div className="truncate text-sm font-medium">{chat.title}</div>
+          </div>
         )}
         {editingChatId !== chat.id && (
           <div className="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1549,6 +1227,25 @@ export default function App() {
           <Button onClick={handleNewChat} className="mb-6">
             <Plus size={16} className="mr-2" /> Start New Chat
           </Button>
+          {sampleDoc && samples && samples.questions.length > 0 && (
+            <div className="w-full max-w-xl">
+              <p className="text-xs text-[var(--text-faint)] mb-3">
+                Or try a sample document: {sampleDoc.title}
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {samples.questions.map(q => (
+                  <button
+                    key={q.id}
+                    onClick={() => handleSampleQuestion(q.text)}
+                    disabled={startingSample}
+                    className="text-left text-sm p-3 rounded-lg border border-[var(--border)] bg-[var(--surface-1)] text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--text)] transition-colors disabled:opacity-50"
+                  >
+                    {q.text}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       );
     }
@@ -1560,14 +1257,31 @@ export default function App() {
 
     return (
       <div className="flex-1 flex flex-col min-w-0 h-full pb-14 md:pb-0">
-        <ScopeBar
-          scope={scope}
-          docCount={activeDocsCount}
-          onModeChange={m => setScope(s => ({ ...s, mode: m }))}
-          onFilterChange={f => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
-          onAddFiles={() => setIsDocPickerOpen(true)}
-          filterOptions={filterOptions}
-        />
+        {activeChat?.isSample ? (
+          <div className="flex items-center gap-3 px-4 h-14 border-b border-[var(--border)] bg-[var(--surface-1)] shrink-0 min-w-0">
+            <Badge variant="accent" className="shrink-0">Sample</Badge>
+            <span className="text-sm text-[var(--text-muted)] truncate">
+              {sampleDoc?.title ?? 'Sample document'}
+            </span>
+            {sampleDoc && (
+              <button
+                onClick={openSampleDoc}
+                className="ml-auto flex items-center gap-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--accent)] shrink-0"
+              >
+                <FileText size={14} /> View PDF
+              </button>
+            )}
+          </div>
+        ) : (
+          <ScopeBar
+            scope={scope}
+            docCount={activeDocsCount}
+            onModeChange={m => setScope(s => ({ ...s, mode: m }))}
+            onFilterChange={f => setScope(s => ({ ...s, filters: { ...s.filters, ...f } }))}
+            onAddFiles={() => setIsDocPickerOpen(true)}
+            filterOptions={filterOptions}
+          />
+        )}
 
         {/* Messages */}
         <div ref={messagesContainerRef} className="flex-1 overflow-y-auto min-h-0 p-4 md:p-8 pb-32 md:pb-8">
@@ -1614,8 +1328,8 @@ export default function App() {
                     )}
 
                     <div className={`space-y-2 ${msg.role === 'user' ? 'flex flex-col items-end ml-[15%] max-w-[85%]' : 'flex-1 min-w-0'}`}>
-                      {msg.role === 'assistant' && stageSnapshots[msg.id] && (
-                        <AgentTimeline snapshot={stageSnapshots[msg.id]} />
+                      {msg.role === 'assistant' && timelines[msg.id] && (
+                        <AgentTimeline timeline={timelines[msg.id]} />
                       )}
                       {msg.role === 'assistant' && (msg.metadata as MessageMetadata)?.route === 'retrieval' && (msg.metadata as MessageMetadata)?.confidence && ['low', 'none'].includes((msg.metadata as MessageMetadata).confidence!) && (
                         <div className="pl-4 mb-1">
@@ -1733,13 +1447,13 @@ export default function App() {
 
               {/* Typing indicator — shown while placeholder message has no content yet */}
               {isTyping && activeMessages[activeMessages.length - 1]?.content === '' && (() => {
-                const placeholderSnap = stageSnapshots[activeMessages[activeMessages.length - 1]?.id ?? ''];
+                const placeholderTimeline = timelines[activeMessages[activeMessages.length - 1]?.id ?? ''];
                 return (
                   <div className="flex gap-3 items-start max-w-[var(--content-max)] mx-auto">
                     <div className="w-8 h-8 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent)] border-opacity-20 flex items-center justify-center flex-shrink-0">
                       <Sparkles size={16} className="text-[var(--accent)]" />
                     </div>
-                    {placeholderSnap && <AgentTimeline snapshot={placeholderSnap} />}
+                    {placeholderTimeline && <AgentTimeline timeline={placeholderTimeline} />}
                   </div>
                 );
               })()}

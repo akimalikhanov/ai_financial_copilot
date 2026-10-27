@@ -16,6 +16,7 @@ import respx
 
 from src.services.llm_adapters.base_adapter import ChatMessage, ImagePart, Role, ToolCallRef
 from src.services.llm_adapters.openai_adapter import OpenAIAdapter
+from src.services.llm_runtime.exceptions import LLMConnectionError
 
 BASE_URL = "http://openai-test/v1"
 PNG = b"\x89PNG\r\n\x1a\n" + b"payload"
@@ -225,7 +226,10 @@ class TestUnsupportedSurfaces:
                 headers={"content-type": "text/event-stream"},
                 content=b'data: {"id":"1","object":"chat.completion.chunk","created":0,'
                 b'"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hi"},'
-                b'"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+                b'"finish_reason":null}]}\n\n'
+                b'data: {"id":"1","object":"chat.completion.chunk","created":0,'
+                b'"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},'
+                b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
             )
         )
         adapter = _adapter()
@@ -234,3 +238,144 @@ class TestUnsupportedSurfaces:
         finally:
             await adapter.close()
         assert "".join(c.text for c in chunks) == "hi"
+
+
+def _sse(*chunks: dict) -> bytes:
+    """A chat.completion.chunk stream: one `choices` delta per dict, then [DONE]."""
+    lines = []
+    for c in chunks:
+        payload = {"id": "1", "object": "chat.completion.chunk", "created": 0, "model": "m"}
+        payload.update(c)
+        lines.append(f"data: {json.dumps(payload)}\n\n")
+    return ("".join(lines) + "data: [DONE]\n\n").encode()
+
+
+def _delta(text: str | None = None, finish: str | None = None) -> dict:
+    delta = {"content": text} if text is not None else {}
+    return {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+
+_USAGE_CHUNK = {
+    "choices": [],
+    "usage": {
+        "prompt_tokens": 100,
+        "completion_tokens": 5,
+        "total_tokens": 105,
+        "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 60},
+    },
+}
+
+
+async def _stream(body: bytes, adapter: OpenAIAdapter | None = None) -> list:
+    respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=body
+        )
+    )
+    adapter = adapter or _adapter()
+    try:
+        return [c async for c in adapter.stream([ChatMessage(role=Role.user, content="x")])]
+    finally:
+        await adapter.close()
+
+
+class TestFinishReason:
+    @respx.mock
+    async def test_complete_reports_finish_reason(self) -> None:
+        body = _completion()
+        body["choices"][0]["finish_reason"] = "length"
+        respx.post(f"{BASE_URL}/chat/completions").mock(return_value=httpx.Response(200, json=body))
+        adapter = _adapter()
+        try:
+            resp = await adapter.complete([ChatMessage(role=Role.user, content="x")])
+        finally:
+            await adapter.close()
+        assert resp.finish_reason == "length"
+
+    @respx.mock
+    async def test_stream_final_chunk_carries_finish_reason_and_stats(self) -> None:
+        chunks = await _stream(_sse(_delta("hi"), _delta(finish="length"), _USAGE_CHUNK))
+        final = chunks[-1]
+        assert final.is_final and final.finish_reason == "length"
+        assert sum(c.is_final for c in chunks) == 1
+        assert final.stats.cached_input_tokens == 40
+        assert final.stats.cache_write_tokens == 60
+
+    @respx.mock
+    async def test_stream_without_usage_still_ends_with_a_final_chunk(self) -> None:
+        """vLLM runs with include_usage off: no usage chunk, but the stop reason must land."""
+        adapter = OpenAIAdapter(
+            default_model="m", api_key="k", base_url=BASE_URL, include_usage=False
+        )
+        chunks = await _stream(_sse(_delta("hi"), _delta(finish="stop")), adapter)
+        assert [c.text for c in chunks] == ["hi", ""]
+        assert chunks[-1].is_final and chunks[-1].finish_reason == "stop"
+        assert chunks[-1].stats is None
+
+    @respx.mock
+    async def test_dropped_stream_raises(self) -> None:
+        """No finish_reason means the connection dropped mid-answer: never a clean end."""
+        with pytest.raises(LLMConnectionError):
+            await _stream(_sse(_delta("partial answer")))
+
+
+class TestReasoningCapability:
+    """`capabilities.reasoning`, not the model name, decides the parameter set."""
+
+    @staticmethod
+    async def _sent(capabilities: dict, model: str = "gpt-5-mini") -> dict:
+        route = _route()
+        adapter = OpenAIAdapter(
+            default_model=model, api_key="k", base_url=BASE_URL, capabilities=capabilities
+        )
+        try:
+            await adapter.complete(
+                [ChatMessage(role=Role.user, content="x")],
+                temperature=0.0,
+                max_tokens=50,
+                reasoning_effort="low",
+                verbosity="low",
+            )
+        finally:
+            await adapter.close()
+        return json.loads(route.calls.last.request.content)
+
+    @respx.mock
+    async def test_reasoning_model_drops_temperature(self) -> None:
+        sent = await self._sent({"reasoning": True}, model="gpt-6-astra")
+        assert "temperature" not in sent
+        assert sent["max_completion_tokens"] == 50 and "max_tokens" not in sent
+        assert sent["reasoning_effort"] == "low" and sent["verbosity"] == "low"
+
+    @respx.mock
+    async def test_non_reasoning_model_keeps_temperature(self) -> None:
+        sent = await self._sent({}, model="gpt-5-chat-latest")
+        assert sent["temperature"] == 0.0 and sent["max_tokens"] == 50
+        assert "reasoning_effort" not in sent and "verbosity" not in sent
+
+
+class TestPromptCacheKey:
+    @staticmethod
+    async def _sent(**adapter_kw) -> dict:
+        route = _route()
+        adapter = OpenAIAdapter(default_model="m", api_key="k", base_url=BASE_URL, **adapter_kw)
+        try:
+            await adapter.complete(
+                [ChatMessage(role=Role.user, content="x")], prompt_cache_key="router:v3"
+            )
+        finally:
+            await adapter.close()
+        return json.loads(route.calls.last.request.content)
+
+    @respx.mock
+    async def test_sent_to_openai(self) -> None:
+        assert (await self._sent())["prompt_cache_key"] == "router:v3"
+
+    @respx.mock
+    async def test_dropped_when_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_PROMPT_CACHE_KEY_ENABLED", "false")
+        assert "prompt_cache_key" not in await self._sent()
+
+    @respx.mock
+    async def test_dropped_for_vllm(self) -> None:
+        assert "prompt_cache_key" not in await self._sent(provider_name="vllm")

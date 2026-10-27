@@ -30,6 +30,7 @@ _FAKE_SESSION = cast(AsyncSession, _fake_session())
 
 class FakeLLM:
     provider = "fake"
+    api = "fake"
 
     def __init__(self, text: str = "", delay: float = 0.0, events: list[str] | None = None) -> None:
         self._text = text

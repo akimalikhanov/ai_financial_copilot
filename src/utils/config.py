@@ -301,6 +301,19 @@ def get_llm_max_retries() -> int:
     return int(os.getenv("LLM_MAX_RETRIES", "1"))
 
 
+def get_llm_prompt_cache_key_enabled() -> bool:
+    """LLM_PROMPT_CACHE_KEY_ENABLED (default: true). Send `prompt_cache_key` to OpenAI, so
+    requests sharing a long prefix are routed to the same cache. Off is the escape hatch if
+    the routing hurts hit rates."""
+    return _parse_bool(os.getenv("LLM_PROMPT_CACHE_KEY_ENABLED"), True)
+
+
+def get_llm_reasoning_summary_max_chars() -> int:
+    """LLM_REASONING_SUMMARY_MAX_CHARS (default 4000). Cap on the reasoning summary kept per
+    call, on the `llm_requests` row and on trace spans."""
+    return int(os.getenv("LLM_REASONING_SUMMARY_MAX_CHARS", "4000"))
+
+
 def get_max_open_streams() -> int:
     """SSE streams one API pod serves before /readyz sheds traffic (MAX_OPEN_STREAMS,
     default 200).
@@ -418,6 +431,12 @@ def get_agent_trace_chunk_chars() -> int:
     GENERATION input carries LANGFUSE_TRACE_EXCERPT_CHARS of it (AGENT_TRACE_CHUNK_CHARS,
     default 200)."""
     return int(os.getenv("AGENT_TRACE_CHUNK_CHARS", "200"))
+
+
+def get_agent_activity_max_sources() -> int:
+    """Documents listed on one search row of the agent timeline
+    (AGENT_ACTIVITY_MAX_SOURCES, default 2)."""
+    return int(os.getenv("AGENT_ACTIVITY_MAX_SOURCES", "2"))
 
 
 # --- Redis ---
@@ -1329,6 +1348,30 @@ def get_eval_user_id() -> UUID | None:
     if not raw:
         return None
     return UUID(raw)
+
+
+def get_demo_user_id() -> UUID | None:
+    """DEMO_USER_ID: owner of the sample corpus. Unset disables the sample feature."""
+    raw = os.getenv("DEMO_USER_ID")
+    return UUID(raw) if raw else None
+
+
+def get_demo_user_email() -> str:
+    return os.getenv("DEMO_USER_EMAIL", "demo@sample.invalid")
+
+
+def get_sample_manifest_path() -> Path:
+    raw = os.getenv("SAMPLE_MANIFEST_PATH")
+    return Path(raw) if raw else get_project_root() / "seed" / "sample" / "manifest.yaml"
+
+
+def get_sample_seed_timeout_seconds() -> float:
+    """How long the seed command waits for ingestion to finish (default 900)."""
+    return float(os.getenv("SAMPLE_SEED_TIMEOUT_SECONDS", "900"))
+
+
+def get_sample_seed_poll_seconds() -> float:
+    return float(os.getenv("SAMPLE_SEED_POLL_SECONDS", "5"))
 
 
 def get_eval_judge_model() -> str:

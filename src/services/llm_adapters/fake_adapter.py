@@ -147,6 +147,7 @@ class FakeAdapter(LLMAdapter):
     """No network calls, no cost, sampled or fixed latency. See module docstring."""
 
     provider_name = "fake"
+    api = "fake"
 
     def __init__(self, *, default_model: str):
         super().__init__(default_model=default_model)

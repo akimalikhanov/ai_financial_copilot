@@ -27,6 +27,8 @@ models:
       streaming: true
       tool_calling: true
       vision: true
+      # Takes reasoning_effort/verbosity and max_completion_tokens; rejects temperature.
+      reasoning: true
     params_override: {temperature: 1.0, max_tokens: 6000, verbosity: high, reasoning_effort: high}
     # Same-provider fallback: smallest quality drop, still a reasoning-tier model.
     # Covers capacity/rollout issues on the gpt-5.2 SKU specifically, not a full
@@ -53,7 +55,8 @@ models:
       # Accepts tool_choice={"type": "allowed_tools"} on chat/completions.
       allowed_tools: true
       vision: true
-    # max_tokens maps to max_completion_tokens for GPT-5 models, which counts reasoning
+      reasoning: true
+    # max_tokens maps to max_completion_tokens for reasoning models, which counts reasoning
     # tokens too. The global default (2000) starves the answer at high reasoning_effort
     # (reasoning consumes the whole budget -> empty output), so give reasoning room here.
     #
@@ -61,15 +64,42 @@ models:
     # wide aspect sets but never issuing gap-targeted follow-up searches or acting on its
     # own medium/low confidence labels before reporting - a multi-step self-monitoring
     # judgment low effort was skipping, not a prompt wording issue (see agent/loop.py
-    # analytical-shape traces from 2026-08-05). gpt-5.4-mini was tried first but OpenAI
-    # rejects reasoning_effort + tool calling together on /v1/chat/completions for that
-    # model (needs /v1/responses, which OpenAIAdapter doesn't implement) - stuck with
-    # gpt-5-mini, which supports this combination on chat/completions today.
+    # analytical-shape traces from 2026-08-05). gpt-5.4-mini and newer need `api: responses`
+    # for reasoning_effort + tool calling.
     params_override: {temperature: 1.0, reasoning_effort: medium, verbosity: low, max_tokens: 6000}
     # Same-provider fallback for the agent tool-calling loop (AGENT_TOOL_MODEL).
     # gpt-4o-mini has no reasoning_effort/verbosity tuning, so agent reasoning
     # quality drops, but the loop keeps functioning instead of failing outright.
     fallback_model: gpt-4o-mini
+
+  # Responses API test entry: point AGENT_TOOL_MODEL here to exercise the loop on Responses.
+  - id: gpt-5.6-luna
+    label: "OpenAI GPT-5.6 Luna"
+    provider: openai
+    model_name: "gpt-5.6-luna"
+    api: responses
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: ${GPT5_6_LUNA_INPUT_PRICE:-0.00020}
+      output: ${GPT5_6_LUNA_OUTPUT_PRICE:-0.00120}
+      cached_input: ${GPT5_6_LUNA_CACHED_INPUT_PRICE:-0.000020}
+      cache_write_input: ${GPT5_6_LUNA_CACHE_WRITE_INPUT_PRICE:-0.00025}
+      cached_output: null
+      rounding: exact
+      effective: 2026-07-30
+      notes: "OpenAI standard pricing (per 1M: $0.20 in, $0.02 cached in, $0.25 cache write, $1.20 out)."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      allowed_tools: true
+      vision: true
+      reasoning: true
+    params_override:
+      {temperature: 1.0, reasoning_effort: medium, verbosity: low, max_tokens: 6000,
+       reasoning_summary: "${GPT5_6_LUNA_REASONING_SUMMARY:-auto}",
+       reasoning_context: "${GPT5_6_LUNA_REASONING_CONTEXT:-}"}
+    fallback_model: gpt-5-mini
 
   - id: gpt-4o-mini
     label: "OpenAI GPT-4o-mini"

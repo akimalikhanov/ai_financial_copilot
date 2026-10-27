@@ -12,10 +12,13 @@ from collections.abc import AsyncGenerator
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
 
 from src.redis_client import get_chat_tail
-from src.services.llm_adapters.base_adapter import LLMStreamChunk
+from src.services.llm_adapters.base_adapter import LLMResponseStats, LLMStreamChunk
+from src.services.llm_adapters.openai_responses_adapter import OpenAIResponsesAdapter
 from tests.integration.conftest import MOCK_RESPONSE, MockStreamingLLM, create_agentic_router
 
 
@@ -359,6 +362,8 @@ async def test_clarification_card_reply_and_binding(
     assert card["outcome"] == "entities"
     [entity] = card["unresolved"]
     assert entity["outcome"] == "ambiguous"
+    live = [d["detail"] for t, d in events if t == "activity" and d["kind"] == "outcome"]
+    assert live == [{"status": "ok", "text": "", "lines": [], "hidden": True}]
     assert {c["company"] for c in entity["candidates"]} == {
         "Aurora Innovation, Inc.",
         "Aurora Mobile Limited",
@@ -384,8 +389,272 @@ async def test_clarification_card_reply_and_binding(
     assert [m["role"] for m in msgs] == ["user", "assistant", "assistant"]
     assert msgs[1]["metadata"]["kind"] == "clarification"
     assert msgs[1]["metadata"]["answered"] is True
+    # The card's timeline survives a reload, ending in the same outcome.
+    persisted = [e["detail"] for e in msgs[1]["trace"]["activity"] if e["kind"] == "outcome"]
+    assert persisted == live
 
     # 3. A later mention of "aurora" uses the binding: no second card.
     events = await _chat(async_client, headers, conversation_id, content="and aurora's debt?")
     assert not [d for t, d in events if t == "scope_clarification"]
     assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+
+
+_MERGER_ROUTER_JSON = json.dumps(
+    {
+        "route": "retrieval",
+        "entities": [
+            {"name": "Origin Bancorp", "entity_type": "company", "raw_span": "Origin Bancorp"},
+            {"name": "BTH", "entity_type": "company", "raw_span": "BTH"},
+        ],
+        "user_intent": "single_lookup",
+        "reasoning": "names two companies",
+        "query_shape": "extraction",
+    }
+)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_clarification_skip_searches_without_the_entity(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BTH matches nothing: "Search without it" answers from Origin alone, and stays answered."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.document import Document
+    from src.models.user import User
+    from src.services.router.company_name import normalize_company
+
+    router = create_agentic_router(MockStreamingLLM(router_json=_MERGER_ROUTER_JSON))
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"skip-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    async with get_session_factory()() as s:
+        user_id = (await s.execute(select(User.id).where(User.email == email))).scalar_one()
+        s.add(
+            Document(
+                user_id=user_id,
+                original_filename="origin.pdf",
+                storage_key=f"uploads/{uuid4()}.pdf",
+                status="ready",
+                document_metadata={"company": "Origin Bancorp", "year": "2022"},
+                company_norm=normalize_company("Origin Bancorp"),
+            )
+        )
+        await s.commit()
+    conv = await async_client.post("/v1/conversations", json={"title": "c"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+    question = "How did the merger with BTH affect Origin Bancorp's provision?"
+
+    events = await _chat(async_client, headers, conversation_id, content=question)
+    [card] = [d for t, d in events if t == "scope_clarification"]
+    assert card["resolved"] == ["Origin Bancorp"]
+    assert [(u["raw_span"], u["outcome"]) for u in card["unresolved"]] == [("BTH", "none")]
+
+    reply = {
+        "clarification_id": card["clarification_id"],
+        "picks": [{"raw_span": "BTH", "skip": True}],
+    }
+    events = await _chat(
+        async_client, headers, conversation_id, content=question, clarification_reply=reply
+    )
+    assert not [d for t, d in events if t == "scope_clarification"]
+    assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+
+    events = await _chat(async_client, headers, conversation_id, content=question)
+    assert not [d for t, d in events if t == "scope_clarification"]
+
+
+def _responses_adapter(terminal: str) -> OpenAIResponsesAdapter:
+    """The real Responses adapter, served one SSE stream by an in-process transport."""
+    response = {
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-5.6-luna",
+        "status": terminal,
+        "incomplete_details": {"reason": "max_output_tokens"} if terminal == "incomplete" else None,
+        "output": [
+            {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "Weighed the segment table."}],
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": terminal,
+                "content": [{"type": "output_text", "text": MOCK_RESPONSE, "annotations": []}],
+            },
+        ],
+        "reasoning": {"effort": "medium", "context": "all_turns"},
+        "service_tier": "default",
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 50},
+            "output_tokens": 20,
+            "output_tokens_details": {"reasoning_tokens": 12},
+            "total_tokens": 120,
+        },
+    }
+    events = [
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 1,
+            "content_index": 0,
+            "delta": MOCK_RESPONSE,
+            "sequence_number": 1,
+        },
+        {"type": f"response.{terminal}", "response": response, "sequence_number": 2},
+    ]
+    body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+
+    def _serve(request: httpx.Request) -> httpx.Response:
+        # Conversation naming makes a non-streaming call to the same model.
+        if not json.loads(request.content).get("stream"):
+            return httpx.Response(200, json=response)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    adapter = OpenAIResponsesAdapter(
+        default_model="gpt-5.6-luna", capabilities={"reasoning": True}, api_key="k"
+    )
+    adapter._client = AsyncOpenAI(
+        api_key="k",
+        base_url="http://openai-test/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(_serve)),
+    )
+    return adapter
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["completed", "incomplete"])
+async def test_responses_answer_persists_summary_and_meta(
+    async_client, monkeypatch: pytest.MonkeyPatch, terminal: str
+) -> None:
+    """An answer streamed over the Responses API keeps its reasoning summary and the
+    response's reasoning context and service tier; one cut off at the cap is flagged."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.llm_request import LLMRequest
+
+    router = create_agentic_router(chat_adapter=_responses_adapter(terminal))  # type: ignore[arg-type]
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"responses-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    conv = await async_client.post("/v1/conversations", json={"title": "t"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+
+    events = await _chat(async_client, headers, conversation_id, content="Hello")
+    assert MOCK_RESPONSE in "".join(d.get("text", "") for t, d in events if t == "delta")
+    [usage] = [d for t, d in events if t == "usage" and d.get("persisted")]
+    assert usage["stats"]["cache_write_tokens"] == 50
+
+    msgs = (
+        await async_client.get(f"/v1/conversations/{conversation_id}/messages", headers=headers)
+    ).json()["messages"]
+    expected_finish = "length" if terminal == "incomplete" else None
+    assert msgs[-1]["metadata"].get("finish_reason") == expected_finish
+
+    async with get_session_factory()() as s:
+        row = (
+            await s.execute(
+                select(LLMRequest).where(
+                    LLMRequest.conversation_id == conversation_id,
+                    LLMRequest.parent_request_id.is_(None),
+                )
+            )
+        ).scalar_one()
+    assert row.status == "completed"
+    assert row.llm_api == "responses"
+    assert row.reasoning_summary == "Weighed the segment table."
+    assert row.cache_write_tokens == 50
+    assert row.request_params["reasoning_context"] == "all_turns"
+    assert row.request_params["service_tier"] == "default"
+
+
+class _MockTruncatedLLM(MockStreamingLLM):
+    """Streams an answer that stops at the token cap."""
+
+    def stream(self, *_args: Any, **_kwargs: Any) -> AsyncGenerator[LLMStreamChunk, None]:
+        async def _gen() -> AsyncGenerator[LLMStreamChunk, None]:
+            yield LLMStreamChunk(text=self._response_text)
+            yield LLMStreamChunk(
+                text="",
+                is_final=True,
+                finish_reason="length",
+                stats=LLMResponseStats(
+                    input_tokens=100, cached_input_tokens=40, cache_write_tokens=60, output_tokens=5
+                ),
+            )
+
+        return _gen()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_truncated_answer_is_persisted_and_flagged(
+    async_client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cut-off answer is kept and shown, but flagged — not a silent normal completion."""
+    from sqlalchemy import select
+
+    from src.db import get_session_factory
+    from src.models.llm_request import LLMRequest
+
+    router = create_agentic_router(chat_adapter=_MockTruncatedLLM())
+    monkeypatch.setattr("src.services.llm_router.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks.get_router", lambda *_a, **_k: router)
+    monkeypatch.setattr("src.services.chat.tasks._router", router)
+
+    email = f"truncated-{uuid4().hex}@test.com"
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": email, "password": "testpass123"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+    conv = await async_client.post("/v1/conversations", json={"title": "t"}, headers=headers)
+    conversation_id = str(conv.json()["conversation_id"])
+
+    events = await _chat(async_client, headers, conversation_id, content="Hello")
+    [usage] = [d for t, d in events if t == "usage" and d.get("persisted")]
+    assert usage["finish_reason"] == "length"
+    assert usage["stats"]["cache_write_tokens"] == 60
+
+    msgs = (
+        await async_client.get(f"/v1/conversations/{conversation_id}/messages", headers=headers)
+    ).json()["messages"]
+    assert MOCK_RESPONSE in msgs[-1]["content"]
+    assert msgs[-1]["metadata"]["finish_reason"] == "length"
+
+    async with get_session_factory()() as s:
+        row = (
+            await s.execute(
+                select(LLMRequest).where(
+                    LLMRequest.conversation_id == conversation_id,
+                    LLMRequest.parent_request_id.is_(None),
+                )
+            )
+        ).scalar_one()
+    # Stays "completed": redelivery, SSE liveness and history all key on it.
+    assert row.status == "completed"
+    assert row.llm_api == "mock"
+    assert row.cache_write_tokens == 60

@@ -89,6 +89,8 @@ class ChatPipelineState:
     session: AsyncSession
     llm_request: LLMRequest | None = None
     conversation_id: UUID | None = None
+    # Whose documents are searched: the requester, or the demo user in a sample chat.
+    corpus_owner_id: UUID | None = None
     assistant_message_id: UUID | None = None
     assistant_seq: int = 0
     history: ConversationHistory | None = None
@@ -124,6 +126,7 @@ class LLMResponseStats(BaseModel):
 
     input_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None
     total_tokens: int | None = None
@@ -184,6 +187,7 @@ class ConversationListItem(BaseModel):
     title: str | None
     created_at: datetime
     last_message_at: datetime | None
+    is_sample: bool = False
 
 
 class ListConversationsResponse(BaseModel):
@@ -234,6 +238,8 @@ class ClarificationPick(BaseModel):
     company: str | None = None
     # For an entity outside the UI scope: search that company anyway, or leave it out.
     include_outside_scope: bool | None = None
+    # For an ambiguous or unmatched entity: search the other companies without it.
+    skip: bool = False
 
 
 class ClarificationReply(BaseModel):

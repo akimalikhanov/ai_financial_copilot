@@ -10,6 +10,7 @@ repos:
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-added-large-files
+        exclude: ^seed/sample/.*\.pdf$  # committed sample corpus (src/services/sample)
       - id: check-merge-conflict
       - id: check-toml
       - id: check-json

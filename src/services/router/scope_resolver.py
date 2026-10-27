@@ -127,7 +127,13 @@ async def resolve_scope(
                 },
             ) as obs:
                 outcomes: dict[str, str] = {}
+                # A skipped entity is left out as if the router never named it, unless
+                # nothing else is left; then it's unmatched and gets the card again.
+                all_skipped = all(r.method == "skipped" for r in resolutions)
                 for entity, res in zip(router_output.entities, resolutions, strict=True):
+                    if res.method == "skipped" and not all_skipped:
+                        outcomes[entity.name] = "skipped"
+                        continue
                     pick = res.candidates[0] if res.decision != "none" else None
                     inside = [d for d in docs if pick and d[1] == pick.company_norm]
                     if pick and not inside and res.outside_scope == "include":

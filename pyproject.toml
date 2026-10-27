@@ -49,7 +49,7 @@ dev = [
 ]
 llm-engine = [
     "google-genai>=1.60.0",
-    "openai>=2.15.0",
+    "openai>=2.45.0,<3",
 ]
 
 

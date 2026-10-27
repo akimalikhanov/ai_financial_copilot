@@ -123,7 +123,7 @@ Scope resolution returns a `DocumentScopeResult`:
 | `source` | `explicit`, `filtered`, `all`, `entity_resolved`, `unresolved` | Without entities: which UI scope produced the universe. With entities: whether any of them resolved. |
 | `per_entity_doc_ids` | `dict[str, list[UUID]]` | Covered company display name to its documents. An unresolved entity appears under the router's name with `[]`. |
 | `unresolved_entities` | `list[str]` | Router names that matched nothing in the universe |
-| `entity_manifest` | `list[EntityManifestItem]` | Per covered company, each document's name and year |
+| `entity_manifest` | `list[EntityManifestItem]` | Per covered company, each document's name and year, and `mentioned_as`: what the question called it when that isn't its name ("PFH" for a company picked on a card) |
 | `clarifications` | `list[EntityClarification]` | Company entities the card should ask about |
 | `too_broad_count` | `int` or `None` | Set only above the company limit: how many companies the question covers |
 
@@ -142,6 +142,10 @@ The agent (see [agent_design.md](agent_design.md)) reads three fields:
   "(not found in your documents)".
 - **`entity_manifest`** gives each company's available years, so the agent doesn't invent
   fiscal years: `- Aurora Innovation, Inc. (available years: 2022, 2021)`.
+- **`mentions()`** maps a covered company to the names in `mentioned_as`. The agent's scope
+  block adds `(the question calls it "PFH")`, and synthesis labels the findings
+  `(asked as "PFH")`. Without the label, a question about "PFH" and findings about
+  "Premier Financial Holdings" look unrelated, and synthesis answers "PFH: N/A".
 
 Keys are the company's display name as stored on its documents, not the router's guess, so
 the plan, the manifest and the search filter all use the same string.
@@ -295,7 +299,7 @@ Each entity gets an `EntityResolution`:
 class EntityResolution(Disambiguation):
     decision: Literal["resolved", "ambiguous", "none"]
     candidates: list[CompanyCandidate]   # most likely first; the first one is the pick
-    method: Literal["binding", "fast_path", "llm", "fallback", "no_candidates"]
+    method: Literal["binding", "skipped", "fast_path", "llm", "fallback", "no_candidates"]
     outside_scope: Literal["include", "exclude"] | None   # only from a binding
 ```
 
@@ -303,7 +307,8 @@ class EntityResolution(Disambiguation):
 flowchart TD
     E["entity: raw_span + name"] --> K["lookup keys:<br/>normalize(raw_span), normalize(name)"]
     K --> B{"conversation binding<br/>for a key?"}
-    B -->|"yes, company still exists"| RB["resolved, method=binding"]
+    B -->|"skip, and no single<br/>exact match"| RS["none, method=skipped"]
+    B -->|"company that<br/>still exists"| RB["resolved, method=binding"]
     B -->|"no"| X{"exactly one candidate whose<br/>company_norm equals a key?"}
     X -->|"yes"| RF["resolved, method=fast_path"]
     X -->|"no"| P{"any trigram<br/>candidates?"}
@@ -316,6 +321,7 @@ flowchart TD
 | `method` | Meaning | LLM call |
 |---|---|---|
 | `binding` | The user answered a card for this name earlier in the conversation | no |
+| `skipped` | The user chose "Search without it" for this name earlier in the conversation | no |
 | `fast_path` | Exactly one company's stored name equals a lookup key | no |
 | `no_candidates` | SQL found no company close to the name | no |
 | `llm` | The disambiguator chose among the entity's candidates | yes |
@@ -371,6 +377,11 @@ If the conversation has a binding for any of the entity's keys (section 9), the 
 `company_norm` is added to the lookup, and the entity resolves to that company with
 `method="binding"`. No LLM call. If the bound company no longer has ready documents, the
 binding is skipped and the entity goes through the normal path.
+
+A skip binding (`{"skip": true}`) resolves the entity as `none` with `method="skipped"`,
+with no lookup and no LLM call, and step 3 leaves it out. The skip lasts only while no
+single company matches the entity exactly. Once the user uploads BTH's filings, "BTH"
+takes the fast path again, so a skip never hides a company the user now has.
 
 ### The fast path
 
@@ -471,6 +482,8 @@ The combine loop in `resolve_scope()` decides, per entity, what it covers.
 | `ambiguous` | yes (top candidate) | Covered: the top candidate's universe documents | yes, `ambiguous` |
 | `ambiguous` | no | Unresolved, outcome `outside_scope` | yes |
 | `none` | | Unresolved, outcome `none` | yes |
+| `skipped`, with another entity not skipped | | Left out: not covered, not unresolved, not in the plan | no |
+| `skipped`, every entity | | Treated as `none` | yes, asks again |
 | No entities in the question | | Every company in the universe is covered | only if too broad |
 
 Notes on the table:
@@ -478,6 +491,12 @@ Notes on the table:
 - An ambiguous entity covers its top candidate *and* asks. With clarification on, the card
   ends the run, so the provisional pick never reaches the agent. With clarification off
   (section 10), the run goes ahead on it.
+- A skipped entity is dropped as if the router never named it. The question text still
+  names it ("Origin's merger with BTH"), so the agent can still search Origin's filings
+  for BTH. If every entity is skipped, nothing would be left to search, so the skips are
+  ignored and the card comes back.
+- A resolved pick whose name differs from the question's (`normalize_company(raw_span)`
+  isn't the pick's `company_norm`) records the span in the manifest's `mentioned_as`.
 - Only `entity_type == "company"` gets a card. A person or product that resolves to nothing
   stays in `unresolved_entities` with the "not found" label and no question.
 - `source` is `entity_resolved` if anything is covered, else `unresolved`. Without entities
@@ -583,6 +602,12 @@ a reload, and tells a reply which question to re-run.
 | `too_broad`, companies named | I can compare up to 5 companies per question. Split it into smaller questions. | Nothing. The user rephrases. |
 | `too_broad`, none named | This covers 12 companies. I can analyse up to 5 at once — pick which ones. | `[Narrow scope]`, which switches the scope bar to Filtered, and `[Ask again]`, enabled once the bar's company filter holds 1 to `max_companies` companies |
 
+An `ambiguous` or `none` entry also gets **Search without it** when the card lists at
+least one company under "Already matched". "Origin's merger with BTH" with no BTH
+documents can then be answered from Origin's filings. Without a matched company the button
+is hidden, since skipping would leave nothing to search. `outside_scope` entries don't get
+it, because **Keep selection** already means that.
+
 A multi-entity question gets one card. It asks only about the entities that need it, and
 sends the reply once every one has a pick.
 
@@ -648,8 +673,8 @@ The request:
 }
 ```
 
-A pick carries either `company` (a display name) or `include_outside_scope` (true or false,
-for an `outside_scope` entity). With a reply, the API creates no user message, and it
+A pick carries one of `company` (a display name), `include_outside_scope` (true or false,
+for an `outside_scope` entity) or `skip: true` (for an `ambiguous` or `none` entity). With a reply, the API creates no user message, and it
 ignores `content` and `client_msg_id`. The new `llm_requests` row and placeholder point at
 the card's `user_message_id`. The worker reads the question and its UI scope from that
 message, so the re-run uses the scope the question was first asked under.
@@ -668,6 +693,7 @@ after a too-broad card and **Ask again**, which adds a second user message.
 | Card is the latest message in the conversation | 409. The re-run reads history up to the original question, so only the last card can be answered. |
 | Every pick's `raw_span` is on the card | 422 |
 | `include_outside_scope` only on an `outside_scope` entry that has a candidate | 422 |
+| `skip` only on an `ambiguous` or `none` entry | 422 |
 | The pick has a choice | 422 |
 | The chosen company normalizes to one of the user's companies | 422 |
 
@@ -679,7 +705,8 @@ span:
 ```json
 {"entity_bindings": {
    "aurora": {"company_norm": "aurora innovation"},
-   "rwe":    {"company_norm": "rwe", "outside_scope": "include"}}}
+   "rwe":    {"company_norm": "rwe", "outside_scope": "include"},
+   "bth":    {"skip": true}}}
 ```
 
 `merge_entity_bindings()` merges in one `UPDATE ... jsonb_set(...)` statement, so two
@@ -1055,6 +1082,8 @@ too-broad card.
 | Disambiguator returns unparseable JSON | Same fallback | Same |
 | Disambiguator picks the wrong company with confidence | Nothing catches it | A wrong-company answer. Find it in the `entity_disambiguator` generation of the trace. |
 | Bound company deleted later | Binding skipped; normal resolution | Possibly a new card |
+| Every name in a later question was skipped | Skips ignored; the names are `none` | The card again |
+| Skip that should have been a pick ("Search without it" on a company the user has) | Nothing until a company matches the name exactly | Answers without that company for the rest of the conversation; a new conversation asks again |
 | Reply to an old card | 409 | Error in the chat |
 | Two replies to one card | The UI disables the card after the first pick. A second reply that arrives after the first committed gets 409. Bindings merge in one statement, so a race loses neither write. | Normally one answer |
 | Reply picks a company the user doesn't have | 422 | Error in the chat |
@@ -1115,6 +1144,12 @@ owns two Auroras.
 Only the too-broad card leads to the scope bar, because there narrowing the scope is the
 user's intent, and the user picks the companies in the bar itself.
 
+**"Search without it", not "ignore".** Some names in a question aren't companies to
+search: the merger partner in "Origin's merger with BTH", a competitor mentioned in
+passing. A skip drops the name from scope but keeps it in the question, so the agent still
+looks for it inside the other companies' filings. It's stored like any pick, so the same
+name doesn't ask twice, and it ends on an exact match so a later upload is never ignored.
+
 **No "search all documents" button.** Searching everything under one company name is the
 unfiltered search this design exists to remove.
 
@@ -1156,13 +1191,14 @@ normalizes query names, so the two sides can't drift.
 | Area | File |
 |---|---|
 | Normalizer snapshot | `tests/unit/test_company_name.py` |
-| Bindings, fast path, pool, fallback | `tests/unit/test_entity_resolver.py` |
+| Bindings, skip bindings, fast path, pool, fallback | `tests/unit/test_entity_resolver.py` |
 | Disambiguator schema, ID mapping, sub-request logging, timeout | `tests/unit/test_disambiguator.py` |
 | Universe, combine table, company limit, card triggers | `tests/unit/test_scope_resolver.py` |
 | Card payload and text | `tests/unit/test_scope_clarification.py` |
 | Scope on the router's fallback route | `tests/unit/test_router_route_query.py` |
 | Candidate SQL against real Postgres | `tests/integration/test_company_candidates.py` |
 | Question, card, reply, answer, follow-up with no card | `tests/integration/test_chat_full_flow.py::test_clarification_card_reply_and_binding` |
+| "Search without it" reply, answer, follow-up with no card | `tests/integration/test_chat_full_flow.py::test_clarification_skip_searches_without_the_entity` |
 | Disambiguator quality with the real LLM | `src/eval/run_entity_resolution.py` on `src/eval/fixtures/entity_resolution_eval.json` |
 
 ```bash

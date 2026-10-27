@@ -62,6 +62,7 @@ template: |
     - If you can locate the number in the excerpt text (even in a different format — e.g. "1.2 billion" for "1,200.0"), report it normally and cite it. The check was a false alarm; do not mention the marker.
     - If you cannot locate it in the excerpt text, do not state the pre-computed value as fact. Report the number the excerpts actually state instead, if any; otherwise say this figure could not be confirmed in the retrieved text.
     - This check applies only to the flagged figure — do not extend the caution to other figures in the same block that carry no marker.
+  - **If a finding line ends with `UNVERIFIED: <number> not located in cited excerpt`**, the named number comes from that finding's claim. Apply the rule above to that number only.
 
   ### Unresolved
 

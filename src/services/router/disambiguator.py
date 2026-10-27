@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.observability.langfuse import describe_error
 from src.observability.langfuse import mark_current as lf_mark_current
-from src.observability.metrics import observe_llm_latency
+from src.observability.metrics import observe_llm_call
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.query_router import CompanyCandidate, ExtractedEntity
 from src.services.llm_adapters.base_adapter import ChatMessage, Role
@@ -159,6 +159,7 @@ async def disambiguate(
                     model=model_id,
                     request_type="entity_disambiguator",
                     request_params={"temperature": cfg["temperature"], "max_tokens": max_tokens},
+                    llm_api=llm.api,
                     **kwargs,
                 )
         except Exception:
@@ -194,7 +195,7 @@ async def disambiguate(
         await log(status="failed", error_code=type(e).__name__, error_message=describe_error(e))
         return None
 
-    observe_llm_latency(model_id, "entity_disambiguator", resp.stats)
+    observe_llm_call(model_id, llm.api, "entity_disambiguator", resp.stats)
     await log(status="completed", **stats_to_request_kwargs(resp.stats))
     try:
         picks = _Picks.model_validate_json(resp.text or "")

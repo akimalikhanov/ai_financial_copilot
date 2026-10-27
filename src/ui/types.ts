@@ -97,6 +97,7 @@ export interface ClarificationPick {
   raw_span: string;
   company?: string;
   include_outside_scope?: boolean;
+  skip?: boolean;
 }
 
 export interface Message {
@@ -119,6 +120,7 @@ export interface Chat {
   title: string;
   createdAt: number;
   conversationId: string; // Backend conversation UUID (required)
+  isSample?: boolean; // Searches the sample corpus instead of the user's documents
 }
 
 export interface ScopeFilters {

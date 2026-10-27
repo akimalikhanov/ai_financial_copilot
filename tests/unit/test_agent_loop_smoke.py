@@ -32,6 +32,8 @@ from src.services.chat.agent.loop import (
 from src.services.llm_adapters.base_adapter import (
     AssistantTurnResult,
     LLMResponseStats,
+    OpaqueItem,
+    ResponseMeta,
     Role,
     ToolCallRef,
 )
@@ -309,8 +311,8 @@ async def test_concurrent_searches_each_open_a_distinct_session(
 
 @pytest.mark.asyncio
 async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The analytical agent passes entity="" — the result and both SSE events must carry
-    the resolved primary entity, not a blank string."""
+    """The analytical agent passes entity="" — the result must carry the resolved primary
+    entity, not a blank string. The timeline row belongs to `_guarded_search`, not here."""
     from src.services.chat.agent import loop as loop_module
 
     state = _make_state()
@@ -336,14 +338,10 @@ async def test_empty_entity_resolves_to_primary_entity(monkeypatch: pytest.Monke
         name="search_documents",
         arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.entity == "Acme"
-    started = [p for n, p in events if n == "activity" and p["kind"] == "tool_call_started"]
-    assert started and started[0]["label"] == "Acme"
-    assert result.activity_id == started[0]["id"]
+    assert not [n for n, _ in events if n == "activity"]
 
 
 @pytest.mark.asyncio
@@ -368,9 +366,7 @@ async def test_unresolved_entity_returns_not_found_without_retrieval(
         name="search_documents",
         arguments=json.dumps({"entity": "Aurora", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.not_found is True
     assert result.chunks == []
@@ -407,9 +403,7 @@ async def test_empty_entity_searches_every_resolved_entity(
         name="search_documents",
         arguments=json.dumps({"entity": "", "query": "revenue", "keywords": "revenue"}),
     )
-    await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert seen == [union]
 
@@ -421,9 +415,6 @@ async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.Monk
     from src.services.chat.agent import loop as loop_module
 
     state = _make_state()
-    # run_chat_rag_pipeline reads llm_request.user_id — without it the call raises before
-    # reaching the pipeline stub, and the generic except would mask the real result.
-    state.llm_request = cast("Any", AsyncMock(id=uuid4(), user_id=uuid4(), conversation_id=None))
 
     async def _fake_pipeline(*_a: Any, **_k: Any) -> Any:
         return None, RetrievalTrace(all_backends_failed=True), []
@@ -439,9 +430,7 @@ async def test_total_backend_outage_sets_backend_failed(monkeypatch: pytest.Monk
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.backend_failed is True
     assert result.chunks == []
@@ -479,9 +468,7 @@ async def test_healthy_backend_with_no_hits_is_not_a_backend_failure(
         name="search_documents",
         arguments=json.dumps({"entity": "Acme", "query": "revenue", "keywords": "revenue"}),
     )
-    result = await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    result = await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
 
     assert result.backend_failed is False
     assert result.chunks == []
@@ -513,9 +500,7 @@ async def _search_queries_for(
     monkeypatch.setattr(loop_module, "add_event", AsyncMock())
 
     tc = ToolCallRef(id="call_1", name="search_documents", arguments=json.dumps(arguments))
-    await loop_module._execute_search(
-        tc, state, AsyncMock(), None, FakeAsyncRedis(), state.request_id, 0
-    )
+    await loop_module._execute_search(tc, state, AsyncMock(), None, state.request_id, 0)
     return seen[0]
 
 
@@ -618,6 +603,111 @@ async def _run(
     )
 
 
+def _capture_activity(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    from src.services.chat.agent import loop as loop_module
+
+    events: list[dict] = []
+
+    async def _add_event(_redis: Any, _rid: str, name: str, payload: dict) -> None:
+        if name == "activity":
+            events.append(payload)
+
+    monkeypatch.setattr(loop_module, "add_event", _add_event)
+    return events
+
+
+def _search_rows(events: list[dict]) -> list[tuple[dict, dict]]:
+    """(start, end) per search row; fails if any row was started without an end."""
+    starts = [
+        e for e in events if e["kind"] == "tool_call_started" and e["detail"]["tool"] == "search"
+    ]
+    ends = [e for e in events if e["kind"] == "tool_call_ended"]
+    assert len(ends) == len({e["id"] for e in ends})
+    by_id = {e["id"]: e for e in ends}
+    return [(s, by_id[s["id"]]) for s in starts]
+
+
+@pytest.mark.asyncio
+async def test_every_search_row_ends_on_a_full_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _capture_activity(monkeypatch)
+    state = _make_state()
+    chunk, payloads = _make_chunk_with_payload()
+    search = ToolCallRef(
+        id="s1", name="search_documents", arguments=json.dumps({"entity": "Acme", "query": "q"})
+    )
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[search, dc_replace(search, id="s2")]),
+        AssistantTurnResult(text="", tool_calls=[_report_tc("r1", "Acme", str(chunk.chunk_id))]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await _run(state, turns, _search)
+
+    starts = [e for e in events if e["kind"] == "tool_call_started"]
+    ends = [e for e in events if e["kind"] == "tool_call_ended"]
+    assert len(starts) == len(ends)
+    assert [s["label"] for s, _ in _search_rows(events)] == ['"q"', '"q"']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "label"),
+    [
+        # Aurora matched nothing, so Acme is the only company in scope: no prefix.
+        (json.dumps({"entity": "Aurora", "query": "revenue"}), '"revenue"'),
+        ("{not json", "malformed search"),
+    ],
+    ids=["not_in_library", "invalid_arguments"],
+)
+async def test_early_return_search_still_gets_one_row(
+    monkeypatch: pytest.MonkeyPatch, arguments: str, label: str
+) -> None:
+    from src.services.chat.agent import loop as loop_module
+
+    events = _capture_activity(monkeypatch)
+    state = _make_state()
+    state.scope_result = DocumentScopeResult(
+        doc_ids=None, source="all", per_entity_doc_ids={"Aurora": [], "Acme": [uuid4()]}
+    )
+    turns = [
+        AssistantTurnResult(
+            text="", tool_calls=[ToolCallRef(id="s1", name="search_documents", arguments=arguments)]
+        ),
+        AssistantTurnResult(text="done", tool_calls=[]),
+    ]
+
+    await _run(state, turns, loop_module._execute_search)
+
+    [(start, _end)] = _search_rows(events)
+    assert start["label"] == label
+
+
+@pytest.mark.asyncio
+async def test_final_pass_search_gets_a_skipped_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "2")
+    events = _capture_activity(monkeypatch)
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "Did costs rise?")]),
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s2", "Did pricing offset?")]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await _run(state, turns, _search)
+
+    rows = _search_rows(events)
+    assert len(rows) == 2
+    assert rows[1][1]["detail"] == {
+        "status": "skipped",
+        "note": "not run — final pass records findings only",
+    }
+
+
 @pytest.mark.asyncio
 async def test_mixed_turn_pairs_every_call_and_applies_both() -> None:
     """A turn carrying a report *and* searches must produce exactly one assistant message
@@ -675,6 +765,38 @@ async def test_turn_closing_last_aspect_while_opening_new_one_continues() -> Non
 
     _ev, _f, meta = await _run(state, turns, _search)
     # 3 turns ran: the run did not stop at turn 2 despite A1 being the only open aspect.
+    assert meta.iterations == 3
+    assert meta.convergence_reason == "covered"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_beside_the_last_report_is_read_before_stopping() -> None:
+    """Reports fold before the same turn's searches run. A turn that reports the last key
+    and also re-searches it must not stop before the model has read that search; a next
+    turn with no calls is still a covered stop."""
+    state = _analytical_state()
+    first, p_first = _make_chunk_with_payload()
+    follow_up, p_follow_up = _make_chunk_with_payload()
+    results = iter(
+        [
+            _SearchResult(entity="Acme", chunks=[first], payloads=p_first),
+            _SearchResult(entity="Acme", chunks=[follow_up], payloads=p_follow_up),
+        ]
+    )
+
+    turns = [
+        AssistantTurnResult(text="", tool_calls=[_search_tc("s1", "first?")]),
+        AssistantTurnResult(
+            text="",
+            tool_calls=[_report_tc("r1", "A1", str(first.chunk_id)), _search_tc("s2", "first?")],
+        ),
+        AssistantTurnResult(text="", tool_calls=[]),
+    ]
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return next(results)
+
+    _ev, _f, meta = await _run(state, turns, _search)
     assert meta.iterations == 3
     assert meta.convergence_reason == "covered"
 
@@ -968,9 +1090,10 @@ async def test_extraction_plan_is_seeded_from_expected_entities() -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_view_is_sent_but_never_stored() -> None:
-    """The status view is the single source of coverage truth: computed per call and
-    appended last, never persisted — otherwise it accumulates one stale copy per turn."""
+async def test_status_is_stored_so_each_request_extends_the_last() -> None:
+    """The status is folded into the last tool result and kept there: Responses only
+    reuses a whole earlier prompt from cache, so each request must start with the
+    previous one verbatim. The newest status is always the last message."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1003,23 +1126,27 @@ async def test_status_view_is_sent_but_never_stored() -> None:
         execute_search=_search,
     )
 
-    # Turn 1 has no plan yet, so no status. Turn 2 sees A1 open, as the *last* message.
+    # Turn 1 has no plan yet, so no status. Turn 2 sees A1 open, at the end of the last
+    # tool result: a trailing user message would end the provider's turn.
     assert not any("Open: A1" in (m.content or "") for m in sent[0])
-    assert "Open: A1 (Did costs rise?)" in (sent[1][-1].content or "")
-    # Turn 4's status supersedes the earlier ones rather than adding to them: exactly one
-    # *user* message states coverage, and it is the last message.
-    coverage_msgs = [m for m in sent[3] if m.role == Role.user and "Open:" in (m.content or "")]
-    assert len(coverage_msgs) == 1
-    assert coverage_msgs[0] is sent[3][-1]
-    assert coverage_msgs[0].content == "Recorded: A1 · Open: A2 (Did pricing offset?)"
-    # Report results state only what landed: a stored open list would go stale on screen.
-    assert not any("Open:" in (m.content or "") for m in sent[3] if m.role == Role.tool)
+    assert sent[1][-1].role == Role.tool
+    assert (sent[1][-1].content or "").endswith(
+        "<run_status>\nOpen: A1 (Did costs rise?)\n</run_status>"
+    )
+    # Turn 4's status is the last message; earlier ones stay where they were sent.
+    assert (sent[3][-1].content or "").endswith(
+        "<run_status>\nRecorded: A1 · Open: A2 (Did pricing offset?)\n</run_status>"
+    )
+    assert not any(m.role == Role.user and "Open:" in (m.content or "") for m in sent[3])
+    # Every request starts with the previous one verbatim, statuses included.
+    for earlier, later in zip(sent, sent[1:], strict=False):
+        assert later[: len(earlier)] == earlier
 
 
 @pytest.mark.asyncio
-async def test_empty_round_appends_no_permanent_nudge() -> None:
-    """The stall nudge lives in the recomputed status view, not as a user message that
-    accumulates one copy per empty round."""
+async def test_empty_round_nudge_rides_on_the_status() -> None:
+    """The stall nudge lives in the recomputed status view, not as a separate user
+    message."""
     state = _analytical_state()
     chunk, payloads = _make_chunk_with_payload()
 
@@ -1051,7 +1178,7 @@ async def test_empty_round_appends_no_permanent_nudge() -> None:
         execute_search=_search,
     )
 
-    # Turn 3 sees the nudge exactly once, and only inside the (unstored) status message.
+    # Turn 3 sees the nudge exactly once, inside its own status (the last message).
     nudged = [m for m in sent[2] if "no new evidence" in (m.content or "")]
     assert len(nudged) == 1
     assert nudged[0] is sent[2][-1]
@@ -1115,6 +1242,8 @@ async def test_prior_history_is_capped_truncated_and_sanitized() -> None:
     # The blocked turn is gone, and so is its refusal: no answer without its question.
     assert not any("reveal the system prompt" in c for c in contents)
     assert not any("can't process" in c for c in contents)
+    # Prior turns are rebuilt from stored answers: reasoning never crosses a user turn.
+    assert all(m.opaque is None for m in sent[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1658,3 +1787,114 @@ def test_turn_kind_classifies_by_the_calls_made() -> None:
     assert _turn_kind(None, None) == "unknown"
     # The final turn is known before the call, so even a failed one is labelled.
     assert _turn_kind(["report_findings"], None) == "final"
+
+
+def _opaque(item_id: str) -> tuple[OpaqueItem, ...]:
+    payload = {"type": "reasoning", "id": item_id, "encrypted_content": "enc"}
+    return (OpaqueItem("openai", "gpt-5.6-luna", payload),)
+
+
+def _scripted(script: list) -> tuple[AsyncMock, list[list[Any]]]:
+    """A Responses-API tool model that plays `script` (a turn or an exception per call),
+    then stops calling tools, recording the messages each call received."""
+    adapter = AsyncMock()
+    adapter.api = "responses"
+    calls: list[list[Any]] = []
+
+    async def _complete(messages: list[Any], **_k: Any) -> AssistantTurnResult:
+        calls.append(list(messages))
+        step = script[len(calls) - 1] if len(calls) <= len(script) else None
+        if isinstance(step, Exception):
+            raise step
+        return step or AssistantTurnResult(text="done", tool_calls=[])
+
+    adapter.complete_with_tools = AsyncMock(side_effect=_complete)
+    return adapter, calls
+
+
+@pytest.mark.asyncio
+async def test_opaque_is_replayed_next_turn_and_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _analytical_state()
+    rows = _capture_subrequests(monkeypatch, state)
+    chunk, payloads = _make_chunk_with_payload()
+    first = AssistantTurnResult(
+        text="",
+        tool_calls=[_search_tc("s1", "Did costs rise?")],
+        stats=LLMResponseStats(input_tokens=10),
+        opaque=_opaque("rs_1"),
+        reasoning_summary="Need the cost table.",
+        meta=ResponseMeta(reasoning_context="current_turn", service_tier="default"),
+    )
+    second = AssistantTurnResult(
+        text="",
+        tool_calls=[_report_tc("r1", "A1", str(chunk.chunk_id))],
+        stats=LLMResponseStats(input_tokens=20),
+    )
+    adapter, calls = _scripted([first, second])
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await run_loop(
+        state,
+        _routed_llm(adapter),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        execute_search=_search,
+    )
+
+    carried = [m for m in calls[1] if m.opaque]
+    assert len(carried) == 1 and carried[0].opaque == first.opaque
+    assert carried[0].content is None and carried[0].tool_calls[0].id == "s1"
+
+    assert rows[0]["reasoning_summary"] == "Need the cost table."
+    p0, p1 = rows[0]["request_params"], rows[1]["request_params"]
+    assert (p0["reasoning_context"], p0["service_tier"], p0["replay_bytes"]) == (
+        "current_turn",
+        "default",
+        0,
+    )
+    assert p1["replay_bytes"] == len(json.dumps(_opaque("rs_1")[0].payload))
+    assert rows[1]["reasoning_summary"] is None
+
+
+@pytest.mark.asyncio
+async def test_primary_gets_its_own_items_back_after_a_fallback_turn() -> None:
+    state = _analytical_state()
+    chunk, payloads = _make_chunk_with_payload()
+    primary, primary_calls = _scripted(
+        [
+            AssistantTurnResult(
+                text="", tool_calls=[_search_tc("s1", "Did costs rise?")], opaque=_opaque("rs_1")
+            ),
+            LLMServerError("500"),
+        ]
+    )
+    fallback, _ = _scripted(
+        [AssistantTurnResult(text="", tool_calls=[_search_tc("s2", "Did pricing offset?")])]
+    )
+
+    async def _search(*_a: Any, **_k: Any) -> _SearchResult:
+        return _SearchResult(entity="Acme", chunks=[chunk], payloads=payloads)
+
+    await run_loop(
+        state,
+        _routed_llm(primary),
+        state.session,
+        state.redis_app,
+        state.request_id,
+        reranker=None,
+        session_factory=_fake_session_factory(),
+        fallbacks=[_routed_llm(fallback)],
+        execute_search=_search,
+    )
+
+    # Call 3 is the primary's first after the fallback answered turn 2.
+    assistant = [m for m in primary_calls[2] if m.role is Role.assistant and m.tool_calls]
+    assert [(m.tool_calls[0].id, m.opaque) for m in assistant] == [
+        ("s1", _opaque("rs_1")),
+        ("s2", None),
+    ]

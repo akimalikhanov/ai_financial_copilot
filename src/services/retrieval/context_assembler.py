@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from uuid import UUID
@@ -23,6 +24,8 @@ from src.utils.config import get_injection_scan_chunks_enabled
 
 logger = logging.getLogger(__name__)
 
+_RUN_STATUS_TAG_RE = re.compile(r"<(\s*/?\s*run_status)", re.IGNORECASE)
+
 
 def _dedup_chunks(chunks: Sequence[RetrievedChunk]) -> list[RetrievedChunk]:
     seen: set[UUID] = set()
@@ -36,6 +39,9 @@ def _dedup_chunks(chunks: Sequence[RetrievedChunk]) -> list[RetrievedChunk]:
 
 def wrap_excerpt(ref_id: str, source_doc: str, flagged: bool, text: str) -> str:
     flagged_attr = "true" if flagged else "false"
+    # The agent loop's coverage view rides in a `<run_status>` block; a document must not
+    # be able to forge one.
+    text = _RUN_STATUS_TAG_RE.sub(r"&lt;\1", text)
     return (
         f'<retrieved_excerpt id="{ref_id}" source_doc="{source_doc}" flagged="{flagged_attr}">\n'
         f"{text}\n"

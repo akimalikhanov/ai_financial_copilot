@@ -87,24 +87,24 @@ class TestGroundingFilter:
         ledger = FindingsLedger()
 
         grounded = _f("Acme", evidence=[ids[0]], figures=[_fig(10.0)])
-        assert ledger.record("Acme", grounded, evidence) is True
+        assert ledger.record("Acme", grounded, evidence) == "accepted"
 
         ungrounded = _f("Acme", evidence=[str(uuid4())], figures=[_fig(999.0)])
-        assert ledger.record("Acme", ungrounded, evidence) is False
+        assert ledger.record("Acme", ungrounded, evidence) == "uncited"
 
         assert [fig.amount for fig in _served(ledger).findings[0].figures] == [10.0]
 
     def test_supported_finding_citing_nothing_is_dropped_and_counted(self) -> None:
         evidence, _ = _seed_evidence(1)
         ledger = FindingsLedger()
-        assert ledger.record("A1", _f("A1"), evidence) is False
+        assert ledger.record("A1", _f("A1"), evidence) == "uncited"
         assert ledger.keys() == set()
         assert ledger.uncited_claim_rate() == 1.0
 
     def test_unresolvable_citation_is_counted(self) -> None:
         evidence, _ = _seed_evidence(1)
         ledger = FindingsLedger()
-        assert ledger.record("Acme", _f("Acme", evidence=["S9"]), evidence) is False
+        assert ledger.record("Acme", _f("Acme", evidence=["S9"]), evidence) == "uncited"
         assert ledger.uncited_claim_rate() == 1.0
 
     def test_stated_negative_is_kept_and_not_counted(self) -> None:
@@ -112,7 +112,7 @@ class TestGroundingFilter:
         would score honesty as hallucination."""
         evidence, _ = _seed_evidence(1)
         ledger = FindingsLedger()
-        assert ledger.record("A4", _neg("A4"), evidence) is True
+        assert ledger.record("A4", _neg("A4"), evidence) == "accepted"
         assert ledger.uncited_claim_rate() == 0.0
 
 
@@ -297,7 +297,7 @@ class TestInjectionScreen:
         ledger.record("A1", clean, evidence)
 
         attack = clean.model_copy(update={"claim": _BLOCKED})
-        assert ledger.record("A1", attack, evidence) is False
+        assert ledger.record("A1", attack, evidence) == "blocked"
 
         assert ledger.get("A1") == clean
         assert ledger.screened() == {"flag": 0, "block": 1}
@@ -305,7 +305,8 @@ class TestInjectionScreen:
     def test_flagged_claim_is_kept_behind_the_marker(self) -> None:
         evidence, ids = _seed_evidence(1)
         ledger = FindingsLedger()
-        assert ledger.record("A1", _f("A1", claim=_FLAGGED, evidence=[ids[0]]), evidence) is True
+        outcome = ledger.record("A1", _f("A1", claim=_FLAGGED, evidence=[ids[0]]), evidence)
+        assert outcome == "accepted"
 
         stored = ledger.get("A1")
         assert stored is not None
@@ -314,14 +315,14 @@ class TestInjectionScreen:
     def test_blocked_negative_is_dropped(self) -> None:
         evidence, _ = _seed_evidence(1)
         ledger = FindingsLedger()
-        assert ledger.record("Acme", _neg("Acme", claim=_BLOCKED), evidence) is False
+        assert ledger.record("Acme", _neg("Acme", claim=_BLOCKED), evidence) == "blocked"
         assert ledger.keys() == set()
 
     def test_blocked_figure_metric_drops_the_finding(self) -> None:
         evidence, ids = _seed_evidence(1)
         ledger = FindingsLedger()
         finding = _f("Acme", evidence=[ids[0]], figures=[_fig(1.0, metric=_BLOCKED)])
-        assert ledger.record("Acme", finding, evidence) is False
+        assert ledger.record("Acme", finding, evidence) == "blocked"
 
     def test_flagged_fiscal_label_is_kept_behind_the_marker(self) -> None:
         evidence, ids = _seed_evidence(1)

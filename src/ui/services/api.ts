@@ -120,7 +120,21 @@ export type ActivityKind =
   | 'stage_ended'
   | 'tool_call_started'
   | 'tool_call_ended'
-  | 'round_started';
+  | 'round_started'
+  | 'note'
+  | 'outcome';
+
+/** Row and outcome status. Never 'running' on the wire: a started row without an end is running. */
+export type ActivityStatus = 'ok' | 'skipped' | 'warn' | 'fail';
+
+/** `detail` of the single `outcome` event: the pill text and the closing lines of the expanded view. */
+export interface OutcomeDetail {
+  status: ActivityStatus;
+  text: string;
+  lines: string[];
+  /** True when no pill is shown (a clarification card is the response). */
+  hidden: boolean;
+}
 
 export interface ActivityEvent {
   kind: ActivityKind;
@@ -617,6 +631,7 @@ export interface ConversationListItem {
   title: string | null;
   created_at: string;
   last_message_at: string | null;
+  is_sample: boolean;
 }
 
 export interface ListConversationsResponse {
@@ -662,6 +677,32 @@ export const createConversation = async (
   }
 
   return (await response.json()) as CreateConversationResponse;
+};
+
+// --- Samples API ---
+
+// Empty lists when the sample corpus isn't ready.
+export interface SamplesResponse {
+  documents: { id: string; title: string }[];
+  questions: { id: string; text: string }[];
+}
+
+export const fetchSamples = async (): Promise<SamplesResponse> => {
+  const res = await fetchApi(joinUrl(API_BASE_URL, '/v1/samples'), {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as SamplesResponse;
+};
+
+export const createSampleConversation = async (): Promise<CreateConversationResponse> => {
+  const res = await fetchApi(joinUrl(API_BASE_URL, '/v1/samples/conversations'), {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) throw await toApiErrorFromResponse(res);
+  return (await res.json()) as CreateConversationResponse;
 };
 
 export interface UpdateConversationRequest {

@@ -20,6 +20,7 @@ def stats_to_request_kwargs(stats: LLMResponseStats | None) -> dict:
         "completion_tokens": stats.output_tokens,
         "reasoning_tokens": stats.reasoning_tokens,
         "cached_input_tokens": stats.cached_input_tokens,
+        "cache_write_tokens": stats.cache_write_tokens,
         "total_tokens": stats.total_tokens,
         "cost_usd": Decimal(str(stats.cost_usd)) if stats.cost_usd is not None else None,
         "latency_ms": int(stats.latency_ms) if stats.latency_ms is not None else None,
@@ -183,6 +184,7 @@ class LLMRequestRepository:
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -191,6 +193,8 @@ class LLMRequestRepository:
         status: str = "completed",
         error_code: str | None = None,
         error_message: str | None = None,
+        reasoning_summary: str | None = None,
+        llm_api: str | None = None,
     ) -> LLMRequest:
         """Create a completed sub-request row linked to a parent chat request."""
         sub = LLMRequest(
@@ -205,6 +209,7 @@ class LLMRequestRepository:
             completion_tokens=completion_tokens,
             reasoning_tokens=reasoning_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_tokens=cache_write_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
             latency_ms=latency_ms,
@@ -213,6 +218,8 @@ class LLMRequestRepository:
             status=status,
             error_code=error_code,
             error_message=error_message,
+            reasoning_summary=reasoning_summary,
+            llm_api=llm_api,
         )
         self.session.add(sub)
         await self.session.flush()
@@ -225,6 +232,7 @@ class LLMRequestRepository:
         completion_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
         total_tokens: int | None = None,
         cost_usd: Decimal | None = None,
         latency_ms: int | None = None,
@@ -233,8 +241,12 @@ class LLMRequestRepository:
         error_code: str | None = None,
         error_message: str | None = None,
         trace_id: str | None = None,
+        reasoning_summary: str | None = None,
+        llm_api: str | None = None,
+        request_params_updates: dict | None = None,
     ) -> LLMRequest | None:
-        """Update LLM request stats on stream completion."""
+        """Update LLM request stats on stream completion. `request_params_updates` merges
+        into the row's `request_params`."""
         result = await self.session.execute(select(LLMRequest).where(LLMRequest.id == request_id))
         llm_request = result.scalar_one_or_none()
         if not llm_request:
@@ -244,6 +256,7 @@ class LLMRequestRepository:
         llm_request.completion_tokens = completion_tokens
         llm_request.reasoning_tokens = reasoning_tokens
         llm_request.cached_input_tokens = cached_input_tokens
+        llm_request.cache_write_tokens = cache_write_tokens
         llm_request.total_tokens = total_tokens
         llm_request.cost_usd = cost_usd
         llm_request.latency_ms = latency_ms
@@ -253,6 +266,16 @@ class LLMRequestRepository:
         llm_request.error_message = error_message
         if trace_id is not None:
             llm_request.trace_id = trace_id
+        if reasoning_summary is not None:
+            llm_request.reasoning_summary = reasoning_summary
+        if llm_api is not None:
+            llm_request.llm_api = llm_api
+        if request_params_updates:
+            # A new dict, so SQLAlchemy sees the JSONB column change.
+            llm_request.request_params = {
+                **(llm_request.request_params or {}),
+                **request_params_updates,
+            }
 
         await self.session.flush()
         return llm_request

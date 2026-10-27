@@ -39,6 +39,7 @@ class GeminiAdapter(LLMAdapter):
     """Uses google-genai (Gemini Developer API)."""
 
     provider_name: str = "google"
+    api: str = "gemini"
 
     def __init__(
         self,

@@ -198,6 +198,20 @@ class LLMInvalidRequestError(LLMPermanentError):
     pass
 
 
+class LLMReasoningReplayError(LLMInvalidRequestError):
+    """A replayed reasoning item was rejected (failed verification, or missing its
+    follow-up item). Recoverable by resending without the opaque items."""
+
+    pass
+
+
+class LLMFeatureUnavailableError(LLMPermissionError):
+    """An optional feature (reasoning summaries) is not enabled for this account.
+    Recoverable by resending without it."""
+
+    pass
+
+
 class LLMNotFoundError(LLMPermanentError):
     """Model or resource not found (HTTP 404)."""
 

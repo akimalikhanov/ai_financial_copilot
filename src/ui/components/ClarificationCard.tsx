@@ -57,7 +57,8 @@ export const ClarificationCard: React.FC<ClarificationCardProps> = ({ card, comp
   const isPicked = (span: string, match: Partial<ClarificationPick>) => {
     const p = picks[span];
     return !!p && (match.company === undefined || p.company === match.company)
-      && (match.include_outside_scope === undefined || p.include_outside_scope === match.include_outside_scope);
+      && (match.include_outside_scope === undefined || p.include_outside_scope === match.include_outside_scope)
+      && (match.skip === undefined || !!p.skip === match.skip);
   };
   const off = disabled || Object.keys(picks).length === card.unresolved.length;
 
@@ -80,6 +81,11 @@ export const ClarificationCard: React.FC<ClarificationCardProps> = ({ card, comp
             onClick={() => choose({ raw_span: u.raw_span, company: c.company })}>{candidateLabel(c)}</Button>
         ))}
         <CompanySelect companies={companies} disabled={off} onPick={company => choose({ raw_span: u.raw_span, company })} />
+        {/* Skipping needs another company to search; the server re-asks if all are skipped. */}
+        {card.resolved.length > 0 && (
+          <Button size="sm" variant={isPicked(u.raw_span, { skip: true }) ? 'primary' : 'secondary'} disabled={off}
+            onClick={() => choose({ raw_span: u.raw_span, skip: true })}>Search without it</Button>
+        )}
         {u.outcome === 'none' && (
           <Button size="sm" variant="ghost" disabled={disabled} onClick={onUpload}>Upload a document</Button>
         )}

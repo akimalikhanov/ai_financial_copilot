@@ -160,6 +160,8 @@ async def test_generation_is_marked_when_the_call_fails(monkeypatch: pytest.Monk
     monkeypatch.setattr(llm_router._lf_mod, "get_client", lambda: client)
 
     class _Adapter:
+        api = "fake"
+
         async def complete(self, **_kwargs: Any) -> Any:
             raise TimeoutError("slow")
 

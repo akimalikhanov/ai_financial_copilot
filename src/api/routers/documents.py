@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from time import perf_counter
@@ -41,20 +40,17 @@ from src.schemas.documents import (
     ListDocumentsResponse,
     UploadDocumentResponse,
 )
-from src.services.ingestion import opensearch_ingest, qdrant_ingest
+from src.services.ingestion.purge import IndexCleanupError, purge_document
 from src.services.ingestion.recovery import reap_abandoned
 from src.services.ingestion.s3_client import build_raw_storage_key, upload_pdf
 from src.services.ingestion.tasks import ingest_document
 from src.services.router.company_name import normalize_company
 from src.utils.config import (
+    get_demo_user_id,
     get_ingest_stream_abandoned_after_seconds,
     get_s3_access_key,
-    get_s3_chunks_bucket,
-    get_s3_docling_bucket,
     get_s3_endpoint_url,
-    get_s3_pictures_bucket,
     get_s3_raw_bucket,
-    get_s3_rendered_bucket,
     get_s3_secret_key,
 )
 
@@ -205,69 +201,13 @@ async def delete_document(
     if doc is None or doc.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    qdrant_collection = os.getenv("QDRANT_COLLECTION", "documents")
-    opensearch_index = os.getenv("OPENSEARCH_INDEX", "chunks")
-
-    # Index cleanup must succeed before the Postgres row goes: a swallowed failure here
-    # (backend down/restarting) leaves chunks indexed with no row to hydrate them, and
-    # nothing ever collects them. Failing the request keeps the document deletable later.
     try:
-        await asyncio.gather(
-            asyncio.to_thread(qdrant_ingest.delete_by_document, qdrant_collection, document_id),
-            asyncio.to_thread(opensearch_ingest.delete_by_document, opensearch_index, document_id),
-        )
-    except Exception:
-        logger.exception(
-            "delete_document.index_cleanup_failed", extra={"document_id": str(document_id)}
-        )
+        await purge_document(session, doc)
+    except IndexCleanupError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Search index cleanup failed; document not deleted. Please retry.",
         ) from None
-
-    s3_keys = {
-        get_s3_raw_bucket(): [doc.storage_key],
-        get_s3_docling_bucket(): [f"processed/{doc.user_id}/{document_id}/docling.json"],
-        get_s3_rendered_bucket(): [f"processed/{doc.user_id}/{document_id}/document.md"],
-        get_s3_chunks_bucket(): [f"processed/{doc.user_id}/{document_id}/chunks.jsonl"],
-    }
-    s3_session = aioboto3.Session()
-    async with s3_session.client(  # type: ignore[attr-defined]
-        "s3",
-        endpoint_url=get_s3_endpoint_url(),
-        region_name="garage",
-        aws_access_key_id=get_s3_access_key(),
-        aws_secret_access_key=get_s3_secret_key(),
-        config=Config(response_checksum_validation="when_required"),
-    ) as s3:
-        for bucket, keys in s3_keys.items():
-            for key in keys:
-                try:
-                    await s3.delete_object(Bucket=bucket, Key=key)
-                except Exception:
-                    logger.warning(
-                        "delete_document.s3_failed",
-                        extra={"bucket": bucket, "key": key},
-                    )
-
-        # Crops are one object per picture under `{document_id}/pictures/N.png`
-        # (build_picture_crop_key), so this sweeps a prefix rather than deleting a fixed key.
-        pictures_bucket = get_s3_pictures_bucket()
-        prefix = f"{document_id}/"
-        try:
-            paginator = s3.get_paginator("list_objects_v2")
-            async for page in paginator.paginate(Bucket=pictures_bucket, Prefix=prefix):
-                batch = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-                if batch:
-                    await s3.delete_objects(Bucket=pictures_bucket, Delete={"Objects": batch})
-        except Exception:
-            logger.warning(
-                "delete_document.s3_failed",
-                extra={"bucket": pictures_bucket, "key": prefix},
-            )
-
-    await session.execute(text("DELETE FROM chunks WHERE document_id = :id"), {"id": document_id})
-    await session.execute(text("DELETE FROM documents WHERE id = :id"), {"id": document_id})
     await session.commit()
     logger.info("document.deleted", extra={"document_id": str(document_id)})
 
@@ -437,7 +377,8 @@ async def serve_pdf(
 ) -> StreamingResponse:
     repo = DocumentRepository(session)
     doc = await repo.get_by_id(document_id)
-    if doc is None or doc.user_id != current_user.id:
+    # Sample documents (owned by the demo user) are readable by everyone.
+    if doc is None or doc.user_id not in {current_user.id, get_demo_user_id()}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
     s3_session = aioboto3.Session()

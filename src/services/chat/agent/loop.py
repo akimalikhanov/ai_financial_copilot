@@ -31,22 +31,26 @@ from src.observability.langfuse import mark_current as lf_mark_current
 from src.observability.langfuse import span as lf_span
 from src.observability.metrics import (
     AGENT_LAST_TURN_INPUT_TOKENS,
+    AGENT_REASONING_REPLAY_BYTES,
     AGENT_TOOL_ARG_ERRORS,
     AGENT_TOOL_CALLS,
     AGENT_TOOL_DURATION,
     AGENT_TOOL_MODEL_DURATION,
     AGENT_TOOL_MODEL_OUTPUT_TOKENS,
     LLM_CACHE_HIT_TOKENS,
+    LLM_CACHE_WRITE_TOKENS,
     LLM_COST,
+    LLM_REASONING_CONTEXT,
     LLM_TOKENS,
+    observe_llm_call,
     observe_llm_failure,
-    observe_llm_latency,
 )
 from src.observability.trace_payload import cap_list
 from src.redis_client import add_event
 from src.repository.llm_request_repository import LLMRequestRepository, stats_to_request_kwargs
 from src.schemas.agent_findings import AgentFindings, Finding, FindingsReport
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
+from src.services.chat import activity  # a module: it imports this package back
 from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.chat.agent.state import (
     AgentLoopMeta,
@@ -63,7 +67,7 @@ from src.services.chat.agent.state import (
     unresolved_lines,
 )
 from src.services.chat.agent.tools import REPORT_TOOL_NAME, SearchDocumentsArgs
-from src.services.chat.agent.transcript import Transcript
+from src.services.chat.agent.transcript import Transcript, opaque_size
 from src.services.chat.events import build_activity_event
 from src.services.context.turns import as_messages, cap_turns, tool_model_history
 from src.services.llm_adapters.base_adapter import (
@@ -76,7 +80,7 @@ from src.services.llm_runtime.exceptions import LLMError
 from src.services.prompts.prompt_renderer import get_system_prompt
 from src.services.retrieval.chat_rag import run_chat_rag_pipeline
 from src.services.retrieval.payload_hydrator import get_chunk_prompt_payloads
-from src.utils.config import get_agent_trace_chunk_chars
+from src.utils.config import get_agent_trace_chunk_chars, get_llm_reasoning_summary_max_chars
 
 if TYPE_CHECKING:
     from src.schemas.chat import ChatPipelineState, Turn
@@ -98,6 +102,8 @@ class _SearchResult:
     # arguments" — only the former justifies Stop("search_unavailable") or a
     # couldn't-search gap. A malformed tool call is the model's problem, not the backend's.
     backend_failed: bool = False
+    # The search timeout fired; also backend_failed, told apart only for the timeline.
+    timed_out: bool = False
     args_invalid: bool = False
     # The entity matched no document in the library, so no retrieval ran.
     not_found: bool = False
@@ -110,13 +116,12 @@ class _SearchResult:
     # order of magnitude apart, so confidence thresholds must not be applied to them.
     scores_are_rerank: bool = True
     # The `tool_call_started` activity event's id, so completion correlates by id
-    # rather than by entity name — None when no started event was ever emitted
-    # (invalid tool-call arguments, resolved before entity/id assignment).
+    # rather than by entity name. Set by `_guarded_search` on every path.
     activity_id: str | None = None
 
 
 ExecuteSearchFn = Callable[
-    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", Redis, str, int],
+    [ToolCallRef, "ChatPipelineState", AsyncSession, "Reranker | None", str, int],
     Awaitable[_SearchResult],
 ]
 
@@ -224,7 +229,6 @@ async def _execute_search(
     state: ChatPipelineState,
     session: AsyncSession,
     reranker: Reranker | None,
-    redis_app: Redis,
     request_id: str,
     iteration: int,
 ) -> _SearchResult:
@@ -263,19 +267,12 @@ async def _execute_search(
         doc_ids = per_entity[entity]
     else:
         # entity="" (the analytical agent) searches every resolved entity's documents.
-        # The SSE events and trace span carry the entity name only when there is one.
+        # The trace span carries the entity name only when there is one.
         doc_ids = state.scope_result.doc_ids if state.scope_result else None
         if not entity and len(per_entity) == 1:
             entity = next(iter(per_entity))
 
     _tool_started = perf_counter()
-    activity_id, start_data = build_activity_event(
-        "tool_call_started",
-        label=entity,
-        parent_id=f"round-{iteration}",
-        detail={"tool": "search"},
-    )
-    await add_event(redis_app, request_id, "activity", start_data)
 
     # The tool model writes both retrievers' queries: `query` feeds the embedder and the
     # reranker, `keywords` feeds BM25. The schema requires `keywords`; a call that omits
@@ -303,7 +300,7 @@ async def _execute_search(
                 session,
                 semantic_query=raw_query,
                 keyword_query=keyword_query,
-                user_id=state.llm_request.user_id,  # type: ignore[union-attr]
+                user_id=state.corpus_owner_id,  # type: ignore[arg-type]
                 doc_ids=doc_ids,
                 reranker=reranker,
                 # Always hybrid; top_k reads from VECTOR_SEARCH_TOP_K / KEYWORD_SEARCH_TOP_K env vars
@@ -328,7 +325,6 @@ async def _execute_search(
                     payloads={},
                     error_str=f"Search failed for entity: {entity}",
                     backend_failed=True,
-                    activity_id=activity_id,
                 )
         except Exception as exc:
             logger.warning("agent_search_failed", extra={"entity": entity})
@@ -343,7 +339,6 @@ async def _execute_search(
                 payloads={},
                 error_str=f"Search failed for entity: {entity}",
                 backend_failed=True,
-                activity_id=activity_id,
             )
 
     degraded = frozenset(
@@ -370,7 +365,6 @@ async def _execute_search(
         payloads=payloads,
         degraded=degraded,
         scores_are_rerank=retrieval_trace.scores_are_rerank,
-        activity_id=activity_id,
     )
 
 
@@ -409,9 +403,8 @@ def _render_report_result(
 ) -> str:
     """The tool result for one report: what landed and what didn't, nothing else.
 
-    It never states coverage. The transcript is append-only, so an open list here would
-    stay on screen and go stale; the status view (appended last on every call) is the
-    only view of what is still open.
+    It never states coverage: the status view, recomputed on every call and placed last,
+    is the only view of what is still open.
     """
     parts: list[str] = []
     # Split on what actually landed, not on what was claimed: with no mid-loop gap
@@ -451,8 +444,10 @@ def _render_report_result(
     return " ".join(parts)
 
 
-def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str:
-    """Fold one report into the ledger and return its tool result.
+def _apply_report(
+    tc: ToolCallRef, state: AgentRunState, request_id: str
+) -> tuple[str, list[activity.NoteRow]]:
+    """Fold one report into the ledger; return its tool result and its timeline rows.
 
     Partial acceptance, never rejection: unknown keys are dropped from the candidate and
     named in the result; known ones land. Nothing is un-done, so there is no rejection
@@ -477,7 +472,7 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
         return (
             f"{tc.name} arguments did not parse against the schema. "
             "Re-issue the call with valid arguments."
-        )
+        ), [activity.MALFORMED_REPORT_ROW]
 
     report = _resolve_refs(parsed, state, request_id)
     raw_keys = {f.key for f in report.findings}
@@ -500,10 +495,22 @@ def _apply_report(tc: ToolCallRef, state: AgentRunState, request_id: str) -> str
     # A reported-but-ungrounded key stays open: closing it would let `Stop("covered")`
     # seal a run that produced no grounded output for that key. Left open, it stays
     # searchable, and if it is still open at the end projection renders it as unresolved.
-    state.findings.ingest(report.model_copy(update={"findings": kept}), state.evidence)
+    ingested = iter(
+        state.findings.ingest(report.model_copy(update={"findings": kept}), state.evidence)
+    )
+    # Back in report order: `kept` is report.findings minus exactly these two rejections.
+    outcomes: list[tuple[activity.ReportOutcome, Finding | None]] = [
+        ("unknown", None)
+        if f.key in unknown
+        else ("unsearched", None)
+        if not f.supported and f.key in unsearched
+        else next(ingested)
+        for f in report.findings
+    ]
 
     AGENT_TOOL_CALLS.labels(tc.name, "ok").inc()
-    return _render_report_result(state, closed=known, unknown=unknown, unsearched=unsearched)
+    text = _render_report_result(state, closed=known, unknown=unknown, unsearched=unsearched)
+    return text, activity.report_rows(outcomes, state.plan)
 
 
 # ---------------------------------------------------------------------------
@@ -516,18 +523,20 @@ def fold_searches(
     searches: list[ToolCallRef],
     results: list[_SearchResult],
     keys: dict[str, str | None],
-) -> tuple[dict[str, str], list[int], dict[str, object]]:
+) -> tuple[dict[str, str], list[int], dict[str, object], list[activity.SearchSources]]:
     """Fold one turn's search results into the state, in call order.
 
     Returns the tool-result text per call id, the count of new labels each search
-    showed the model, and a trace view per call id (chunk ids with trimmed text; the next
-    turn's GENERATION input carries a longer, still capped, cut). No awaits and no I/O:
+    showed the model, a trace view per call id (chunk ids with trimmed text; the next
+    turn's GENERATION input carries a longer, still capped, cut), and per search the
+    documents and pages it showed, for the timeline. No awaits and no I/O:
     labels are assigned here, sequentially, so S-labels continue across searches instead
     of restarting at S1, and stay deterministic however the concurrent searches finished.
     """
     texts: dict[str, str] = {}
     traces: dict[str, object] = {}
     new_per_search: list[int] = []
+    sources_per_search: list[activity.SearchSources] = []
     trace_chars = get_agent_trace_chunk_chars()
     for tc, result in zip(searches, results, strict=True):
         entity_new = state.evidence.admit(result.chunks)
@@ -567,6 +576,7 @@ def fold_searches(
         if result.error_str is not None:
             texts[tc.id] = traces[tc.id] = result.error_str
             new_per_search.append(0)
+            sources_per_search.append([])
             continue
         # Admit the full result above for provenance, but render only the top-N into the
         # transcript — uncapped tool results are the biggest per-turn token cost. The
@@ -579,6 +589,12 @@ def fold_searches(
         # Progress counts only what the model can read: a chunk admitted below the top-N
         # cut is never shown, so it can't make a near-repeat search look productive.
         new_per_search.append(len(ctx.items))
+        pages_by_doc: dict[str, set[int]] = {}
+        for item in ctx.items:
+            payload = result.payloads.get(item.chunk_id)
+            if payload is not None:
+                pages_by_doc.setdefault(payload.document_name, set()).update(payload.page_numbers)
+        sources_per_search.append([(doc, sorted(pages)) for doc, pages in pages_by_doc.items()])
         parts = [ctx.formatted_context] if ctx.formatted_context else []
         if shown:
             parts.append("Already shown above: " + " · ".join(shown))
@@ -598,22 +614,27 @@ def fold_searches(
             ],
             "already_shown": shown,
         }
-    return texts, new_per_search, traces
+    return texts, new_per_search, traces, sources_per_search
 
 
 def fold_reports(
     state: AgentRunState, reports: list[ToolCallRef], request_id: str
-) -> tuple[dict[str, str], frozenset[str]]:
+) -> tuple[dict[str, str], frozenset[str], list[activity.NoteRow]]:
     """Fold one turn's reports into the ledger, in call order.
 
-    Returns the tool-result text per call id and the plan keys this turn closed. Called
+    Returns the tool-result text per call id, the plan keys this turn closed, and the
+    timeline's note rows in call order. Called
     after minting and before this turn's searches run: the model wrote these reports
     without seeing those results, so they are judged against the state the previous turn
     left — they cite only earlier labels, and a negative needs an earlier search.
     """
     before = set(state.addressed)
-    texts = {tc.id: _apply_report(tc, state, request_id) for tc in reports}
-    return texts, frozenset(state.addressed - before)
+    texts: dict[str, str] = {}
+    rows: list[activity.NoteRow] = []
+    for tc in reports:
+        texts[tc.id], call_rows = _apply_report(tc, state, request_id)
+        rows += call_rows
+    return texts, frozenset(state.addressed - before), rows
 
 
 def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
@@ -624,7 +645,10 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
     """
     # Ordering is load-bearing: minting happened before this, so a turn that closes the
     # last open key *and* opens a new thread continues rather than stopping.
-    if state.plan and not open_aspects(state):
+    # Reports fold before the same turn's searches run, so a turn that reports every key
+    # and also searches has results the model has not read yet. Stopping there would pay
+    # for a follow-up and discard it; the next turn reads it, then re-reports or stops.
+    if state.plan and not open_aspects(state) and facts.new_labels == 0:
         state.sealed_by_coverage = True
         return Stop("covered")
 
@@ -641,7 +665,7 @@ def decide(state: AgentRunState, facts: TurnFacts) -> TurnOutcome:
         if state.empty_rounds > state.settings.max_empty_rounds:
             return Stop("convergence")
         # The stall nudge lives in `render_status`, recomputed per call from
-        # `empty_rounds`, so it never accumulates in the transcript.
+        # `empty_rounds`.
     else:
         # `max_empty_rounds` counts *consecutive* empty rounds, not cumulative.
         state.empty_rounds = 0
@@ -674,16 +698,18 @@ async def _call_tool_model(
     via `allowed_tools` where the model supports it (keeps the cached prefix), otherwise by
     dropping the other tools from the request."""
 
+    # The prefix shared across requests is the system prompt plus tools, both keyed by the
+    # shape's prompt version.
+    params = {"temperature": 0.0, "prompt_cache_key": f"agent:{deps.shape.prompt}"}
+
     async def complete(llm: RoutedLLM) -> AssistantTurnResult:
         if allowed is None:
-            call = llm.complete_with_tools(messages, tools=tools, temperature=0.0)
+            call = llm.complete_with_tools(messages, tools=tools, **params)
         elif llm.capabilities.get("allowed_tools", False):
-            call = llm.complete_with_tools(
-                messages, tools=tools, allowed_tools=allowed, temperature=0.0
-            )
+            call = llm.complete_with_tools(messages, tools=tools, allowed_tools=allowed, **params)
         else:
             subset = [t for t in tools if t["function"]["name"] in allowed]
-            call = llm.complete_with_tools(messages, tools=subset, temperature=0.0)
+            call = llm.complete_with_tools(messages, tools=subset, **params)
         # Recomputed per call: a fallback gets only what the failed attempt left.
         budget = _call_budget(state)
         started = perf_counter()
@@ -781,6 +807,7 @@ async def _write_tool_call_row(
                 model=llm.model_id,
                 request_type="agent_tool_call",
                 request_params={"iteration": state.iteration, **request_params},
+                llm_api=llm.api,
                 **row,
             )
             await session.commit()
@@ -806,7 +833,7 @@ async def _record_failed_call(
     The tokens a timed-out call was billed for are unknown, so the row has none."""
     elapsed = perf_counter() - started
     turn_kind = _turn_kind(allowed, None)
-    observe_llm_failure(llm.model_id, "agent_tool_call", outcome, elapsed)
+    observe_llm_failure(llm.model_id, llm.api, "agent_tool_call", outcome, elapsed)
     AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(elapsed)
     if outcome == "timeout":
         logger.warning(
@@ -838,12 +865,19 @@ async def _record_turn_spend(
     llm: RoutedLLM,
     turn: AssistantTurnResult,
     allowed: list[str] | None,
+    replay_bytes: int = 0,
 ) -> None:
-    """Spend, metrics and the `llm_requests` sub-request row for one tool-model call."""
+    """Spend, metrics and the `llm_requests` sub-request row for one tool-model call.
+    `replay_bytes` is the opaque payload the request carried."""
     stats = turn.stats
     if stats is None:
         return
     turn_kind = _turn_kind(allowed, turn)
+    meta = turn.meta
+    if llm.api == "responses":
+        AGENT_REASONING_REPLAY_BYTES.observe(replay_bytes)
+    if meta and meta.reasoning_context:
+        LLM_REASONING_CONTEXT.labels(llm.model_id, meta.reasoning_context).inc()
     state.record_spend(llm.model_id, stats)
     state.last_turn_input_tokens = stats.input_tokens or 0
     if stats.input_tokens:
@@ -852,6 +886,8 @@ async def _record_turn_spend(
         LLM_TOKENS.labels("output", llm.model_id).inc(stats.output_tokens)
     if stats.cached_input_tokens:
         LLM_CACHE_HIT_TOKENS.labels(llm.model_id).inc(stats.cached_input_tokens)
+    if stats.cache_write_tokens:
+        LLM_CACHE_WRITE_TOKENS.labels(llm.model_id).inc(stats.cache_write_tokens)
     if stats.cost_usd:
         LLM_COST.labels(llm.model_id).inc(stats.cost_usd)
     # Hitting the completion-token cap is its own failure: reasoning can spend the whole
@@ -871,7 +907,7 @@ async def _record_turn_spend(
             },
         )
         lf_mark_current("WARNING", f"tool model hit its token cap ({stats.output_tokens} out)")
-    observe_llm_latency(llm.model_id, "agent_tool_call", stats, outcome)
+    observe_llm_call(llm.model_id, llm.api, "agent_tool_call", stats, outcome)
     if stats.latency_ms is not None:
         AGENT_TOOL_MODEL_DURATION.labels(llm.model_id, turn_kind, outcome).observe(
             stats.latency_ms / 1000.0
@@ -887,25 +923,51 @@ async def _record_turn_spend(
         state,
         deps,
         llm,
-        {"tool_calls_issued": len(turn.tool_calls or []), "turn_kind": turn_kind},
+        {
+            "tool_calls_issued": len(turn.tool_calls or []),
+            "turn_kind": turn_kind,
+            # Effective values the provider reports, for debugging.
+            **({"reasoning_context": meta.reasoning_context} if meta else {}),
+            **({"service_tier": meta.service_tier} if meta else {}),
+            **({"replay_bytes": replay_bytes} if llm.api == "responses" else {}),
+        },
         status="truncated" if truncated else "completed",
+        reasoning_summary=_capped_summary(turn),
         **stats_to_request_kwargs(stats),
     )
 
 
-async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) -> _SearchResult:
-    """One search, bounded by the search timeout; a timeout becomes a backend failure."""
+def _capped_summary(turn: AssistantTurnResult | None) -> str | None:
+    if turn is None or not turn.reasoning_summary:
+        return None
+    return turn.reasoning_summary[: get_llm_reasoning_summary_max_chars()]
+
+
+async def _guarded_search(
+    tc: ToolCallRef, state: AgentRunState, deps: RunDeps, key: str | None
+) -> _SearchResult:
+    """One search, bounded by the search timeout; a timeout becomes a backend failure.
+
+    Opens the search's timeline row before anything can return early, so every path
+    (early return, failure, timeout) comes back carrying the row's id."""
+    scope = deps.chat_state.scope_result
+    activity_id, start_data = build_activity_event(
+        "tool_call_started",
+        label=activity.search_label(tc.arguments, scope.per_entity_doc_ids if scope else None),
+        parent_id=f"round-{state.iteration}",
+        detail={"tool": "search", "key": key},
+    )
+    await add_event(deps.redis_app, deps.request_id, "activity", start_data)
     try:
         async with asyncio.timeout(state.settings.search_timeout_seconds):
             # A fresh session per concurrent search — the shared `deps.session` is not
             # safe for concurrent use under asyncio.gather.
             async with deps.search_sem, deps.session_factory() as task_session:
-                return await deps.execute_search(
+                result = await deps.execute_search(
                     tc,
                     deps.chat_state,
                     task_session,
                     deps.reranker,
-                    deps.redis_app,
                     deps.request_id,
                     state.iteration,
                 )
@@ -919,13 +981,16 @@ async def _guarded_search(tc: ToolCallRef, state: AgentRunState, deps: RunDeps) 
             },
         )
         AGENT_TOOL_CALLS.labels("search_documents", "error").inc()
-        return _SearchResult(
+        result = _SearchResult(
             entity="",
             chunks=[],
             payloads={},
             error_str="search timed out — the search backend did not respond in time.",
             backend_failed=True,
+            timed_out=True,
         )
+    result.activity_id = activity_id
+    return result
 
 
 async def _run_turn(
@@ -934,6 +999,7 @@ async def _run_turn(
     """One turn: call the tool model, dispatch its calls, fold the results, decide."""
     iteration = state.iteration
     request_id = deps.request_id
+    scope = deps.chat_state.scope_result
     _, round_data = build_activity_event(
         "round_started",
         event_id=f"round-{iteration}",
@@ -943,9 +1009,9 @@ async def _run_turn(
     await add_event(deps.redis_app, request_id, "activity", round_data)
     logger.debug("agent_turn_started", extra={"request_id": request_id, "iteration": iteration})
 
-    # The status view is computed per call and appended last — never stored, so it never
-    # invalidates the cached prefix and never accumulates. It is the single source of
-    # coverage truth: nothing permanent in the transcript states coverage. It also doubles
+    # The status view is computed per call and stored folded into the last tool result
+    # (`add_status`), so the next request starts with this one verbatim and hits the
+    # cache. Older statuses stay in history; the newest is always last. It also doubles
     # as this turn's trace input: the transcript up to here is what earlier turns' own
     # spans already recorded (Langfuse nests them under the same agent_loop chain), so
     # re-dumping all of `state.transcript.messages` on every turn would repeat turn 0's
@@ -964,14 +1030,21 @@ async def _run_turn(
         },
     ) as obs:
         try:
-            prompt_messages = [
-                *state.transcript.messages,
-                *([ChatMessage(role=Role.user, content=status)] if status else []),
-            ]
+            state.transcript.add_status(status)
+            prompt_messages = list(state.transcript.messages)
             served, turn = await _call_tool_model(state, deps, prompt_messages, tools, allowed)
-            await _finish_despite_cancel(_record_turn_spend(state, deps, served, turn, allowed))
+            _, replay_bytes = opaque_size(prompt_messages)
+            await _finish_despite_cancel(
+                _record_turn_spend(state, deps, served, turn, allowed, replay_bytes)
+            )
 
             if not turn.tool_calls:
+                # Every key was already recorded and `decide` held the run open only so
+                # the model could read its last results: declining to act on them is the
+                # covered stop it deferred.
+                if state.plan and not open_aspects(state):
+                    state.sealed_by_coverage = True
+                    return Stop("covered")
                 # With no terminal tool this is a normal exit, not a rare one: the model
                 # emitted prose instead of a call. projection() still serves whatever the
                 # ledger accumulated (None only if nothing was ever reported). A turn cut
@@ -993,41 +1066,64 @@ async def _run_turn(
                         f"Tool {tc.name!r} is not available. "
                         f"Available: {', '.join(sorted(offered))}."
                     )
+                    if any(t["function"]["name"] == tc.name for t in tools):
+                        # A real tool withheld on the final pass: still gets its row.
+                        row_id, row_start = build_activity_event(
+                            "tool_call_started",
+                            label=activity.search_label(
+                                tc.arguments, scope.per_entity_doc_ids if scope else None
+                            ),
+                            parent_id=f"round-{iteration}",
+                            detail={"tool": "search"},
+                        )
+                        await add_event(deps.redis_app, request_id, "activity", row_start)
+                        _, row_end = build_activity_event(
+                            "tool_call_ended",
+                            event_id=row_id,
+                            detail={"status": "skipped", "note": activity.NOT_RUN_FINAL_PASS},
+                        )
+                        await add_event(deps.redis_app, request_id, "activity", row_end)
 
             # The assistant message is appended ONCE, verbatim, in emission order, and
             # (below) there is exactly one role=tool result per tool_call id. An assistant
             # tool_calls entry without a matching result — or vice versa — is a 400 on
-            # every OpenAI-compatible provider.
-            state.transcript.append_tool_calls(turn.tool_calls)
+            # every OpenAI-compatible provider. The turn's opaque items (encrypted
+            # reasoning) ride on the same message, in emission order; only the adapter
+            # reads them, so the model continues its own reasoning on the next call.
+            state.transcript.append_turn(turn)
             state.tool_calls_total += len(turn.tool_calls)
 
             # Key before execution, so the tool result can echo the key the model must cite.
             keys = {tc.id: _search_key(tc, state, deps.shape) for tc in searches}
 
-            report_texts, closed = fold_reports(state, reports, request_id)
+            report_texts, closed, note_rows = fold_reports(state, reports, request_id)
             results_by_id |= report_texts
-            for _ in reports:
-                report_id, report_start = build_activity_event(
-                    "tool_call_started",
-                    label="Recording findings",
-                    parent_id=f"round-{iteration}",
-                    detail={"tool": "report"},
+            for row in note_rows:
+                detail: dict[str, str] = {"status": row.status}
+                if row.note is not None:
+                    detail["note"] = row.note
+                if row.claim is not None:
+                    detail["claim"] = row.claim
+                _, note_data = build_activity_event(
+                    "note", label=row.label, parent_id=f"round-{iteration}", detail=detail
                 )
-                await add_event(deps.redis_app, request_id, "activity", report_start)
-                _, report_end = build_activity_event("tool_call_ended", event_id=report_id)
-                await add_event(deps.redis_app, request_id, "activity", report_end)
+                await add_event(deps.redis_app, request_id, "activity", note_data)
 
             results = list(
-                await asyncio.gather(*[_guarded_search(tc, state, deps) for tc in searches])
+                await asyncio.gather(
+                    *[_guarded_search(tc, state, deps, keys[tc.id]) for tc in searches]
+                )
             )
             before_searches = state.addressed
-            search_texts, new_per_search, search_traces = fold_searches(
+            search_texts, new_per_search, search_traces, search_sources = fold_searches(
                 state, searches, results, keys
             )
             closed |= state.addressed - before_searches
             results_by_id |= search_texts
             new_labels = sum(new_per_search)
-            for tc, result, search_new in zip(searches, results, new_per_search, strict=True):
+            for tc, result, search_new, sources in zip(
+                searches, results, new_per_search, search_sources, strict=True
+            ):
                 logger.debug(
                     "tool_call_completed",
                     extra={
@@ -1039,16 +1135,21 @@ async def _run_turn(
                         "new_labels": search_new,
                     },
                 )
-                if result.activity_id is not None:
-                    _, end_data = build_activity_event(
-                        "tool_call_ended",
-                        event_id=result.activity_id,
-                        detail={
-                            "chunks_returned": len(result.chunks),
-                            "new_chunks_added": search_new,
-                        },
-                    )
-                    await add_event(deps.redis_app, request_id, "activity", end_data)
+                row_status, row_note = activity.search_result_row(
+                    result, search_new, state.settings.search_timeout_seconds
+                )
+                end_detail: dict = {
+                    "status": row_status,
+                    "note": row_note,
+                    "chunks_returned": len(result.chunks),
+                    "new_chunks_added": search_new,
+                }
+                if search_new and (row_sources := activity.search_sources(sources)):
+                    end_detail["sources"] = row_sources
+                _, end_data = build_activity_event(
+                    "tool_call_ended", event_id=result.activity_id, detail=end_detail
+                )
+                await add_event(deps.redis_app, request_id, "activity", end_data)
 
             # Exactly one result per call id, in turn.tool_calls order.
             for tc in turn.tool_calls:
@@ -1090,6 +1191,8 @@ async def _run_turn(
                         "token_spend_cumulative": state.input_tokens_total(),
                         "cost_usd_cumulative": state.cost_usd_total(),
                         "new_labels": new_labels,
+                        # The provider's readable "why" behind this turn's calls.
+                        **({"reasoning_summary": s} if (s := _capped_summary(turn)) else {}),
                     },
                 )
 
