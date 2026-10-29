@@ -16,3 +16,10 @@ is applied to the live stack before the cutover.
   template labels are unchanged.
 - ConfigMaps and Secrets lose their hash suffix. Pods roll on change via `checksum/config` and
   `checksum/secrets` instead. The Secrets are created by `make k8s-secrets-apply`.
+- `es-bootstrap` and `garage-bootstrap` are post-install/post-upgrade hooks, re-run on every
+  deploy. Their pods also gain `app.kubernetes.io/name`. Delete the live Jobs before the
+  cutover; a hook can't adopt them.
+- Grafana loses its `wait-for-es-bootstrap` initContainer. As a hook under `--wait`,
+  es-bootstrap runs only after Grafana is ready, so the gate would deadlock a fresh install.
+  Grafana now starts before the `copilot-logs` alias exists, and logs panels error for the
+  ~15s until es-bootstrap finishes.

@@ -23,7 +23,7 @@ spec:
             - sh
             - -c
             - |
-              for t in postgres:5432 clickhouse:8123 redis-app:6379 garage:3900; do
+              for t in postgres:5432 clickhouse:8123 redis-langfuse:6379 garage:3900; do
                 until nc -z "${t%:*}" "${t#*:}"; do echo "waiting for $t"; sleep 2; done
               done
           resources:

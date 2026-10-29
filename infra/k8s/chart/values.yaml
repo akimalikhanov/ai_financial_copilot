@@ -71,3 +71,53 @@ redisBroker:
     limits: { cpu: 500m, memory: 512Mi }
   persistence:
     size: 1Gi
+
+redisLangfuse:
+  image: redis:7.2.12-alpine
+  maxmemory: 192mb         # write errors past this, never eviction; keep below the memory limit
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+  persistence:
+    size: 1Gi
+
+# --- search ---
+sysctlInit:                # privileged initContainer setting vm.max_map_count for OpenSearch/ES
+  enabled: true            # false where nodes set it at bootstrap
+  image: busybox:1.36
+
+qdrant:
+  image: qdrant/qdrant:v1.16.3
+  resources:
+    requests: { cpu: 500m, memory: 1536Mi }
+    limits: { cpu: "2", memory: 3Gi }
+  persistence:
+    size: 10Gi
+
+opensearch:
+  image: opensearchproject/opensearch:2.19.0
+  heap: 1g                 # -Xms/-Xmx; keep the memory limit ~2x heap for off-heap use
+  resources:
+    requests: { cpu: 750m, memory: 1280Mi }
+    limits: { cpu: 1500m, memory: 2560Mi }
+  persistence:
+    size: 10Gi
+
+elasticsearch:
+  image: docker.elastic.co/elasticsearch/elasticsearch:8.18.1
+  heap: 512m               # -Xms/-Xmx
+  resources:
+    requests: { cpu: 500m, memory: 768Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  persistence:
+    size: 5Gi
+
+# --- storage ---
+garage:
+  image: dxflrs/garage:v2.2.0
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  persistence:
+    metaSize: 1Gi
+    dataSize: 10Gi

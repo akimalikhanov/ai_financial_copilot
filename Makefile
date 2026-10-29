@@ -317,6 +317,10 @@ k8s-sync-es-bootstrap:
 	cp infra/docker/elasticsearch/bootstrap.sh infra/k8s/base/search/es-bootstrap/bootstrap.sh
 	cp infra/docker/elasticsearch/ilm-policy.json infra/k8s/base/search/es-bootstrap/ilm-policy.json
 	cp infra/docker/elasticsearch/index-template.json infra/k8s/base/search/es-bootstrap/index-template.json
+	mkdir -p $(CHART)/files/search/es-bootstrap
+	cp infra/docker/elasticsearch/bootstrap.sh $(CHART)/files/search/es-bootstrap/bootstrap.sh
+	cp infra/docker/elasticsearch/ilm-policy.json $(CHART)/files/search/es-bootstrap/ilm-policy.json
+	cp infra/docker/elasticsearch/index-template.json $(CHART)/files/search/es-bootstrap/index-template.json
 
 # Fails if the K8s es-bootstrap copies have drifted from infra/docker/elasticsearch/. Run
 # `make k8s-sync-es-bootstrap` to fix. Wired into `lint` so CI catches silent drift.
@@ -325,6 +329,9 @@ k8s-check-es-bootstrap:
 	@diff -q infra/docker/elasticsearch/bootstrap.sh infra/k8s/base/search/es-bootstrap/bootstrap.sh
 	@diff -q infra/docker/elasticsearch/ilm-policy.json infra/k8s/base/search/es-bootstrap/ilm-policy.json
 	@diff -q infra/docker/elasticsearch/index-template.json infra/k8s/base/search/es-bootstrap/index-template.json
+	@diff -q infra/docker/elasticsearch/bootstrap.sh $(CHART)/files/search/es-bootstrap/bootstrap.sh
+	@diff -q infra/docker/elasticsearch/ilm-policy.json $(CHART)/files/search/es-bootstrap/ilm-policy.json
+	@diff -q infra/docker/elasticsearch/index-template.json $(CHART)/files/search/es-bootstrap/index-template.json
 
 # infra/k8s/base/observability/grafana/dashboards/* are copies of infra/docker/grafana/dashboards/*.
 # infra/docker/ is the source of truth. worker-health.json is excluded on purpose: the K8s copy

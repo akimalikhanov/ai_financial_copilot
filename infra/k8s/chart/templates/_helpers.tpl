@@ -35,6 +35,19 @@ app.kubernetes.io/component: {{ . }}
 {{- if $i.registry }}{{ $i.registry }}/{{ end }}copilot/{{ .name }}:{{ $i.tag | toString }}
 {{- end }}
 
+{{/*
+Privileged initContainer setting vm.max_map_count on the node, for Lucene's mmaps. Callers wrap
+it in `if .Values.sysctlInit.enabled`. Privileged is required: runc masks /proc/sys read-only for
+non-privileged containers even with SYS_ADMIN.
+*/}}
+{{- define "copilot.sysctlInitContainer" -}}
+- name: sysctl
+  image: {{ .Values.sysctlInit.image }}
+  command: ["sh", "-c", "sysctl -w vm.max_map_count=262144"]
+  securityContext:
+    privileged: true
+{{- end }}
+
 {{/* storageClassName, omitted when persistence.storageClass is "" (cluster default). */}}
 {{- define "copilot.storageClass" -}}
 {{- with .Values.persistence.storageClass -}}

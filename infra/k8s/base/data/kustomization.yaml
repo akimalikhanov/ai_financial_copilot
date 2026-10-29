@@ -10,6 +10,8 @@ resources:
   - redis-app-statefulset.yaml
   - redis-broker-service.yaml
   - redis-broker-statefulset.yaml
+  - redis-langfuse-service.yaml
+  - redis-langfuse-statefulset.yaml
 
 # initdb/*.sh and pgbouncer-entrypoint.sh are copies of infra/scripts/db_init/*.sh and
 # infra/scripts/pgbouncer-entrypoint.sh, kept under this kustomization root so

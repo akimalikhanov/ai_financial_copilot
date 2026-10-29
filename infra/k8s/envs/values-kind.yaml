@@ -12,3 +12,15 @@ redisApp:
 redisBroker:
   persistence:
     size: 2Gi
+qdrant:
+  persistence:
+    size: 2Gi
+opensearch:
+  persistence:
+    size: 2Gi
+elasticsearch:
+  persistence:
+    size: 2Gi
+garage:
+  persistence:
+    dataSize: 2Gi

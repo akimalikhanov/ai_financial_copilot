@@ -29,7 +29,7 @@ secretGenerator:
   - name: postgres-secret
     envs: [secrets/postgres.env]        # gitignored
   - name: redis-secret
-    envs: [secrets/redis.env]           # gitignored; shared by redis-app and redis-broker
+    envs: [secrets/redis.env]           # gitignored; shared by all three Redis instances
   - name: garage-secret
     envs: [secrets/garage.env]          # gitignored
   - name: app-secret

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-toml
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "garage") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/storage/garage.toml").AsConfig | nindent 2 }}
