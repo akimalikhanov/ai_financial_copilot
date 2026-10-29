@@ -48,6 +48,99 @@ non-privileged containers even with SYS_ADMIN.
     privileged: true
 {{- end }}
 
+{{/* Pod-level GPU scheduling. The container adds nvidia.com/gpu to its own limits. */}}
+{{- define "copilot.gpuScheduling" -}}
+{{- if .Values.gpu.enabled -}}
+{{- with .Values.gpu.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.gpu.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+{{- end }}
+
+{{/*
+ConfigMap data from a KEY=VALUE chart file, plus overrides. Argument:
+(dict "root" $ "path" "files/..." "overrides" map). Inside, $ is that dict.
+*/}}
+{{- define "copilot.envFileData" -}}
+{{- $data := dict -}}
+{{- range $line := splitList "\n" (.root.Files.Get .path) -}}
+{{- $l := trim $line -}}
+{{- if and $l (not (hasPrefix "#" $l)) -}}
+{{- $kv := regexSplit "=" $l 2 -}}
+{{- if ne (len $kv) 2 -}}{{- fail (printf "%s: expected KEY=VALUE, got %q" $.path $l) -}}{{- end -}}
+{{- $_ := set $data (index $kv 0) (index $kv 1) -}}
+{{- end -}}
+{{- end -}}
+{{- range $k, $v := (.overrides | default dict) -}}
+{{- $_ := set $data $k (toString $v) -}}
+{{- end -}}
+{{- range $k, $v := $data }}
+{{ $k }}: {{ $v | quote }}
+{{- end -}}
+{{- end }}
+
+{{/* initContainer that blocks until pg_isready. Argument: (dict "root" $ "host" "pgbouncer" "port" 6432 "userVar" "APP_DB_USER"). */}}
+{{- define "copilot.waitForPostgres" -}}
+- name: wait-for-{{ .host }}
+  image: {{ .root.Values.waitImages.postgres }}
+  command:
+    - sh
+    - -c
+    - |
+      until pg_isready -h {{ .host }} -p {{ .port }} -U "${{ .userVar }}"; do
+        echo "waiting for {{ .host }}:{{ .port }}"; sleep 2
+      done
+  envFrom:
+    - secretRef: { name: {{ .root.Values.secrets.postgres }} }
+  resources:
+    requests: { cpu: "10m", memory: "16Mi" }
+{{- end }}
+
+{{/* initContainer that blocks until a Redis instance answers PING. Argument: (dict "root" $ "host" "redis-app"). */}}
+{{- define "copilot.waitForRedis" -}}
+- name: wait-for-{{ .host }}
+  image: {{ .root.Values.waitImages.redis }}
+  command:
+    - sh
+    - -c
+    - |
+      until redis-cli -h {{ .host }} -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; do
+        echo "waiting for {{ .host }}:6379"; sleep 2
+      done
+  envFrom:
+    - secretRef: { name: {{ .root.Values.secrets.redis }} }
+  resources:
+    requests: { cpu: "10m", memory: "16Mi" }
+{{- end }}
+
+{{/*
+initContainer that blocks until an HTTP endpoint answers. Argument:
+(dict "root" $ "host" "tei" "port" 80 "path" "/health" ["anyStatus" true]).
+anyStatus accepts any HTTP response, e.g. Garage's 403 to anonymous requests.
+*/}}
+{{- define "copilot.waitForHttp" -}}
+- name: wait-for-{{ .host }}
+  image: {{ .root.Values.waitImages.curl }}
+  command:
+    - sh
+    - -c
+    - |
+      {{- if .anyStatus }}
+      until curl -sS -o /dev/null http://{{ .host }}:{{ .port }}{{ .path }}; do
+      {{- else }}
+      until curl -fsS http://{{ .host }}:{{ .port }}{{ .path }} >/dev/null 2>&1; do
+      {{- end }}
+        echo "waiting for {{ .host }}:{{ .port }}"; sleep 2
+      done
+  resources:
+    requests: { cpu: "10m", memory: "16Mi" }
+{{- end }}
+
 {{/* storageClassName, omitted when persistence.storageClass is "" (cluster default). */}}
 {{- define "copilot.storageClass" -}}
 {{- with .Values.persistence.storageClass -}}

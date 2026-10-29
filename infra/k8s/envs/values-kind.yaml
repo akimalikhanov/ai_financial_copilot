@@ -2,6 +2,21 @@
 images:
   registry: localhost:5001
 
+# worker-ingestion, tei and tei-embedder share the time-sliced GPU.
+gpu:
+  enabled: true
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:             # SSE: no buffering, timeouts and body size match src/ui/nginx.k8s.conf
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+
 # PVC sizes match the live volumeClaimTemplates, which are immutable.
 postgres:
   persistence:

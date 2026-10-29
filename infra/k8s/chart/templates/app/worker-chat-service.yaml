@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-chat
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "chat_worker") | nindent 4 }}
+spec:
+  clusterIP: None              # headless: a stable target for Prometheus SD and port-forward
+  selector:
+    {{- include "copilot.selectorLabels" (dict "name" "chat_worker") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100

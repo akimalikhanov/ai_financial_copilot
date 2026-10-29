@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "api") | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  # Never drop a replica before its replacement is ready: draining takes up to 240s.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "api") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+        checksum/config: {{ include (print $.Template.BasePath "/app/app-configmaps.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      initContainers:
+        {{- include "copilot.waitForPostgres" (dict "root" $ "host" "pgbouncer" "port" 6432 "userVar" "APP_DB_USER") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-app") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-broker") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "opensearch" "port" 9200 "path" "/_cluster/health") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "garage" "port" 3900 "anyStatus" true) | nindent 8 }}
+      # An SSE stream lives as long as its pipeline: chat_agent p99 187s, max 230s (Aug-Sep 2026).
+      terminationGracePeriodSeconds: 240
+      containers:
+        - name: api
+          image: {{ include "copilot.appImage" (dict "root" $ "name" "api") | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal and SIGTERM race; wait for the removal to propagate first.
+                command: ["sh", "-c", "sleep 5"]
+          # Later sources win; env: below beats all of them.
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: {{ .Values.secrets.app }} }
+          env:
+            - name: LOG_FILE
+              value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: api
+          # Liveness strictly laxer than readiness: shed after ~15s of failures, restart after ~120s.
+          readinessProbe:
+            httpGet:
+              path: /readyz          # Redis reachable + below the stream cap
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3        # > the handler's own 2s Redis budget
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz         # static 200: is the event loop turning
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}

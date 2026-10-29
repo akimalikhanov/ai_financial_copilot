@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "frontend") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "copilot.selectorLabels" (dict "name" "frontend") | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

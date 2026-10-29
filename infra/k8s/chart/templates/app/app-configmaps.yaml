@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config             # tuning knobs
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "app") | nindent 4 }}
+data:
+  {{- include "copilot.envFileData" (dict "root" $ "path" "files/app/app-config.env" "overrides" .Values.appConfig.overrides) | nindent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-endpoints          # in-cluster hosts/ports
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "app") | nindent 4 }}
+data:
+  {{- include "copilot.envFileData" (dict "root" $ "path" "files/app/app-endpoints.env") | nindent 2 }}

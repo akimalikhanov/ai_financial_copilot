@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-ingestion
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "ingestion_worker") | nindent 4 }}
+spec:
+  replicas: {{ .Values.workerIngestion.replicas }}
+  # The model cache PVC is ReadWriteOnce: a rolling update's new pod would wait on the old one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      # `ingestion_worker`: the job name the dashboards query (see worker-chat-deployment.yaml).
+      {{- include "copilot.selectorLabels" (dict "name" "ingestion_worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "ingestion_worker" "component" "worker") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+        prometheus.io/path: "/metrics"
+        checksum/config: {{ include (print $.Template.BasePath "/app/app-configmaps.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      # Above INGEST_TASK_TIME_LIMIT_SECONDS (2700), the hard limit, for the same reason as worker-chat.
+      terminationGracePeriodSeconds: 2800
+      {{- include "copilot.gpuScheduling" . | nindent 6 }}
+      initContainers:
+        {{- include "copilot.waitForPostgres" (dict "root" $ "host" "pgbouncer" "port" 6432 "userVar" "APP_DB_USER") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-broker") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-app") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "opensearch" "port" 9200 "path" "/_cluster/health") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "garage" "port" 3900 "anyStatus" true) | nindent 8 }}
+        {{- /* Embedder only: ingestion never calls the reranker. */}}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "tei-embedder" "port" 80 "path" "/health") | nindent 8 }}
+      containers:
+        - name: worker-ingestion
+          image: {{ include "copilot.appImage" (dict "root" $ "name" "worker") | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "src.workers.ingestion_worker"]
+          ports:
+            - name: metrics
+              containerPort: 9101
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: {{ .Values.secrets.app }} }
+          env:
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom_ingestion
+            - name: LOG_FILE
+              value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: worker-ingestion
+            # Dockerfile.worker runs as non-root appuser and pre-creates this path.
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+          volumeMounts:
+            - name: prom-multiproc
+              mountPath: /tmp/prom_ingestion
+            - name: hf-model-cache
+              mountPath: /home/appuser/.cache/huggingface
+          # The ping imports torch+docling and waits on busy children: long timeout, long period.
+          # env -u: importing src.observability purges the multiproc dir, wiping live shards.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping >/dev/null 2>&1
+            initialDelaySeconds: 60
+            periodSeconds: 120
+            timeoutSeconds: 60
+            failureThreshold: 5
+          # requests.memory is the observed steady state; the limit absorbs a large-PDF parse spike.
+          resources:
+            requests:
+              {{- toYaml .Values.workerIngestion.resources.requests | nindent 14 }}
+            limits:
+              {{- toYaml .Values.workerIngestion.resources.limits | nindent 14 }}
+              {{- if .Values.gpu.enabled }}
+              nvidia.com/gpu: 1
+              {{- end }}
+      volumes:
+        - name: prom-multiproc
+          emptyDir: {}
+        - name: hf-model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache

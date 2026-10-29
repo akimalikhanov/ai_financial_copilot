@@ -38,6 +38,7 @@ lint:
 	.venv/bin/ruff format --check .
 	$(MAKE) k8s-check-initdb
 	$(MAKE) k8s-check-es-bootstrap
+	$(MAKE) k8s-check-app-config
 	$(MAKE) k8s-check-dashboards
 	$(MAKE) k8s-check-loadtest
 
@@ -332,6 +333,20 @@ k8s-check-es-bootstrap:
 	@diff -q infra/docker/elasticsearch/bootstrap.sh $(CHART)/files/search/es-bootstrap/bootstrap.sh
 	@diff -q infra/docker/elasticsearch/ilm-policy.json $(CHART)/files/search/es-bootstrap/ilm-policy.json
 	@diff -q infra/docker/elasticsearch/index-template.json $(CHART)/files/search/es-bootstrap/index-template.json
+
+# $(CHART)/files/app/*.env are copies of infra/k8s/base/app/*.env, the source of truth until the
+# Helm cutover. Run this after editing either env file.
+.PHONY: k8s-sync-app-config
+k8s-sync-app-config:
+	mkdir -p $(CHART)/files/app
+	cp infra/k8s/base/app/app-config.env $(CHART)/files/app/app-config.env
+	cp infra/k8s/base/app/app-endpoints.env $(CHART)/files/app/app-endpoints.env
+
+# Fails if the chart's env file copies have drifted. Run `make k8s-sync-app-config` to fix.
+.PHONY: k8s-check-app-config
+k8s-check-app-config:
+	@diff -q infra/k8s/base/app/app-config.env $(CHART)/files/app/app-config.env
+	@diff -q infra/k8s/base/app/app-endpoints.env $(CHART)/files/app/app-endpoints.env
 
 # infra/k8s/base/observability/grafana/dashboards/* are copies of infra/docker/grafana/dashboards/*.
 # infra/docker/ is the source of truth. worker-health.json is excluded on purpose: the K8s copy

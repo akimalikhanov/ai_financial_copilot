@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-chat
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "chat_worker") | nindent 4 }}
+spec:
+  replicas: {{ .Values.workerChat.replicas }}
+  # Surge so the queue stays served while old pods drain; 2 at a time keeps a 6-replica rollout short.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 2
+  selector:
+    matchLabels:
+      # `chat_worker`, not `worker-chat`: Prometheus copies it into `job`, which the dashboards query.
+      {{- include "copilot.selectorLabels" (dict "name" "chat_worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "chat_worker" "component" "worker") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+        checksum/config: {{ include (print $.Template.BasePath "/app/app-configmaps.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      # Above CELERY_TASK_TIME_LIMIT_SECONDS (450): a warm shutdown can finish the longest task.
+      terminationGracePeriodSeconds: 510
+      initContainers:
+        {{- include "copilot.waitForPostgres" (dict "root" $ "host" "pgbouncer" "port" 6432 "userVar" "APP_DB_USER") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-broker") | nindent 8 }}
+        {{- include "copilot.waitForRedis" (dict "root" $ "host" "redis-app") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "opensearch" "port" 9200 "path" "/_cluster/health") | nindent 8 }}
+        {{- /* Without TEI, embed/rerank fail and the agent answers "not found in the documents". */}}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "tei-embedder" "port" 80 "path" "/health") | nindent 8 }}
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "tei" "port" 80 "path" "/health") | nindent 8 }}
+      containers:
+        - name: worker-chat
+          image: {{ include "copilot.appImage" (dict "root" $ "name" "worker") | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "src.workers.chat_worker"]
+          ports:
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: {{ .Values.secrets.app }} }
+          env:
+            # Prefork children write metric shards here; must be set before prometheus_client imports.
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom_chat
+            - name: LOG_FILE
+              value: ""
+            - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
+              value: worker-chat
+          volumeMounts:
+            - name: prom-multiproc
+              mountPath: /tmp/prom_chat
+          # $HOSTNAME is the Celery node name. Long timeout: the probe imports the whole app.
+          # env -u: importing src.observability purges the multiproc dir, wiping live shards.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - env -u PROMETHEUS_MULTIPROC_DIR python -m celery -A src.celery_app:celery_app inspect ping -d celery@$HOSTNAME >/dev/null 2>&1
+            initialDelaySeconds: 40
+            periodSeconds: 120
+            timeoutSeconds: 60
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.workerChat.resources | nindent 12 }}
+      volumes:
+        # Pod-scoped, so it survives a container restart; the app purges stale shards at startup.
+        - name: prom-multiproc
+          emptyDir: {}
