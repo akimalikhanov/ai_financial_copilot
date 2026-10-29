@@ -1,0 +1,54 @@
+# cAdvisor reports usage but not why a container died (its OOM counter reads 0 under cgroup v2).
+# kube-state-metrics reads the API server's object state: OOMKilled reasons, restarts, phases.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "kube-state-metrics") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "kube-state-metrics") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "kube-state-metrics" "component" "observability") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+        - name: kube-state-metrics
+          image: {{ .Values.kubeStateMetrics.image }}
+          args:
+            # Only the collectors the alerts and the resources dashboard read.
+            - --resources=pods,nodes,deployments,statefulsets,daemonsets,jobs
+            - --namespaces={{ include "copilot.namespace" . }}
+            - --metric-labels-allowlist=pods=[app.kubernetes.io/name,app.kubernetes.io/component]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          # Not the way round you'd guess: /healthz is on 8080, /readyz on 8081 (v2.17.0).
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8081 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.kubeStateMetrics.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

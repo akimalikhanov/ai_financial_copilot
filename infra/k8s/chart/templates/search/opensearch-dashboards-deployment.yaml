@@ -1,0 +1,40 @@
+{{- if .Values.opensearchDashboards.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch-dashboards
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "opensearch-dashboards") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "opensearch-dashboards") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "opensearch-dashboards") | nindent 8 }}
+    spec:
+      initContainers:
+        {{- include "copilot.waitForHttp" (dict "root" $ "host" "opensearch" "port" 9200 "path" "/_cluster/health") | nindent 8 }}
+      containers:
+        - name: opensearch-dashboards
+          image: {{ .Values.opensearchDashboards.image }}
+          env:
+            - name: OPENSEARCH_HOSTS
+              value: http://opensearch:9200
+            - name: DISABLE_SECURITY_DASHBOARDS_PLUGIN     # DEV ONLY
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 5601
+          readinessProbe:
+            httpGet: { path: /api/status, port: 5601 }
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 10
+          resources:
+            {{- toYaml .Values.opensearchDashboards.resources | nindent 12 }}
+{{- end }}

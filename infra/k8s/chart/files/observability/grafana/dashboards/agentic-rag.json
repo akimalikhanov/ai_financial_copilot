@@ -1,0 +1,641 @@
+{
+  "title": "Agentic RAG",
+  "uid": "agentic-rag",
+  "description": "ML / product engineer view: retrieval latency, agent loop health, router decisions, and answer quality signals.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Retrieval Pipeline",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "Retrieval Latency p95 by Stage (s)",
+      "type": "timeseries",
+      "description": "Identify which retrieval stage is the bottleneck: embed / hybrid_retrieve / rerank.",
+      "gridPos": { "x": 0, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rag_retrieval_duration_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p95 {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 3,
+      "title": "Chunks Retrieved (p50 / p95) by Retriever",
+      "type": "timeseries",
+      "description": "Abnormally low = recall problem; abnormally high = reranker overload.",
+      "gridPos": { "x": 8, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(rag_chunks_retrieved_bucket[5m])) by (le, retriever))",
+          "legendFormat": "p50 {{retriever}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rag_chunks_retrieved_bucket[5m])) by (le, retriever))",
+          "legendFormat": "p95 {{retriever}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "title": "Context Tokens (p50 / p95)",
+      "type": "timeseries",
+      "description": "Proximity to context window limits; prompt cost driver.",
+      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(rag_context_tokens_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rag_context_tokens_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 5,
+      "title": "Citations per Response (p50 / p95)",
+      "type": "timeseries",
+      "description": "Zero-citation responses = retrieval miss or citation parser failure.",
+      "gridPos": { "x": 0, "y": 9, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(rag_citations_per_response_bucket[10m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rag_citations_per_response_bucket[10m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Agent Loop",
+      "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 7,
+      "title": "Agent Loop Iterations (p50 / p95)",
+      "type": "timeseries",
+      "description": "Runaway loops (>5 iterations) signal tool-call failures or prompt issues.",
+      "gridPos": { "x": 0, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(agent_loop_iterations_bucket[10m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_loop_iterations_bucket[10m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p95" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 8,
+      "title": "Tool Call Rate by Tool & Status",
+      "type": "timeseries",
+      "description": "Which tools are called most and which are error-prone.",
+      "gridPos": { "x": 8, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(agent_tool_calls_total[5m])) by (tool, status)",
+          "legendFormat": "{{tool}} [{{status}}]"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 5 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 9,
+      "title": "Tool Duration p95 by Tool (s)",
+      "type": "timeseries",
+      "description": "Which tools are slow — latency per tool call.",
+      "gridPos": { "x": 16, "y": 18, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_tool_duration_seconds_bucket[5m])) by (le, tool))",
+          "legendFormat": "p95 {{tool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Router & Guardrails",
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "title": "Router Decision Split",
+      "type": "timeseries",
+      "description": "direct_answer share creeping up = router misfiring; out_of_scope spike = coverage gap.",
+      "gridPos": { "x": 0, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(query_router_decisions_total[5m])) by (decision)",
+          "legendFormat": "{{decision}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 12,
+      "title": "Guardrail Blocks by Type",
+      "type": "timeseries",
+      "description": "Injection attempt rate and prompt abuse patterns.",
+      "gridPos": { "x": 8, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(guardrail_blocks_total[5m])) by (type)",
+          "legendFormat": "{{type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*injection.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 13,
+      "title": "Pipeline Errors by Stage",
+      "type": "timeseries",
+      "description": "Which pipeline stage is most fragile.",
+      "gridPos": { "x": 16, "y": 27, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(chat_pipeline_errors_total[5m])) by (stage)",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byValue", "options": { "reducer": "lastNotNull", "op": "gt", "value": 0 } },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Latency Breakdown",
+      "gridPos": { "x": 0, "y": 35, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 19,
+      "title": "Chat Stage Latency p95 (s)",
+      "type": "timeseries",
+      "description": "Which chat pipeline stage dominates end-to-end latency: route_query / agent_loop / render_prompt / stream_llm_response / persist_and_emit.",
+      "gridPos": { "x": 0, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chat_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p95 {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 20,
+      "title": "Chat Stage Latency p50 (s)",
+      "type": "timeseries",
+      "description": "Typical-case stage cost. Read against p95 to tell a stage with a high floor from one with a long tail.",
+      "gridPos": { "x": 8, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chat_pipeline_stage_duration_seconds_bucket[5m])) by (le, stage))",
+          "legendFormat": "p50 {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 21,
+      "title": "Mean Time per Stage (s)",
+      "type": "timeseries",
+      "description": "Average seconds per stage occurrence. Stacks to the mean end-to-end pipeline cost, so it reads as a latency budget.",
+      "gridPos": { "x": 16, "y": 36, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(chat_pipeline_stage_duration_seconds_sum[5m])) by (stage) / sum(rate(chat_pipeline_stage_duration_seconds_count[5m])) by (stage)",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 22,
+      "title": "LLM Call Latency by Type (s)",
+      "type": "timeseries",
+      "description": "Per-call-site LLM latency — router / agent_tool_call / chat. Replaces the old avg-from-Postgres panel: real percentiles, no query against the primary DB.",
+      "gridPos": { "x": 0, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, request_type))",
+          "legendFormat": "p95 {{request_type}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, request_type))",
+          "legendFormat": "p50 {{request_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 23,
+      "title": "LLM Call Latency p95 by Model (s)",
+      "type": "timeseries",
+      "description": "Same calls sliced by model — the input for swapping a model on a hot path.",
+      "gridPos": { "x": 8, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p95 {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 24,
+      "title": "Time to First Token (s)",
+      "type": "timeseries",
+      "description": "User-perceived wait on streaming calls. Diverges from total call latency once generations get long.",
+      "gridPos": { "x": 16, "y": 44, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_time_to_first_token_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p95 {{model}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(llm_time_to_first_token_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p50 {{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Latency SLOs & Agent Health",
+      "gridPos": { "x": 0, "y": 52, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 26,
+      "title": "Time to First Answer Token by Query Shape (s)",
+      "type": "timeseries",
+      "description": "What the user waits for: enqueue to first answer token, including queue wait, routing and the agent loop. \"direct\" is turns answered without retrieval. The input for latency SLOs and the agent deadline.",
+      "gridPos": { "x": 0, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chat_time_to_first_token_seconds_bucket[15m])) by (le, query_shape))",
+          "legendFormat": "p95 {{query_shape}}"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chat_time_to_first_token_seconds_bucket[15m])) by (le, query_shape))",
+          "legendFormat": "p50 {{query_shape}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 27,
+      "title": "Agent Stop Reasons",
+      "type": "timeseries",
+      "description": "Why agent runs ended. covered is the healthy case; iteration_cap, budget_cap, deadline, timeout and truncated (the tool model hit its token cap) mean the run was cut off and served partial findings.",
+      "gridPos": { "x": 8, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_stop_reasons_total[1h])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" }, "fillOpacity": 70 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 28,
+      "title": "Deadline & Timeout Stops (% of agent runs)",
+      "type": "timeseries",
+      "description": "Share of agent runs cut off by the wall-clock deadline or a turn timeout, by query shape. A rising line means the deadline is too tight for the workload or a provider is slow.",
+      "gridPos": { "x": 16, "y": 53, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_stop_reasons_total{reason=~\"deadline|timeout\"}[1h])) by (reason, query_shape) / on(query_shape) group_left sum(increase(agent_stop_reasons_total[1h])) by (query_shape)",
+          "legendFormat": "{{reason}} {{query_shape}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 29,
+      "title": "Tool Argument Errors per 100 Turns",
+      "type": "timeseries",
+      "description": "Tool calls whose arguments failed schema validation, per 100 agent turns. Each one costs the model a turn to re-issue. Baseline for deciding whether to turn on strict function calling.",
+      "gridPos": { "x": 0, "y": 61, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "100 * sum(increase(agent_tool_arg_errors_total[1h])) by (tool) / scalar(sum(increase(agent_loop_iterations_sum[1h])))",
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 30,
+      "title": "Latency & Argument Errors by Configuration",
+      "type": "table",
+      "description": "Per configuration (query shape, tool-model prompt, tool model) in the selected range: runs, time to first answer token, and tool argument errors per 100 turns. Read before and after a prompt or model change.",
+      "gridPos": { "x": 8, "y": 61, "w": 16, "h": 8 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(l.query_shape, 'direct') AS query_shape, m.trace->'config'->'prompts'->>'agent' AS agent_prompt, m.trace->'config'->>'tool_model' AS tool_model, count(*) AS runs, round(percentile_cont(0.5) WITHIN GROUP (ORDER BY (m.trace->>'ttft_s')::numeric)::numeric, 1) AS p50_ttft_s, round(percentile_cont(0.95) WITHIN GROUP (ORDER BY (m.trace->>'ttft_s')::numeric)::numeric, 1) AS p95_ttft_s, round(100.0 * sum((m.trace->'agent'->>'search_arg_errors')::int + (m.trace->'agent'->>'report_parse_failures')::int) / NULLIF(sum((m.trace->'agent'->>'iterations')::int), 0), 2) AS arg_errors_per_100_turns FROM messages m JOIN llm_requests l ON l.id = m.request_id WHERE m.role = 'assistant' AND m.trace ? 'config' AND $__timeFilter(m.created_at) GROUP BY 1, 2, 3 ORDER BY runs DESC;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": "p(50|95)_ttft_s" }, "properties": [{ "id": "unit", "value": "s" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "runs", "desc": true }] }
+    },
+    {
+      "id": 31,
+      "title": "Tool-Model Latency p95 by Turn Kind (s)",
+      "type": "timeseries",
+      "description": "p95 of tool-model calls, split by what the turn did: search, report, mixed, final (report-only last turn) or none (prose). Includes calls that timed out or were cancelled; those count as unknown unless they were the final turn. Each call's budget is what is left of the run deadline less a reserve, so a rising report or final line means late turns start running out of time.",
+      "gridPos": { "x": 0, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_tool_model_duration_seconds_bucket[5m])) by (le, turn_kind))",
+          "legendFormat": "{{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 32,
+      "title": "Failed Tool-Model Calls",
+      "type": "timeseries",
+      "description": "Tool-model calls that failed, by outcome. timeout: the call used up its budget (the cap, or what was left of the run). cancelled: a worker shutdown cut it off. error: provider error (the fallback model may still have answered). length: answered, but hit the completion-token cap. Each also has a row in llm_requests (status timeout, cancelled, failed or truncated).",
+      "gridPos": { "x": 8, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_tool_model_duration_seconds_count{outcome!=\"ok\"}[1h])) by (outcome, turn_kind)",
+          "legendFormat": "{{outcome}} {{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "stacking": { "mode": "normal" }, "fillOpacity": 70 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 33,
+      "title": "Reasoning Tokens per Tool-Model Call",
+      "type": "timeseries",
+      "description": "Mean hidden reasoning tokens per answered call, by turn kind. Reasoning is most of a call's output and the main driver of its latency, at roughly 8.5 ms per output token. A rise here with flat throughput means the model is thinking longer, not that the provider got slower.",
+      "gridPos": { "x": 16, "y": 69, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(agent_tool_model_output_tokens_total{part=\"reasoning\"}[1h])) by (turn_kind) / sum(increase(agent_tool_model_duration_seconds_count{outcome=\"ok\"}[1h])) by (turn_kind)",
+          "legendFormat": "{{turn_kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 34,
+      "title": "Reasoning Replay Size per Tool-Model Call (p50 / p95)",
+      "type": "timeseries",
+      "description": "Encrypted reasoning sent back to the model on each Responses API tool call. It's cached input, so it's cheap, but it adds to request size. Above ~100 kB at p95, check whether long runs are worth the carryover.",
+      "gridPos": { "x": 0, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(agent_reasoning_replay_bytes_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(agent_reasoning_replay_bytes_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "decbytes", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 35,
+      "title": "Effective Reasoning Context by Model",
+      "type": "timeseries",
+      "description": "Reasoning context mode the API reports per call. current_turn drops reasoning from before the last user message; all_turns keeps it. A model that moves to a different mode without a config change means the provider default changed.",
+      "gridPos": { "x": 8, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_reasoning_context_total[5m])) by (model, mode)",
+          "legendFormat": "{{model}} · {{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 36,
+      "title": "Degraded Retries by Reason",
+      "type": "timeseries",
+      "description": "Calls resent without a feature the API rejected. summary_unavailable: the account can't get reasoning summaries, so this process stops asking. reasoning_replay: a replayed reasoning item failed verification, so the call went out without carryover. Both should sit near zero.",
+      "gridPos": { "x": 16, "y": 77, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(llm_degraded_retries_total[1h])) by (model, reason)",
+          "legendFormat": "{{model}} · {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 5 } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Quality Drill-Down (PostgreSQL)",
+      "gridPos": { "x": 0, "y": 85, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 15,
+      "title": "Per-Request Stage Breakdown (slowest in range)",
+      "type": "table",
+      "description": "Outlier drill-down: the slowest requests in the dashboard time range. Not possible from aggregate histograms — find the specific requests where a stage blew up.",
+      "gridPos": { "x": 0, "y": 86, "w": 12, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT m.id, m.created_at, (m.trace->>'total_time')::numeric AS total_time_s, m.trace->'stage_times' AS stage_times FROM messages m WHERE m.role = 'assistant' AND m.trace ? 'total_time' AND $__timeFilter(m.created_at) ORDER BY (m.trace->>'total_time')::numeric DESC NULLS LAST LIMIT 50;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_time_s" }, "properties": [{ "id": "unit", "value": "s" }] },
+          { "matcher": { "id": "byName", "options": "created_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "total_time_s", "desc": true }] }
+    },
+    {
+      "id": 16,
+      "title": "Response Quality — Thumbs Down Rate (hourly)",
+      "type": "timeseries",
+      "description": "Only user-perceived quality signal — catches fast-but-wrong regressions.",
+      "gridPos": { "x": 12, "y": 86, "w": 12, "h": 10 },
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "targets": [
+        {
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour', created_at) AS time, count(*) FILTER (WHERE rating = 'down')::float / NULLIF(count(*), 0) AS thumbs_down_rate FROM message_feedback GROUP BY 1 ORDER BY 1;"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    }
+  ]
+}

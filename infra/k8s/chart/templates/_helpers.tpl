@@ -141,6 +141,24 @@ anyStatus accepts any HTTP response, e.g. Garage's 403 to anonymous requests.
     requests: { cpu: "10m", memory: "16Mi" }
 {{- end }}
 
+{{/*
+initContainer that blocks until each host:port accepts TCP connections, in order. No client or
+credentials needed. Argument: (dict "root" $ "name" "deps" "targets" (list "postgres:5432" ...)).
+*/}}
+{{- define "copilot.waitForTcp" -}}
+- name: wait-for-{{ .name }}
+  image: {{ .root.Values.waitImages.busybox }}
+  command:
+    - sh
+    - -c
+    - |
+      for t in {{ join " " .targets }}; do
+        until nc -z "${t%:*}" "${t#*:}"; do echo "waiting for $t"; sleep 2; done
+      done
+  resources:
+    requests: { cpu: "10m", memory: "16Mi" }
+{{- end }}
+
 {{/* storageClassName, omitted when persistence.storageClass is "" (cluster default). */}}
 {{- define "copilot.storageClass" -}}
 {{- with .Values.persistence.storageClass -}}

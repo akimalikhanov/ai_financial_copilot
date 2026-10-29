@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse-headless
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "clickhouse") | nindent 4 }}
+spec:
+  clusterIP: None            # headless: no VIP, DNS returns pod IPs directly
+  selector:
+    {{- include "copilot.selectorLabels" (dict "name" "clickhouse") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse           # Langfuse dials it; renaming breaks ON CLUSTER migrations
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "clickhouse") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "copilot.selectorLabels" (dict "name" "clickhouse") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000

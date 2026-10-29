@@ -22,8 +22,16 @@ is applied to the live stack before the cutover.
   `app.kubernetes.io/name`. Delete the live Jobs before the cutover; a hook can't adopt them.
 - `wait-for-*` initContainers come from shared helpers. The Garage gate's script loses its
   comment lines, so `api` and `worker-ingestion` see a pod template change.
-- `hf-model-cache`, `tei-data` and `tei-embedder-data` carry `helm.sh/resource-policy: keep`
-  (scrubbed by the diff script), so `helm uninstall` leaves them in place.
+- OpenSearch Dashboards' gate uses the shared helper too: curl 8.14.1 instead of 8.11.1, and no
+  `grep '"status"'` (`curl -f` already fails on a non-2xx).
+- `hf-model-cache`, `tei-data`, `tei-embedder-data`, `prometheus-data` and `grafana-data` carry
+  `helm.sh/resource-policy: keep` (scrubbed by the diff script), so `helm uninstall` leaves them
+  in place.
+- The ClusterRoles and ClusterRoleBindings for `prometheus`, `fluent-bit` and
+  `kube-state-metrics` are renamed `copilot-<name>`, because cluster-scoped names are global.
+  The cutover creates the new pairs; delete the old three pairs after it.
+- `dcgm-exporter` and `opensearch-dashboards` render only when `dcgmExporter.enabled` /
+  `opensearchDashboards.enabled` are true (kind only).
 - Grafana loses its `wait-for-es-bootstrap` initContainer. As a hook under `--wait`,
   es-bootstrap runs only after Grafana is ready, so the gate would deadlock a fresh install.
   Grafana now starts before the `copilot-logs` alias exists, and logs panels error for the

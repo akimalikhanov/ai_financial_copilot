@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-web
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "langfuse-web") | nindent 4 }}
+spec:
+  replicas: {{ .Values.langfuseWeb.replicas }}
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "langfuse-web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "langfuse-web") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/langfuse/langfuse-configmap.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      initContainers:
+        {{- include "copilot.waitForTcp" (dict "root" $ "name" "deps" "targets" (list "postgres:5432" "clickhouse:8123" "redis-langfuse:6379" "garage:3900")) | nindent 8 }}
+      containers:
+        - name: langfuse-web
+          image: {{ .Values.langfuseWeb.image }}
+          envFrom:
+            - configMapRef: { name: langfuse-common }
+            - secretRef:    { name: {{ .Values.secrets.clickhouse }} }   # same credentials the server reads
+            - secretRef:    { name: {{ .Values.secrets.langfuse }} }
+          env:
+            # Next.js binds to $HOSTNAME, the pod name in K8s, so 127.0.0.1 (port-forward) is refused.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: NEXTAUTH_URL
+              value: {{ .Values.langfuseWeb.nextauthUrl | quote }}
+          ports:
+            - name: http
+              containerPort: 3000
+          # Readiness only: a liveness kill mid-migration leaves a half-migrated database.
+          readinessProbe:
+            httpGet: { path: /api/public/health, port: 3000 }
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 20         # migrations are slow
+          resources:
+            {{- toYaml .Values.langfuseWeb.resources | nindent 12 }}

@@ -40,6 +40,7 @@ lint:
 	$(MAKE) k8s-check-es-bootstrap
 	$(MAKE) k8s-check-app-config
 	$(MAKE) k8s-check-dashboards
+	$(MAKE) k8s-check-observability
 	$(MAKE) k8s-check-loadtest
 
 .PHONY: typecheck
@@ -347,6 +348,31 @@ k8s-sync-app-config:
 k8s-check-app-config:
 	@diff -q infra/k8s/base/app/app-config.env $(CHART)/files/app/app-config.env
 	@diff -q infra/k8s/base/app/app-endpoints.env $(CHART)/files/app/app-endpoints.env
+
+# $(CHART)/files/{observability,langfuse}/ are copies of the same files under infra/k8s/base/,
+# the source of truth until the Helm cutover. Run this after editing any of them.
+CHART_OBS_FILES := prometheus.yml alert-rules.yml fluent-bit.conf parsers.conf \
+  grafana/datasources.yaml grafana/dashboard-provider.yaml \
+  $(addprefix grafana/dashboards/,$(notdir $(wildcard infra/k8s/base/observability/grafana/dashboards/*.json)))
+CHART_LANGFUSE_FILES := langfuse-cluster.xml langfuse-common.env
+
+.PHONY: k8s-sync-observability
+k8s-sync-observability:
+	mkdir -p $(CHART)/files/observability/grafana/dashboards $(CHART)/files/langfuse
+	@for f in $(CHART_OBS_FILES); do \
+	  cp infra/k8s/base/observability/$$f $(CHART)/files/observability/$$f; done
+	@for f in $(CHART_LANGFUSE_FILES); do \
+	  cp infra/k8s/base/langfuse/$$f $(CHART)/files/langfuse/$$f; done
+
+# Fails if the chart's observability/langfuse copies have drifted, or a dashboard exists only in
+# the chart. Run `make k8s-sync-observability` to fix.
+.PHONY: k8s-check-observability
+k8s-check-observability:
+	@for f in $(CHART_OBS_FILES); do \
+	  diff -q infra/k8s/base/observability/$$f $(CHART)/files/observability/$$f || exit 1; done
+	@for f in $(CHART_LANGFUSE_FILES); do \
+	  diff -q infra/k8s/base/langfuse/$$f $(CHART)/files/langfuse/$$f || exit 1; done
+	@diff -q infra/k8s/base/observability/grafana/dashboards $(CHART)/files/observability/grafana/dashboards
 
 # infra/k8s/base/observability/grafana/dashboards/* are copies of infra/docker/grafana/dashboards/*.
 # infra/docker/ is the source of truth. worker-health.json is excluded on purpose: the K8s copy

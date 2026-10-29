@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-cluster-config
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "clickhouse") | nindent 4 }}
+# Not a verbatim copy of the compose file: the replica host is the pod's headless DNS name here.
+data:
+  {{- (.Files.Glob "files/langfuse/langfuse-cluster.xml").AsConfig | nindent 2 }}

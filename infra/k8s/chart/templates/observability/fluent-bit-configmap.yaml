@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "fluent-bit") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/observability/{fluent-bit,parsers}.conf").AsConfig | nindent 2 }}

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "prometheus") | nindent 4 }}
+# Both land in /etc/prometheus; prometheus.yml's rule_files points at alert-rules.yml there.
+# .Files passes alert-rules.yml's own Prometheus templates through untouched; tpl would not.
+data:
+  {{- (.Files.Glob "files/observability/{prometheus.yml,alert-rules.yml}").AsConfig | nindent 2 }}

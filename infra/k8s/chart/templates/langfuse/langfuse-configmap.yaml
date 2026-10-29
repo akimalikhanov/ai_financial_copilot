@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: langfuse-common        # non-secret env shared by langfuse-web and langfuse-worker
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "langfuse") | nindent 4 }}
+data:
+  {{- include "copilot.envFileData" (dict "root" $ "path" "files/langfuse/langfuse-common.env") | nindent 2 }}

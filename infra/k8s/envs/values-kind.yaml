@@ -39,3 +39,12 @@ elasticsearch:
 garage:
   persistence:
     dataSize: 2Gi
+clickhouse:
+  persistence:
+    size: 2Gi
+
+# Dev-only components.
+dcgmExporter:
+  enabled: true
+opensearchDashboards:
+  enabled: true

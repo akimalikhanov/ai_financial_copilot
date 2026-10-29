@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/observability/grafana/datasources.yaml").AsConfig | nindent 2 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/observability/grafana/dashboard-provider.yaml").AsConfig | nindent 2 }}
+---
+# The 1 MiB ConfigMap limit counts all keys together; past ~800 KB, split per dashboard.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/observability/grafana/dashboards/*.json").AsConfig | nindent 2 }}

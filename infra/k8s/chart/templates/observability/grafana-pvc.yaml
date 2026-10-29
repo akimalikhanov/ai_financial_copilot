@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep    # survives helm uninstall; Grafana's SQLite state
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- include "copilot.storageClass" . | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.grafana.persistence.size }}
