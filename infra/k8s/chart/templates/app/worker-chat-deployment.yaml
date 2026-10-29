@@ -27,6 +27,7 @@ spec:
         prometheus.io/path: "/metrics"
         checksum/config: {{ include (print $.Template.BasePath "/app/app-configmaps.yaml") . | sha256sum }}
         checksum/secrets: {{ .Values.secretsChecksum | quote }}
+        {{- include "copilot.fakeLlm.annotations" . | nindent 8 }}
     spec:
       # Above CELERY_TASK_TIME_LIMIT_SECONDS (450): a warm shutdown can finish the longest task.
       terminationGracePeriodSeconds: 510
@@ -58,9 +59,12 @@ spec:
               value: ""
             - name: OTEL_SERVICE_NAME      # service.name on Langfuse spans
               value: worker-chat
+            {{- include "copilot.fakeLlm.env" (dict "root" $ "name" "worker-chat") | nindent 12 }}
+            {{- include "copilot.loadtestFaults.env" (dict "root" $ "name" "worker-chat") | nindent 12 }}
           volumeMounts:
             - name: prom-multiproc
               mountPath: /tmp/prom_chat
+            {{- include "copilot.fakeLlm.volumeMount" . | nindent 12 }}
           # $HOSTNAME is the Celery node name. Long timeout: the probe imports the whole app.
           # env -u: importing src.observability purges the multiproc dir, wiping live shards.
           readinessProbe:
@@ -79,3 +83,4 @@ spec:
         # Pod-scoped, so it survives a container restart; the app purges stale shards at startup.
         - name: prom-multiproc
           emptyDir: {}
+        {{- include "copilot.fakeLlm.volume" . | nindent 8 }}

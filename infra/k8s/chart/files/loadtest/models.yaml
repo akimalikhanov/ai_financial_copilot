@@ -1,0 +1,108 @@
+# Load-test overlay for infra/config/models.yaml (Stage 17.5 Phase 8).
+#
+# Every model id the app can reference is redefined with provider: fake, so a load-test
+# deployment that sets MODELS_CONFIG_PATH to this file's mounted path never reaches a real
+# LLM provider — see src/services/llm_adapters/fake_adapter.py and
+# docs/notes/loadtest-concepts.md §6 for why (cost, determinism, and reproducibility).
+#
+# Not used by any real environment: infra/config/models.yaml (no ".loadtest" suffix) is what
+# ships in the Docker image and is loaded by default. This file only takes effect if something
+# explicitly sets MODELS_CONFIG_PATH to point at it.
+
+defaults:
+  params:
+    temperature: 0.2
+    max_tokens: 6000
+  stream: true
+
+models:
+  - id: gpt-5.2
+    label: "Fake (was OpenAI GPT-5.2)"
+    provider: fake
+    model_name: "fake-gpt-5.2"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: 0
+      output: 0
+      cached_input: 0
+      cached_output: null
+      rounding: exact
+      notes: "Fake adapter — no real spend."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      vision: true
+    params_override: {}
+
+  - id: gpt-5-mini
+    label: "Fake (was OpenAI GPT-5-mini)"
+    provider: fake
+    model_name: "fake-gpt-5-mini"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: 0
+      output: 0
+      cached_input: 0
+      cached_output: null
+      rounding: exact
+      notes: "Fake adapter — no real spend."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      vision: true
+    params_override: {}
+
+  - id: gpt-4o-mini
+    label: "Fake (was OpenAI GPT-4o-mini)"
+    provider: fake
+    model_name: "fake-gpt-4o-mini"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: 0
+      output: 0
+      cached_input: 0
+      cached_output: null
+      rounding: exact
+      notes: "Fake adapter — no real spend."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      vision: true
+    params_override: {}
+
+  - id: gemini-3.7-flash
+    label: "Fake (was Gemini 3.7 Flash)"
+    provider: fake
+    model_name: "fake-gemini-3.7-flash"
+    pricing:
+      currency: USD
+      unit: per_1k_tokens
+      input: 0
+      output: 0
+      cached_input: 0
+      cached_output: null
+      rounding: exact
+      notes: "Fake adapter — no real spend."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      vision: true
+    params_override: {}
+
+  - id: qwen3-8b
+    label: "Fake (was Qwen3-8B-AWQ)"
+    provider: fake
+    model_name: "fake-qwen3-8b"
+    pricing:
+      currency: USD
+      unit: local
+      cost: 0.0
+      notes: "Fake adapter — no real spend."
+    capabilities:
+      streaming: true
+      tool_calling: true
+      vision: true
+    params_override: {}

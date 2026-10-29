@@ -24,6 +24,7 @@ spec:
         prometheus.io/path: "/metrics"
         checksum/config: {{ include (print $.Template.BasePath "/app/app-configmaps.yaml") . | sha256sum }}
         checksum/secrets: {{ .Values.secretsChecksum | quote }}
+        {{- include "copilot.fakeLlm.annotations" . | nindent 8 }}
     spec:
       # Above INGEST_TASK_TIME_LIMIT_SECONDS (2700), the hard limit, for the same reason as worker-chat.
       terminationGracePeriodSeconds: 2800
@@ -58,11 +59,13 @@ spec:
             # Dockerfile.worker runs as non-root appuser and pre-creates this path.
             - name: HF_HOME
               value: /home/appuser/.cache/huggingface
+            {{- include "copilot.fakeLlm.env" (dict "root" $ "name" "worker-ingestion") | nindent 12 }}
           volumeMounts:
             - name: prom-multiproc
               mountPath: /tmp/prom_ingestion
             - name: hf-model-cache
               mountPath: /home/appuser/.cache/huggingface
+            {{- include "copilot.fakeLlm.volumeMount" . | nindent 12 }}
           # The ping imports torch+docling and waits on busy children: long timeout, long period.
           # env -u: importing src.observability purges the multiproc dir, wiping live shards.
           readinessProbe:
@@ -90,3 +93,4 @@ spec:
         - name: hf-model-cache
           persistentVolumeClaim:
             claimName: hf-model-cache
+        {{- include "copilot.fakeLlm.volume" . | nindent 8 }}

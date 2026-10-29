@@ -1,0 +1,40 @@
+suite: image seam
+templates:
+  - app/app-configmaps.yaml          # loaded for the checksum include; not asserted
+  - app/api-deployment.yaml
+  - app/frontend-deployment.yaml
+  - app/worker-chat-deployment.yaml
+release:
+  namespace: copilot
+tests:
+  - it: renders bare copilot/<name> without a registry
+    template: app/api-deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: copilot/api:dev
+
+  - it: prefixes the registry and uses the tag from values
+    set:
+      images.registry: registry.example:5000
+      images.tag: "1234567"          # a string, as make's --set-string passes it
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example:5000/copilot/api:1234567
+        template: app/api-deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example:5000/copilot/frontend:1234567
+        template: app/frontend-deployment.yaml
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example:5000/copilot/worker:1234567
+        template: app/worker-chat-deployment.yaml
+
+  - it: rejects a numeric tag, which is what plain --set images.tag=1234567 passes
+    set:
+      images.tag: 1234567
+    asserts:
+      - failedTemplate:
+          errorPattern: "images/tag.*want string"

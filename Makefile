@@ -214,11 +214,81 @@ helm-diff-kustomize: k8s-set-images
 	@bash -c '.venv/bin/python -m scripts.k8s_render_diff --names kustomize helm \
 	  <(kustomize build $(K8S_OVERLAY)) <($(HELM_RENDER)) $(if $(MATCH),--match "$(MATCH)")'
 
-# What a values file changes: kind vs eks, both rendered by Helm. Needs envs/values-eks.yaml.
+# What a values file changes: kind vs eks, both rendered by Helm.
 .PHONY: helm-diff-envs
 helm-diff-envs:
 	@bash -c '.venv/bin/python -m scripts.k8s_render_diff --names kind eks \
 	  <($(MAKE) -s helm-render ENV=kind) <($(MAKE) -s helm-render ENV=eks)'
+
+# The chart gate, also run by CI: lint + schema, kubeconform on each env's render, unit tests.
+# Needs kubeconform and the helm-unittest plugin. Pin KUBECONFORM_K8S to the newest schema
+# version not newer than the clusters (kind runs 1.36.1).
+# Each entry is a comma-separated stack of envs/values-<name>.yaml files.
+HELM_ENVS := kind eks kind,loadtest
+KUBECONFORM_K8S := 1.36.1
+.PHONY: helm-check
+helm-check:
+	helm lint --strict -n copilot $(CHART)
+	@set -e; for e in $(HELM_ENVS); do \
+	  echo "== $$e"; \
+	  f=$$(for v in $$(echo $$e | tr , ' '); do printf -- '-f infra/k8s/envs/values-%s.yaml ' $$v; done); \
+	  helm lint --strict -n copilot $(CHART) $$f --set-string images.tag=ci; \
+	  out=$$(helm template copilot $(CHART) -n copilot $$f --set-string images.tag=ci); \
+	  printf '%s\n' "$$out" | kubeconform -strict -summary -kubernetes-version $(KUBECONFORM_K8S); \
+	done
+	@echo "== loadtest chart"
+	helm lint --strict -n copilot $(K8S_LOADTEST)/chart
+	@set -e; out=$$(helm template loadtest $(K8S_LOADTEST)/chart -n copilot --set-string image.tag=ci); \
+	  printf '%s\n' "$$out" | kubeconform -strict -summary -kubernetes-version $(KUBECONFORM_K8S)
+	helm unittest $(CHART) $(K8S_LOADTEST)/chart
+
+# Every deploy states all its values: never --reuse-values. --wait returns only once every
+# Deployment has fully rolled out, which helm-loadtest relies on.
+HELM_TIMEOUT ?= 20m
+HELM_DEPLOY = helm upgrade --install copilot $(CHART) -n copilot $(HELM_VALUES) \
+  --set-string images.tag=$(GIT_SHA) --set-string secretsChecksum=$(SECRETS_CHECKSUM) \
+  --wait --timeout $(HELM_TIMEOUT)
+
+# Load test on the Helm stack. Not live until the cutover: they replace k8s-loadtest and
+# k8s-loadtest-clean then, and until then Helm refuses the Kustomize-owned objects.
+#
+# Money safety is the order. copilot rolls out in fake-LLM mode under --wait, and only then is
+# the Job's release created; its install refuses unless api, worker-chat and worker-ingestion
+# all carry FAKE_LLM_ONLY=true, and the Job's own gates check again in the cluster. Takes the
+# same LOADTEST_* variables as k8s-loadtest.
+LOADTEST_PARAMS := TARGET_HOST USERS SPAWN_RATE DURATION CHAT_MODEL CHAT_EMAIL CHAT_PASSWORD \
+  SSE_TIMEOUT_S MIN_WAIT MAX_WAIT MODE FIXTURE_DIR FIXTURES UPLOADS_PER_USER UPLOAD_MIN_WAIT \
+  UPLOAD_MAX_WAIT INGEST_TIMEOUT_S HOLD_FOR_S SHAPE RAMP_INITIAL_USERS RAMP_STEP_USERS \
+  RAMP_STEP_SECONDS RAMP_MAX_USERS RAMP_SPAWN_RATE SPIKE_USERS SPIKE_SPAWN_SECONDS SPIKE_HOLD
+# Only the ones set on the command line or in the environment, as shell-quoted NAME=value
+# words; the loadtest chart's values.yaml holds the defaults. Sent as JSON, so commas
+# (LOADTEST_FIXTURES) and quotes survive.
+shell-quote = '$(subst ','\'',$(1))'
+LOADTEST_SET = $(foreach p,$(LOADTEST_PARAMS),$(if $(filter command environment,$(origin LOADTEST_$(p))),$(call shell-quote,LOADTEST_$(p)=$(LOADTEST_$(p)))))
+LOADTEST_PARAMS_JSON = .venv/bin/python -c \
+  'import json,sys; print(json.dumps(dict(a.split("=", 1) for a in sys.argv[1:])))' $(LOADTEST_SET)
+
+.PHONY: helm-loadtest
+helm-loadtest: k8s-sync-loadtest k8s-build-push
+	$(HELM_DEPLOY) -f infra/k8s/envs/values-loadtest.yaml \
+	  --set-string loadtest.faults.fakeLlmLatencyMs=$(LOADTEST_FAKE_LLM_LATENCY_MS) \
+	  --set-string loadtest.faults.opensearchHost=$(LOADTEST_OPENSEARCH_HOST)
+	helm uninstall loadtest -n copilot --ignore-not-found --wait
+	params=$$($(LOADTEST_PARAMS_JSON)) && helm install loadtest $(K8S_LOADTEST)/chart -n copilot \
+	    --set-string image.tag=$(GIT_SHA) --set-json "params=$$params"
+	@echo "streaming loadtest logs (Ctrl-C is safe, the Job keeps running)..."
+	kubectl wait --for=create pod -l job-name=loadtest -n copilot --timeout=180s
+	kubectl logs -f job/loadtest -n copilot
+
+# Back out of fake-LLM mode. The Job goes first, and its pod must be gone before the real config
+# returns, or Locust's last requests would reach real-config workers. --reset-values: the
+# result never depends on what the load-test release held. Helm prunes toxiproxy.
+.PHONY: helm-loadtest-clean
+helm-loadtest-clean: k8s-build-push
+	helm uninstall loadtest -n copilot --ignore-not-found --wait
+	@if kubectl get pod -l job-name=loadtest -n copilot -o name | grep -q .; then \
+	  kubectl wait --for=delete pod -l job-name=loadtest -n copilot --timeout=120s; fi
+	$(HELM_DEPLOY) --reset-values
 
 # Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run
 # after editing the Dockerfile; tag must match kind-cluster.yaml's `image:`.
@@ -559,16 +629,22 @@ k8s-loadtest-t9-restore:
 	kubectl rollout status statefulset/qdrant -n copilot --timeout=300s
 	kubectl rollout status statefulset/opensearch -n copilot --timeout=600s
 
+# Helm reads only files inside a chart, so both charts carry copies too.
 .PHONY: k8s-sync-loadtest
 k8s-sync-loadtest:
 	cp infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
 	cp infra/config/models.loadtest.yaml infra/k8s/loadtest/models.yaml
+	mkdir -p $(CHART)/files/loadtest $(K8S_LOADTEST)/chart/files
+	cp infra/config/models.loadtest.yaml $(CHART)/files/loadtest/models.yaml
+	cp infra/loadtest/locustfile.py $(K8S_LOADTEST)/chart/files/locustfile.py
 
 # Fails if the K8s loadtest copies have drifted. Run `make k8s-sync-loadtest` to fix.
 .PHONY: k8s-check-loadtest
 k8s-check-loadtest:
 	@diff -q infra/loadtest/locustfile.py infra/k8s/loadtest/locustfile.py
 	@diff -q infra/config/models.loadtest.yaml infra/k8s/loadtest/models.yaml
+	@diff -q infra/config/models.loadtest.yaml $(CHART)/files/loadtest/models.yaml
+	@diff -q infra/loadtest/locustfile.py $(K8S_LOADTEST)/chart/files/locustfile.py
 
 # Runs the Locust load test from inside the cluster (docs/notes/loadtest-concepts.md §7).
 # Applying this overlay puts api + both workers into fake-LLM mode; `k8s-loadtest-clean`

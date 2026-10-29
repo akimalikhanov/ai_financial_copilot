@@ -1,0 +1,84 @@
+suite: storage seam and keep policy
+templates:
+  # loaded for the checksum includes; not asserted
+  - data/postgres-configmaps.yaml
+  - storage/garage-configmaps.yaml
+  - langfuse/clickhouse-configmap.yaml
+  # StatefulSets
+  - data/postgres-statefulset.yaml
+  - data/redis-app-statefulset.yaml
+  - data/redis-broker-statefulset.yaml
+  - data/redis-langfuse-statefulset.yaml
+  - search/qdrant-statefulset.yaml
+  - search/opensearch-statefulset.yaml
+  - search/elasticsearch-statefulset.yaml
+  - storage/garage-statefulset.yaml
+  - langfuse/clickhouse-statefulset.yaml
+  # standalone PVCs
+  - app/worker-ingestion-pvc.yaml
+  - app/tei-pvc.yaml
+  - app/tei-embedder-pvc.yaml
+  - observability/prometheus-pvc.yaml
+  - observability/grafana-pvc.yaml
+release:
+  namespace: copilot
+tests:
+  - it: leaves storageClassName to the cluster default without an environment file
+    templates: &statefulSets
+      - data/postgres-statefulset.yaml
+      - data/redis-app-statefulset.yaml
+      - data/redis-broker-statefulset.yaml
+      - data/redis-langfuse-statefulset.yaml
+      - search/qdrant-statefulset.yaml
+      - search/opensearch-statefulset.yaml
+      - search/elasticsearch-statefulset.yaml
+      - storage/garage-statefulset.yaml
+      - langfuse/clickhouse-statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+
+  - it: leaves standalone PVCs on the cluster default without an environment file
+    templates: &pvcs
+      - app/worker-ingestion-pvc.yaml
+      - app/tei-pvc.yaml
+      - app/tei-embedder-pvc.yaml
+      - observability/prometheus-pvc.yaml
+      - observability/grafana-pvc.yaml
+    asserts:
+      - notExists:
+          path: spec.storageClassName
+
+  - it: uses gp3 on every volumeClaimTemplate on EKS
+    values:
+      - ../../envs/values-eks.yaml
+    templates: *statefulSets
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.storageClassName
+          value: gp3
+
+  - it: uses gp3 on garage's second volumeClaimTemplate on EKS
+    values:
+      - ../../envs/values-eks.yaml
+    template: storage/garage-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[1].spec.storageClassName
+          value: gp3
+
+  - it: uses gp3 on every standalone PVC on EKS
+    values:
+      - ../../envs/values-eks.yaml
+    templates: *pvcs
+    asserts:
+      - equal:
+          path: spec.storageClassName
+          value: gp3
+
+  - it: keeps every standalone PVC on helm uninstall
+    templates: *pvcs
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep

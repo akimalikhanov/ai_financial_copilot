@@ -252,3 +252,21 @@ langfuseWorker:
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits: { cpu: "1", memory: 1Gi }
+
+# --- load test: on only through envs/values-loadtest.yaml ---
+loadtest:
+  fakeLlm:
+    enabled: false         # api, worker-chat and worker-ingestion together, or none
+  toxiproxy:               # T8's latency injector in front of OpenSearch
+    enabled: false
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    latencyMs: 8000        # downstream only; keep under the opensearch-py 10s timeout
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    configureResources:
+      requests: { cpu: 10m, memory: 16Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+  faults:                  # "" = no fault; each needs fakeLlm.enabled
+    fakeLlmLatencyMs: ""   # T7: fixed FakeAdapter latency on worker-chat
+    opensearchHost: ""     # T8: "toxiproxy" routes api + worker-chat through the proxy

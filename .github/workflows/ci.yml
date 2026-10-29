@@ -171,6 +171,33 @@ jobs:
           exit-code: 1
           severity: HIGH,CRITICAL
 
+  helm:
+    # Renders the chart for every env without a cluster: lint + values schema, kubeconform,
+    # helm-unittest. Immutable-field and admission errors only show up against a live cluster.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HELM_VERSION: v4.3.1
+      HELM_SHA256: 0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+      KUBECONFORM_VERSION: v0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      HELM_UNITTEST_VERSION: v1.2.1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install helm, kubeconform and helm-unittest
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 -C bin linux-amd64/helm
+          curl -fsSLo kc.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kc.tgz" | sha256sum -c -
+          tar -xzf kc.tgz -C bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/helm" plugin install https://github.com/helm-unittest/helm-unittest.git \
+            --version "${HELM_UNITTEST_VERSION}" --verify=false
+      - run: make helm-check
+
   frontend-typecheck:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -198,6 +225,7 @@ jobs:
       - integration-tests
       - security
       - docker
+      - helm
       - frontend-typecheck
     runs-on: ubuntu-24.04
     if: always()
@@ -211,6 +239,7 @@ jobs:
             "${{ needs.integration-tests.result }}"
             "${{ needs.security.result }}"
             "${{ needs.docker.result }}"
+            "${{ needs.helm.result }}"
             "${{ needs.frontend-typecheck.result }}"
           )
           for result in "${results[@]}"; do

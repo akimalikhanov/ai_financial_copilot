@@ -1,0 +1,12 @@
+# Load test: layered on values-kind.yaml by `make helm-loadtest`; `make helm-loadtest-clean`
+# deploys without it. Never pass it to a normal deploy: the LLM path becomes the FakeAdapter.
+loadtest:
+  fakeLlm:
+    enabled: true
+  toxiproxy:
+    enabled: true
+    image: localhost:5001/toxiproxy:2.12.0   # mirrored by make k8s-loadtest-toxiproxy-image
+
+# The hook would ingest the sample corpus through fake-LLM workers, with fake table summaries.
+seedSample:
+  enabled: false

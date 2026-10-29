@@ -159,6 +159,72 @@ credentials needed. Argument: (dict "root" $ "name" "deps" "targets" (list "post
     requests: { cpu: "10m", memory: "16Mi" }
 {{- end }}
 
+{{/*
+Fake-LLM mode, one switch for api, worker-chat and worker-ingestion: each includes all four
+pieces below, and every piece reads only loadtest.fakeLlm.enabled, so the three can't diverge.
+Turning it on for two of the three would leave one workload able to spend real money.
+*/}}
+{{/* env entries. Argument: (dict "root" $ "name" "<container name>"). */}}
+{{- define "copilot.fakeLlm.env" -}}
+{{- if .root.Values.loadtest.fakeLlm.enabled }}
+- name: MODELS_CONFIG_PATH
+  value: infra/config/loadtest/models.yaml
+# Fail closed: no real adapter is built even if the production models.yaml loads.
+- name: FAKE_LLM_ONLY
+  value: "true"
+{{- if eq .name "worker-ingestion" }}
+- name: PICTURE_ENRICHER_ENABLED
+  value: "false"
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- define "copilot.fakeLlm.volumeMount" -}}
+{{- if .Values.loadtest.fakeLlm.enabled }}
+- name: loadtest-models-config
+  mountPath: /app/infra/config/loadtest
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- define "copilot.fakeLlm.volume" -}}
+{{- if .Values.loadtest.fakeLlm.enabled }}
+- name: loadtest-models-config
+  configMap:
+    name: loadtest-models-config
+{{- end }}
+{{- end }}
+
+{{/* Pod annotation: an edit to the fake models config rolls the pods that mount it. */}}
+{{- define "copilot.fakeLlm.annotations" -}}
+{{- if .Values.loadtest.fakeLlm.enabled }}
+checksum/loadtest-models: {{ include (print .Template.BasePath "/loadtest/models-configmap.yaml") . | sha256sum }}
+{{- end }}
+{{- end }}
+
+{{/*
+Load-test fault env, rendered only when a fault is set. Argument: (dict "root" $ "name" "<container name>").
+FAKE_LLM_LATENCY_MS goes to worker-chat only: the api makes no LLM call on the chat path.
+*/}}
+{{- define "copilot.loadtestFaults.env" -}}
+{{- $lt := .root.Values.loadtest -}}
+{{- if and (or $lt.faults.fakeLlmLatencyMs $lt.faults.opensearchHost) (not $lt.fakeLlm.enabled) -}}
+{{- fail "loadtest.faults.* need loadtest.fakeLlm.enabled (envs/values-loadtest.yaml)" -}}
+{{- end -}}
+{{- if and (eq $lt.faults.opensearchHost "toxiproxy") (not $lt.toxiproxy.enabled) -}}
+{{- fail "loadtest.faults.opensearchHost=toxiproxy needs loadtest.toxiproxy.enabled" -}}
+{{- end -}}
+{{- if and $lt.faults.fakeLlmLatencyMs (eq .name "worker-chat") }}
+- name: FAKE_LLM_LATENCY_MS
+  value: {{ $lt.faults.fakeLlmLatencyMs | toString | quote }}
+{{- end }}
+{{- with $lt.faults.opensearchHost }}
+# Beats the OPENSEARCH_HOST from app-endpoints: env wins over envFrom.
+- name: OPENSEARCH_HOST
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+
 {{/* storageClassName, omitted when persistence.storageClass is "" (cluster default). */}}
 {{- define "copilot.storageClass" -}}
 {{- with .Values.persistence.storageClass -}}

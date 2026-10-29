@@ -1,0 +1,91 @@
+{{- if .Values.loadtest.toxiproxy.enabled }}
+# T8's latency injector: a TCP proxy in front of OpenSearch that delays every byte it forwards,
+# so the dependency stays real. Nothing dials it unless loadtest.faults.opensearchHost=toxiproxy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: toxiproxy
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "toxiproxy") | nindent 4 }}
+spec:
+  selector:
+    {{- include "copilot.selectorLabels" (dict "name" "toxiproxy") | nindent 4 }}
+  ports:
+    # OpenSearch's own port, so the fault is one env var and OPENSEARCH_HTTP_PORT never changes.
+    - name: opensearch
+      port: 9200
+      targetPort: 9200
+    # Control API: add, retune or remove a toxic mid-run without a rollout.
+    - name: api
+      port: 8474
+      targetPort: 8474
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "toxiproxy") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "toxiproxy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "toxiproxy") | nindent 8 }}
+    spec:
+      containers:
+        - name: toxiproxy
+          image: {{ .Values.loadtest.toxiproxy.image }}
+          args: ["-host=0.0.0.0"]
+          ports:
+            - name: opensearch
+              containerPort: 9200
+            - name: api
+              containerPort: 8474
+          # Probes the proxy the configure sidecar creates, not just the control API: a ready pod
+          # with no listener on 9200 would fail every call, which reads as T9, not T8.
+          readinessProbe:
+            httpGet: { path: /proxies/opensearch, port: 8474 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 12
+          resources:
+            {{- toYaml .Values.loadtest.toxiproxy.resources | nindent 12 }}
+        # The image is distroless and its -config file can't carry toxics, so a sidecar POSTs
+        # them; unlike postStart, its output shows in kubectl logs.
+        - name: configure
+          image: {{ .Values.waitImages.curl }}
+          env:
+            - name: TOXIPROXY_LATENCY_MS
+              value: {{ .Values.loadtest.toxiproxy.latencyMs | toString | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until curl -fsS http://127.0.0.1:8474/version >/dev/null 2>&1; do
+                echo "waiting for the toxiproxy control API"; sleep 1
+              done
+              # Idempotent: a pod restart must not wedge on a 409 for an existing proxy.
+              curl -fsS -X POST http://127.0.0.1:8474/proxies \
+                -H 'Content-Type: application/json' \
+                -d '{"name":"opensearch","listen":"0.0.0.0:9200","upstream":"opensearch:9200","enabled":true}' \
+                || echo "proxy already exists, continuing"
+              # Downstream only: upstream + downstream would pass the opensearch-py 10s timeout.
+              curl -fsS -X POST http://127.0.0.1:8474/proxies/opensearch/toxics \
+                -H 'Content-Type: application/json' \
+                -d "{\"name\":\"latency_downstream\",\"type\":\"latency\",\"stream\":\"downstream\",\"toxicity\":1.0,\"attributes\":{\"latency\":${TOXIPROXY_LATENCY_MS},\"jitter\":0}}" \
+                || echo "toxic already present, continuing"
+              echo "toxiproxy configured:"
+              curl -fsS http://127.0.0.1:8474/proxies/opensearch
+              echo
+              # Stay alive: a Deployment's restartPolicy is always Always.
+              while true; do sleep 3600; done
+          resources:
+            {{- toYaml .Values.loadtest.toxiproxy.configureResources | nindent 12 }}
+{{- end }}

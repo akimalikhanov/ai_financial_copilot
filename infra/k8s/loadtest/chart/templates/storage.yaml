@@ -1,0 +1,42 @@
+{{- /*
+Static hostPath PV/PVC pairs: results flow out to the host, fixture PDFs flow in. Not the
+local-path provisioner, which allocates inside the node container where the host can't see it.
+Each PVC binds to its PV by name. All four are kept on uninstall (see loadtest.keep).
+*/}}
+{{- range $name, $v := .Values.storage }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: loadtest-{{ $name }}
+  labels:
+    {{- include "loadtest.labels" $ | nindent 4 }}
+  annotations:
+    {{- include "loadtest.keep" $ | nindent 4 }}
+spec:
+  capacity:
+    storage: {{ $v.size }}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain   # the CSVs and PDFs on the host outlive any claim
+  storageClassName: loadtest-{{ $name }}
+  hostPath:
+    path: {{ $v.hostPath }}
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loadtest-{{ $name }}
+  namespace: {{ include "loadtest.namespace" $ }}
+  labels:
+    {{- include "loadtest.labels" $ | nindent 4 }}
+  annotations:
+    {{- include "loadtest.keep" $ | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: loadtest-{{ $name }}
+  resources:
+    requests:
+      storage: {{ $v.size }}
+  volumeName: loadtest-{{ $name }}
+{{- end }}

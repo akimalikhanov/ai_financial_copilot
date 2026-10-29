@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "loadtest chart values",
+  "description": "Strict: a misspelled param would otherwise run the default scenario silently.",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "str": { "type": "string" },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostPath", "size"],
+      "properties": {
+        "hostPath": { "type": "string", "pattern": "^/" },
+        "size": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "tag", "pullPolicy"],
+      "properties": {
+        "registry": { "type": "string" },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "kubectlImage": { "type": "string", "minLength": 1 },
+    "busyboxImage": { "type": "string", "minLength": 1 },
+    "curlImage": { "type": "string", "minLength": 1 },
+    "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
+    "resources": { "type": "object" },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["results", "fixtures"],
+      "properties": {
+        "results": { "$ref": "#/definitions/volume" },
+        "fixtures": { "$ref": "#/definitions/volume" }
+      }
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "LOADTEST_TARGET_HOST": { "$ref": "#/definitions/str" },
+        "LOADTEST_USERS": { "$ref": "#/definitions/str" },
+        "LOADTEST_SPAWN_RATE": { "$ref": "#/definitions/str" },
+        "LOADTEST_DURATION": { "$ref": "#/definitions/str" },
+        "LOADTEST_CHAT_MODEL": { "$ref": "#/definitions/str" },
+        "LOADTEST_CHAT_EMAIL": { "$ref": "#/definitions/str" },
+        "LOADTEST_CHAT_PASSWORD": { "$ref": "#/definitions/str" },
+        "LOADTEST_SSE_TIMEOUT_S": { "$ref": "#/definitions/str" },
+        "LOADTEST_MIN_WAIT": { "$ref": "#/definitions/str" },
+        "LOADTEST_MAX_WAIT": { "$ref": "#/definitions/str" },
+        "LOADTEST_MODE": { "enum": ["ask", "sse_hold", "upload"] },
+        "LOADTEST_FIXTURE_DIR": { "$ref": "#/definitions/str" },
+        "LOADTEST_FIXTURES": { "$ref": "#/definitions/str" },
+        "LOADTEST_UPLOADS_PER_USER": { "$ref": "#/definitions/str" },
+        "LOADTEST_UPLOAD_MIN_WAIT": { "$ref": "#/definitions/str" },
+        "LOADTEST_UPLOAD_MAX_WAIT": { "$ref": "#/definitions/str" },
+        "LOADTEST_INGEST_TIMEOUT_S": { "$ref": "#/definitions/str" },
+        "LOADTEST_HOLD_FOR_S": { "$ref": "#/definitions/str" },
+        "LOADTEST_SHAPE": { "enum": ["", "ramp", "spike"] },
+        "LOADTEST_RAMP_INITIAL_USERS": { "$ref": "#/definitions/str" },
+        "LOADTEST_RAMP_STEP_USERS": { "$ref": "#/definitions/str" },
+        "LOADTEST_RAMP_STEP_SECONDS": { "$ref": "#/definitions/str" },
+        "LOADTEST_RAMP_MAX_USERS": { "$ref": "#/definitions/str" },
+        "LOADTEST_RAMP_SPAWN_RATE": { "$ref": "#/definitions/str" },
+        "LOADTEST_SPIKE_USERS": { "$ref": "#/definitions/str" },
+        "LOADTEST_SPIKE_SPAWN_SECONDS": { "$ref": "#/definitions/str" },
+        "LOADTEST_SPIKE_HOLD": { "$ref": "#/definitions/str" }
+      }
+    }
+  }
+}

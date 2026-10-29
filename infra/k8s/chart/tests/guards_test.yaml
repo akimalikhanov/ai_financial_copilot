@@ -1,0 +1,33 @@
+suite: guards
+templates:
+  - app/frontend-service.yaml
+release:
+  namespace: copilot
+tests:
+  - it: refuses any namespace but copilot
+    release:
+      namespace: other
+    asserts:
+      - failedTemplate:
+          errorPattern: "only into namespace copilot"
+
+  - it: rejects a misspelled seam key (gpu.enable)
+    set:
+      gpu.enable: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "additional properties 'enable' not allowed"
+
+  - it: rejects a misspelled component at the top level
+    set:
+      workerIngetsion.replicas: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "additional properties 'workerIngetsion' not allowed"
+
+  - it: rejects a misspelled enable flag on a dev-only component
+    set:
+      dcgmExporter.enable: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "additional properties 'enable' not allowed"

@@ -1,0 +1,93 @@
+# Fields that are immutable on live objects. Changing one breaks helm upgrade, so these tests
+# fail first.
+suite: frozen fields
+templates:
+  # loaded for the checksum includes; not asserted
+  - app/app-configmaps.yaml
+  - data/postgres-configmaps.yaml
+  - storage/garage-configmaps.yaml
+  - langfuse/clickhouse-configmap.yaml
+  # asserted
+  - app/worker-chat-deployment.yaml
+  - app/worker-ingestion-deployment.yaml
+  - data/postgres-statefulset.yaml
+  - data/redis-app-statefulset.yaml
+  - data/redis-broker-statefulset.yaml
+  - data/redis-langfuse-statefulset.yaml
+  - search/qdrant-statefulset.yaml
+  - search/opensearch-statefulset.yaml
+  - search/elasticsearch-statefulset.yaml
+  - storage/garage-statefulset.yaml
+  - langfuse/clickhouse-statefulset.yaml
+release:
+  namespace: copilot
+tests:
+  - it: selects worker-chat pods as chat_worker, the Prometheus job name
+    template: app/worker-chat-deployment.yaml
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: chat_worker
+
+  - it: selects worker-ingestion pods as ingestion_worker
+    template: app/worker-ingestion-deployment.yaml
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: ingestion_worker
+
+  - it: names the postgres volumeClaimTemplate data
+    template: data/postgres-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/name: postgres
+
+  - it: names every single-volume volumeClaimTemplate data
+    templates:
+      - data/redis-app-statefulset.yaml
+      - data/redis-broker-statefulset.yaml
+      - data/redis-langfuse-statefulset.yaml
+      - search/qdrant-statefulset.yaml
+      - search/opensearch-statefulset.yaml
+      - search/elasticsearch-statefulset.yaml
+      - langfuse/clickhouse-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+
+  - it: selects each StatefulSet's pods by name label only
+    asserts:
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: redis-app } }
+        template: data/redis-app-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: redis-broker } }
+        template: data/redis-broker-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: redis-langfuse } }
+        template: data/redis-langfuse-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: qdrant } }
+        template: search/qdrant-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: opensearch } }
+        template: search/opensearch-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: elasticsearch } }
+        template: search/elasticsearch-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: clickhouse } }
+        template: langfuse/clickhouse-statefulset.yaml
+      - equal: { path: spec.selector.matchLabels, value: { app.kubernetes.io/name: garage } }
+        template: storage/garage-statefulset.yaml
+
+  - it: names garage's volumeClaimTemplates meta and data
+    template: storage/garage-statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: meta
+      - equal:
+          path: spec.volumeClaimTemplates[1].metadata.name
+          value: data

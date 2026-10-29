@@ -1,0 +1,124 @@
+suite: loadtest chart
+templates:
+  - job.yaml
+  - configmaps.yaml
+  - storage.yaml
+release:
+  namespace: copilot
+tests:
+  - it: refuses any namespace but copilot
+    release:
+      namespace: other
+    asserts:
+      - failedTemplate:
+          errorPattern: "only into namespace copilot"
+
+  - it: runs the worker image from the kind registry at the given tag
+    template: job.yaml
+    set:
+      image.tag: "1234567"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: localhost:5001/copilot/worker:1234567
+      - equal:
+          path: spec.backoffLimit
+          value: 0
+
+  - it: renders params as strings, overrides on top of the defaults
+    template: configmaps.yaml
+    documentSelector:
+      path: metadata.name
+      value: loadtest-params
+    set:
+      params.LOADTEST_FIXTURES: normal.pdf,scanned.pdf
+    asserts:
+      - equal:
+          path: data.LOADTEST_FIXTURES
+          value: normal.pdf,scanned.pdf
+      - equal:
+          path: data.LOADTEST_USERS
+          value: "20"
+
+  - it: rejects a misspelled param
+    set:
+      params.LOADTEST_USER: "40"
+    asserts:
+      - failedTemplate:
+          errorPattern: "additional properties 'LOADTEST_USER' not allowed"
+
+  - it: rejects an unknown mode
+    set:
+      params.LOADTEST_MODE: Upload
+    asserts:
+      - failedTemplate:
+          errorPattern: "LOADTEST_MODE"
+
+  - it: keeps the PVs and PVCs on uninstall, so the Retain PVs never go Released
+    template: storage.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/resource-policy"]
+          value: keep
+      - hasDocuments:
+          count: 4
+
+  - it: refuses to install while a Deployment is not in fake-LLM mode
+    template: job.yaml
+    kubernetesProvider:
+      scheme: &scheme
+        "v1/Namespace":
+          gvr: { version: "v1", resource: "namespaces" }
+          namespaced: false
+        "apps/v1/Deployment":
+          gvr: { group: "apps", version: "v1", resource: "deployments" }
+          namespaced: true
+      objects:
+        - { apiVersion: v1, kind: Namespace, metadata: { name: copilot } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: api, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: api, env: [ { name: FAKE_LLM_ONLY, value: "true" } ] } ] } } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: worker-chat, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: worker-chat, env: [ { name: FAKE_LLM_ONLY, value: "true" } ] } ] } } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: worker-ingestion, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: worker-ingestion, env: [ { name: LOG_FILE, value: "" } ] } ] } } }
+    asserts:
+      - failedTemplate:
+          errorPattern: "worker-ingestion is not in fake-LLM mode"
+
+  - it: refuses to install while a Deployment is missing
+    template: job.yaml
+    kubernetesProvider:
+      scheme: *scheme
+      objects:
+        - { apiVersion: v1, kind: Namespace, metadata: { name: copilot } }
+    asserts:
+      - failedTemplate:
+          errorPattern: "Deployment api not found"
+
+  - it: installs once all three Deployments are in fake-LLM mode
+    template: job.yaml
+    kubernetesProvider:
+      scheme: *scheme
+      objects:
+        - { apiVersion: v1, kind: Namespace, metadata: { name: copilot } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: api, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: api, env: [ { name: FAKE_LLM_ONLY, value: "true" } ] } ] } } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: worker-chat, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: worker-chat, env: [ { name: FAKE_LLM_ONLY, value: "true" } ] } ] } } }
+        - apiVersion: apps/v1
+          kind: Deployment
+          metadata: { name: worker-ingestion, namespace: copilot }
+          spec: { template: { spec: { containers: [ { name: worker-ingestion, env: [ { name: FAKE_LLM_ONLY, value: "true" } ] } ] } } }
+    asserts:
+      - hasDocuments:
+          count: 1
