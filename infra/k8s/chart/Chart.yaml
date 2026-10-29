@@ -1,0 +1,9 @@
+apiVersion: v2
+name: copilot
+description: AI Financial Copilot on Kubernetes
+type: application
+# Chart version: bump when templates change. The image tag comes from images.tag, not appVersion.
+version: 0.1.0
+appVersion: "0.1.0"
+# The -0 admits EKS pre-release-style versions like v1.33.5-eks-113cf36.
+kubeVersion: ">=1.30.0-0"

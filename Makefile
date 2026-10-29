@@ -194,6 +194,30 @@ k8s-prune:
 	  --repos copilot/api copilot/worker copilot/frontend --keep $(K8S_KEEP_TAGS) \
 	  --node $(K8S_NODE) --registry-container kind-registry $(PRUNE_ARGS)
 
+# Helm chart (Stage 18). Render-only until the cutover; k8s-deploy still applies Kustomize.
+CHART := infra/k8s/chart
+ENV ?= kind
+HELM_VALUES = -f infra/k8s/envs/values-$(ENV).yaml $(HELM_EXTRA_VALUES)
+HELM_RENDER = helm template copilot $(CHART) -n copilot $(HELM_VALUES) \
+  --set-string images.tag=$(GIT_SHA) --set-string secretsChecksum=$(SECRETS_CHECKSUM)
+
+.PHONY: helm-render
+helm-render:
+	@$(HELM_RENDER)
+
+# Render diff, Kustomize vs Helm. MATCH narrows it to object names, e.g. MATCH='^postgres'.
+# Process substitution keeps the Kustomize render, which includes Secret data, off the disk.
+.PHONY: helm-diff-kustomize
+helm-diff-kustomize: k8s-set-images
+	@bash -c '.venv/bin/python -m scripts.k8s_render_diff --names kustomize helm \
+	  <(kustomize build $(K8S_OVERLAY)) <($(HELM_RENDER)) $(if $(MATCH),--match "$(MATCH)")'
+
+# What a values file changes: kind vs eks, both rendered by Helm. Needs envs/values-eks.yaml.
+.PHONY: helm-diff-envs
+helm-diff-envs:
+	@bash -c '.venv/bin/python -m scripts.k8s_render_diff --names kind eks \
+	  <($(MAKE) -s helm-render ENV=kind) <($(MAKE) -s helm-render ENV=eks)'
+
 # Builds the custom kind node image (NVIDIA toolkit + registry hosts.toml baked in). Re-run
 # after editing the Dockerfile; tag must match kind-cluster.yaml's `image:`.
 .PHONY: k8s-node-image
@@ -268,14 +292,23 @@ k8s-sync-initdb:
 	cp infra/scripts/db_init/00_db_init.sh infra/k8s/base/data/initdb/00_db_init.sh
 	cp infra/scripts/db_init/01_create_app_tables.sh infra/k8s/base/data/initdb/01_create_app_tables.sh
 	cp infra/scripts/pgbouncer-entrypoint.sh infra/k8s/base/data/pgbouncer-entrypoint.sh
+	mkdir -p $(CHART)/files/data/initdb
+	cp infra/scripts/db_init/00_db_init.sh $(CHART)/files/data/initdb/00_db_init.sh
+	cp infra/scripts/db_init/01_create_app_tables.sh $(CHART)/files/data/initdb/01_create_app_tables.sh
+	cp infra/scripts/pgbouncer-entrypoint.sh $(CHART)/files/data/pgbouncer-entrypoint.sh
+	cp infra/k8s/base/data/postgres-exporter-queries.yaml $(CHART)/files/data/postgres-exporter-queries.yaml
 
-# Fails if the K8s initdb/pgbouncer-entrypoint copies have drifted from infra/scripts/. Run
-# `make k8s-sync-initdb` to fix. Wired into `lint` so CI catches silent drift.
+# Fails if the K8s initdb/pgbouncer-entrypoint copies (Kustomize base and Helm chart) have
+# drifted from infra/scripts/. Run `make k8s-sync-initdb` to fix. Wired into `lint`.
 .PHONY: k8s-check-initdb
 k8s-check-initdb:
 	@diff -q infra/scripts/db_init/00_db_init.sh infra/k8s/base/data/initdb/00_db_init.sh
 	@diff -q infra/scripts/db_init/01_create_app_tables.sh infra/k8s/base/data/initdb/01_create_app_tables.sh
 	@diff -q infra/scripts/pgbouncer-entrypoint.sh infra/k8s/base/data/pgbouncer-entrypoint.sh
+	@diff -q infra/scripts/db_init/00_db_init.sh $(CHART)/files/data/initdb/00_db_init.sh
+	@diff -q infra/scripts/db_init/01_create_app_tables.sh $(CHART)/files/data/initdb/01_create_app_tables.sh
+	@diff -q infra/scripts/pgbouncer-entrypoint.sh $(CHART)/files/data/pgbouncer-entrypoint.sh
+	@diff -q infra/k8s/base/data/postgres-exporter-queries.yaml $(CHART)/files/data/postgres-exporter-queries.yaml
 
 # infra/k8s/base/search/es-bootstrap/*.{sh,json} are copies of infra/docker/elasticsearch/*.
 # infra/docker/elasticsearch/ is the source of truth; run this after editing any of them.
@@ -678,6 +711,23 @@ k8s-loadtest-clean: k8s-deploy
 	kubectl rollout status deployment/worker-ingestion -n copilot --timeout=600s
 
 K8S_SECRETS := infra/k8s/overlays/kind/secrets
+K8S_SECRET_NAMES := postgres redis garage app grafana clickhouse langfuse
+# Changes whenever any env file changes; the chart puts it on every secret-reading pod.
+SECRETS_CHECKSUM = $(shell cat $(foreach s,$(K8S_SECRET_NAMES),$(K8S_SECRETS)/$(s).env) \
+  2>/dev/null | sha256sum | cut -c1-16)
+
+# Creates or updates the chart's unhashed Secrets from the same env files. Idempotent, and
+# additive until the cutover: only the Helm chart references these names. Server-side apply,
+# so the secret data isn't duplicated into a last-applied-configuration annotation.
+.PHONY: k8s-secrets-apply
+k8s-secrets-apply: k8s-secrets
+	@# Create-only: applying a bare Namespace would strip the labels Kustomize put on it.
+	kubectl get namespace copilot >/dev/null 2>&1 || kubectl create namespace copilot
+	@for s in $(K8S_SECRET_NAMES); do \
+	  kubectl create secret generic $$s-secret -n copilot \
+	    --from-env-file=$(K8S_SECRETS)/$$s.env --dry-run=client -o yaml \
+	    | kubectl apply --server-side --field-manager=make -f - ; \
+	done
 
 .PHONY: k8s-secrets
 k8s-secrets:

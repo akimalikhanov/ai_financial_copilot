@@ -1,0 +1,73 @@
+# Base values. Rendered alone, the stack schedules on a cluster without GPUs.
+images:
+  registry: ""             # "" renders bare copilot/<name>, like the Kustomize base
+  tag: dev
+  pullPolicy: IfNotPresent
+
+secretsChecksum: ""        # set by make; changing it rolls every pod that reads a Secret
+
+secrets:                   # Secrets created outside the chart
+  postgres: postgres-secret
+  redis: redis-secret
+  garage: garage-secret
+  app: app-secret
+  grafana: grafana-secret
+  clickhouse: clickhouse-secret
+  langfuse: langfuse-secret
+
+persistence:
+  storageClass: ""         # "" omits the field
+
+gpu:
+  enabled: false
+  nodeSelector: {}
+  tolerations: []
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+
+waitImages:
+  postgres: postgres:16.11-alpine
+  redis: redis:7.2.12-alpine
+  curl: curlimages/curl:8.14.1
+
+exporterImages:            # Prometheus sidecars
+  postgres: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+  pgbouncer: prometheuscommunity/pgbouncer-exporter:v0.10.2
+  redis: oliver006/redis_exporter:v1.67.0
+
+# --- data ---
+postgres:
+  image: postgres:16.11-alpine
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+  persistence:
+    size: 5Gi
+
+pgbouncer:
+  replicas: 1
+  image: edoburu/pgbouncer:v1.24.1-p1
+  resources:
+    requests: { cpu: 60m, memory: 32Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+
+redisApp:
+  image: redis:7.2.12-alpine
+  maxmemory: 768mb         # eviction backstop; keep below the memory limit
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  persistence:
+    size: 2Gi
+
+redisBroker:
+  image: redis:7.2.12-alpine
+  resources:
+    requests: { cpu: 125m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  persistence:
+    size: 1Gi

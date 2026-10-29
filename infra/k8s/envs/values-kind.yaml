@@ -1,0 +1,14 @@
+# kind: layered on top of chart/values.yaml.
+images:
+  registry: localhost:5001
+
+# PVC sizes match the live volumeClaimTemplates, which are immutable.
+postgres:
+  persistence:
+    size: 2Gi
+redisApp:
+  persistence:
+    size: 2Gi
+redisBroker:
+  persistence:
+    size: 2Gi

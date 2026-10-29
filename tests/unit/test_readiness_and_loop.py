@@ -109,6 +109,9 @@ async def test_upload_pdf_reads_the_file_off_the_loop(monkeypatch: pytest.Monkey
     """
     from src.services.ingestion import s3_client
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+
     captured: dict[str, Any] = {}
 
     class _FakeClient:

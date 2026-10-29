@@ -9,6 +9,7 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
+        exclude: ^infra/k8s/chart/templates/  # Go templates; `helm lint` validates the render
       - id: check-added-large-files
         exclude: ^seed/sample/.*\.pdf$  # committed sample corpus (src/services/sample)
       - id: check-merge-conflict
