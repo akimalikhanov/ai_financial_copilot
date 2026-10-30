@@ -23,8 +23,8 @@ far longer. Point --source at any filing under data/corpus/pdfs/ — that corpus
 pages, median 128, so check the page count printed below against it before trusting a run.
 
 Fixtures are written to infra/k8s/loadtest/fixtures/, which is gitignored and mounted into
-the kind node (see kind-cluster.yaml extraMounts + loadtest/fixtures-pv.yaml). Real filings
-must not be committed, and generated PDFs are reproducible from this script, so nothing here
+the kind node (see kind-cluster.yaml extraMounts and the loadtest chart's storage.yaml). Real
+filings must not be committed, and generated PDFs are reproducible from this script, so nothing here
 belongs in git.
 
 Usage:

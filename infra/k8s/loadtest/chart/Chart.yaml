@@ -2,7 +2,7 @@ apiVersion: v2
 name: loadtest
 description: One Locust load-test run against the copilot release (kind only)
 type: application
-# Its own release: a run lives minutes, the stack weeks. `make helm-loadtest` installs it after
+# Its own release: a run lives minutes, the stack weeks. `make k8s-loadtest` installs it after
 # copilot has rolled out with envs/values-loadtest.yaml, and uninstalls it before the next run.
 version: 0.1.0
 appVersion: "0.1.0"

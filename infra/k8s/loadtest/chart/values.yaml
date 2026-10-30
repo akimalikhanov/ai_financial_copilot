@@ -1,4 +1,4 @@
-# Defaults for one run. `make helm-loadtest` passes only the LOADTEST_* variables you set.
+# Defaults for one run. `make k8s-loadtest` passes only the LOADTEST_* variables you set.
 image:                     # the worker image; locust is a main dependency
   registry: localhost:5001
   tag: dev

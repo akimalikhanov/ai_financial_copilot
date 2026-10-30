@@ -1,6 +1,6 @@
 # Base values. Rendered alone, the stack schedules on a cluster without GPUs.
 images:
-  registry: ""             # "" renders bare copilot/<name>, like the Kustomize base
+  registry: ""             # "" renders bare copilot/<name>
   tag: dev
   pullPolicy: IfNotPresent
 

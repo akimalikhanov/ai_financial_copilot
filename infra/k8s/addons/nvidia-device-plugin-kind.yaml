@@ -1,0 +1,34 @@
+# Values for NVIDIA's nvidia-device-plugin chart on kind (`make k8s-gpu-plugin`).
+# The chart version is pinned in the Makefile and also pins the image tag.
+
+# Sets PASS_DEVICE_SPECS=true and privileged, which a containerized (kind) node needs.
+compatWithCPUManager: true
+# Pairs with accept-nvidia-visible-devices-as-volume-mounts in the node image.
+deviceListStrategy: volume-mounts
+
+# The chart's default affinity already matches the node's nvidia.com/gpu.present=true label.
+# Lists replace the chart default rather than merge, so its nvidia.com/gpu toleration is restated.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+resources:
+  requests: { cpu: "50m", memory: "64Mi" }
+  limits: { cpu: "200m", memory: "256Mi" }
+
+# Time-slicing: one physical GPU advertised as 3 units, one per in-cluster GPU consumer
+# (worker-ingestion, tei, tei-embedder). No VRAM isolation, so keep replicas = consumer count.
+config:
+  default: time-sliced
+  map:
+    time-sliced: |-
+      version: v1
+      sharing:
+        timeSlicing:
+          resources:
+            - name: nvidia.com/gpu
+              replicas: 3

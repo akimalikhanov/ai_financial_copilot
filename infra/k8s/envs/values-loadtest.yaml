@@ -1,4 +1,4 @@
-# Load test: layered on values-kind.yaml by `make helm-loadtest`; `make helm-loadtest-clean`
+# Load test: layered on values-kind.yaml by `make k8s-loadtest`; `make k8s-loadtest-clean`
 # deploys without it. Never pass it to a normal deploy: the LLM path becomes the FakeAdapter.
 loadtest:
   fakeLlm:

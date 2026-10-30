@@ -1,0 +1,20 @@
+# Layered on values-kind.yaml for install rehearsals on a throwaway cluster without a GPU.
+# The GPU pods, and everything that waits on them, are scaled to zero.
+gpu:
+  enabled: false
+tei:
+  replicas: 0
+teiEmbedder:
+  replicas: 0
+workerChat:                # waits on both TEI services
+  replicas: 0
+workerIngestion:
+  replicas: 0
+modelPreload:
+  enabled: false
+seedSample:                # waits for ingestion to finish
+  enabled: false
+dcgmExporter:
+  enabled: false
+ingress:
+  enabled: false

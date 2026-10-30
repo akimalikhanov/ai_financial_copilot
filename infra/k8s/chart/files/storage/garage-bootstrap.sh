@@ -8,7 +8,7 @@
 # es-bootstrap) has both curl and a shell, and the Admin API only needs the admin token, not the
 # RPC secret + garage.toml the CLI approach would have required.
 #
-# Idempotent: safe to re-run (kubectl delete job garage-bootstrap && kubectl apply -k ...).
+# Idempotent: a post-install/post-upgrade hook, so it re-runs on every deploy.
 # Imports a pre-generated key pair instead of creating one at runtime (stage-17 plan Phase 9,
 # concept 4) — the secret never needs to be read out of `kubectl logs`.
 
@@ -68,7 +68,7 @@ done
 
 # Key: imported from pre-generated material (make k8s-secrets), not created at runtime.
 # ImportKey accepts a caller-supplied pair, so the value is already known (in
-# overlays/kind/secrets/garage.env) before this Job runs — nothing to extract from a Job log.
+# infra/k8s/secrets/kind/garage.env) before this Job runs — nothing to extract from a Job log.
 : "${GARAGE_S3_ACCESS_KEY_ID:?GARAGE_S3_ACCESS_KEY_ID not set}"
 : "${GARAGE_S3_SECRET_ACCESS_KEY:?GARAGE_S3_SECRET_ACCESS_KEY not set}"
 
