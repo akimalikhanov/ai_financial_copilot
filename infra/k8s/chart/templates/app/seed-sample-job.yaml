@@ -1,0 +1,39 @@
+{{- if .Values.seedSample.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-sample
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "seed-sample") | nindent 4 }}
+  annotations:
+    # Weight 1: after model-preload and garage-bootstrap, since ingestion needs both.
+    # Idempotent: a ready corpus exits 0 at once; a failed run's retry starts that document over.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "1"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "seed-sample") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: {{ include "copilot.appImage" (dict "root" $ "name" "api") | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "src.services.sample.seed"]
+          envFrom:
+            - configMapRef: { name: app-config }
+            - configMapRef: { name: app-endpoints }
+            - secretRef:    { name: {{ .Values.secrets.app }} }
+          env:
+            - name: LOG_FILE
+              value: ""
+          # Importing the ingestion task module alone peaks at ~880Mi.
+          resources:
+            {{- toYaml .Values.seedSample.resources | nindent 12 }}
+{{- end }}

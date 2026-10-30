@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: es-bootstrap
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "es-bootstrap") | nindent 4 }}
+  annotations:
+    # Re-runs on every install/upgrade; the script is idempotent and waits for Elasticsearch.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 6
+  # High so `kubectl logs job/es-bootstrap` still works after a run; trim in Stage 19.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "es-bootstrap") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure          # required for Jobs; Always is rejected
+      containers:
+        - name: bootstrap
+          image: {{ .Values.waitImages.curl }}
+          command: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+          env:
+            - name: ES_URL
+              value: "http://elasticsearch:9200"
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: es-bootstrap-scripts
+            defaultMode: 0755

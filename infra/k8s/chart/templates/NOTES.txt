@@ -1,0 +1,5 @@
+{{- /* Calling the guard here makes every render fail outside namespace copilot, even before any object template exists. */ -}}
+Release {{ .Release.Name }} (chart {{ .Chart.Name }}-{{ .Chart.Version }}) in namespace {{ include "copilot.namespace" . }}.
+
+  helm status {{ .Release.Name }} -n {{ .Release.Namespace }}
+  kubectl get pods -n {{ .Release.Namespace }}

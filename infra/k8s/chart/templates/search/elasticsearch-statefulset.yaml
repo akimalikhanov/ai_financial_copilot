@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "elasticsearch") | nindent 4 }}
+spec:
+  serviceName: elasticsearch-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "elasticsearch") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "elasticsearch") | nindent 8 }}
+    spec:
+      # Same node-wide sysctl as OpenSearch; kept here so this StatefulSet is correct standalone.
+      {{- if .Values.sysctlInit.enabled }}
+      initContainers:
+        {{- include "copilot.sysctlInitContainer" . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: elasticsearch
+          image: {{ .Values.elasticsearch.image }}
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: xpack.security.enabled     # DEV ONLY
+              value: "false"
+            # `copilot-logs` may only ever exist as the ILM rollover alias. Without this,
+            # a log writer racing es-bootstrap auto-creates it as a plain index, and the
+            # alias can then never be created. Everything else still auto-creates.
+            - name: action.auto_create_index
+              value: "-copilot-logs,+*"
+            - name: ES_JAVA_OPTS
+              value: "-Xms{{ .Values.elasticsearch.heap }} -Xmx{{ .Values.elasticsearch.heap }}"
+          ports:
+            - name: http
+              containerPort: 9200
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+            initialDelaySeconds: 60
+            periodSeconds: 30            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.elasticsearch.resources | nindent 12 }}
+  # Immutable on the live object: keep the part-of label and omit storageClassName on kind.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.elasticsearch.persistence.size }}

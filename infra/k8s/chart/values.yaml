@@ -1,0 +1,272 @@
+# Base values. Rendered alone, the stack schedules on a cluster without GPUs.
+images:
+  registry: ""             # "" renders bare copilot/<name>
+  tag: dev
+  pullPolicy: IfNotPresent
+
+secretsChecksum: ""        # set by make; changing it rolls every pod that reads a Secret
+
+secrets:                   # Secrets created outside the chart
+  postgres: postgres-secret
+  redis: redis-secret
+  garage: garage-secret
+  app: app-secret
+  grafana: grafana-secret
+  clickhouse: clickhouse-secret
+  langfuse: langfuse-secret
+
+persistence:
+  storageClass: ""         # "" omits the field
+
+gpu:
+  enabled: false
+  nodeSelector: {}
+  tolerations: []
+
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  annotations: {}
+
+waitImages:
+  postgres: postgres:16.11-alpine
+  redis: redis:7.2.12-alpine
+  curl: curlimages/curl:8.14.1
+  busybox: busybox:1.36    # nc, for gates that only need an open port
+
+exporterImages:            # Prometheus sidecars
+  postgres: quay.io/prometheuscommunity/postgres-exporter:v0.20.1
+  pgbouncer: prometheuscommunity/pgbouncer-exporter:v0.10.2
+  redis: oliver006/redis_exporter:v1.67.0
+
+# --- data ---
+postgres:
+  image: postgres:16.11-alpine
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+  persistence:
+    size: 5Gi
+
+pgbouncer:
+  replicas: 1
+  image: edoburu/pgbouncer:v1.24.1-p1
+  resources:
+    requests: { cpu: 60m, memory: 32Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+
+redisApp:
+  image: redis:7.2.12-alpine
+  maxmemory: 768mb         # eviction backstop; keep below the memory limit
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  persistence:
+    size: 2Gi
+
+redisBroker:
+  image: redis:7.2.12-alpine
+  resources:
+    requests: { cpu: 125m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  persistence:
+    size: 1Gi
+
+redisLangfuse:
+  image: redis:7.2.12-alpine
+  maxmemory: 192mb         # write errors past this, never eviction; keep below the memory limit
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+  persistence:
+    size: 1Gi
+
+# --- search ---
+sysctlInit:                # privileged initContainer setting vm.max_map_count for OpenSearch/ES
+  enabled: true            # false where nodes set it at bootstrap
+  image: busybox:1.36
+
+qdrant:
+  image: qdrant/qdrant:v1.16.3
+  resources:
+    requests: { cpu: 500m, memory: 1536Mi }
+    limits: { cpu: "2", memory: 3Gi }
+  persistence:
+    size: 10Gi
+
+opensearch:
+  image: opensearchproject/opensearch:2.19.0
+  heap: 1g                 # -Xms/-Xmx; keep the memory limit ~2x heap for off-heap use
+  resources:
+    requests: { cpu: 750m, memory: 1280Mi }
+    limits: { cpu: 1500m, memory: 2560Mi }
+  persistence:
+    size: 10Gi
+
+elasticsearch:
+  image: docker.elastic.co/elasticsearch/elasticsearch:8.18.1
+  heap: 512m               # -Xms/-Xmx
+  resources:
+    requests: { cpu: 500m, memory: 768Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  persistence:
+    size: 5Gi
+
+# --- storage ---
+garage:
+  image: dxflrs/garage:v2.2.0
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  persistence:
+    metaSize: 1Gi
+    dataSize: 10Gi
+
+# --- app ---
+appConfig:
+  overrides: {}            # KEY: value pairs layered over files/app/app-config.env
+
+api:
+  replicas: 1
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: 2000m, memory: 2Gi }
+
+frontend:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+workerChat:
+  replicas: 6              # x CELERY_CHAT_WORKER_CONCURRENCY slots; see docs/notes/capacity-model.md
+  resources:
+    requests: { cpu: 250m, memory: 1536Mi }
+    limits: { cpu: 2000m, memory: 3Gi }
+
+workerIngestion:
+  replicas: 1
+  resources:
+    requests: { cpu: 500m, memory: 4Gi }
+    limits: { cpu: 4000m, memory: 12Gi }
+  modelCache:
+    size: 35Gi             # Docling/EasyOCR/HF models; shared with model-preload
+
+tei:                       # reranker
+  replicas: 1
+  image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0
+  modelId: BAAI/bge-reranker-v2-m3   # keep in sync with RERANKER_MODEL_NAME in app-config.env
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { cpu: 2000m, memory: 8Gi }
+  persistence:
+    size: 10Gi
+
+teiEmbedder:
+  replicas: 1
+  image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.8.0
+  modelId: BAAI/bge-m3     # keep in sync with EMBED_MODEL_ID in app-config.env
+  resources:
+    requests: { cpu: 250m, memory: 2Gi }
+    limits: { cpu: 2000m, memory: 12Gi }
+  persistence:
+    size: 10Gi
+
+modelPreload:              # hook: warms the model cache before the first ingest
+  enabled: true
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: 2000m, memory: 4Gi }
+
+seedSample:                # hook: ingests the sample corpus for the demo user
+  enabled: true
+  resources:
+    requests: { cpu: 50m, memory: 1Gi }
+    limits: { cpu: 500m, memory: 1536Mi }
+
+# --- observability ---
+prometheus:
+  image: prom/prometheus:v3.7.3
+  retention: 30d
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+  persistence:
+    size: 5Gi
+
+kubeStateMetrics:
+  image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.17.0
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+fluentBit:
+  image: fluent/fluent-bit:4.0.3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+grafana:
+  image: grafana/grafana:12.2.0
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 768Mi }
+  persistence:
+    size: 1Gi
+
+dcgmExporter:              # GPU metrics; dev-only, a GPU Operator ships its own
+  enabled: false
+  image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { cpu: 250m, memory: 512Mi }   # 256Mi OOMKilled it right after DCGM init
+
+opensearchDashboards:      # dev-only UI, security plugin disabled
+  enabled: false
+  image: opensearchproject/opensearch-dashboards:2.19.0
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+# --- langfuse ---
+clickhouse:
+  image: docker.io/clickhouse/clickhouse-server:24.12-alpine
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 4Gi }
+  persistence:
+    size: 20Gi
+
+langfuseWeb:
+  replicas: 1
+  image: docker.io/langfuse/langfuse:3
+  nextauthUrl: http://localhost:3003   # the URL you browse to; port-forward on kind
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }   # at 1Gi Node's heap is too small to boot
+
+langfuseWorker:
+  replicas: 1
+  image: docker.io/langfuse/langfuse-worker:3
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+# --- load test: on only through envs/values-loadtest.yaml ---
+loadtest:
+  fakeLlm:
+    enabled: false         # api, worker-chat and worker-ingestion together, or none
+  toxiproxy:               # T8's latency injector in front of OpenSearch
+    enabled: false
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    latencyMs: 8000        # downstream only; keep under the opensearch-py 10s timeout
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    configureResources:
+      requests: { cpu: 10m, memory: 16Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+  faults:                  # "" = no fault; each needs fakeLlm.enabled
+    fakeLlmLatencyMs: ""   # T7: fixed FakeAdapter latency on worker-chat
+    opensearchHost: ""     # T8: "toxiproxy" routes api + worker-chat through the proxy

@@ -1,0 +1,12 @@
+{{- if .Values.loadtest.fakeLlm.enabled }}
+# The FakeAdapter models config, mounted by api, worker-chat and worker-ingestion in fake-LLM mode.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loadtest-models-config
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "loadtest") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/loadtest/models.yaml").AsConfig | nindent 2 }}
+{{- end }}

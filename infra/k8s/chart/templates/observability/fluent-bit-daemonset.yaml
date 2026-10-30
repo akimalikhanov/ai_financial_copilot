@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "fluent-bit") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "fluent-bit") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "fluent-bit") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observability/fluent-bit-configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: fluent-bit
+      # Single-node kind: the only node is the control plane, which is tainted.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: fluent-bit
+          image: {{ .Values.fluentBit.image }}
+          env:
+            - name: ES_HOST
+              value: elasticsearch
+            - name: ES_PORT
+              value: "9200"
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/etc
+              readOnly: true
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+          resources:
+            {{- toYaml .Values.fluentBit.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: fluent-bit-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers

@@ -109,6 +109,9 @@ async def test_upload_pdf_reads_the_file_off_the_loop(monkeypatch: pytest.Monkey
     """
     from src.services.ingestion import s3_client
 
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+
     captured: dict[str, Any] = {}
 
     class _FakeClient:
@@ -345,15 +348,28 @@ def test_liveness_is_strictly_laxer_than_readiness() -> None:
     had time to shed, the destructive action happens before the safe one — which is the
     behaviour of the two identical /healthz probes this replaced.
     """
+    import textwrap
+
     import yaml
 
-    with open("infra/k8s/base/app/api-deployment.yaml") as f:
-        docs = [d for d in yaml.safe_load_all(f) if d]
-
-    deployment = next(d for d in docs if d["kind"] == "Deployment")
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    readiness = container["readinessProbe"]
-    liveness = container["livenessProbe"]
+    # The template isn't YAML until Helm renders it, but its probe block is plain YAML: cut it
+    # out from readinessProbe to the next key, so the test needs no helm binary.
+    with open("infra/k8s/chart/templates/app/api-deployment.yaml") as f:
+        lines = f.read().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "readinessProbe:")
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next(
+        i
+        for i in range(start + 1, len(lines))
+        if lines[i].strip()
+        and len(lines[i]) - len(lines[i].lstrip()) == indent
+        and not lines[i].strip().startswith("livenessProbe:")
+    )
+    block = "\n".join(lines[start:end])
+    assert "{{" not in block, "the probe block must stay free of template directives"
+    probes = yaml.safe_load(textwrap.dedent(block))
+    readiness = probes["readinessProbe"]
+    liveness = probes["livenessProbe"]
 
     assert readiness["httpGet"]["path"] == "/readyz"
     assert liveness["httpGet"]["path"] == "/healthz"

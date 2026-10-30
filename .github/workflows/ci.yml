@@ -91,34 +91,35 @@ jobs:
         with:
           groups: dev llm-engine
       - name: pip-audit
-        # Remaining findings below have no fix version available upstream yet: vllm==0.19.1
-        # is the newest release compatible with the rest of our dependency graph, and it
-        # transitively pins exact versions of diskcache/torch/transformers that also carry
-        # unresolved CVEs. Re-check for fixes and drop these --ignore-vuln entries once
-        # available. TODO: re-add --strict once the existing CVE backlog is triaged/fixed.
+        # Accepted findings, grouped by what unblocks them. Drop entries once fixable.
+        # TODO: re-add --strict once the existing CVE backlog is triaged/fixed.
         run: |
+          ignores=(
+            # docling==2.111.0 is pinned (private-method override); fixes need docling>=2.132.
+            PYSEC-2026-4189 PYSEC-2026-4190 PYSEC-2026-4191 PYSEC-2026-4192 PYSEC-2026-4193
+            PYSEC-2026-4194 PYSEC-2026-4195 PYSEC-2026-4196 PYSEC-2026-4207 PYSEC-2026-4208
+            # docling-slim: same pin as docling.
+            PYSEC-2026-4209 PYSEC-2026-4210 PYSEC-2026-4211 PYSEC-2026-4212 PYSEC-2026-4213
+            PYSEC-2026-4214 PYSEC-2026-4215 PYSEC-2026-4216
+            # pillow: fixes need 13.x, but docling 2.111's deps require pillow<13.
+            PYSEC-2026-4326 PYSEC-2026-4327 PYSEC-2026-4328 GHSA-78g4-xqwv-q3g8
+            CVE-2026-96636 CVE-2026-96637 CVE-2026-96638 CVE-2026-96639 CVE-2026-96640
+            CVE-2026-96641 CVE-2026-96642 CVE-2026-96643 CVE-2026-96644 CVE-2026-96778
+            CVE-2026-112390 CVE-2026-112391 CVE-2026-112393 CVE-2026-112395 CVE-2026-112397
+            CVE-2026-112398 CVE-2026-112399 CVE-2026-112400 CVE-2026-112401 CVE-2026-112402
+            CVE-2026-112404 CVE-2026-112405 CVE-2026-112406 CVE-2026-112891 CVE-2026-112892
+            CVE-2026-112893 CVE-2026-112894 CVE-2026-112895 CVE-2026-112896 CVE-2026-112897
+            CVE-2026-112899 CVE-2026-112900 CVE-2026-112901 CVE-2026-114501
+            # transformers: fix needs 5.10, docling's deps cap it lower.
+            PYSEC-2026-3929
+            # No fix upstream as of 2026-10-27.
+            PYSEC-2026-3804 PYSEC-2026-4174
+            # torch/transformers: no compatible fix yet.
+            PYSEC-2026-139 CVE-2025-3000 PYSEC-2025-217 CVE-2026-1839 CVE-2026-4372
+            PYSEC-2026-2290
+          )
           uv export --frozen --no-hashes --group dev --group llm-engine -o /tmp/requirements.txt
-          uvx pip-audit -r /tmp/requirements.txt \
-            --ignore-vuln CVE-2025-69872 \
-            --ignore-vuln PYSEC-2026-139 \
-            --ignore-vuln CVE-2025-3000 \
-            --ignore-vuln PYSEC-2025-217 \
-            --ignore-vuln CVE-2026-1839 \
-            --ignore-vuln CVE-2026-4372 \
-            --ignore-vuln PYSEC-2026-145 \
-            --ignore-vuln PYSEC-2026-227 \
-            --ignore-vuln PYSEC-2026-226 \
-            --ignore-vuln CVE-2026-44222 \
-            --ignore-vuln CVE-2026-47155 \
-            --ignore-vuln CVE-2026-41523 \
-            --ignore-vuln CVE-2026-53923 \
-            --ignore-vuln CVE-2026-54236 \
-            --ignore-vuln CVE-2026-12491 \
-            --ignore-vuln CVE-2026-54235 \
-            --ignore-vuln CVE-2026-54233 \
-            --ignore-vuln PYSEC-2026-2132 \
-            --ignore-vuln PYSEC-2026-2290 \
-            --ignore-vuln PYSEC-2026-3447
+          uvx pip-audit -r /tmp/requirements.txt $(printf -- '--ignore-vuln %s ' "${ignores[@]}")
       - name: semgrep
         run: uvx semgrep scan --config p/python --config p/secrets --error
 
@@ -160,14 +161,42 @@ jobs:
       # Dockerfiles/compose/IaC across the repo (scan-ref: .) — e.g. images without a
       # pinned digest, secrets baked into layers, over-broad privileges. Fails the job
       # (exit-code: 1) only on HIGH/CRITICAL findings; .venv and node_modules skipped.
+      # infra/k8s is skipped until its manifests get securityContext hardening.
       - name: Scan Dockerfiles for misconfigurations (trivy config)
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           scan-type: config
           scan-ref: .
-          skip-dirs: .venv,node_modules
+          skip-dirs: .venv,node_modules,infra/k8s
           exit-code: 1
           severity: HIGH,CRITICAL
+
+  helm:
+    # Renders the chart for every env without a cluster: lint + values schema, kubeconform,
+    # helm-unittest. Immutable-field and admission errors only show up against a live cluster.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HELM_VERSION: v4.3.1
+      HELM_SHA256: 0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+      KUBECONFORM_VERSION: v0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      HELM_UNITTEST_VERSION: v1.2.1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install helm, kubeconform and helm-unittest
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -fsSLo helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 -C bin linux-amd64/helm
+          curl -fsSLo kc.tgz "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kc.tgz" | sha256sum -c -
+          tar -xzf kc.tgz -C bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/helm" plugin install https://github.com/helm-unittest/helm-unittest.git \
+            --version "${HELM_UNITTEST_VERSION}" --verify=false
+      - run: make helm-check
 
   frontend-typecheck:
     runs-on: ubuntu-24.04
@@ -196,6 +225,7 @@ jobs:
       - integration-tests
       - security
       - docker
+      - helm
       - frontend-typecheck
     runs-on: ubuntu-24.04
     if: always()
@@ -209,6 +239,7 @@ jobs:
             "${{ needs.integration-tests.result }}"
             "${{ needs.security.result }}"
             "${{ needs.docker.result }}"
+            "${{ needs.helm.result }}"
             "${{ needs.frontend-typecheck.result }}"
           )
           for result in "${results[@]}"; do

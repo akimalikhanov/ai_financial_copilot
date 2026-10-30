@@ -1,0 +1,50 @@
+# kind: layered on top of chart/values.yaml.
+images:
+  registry: localhost:5001
+
+# worker-ingestion, tei and tei-embedder share the time-sliced GPU.
+gpu:
+  enabled: true
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:             # SSE: no buffering, timeouts and body size match src/ui/nginx.k8s.conf
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+
+# PVC sizes match the live volumeClaimTemplates, which are immutable.
+postgres:
+  persistence:
+    size: 2Gi
+redisApp:
+  persistence:
+    size: 2Gi
+redisBroker:
+  persistence:
+    size: 2Gi
+qdrant:
+  persistence:
+    size: 2Gi
+opensearch:
+  persistence:
+    size: 2Gi
+elasticsearch:
+  persistence:
+    size: 2Gi
+garage:
+  persistence:
+    dataSize: 2Gi
+clickhouse:
+  persistence:
+    size: 2Gi
+
+# Dev-only components.
+dcgmExporter:
+  enabled: true
+opensearchDashboards:
+  enabled: true

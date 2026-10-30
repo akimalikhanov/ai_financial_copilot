@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-entrypoint
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "pgbouncer") | nindent 4 }}
+data:
+  {{- (.Files.Glob "files/data/pgbouncer-entrypoint.sh").AsConfig | nindent 2 }}

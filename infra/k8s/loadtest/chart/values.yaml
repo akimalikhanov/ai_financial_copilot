@@ -1,0 +1,56 @@
+# Defaults for one run. `make k8s-loadtest` passes only the LOADTEST_* variables you set.
+image:                     # the worker image; locust is a main dependency
+  registry: localhost:5001
+  tag: dev
+  pullPolicy: IfNotPresent
+
+kubectlImage: registry.k8s.io/kubectl:v1.36.1   # tracks the kind node version
+busyboxImage: busybox:1.37
+curlImage: curlimages/curl:8.14.1
+
+ttlSecondsAfterFinished: 86400
+
+# Generous on purpose: a throttled load generator produces a false knee.
+resources:
+  requests: { cpu: 500m, memory: 512Mi }
+  limits: { cpu: 2000m, memory: 2Gi }
+
+# Static hostPath PVs; the paths are kind-cluster.yaml extraMounts, so files reach the host.
+storage:
+  results:
+    hostPath: /mnt/loadtest-results
+    size: 1Gi
+  fixtures:
+    hostPath: /mnt/loadtest-fixtures
+    size: 2Gi
+
+# The loadtest-params ConfigMap, read by the Job as env. Strings only.
+# Scenario settings: docs/notes/loadtest-concepts.md §8.
+params:
+  LOADTEST_TARGET_HOST: http://api:8000
+  LOADTEST_USERS: "20"
+  LOADTEST_SPAWN_RATE: "1"
+  LOADTEST_DURATION: 10m
+  LOADTEST_CHAT_MODEL: gpt-4o-mini
+  LOADTEST_CHAT_EMAIL: ""          # a seeded account; "" registers a throwaway one per user
+  LOADTEST_CHAT_PASSWORD: ""
+  LOADTEST_SSE_TIMEOUT_S: "180"    # keep above the scenario's worst legitimate service time
+  LOADTEST_MIN_WAIT: "180"         # think time, the real driver of arrival rate
+  LOADTEST_MAX_WAIT: "300"
+  LOADTEST_MODE: ask               # ask | sse_hold (T3) | upload (T11-T13)
+  LOADTEST_FIXTURE_DIR: /fixtures  # /fixtures/backlog for the 20-filing backlog
+  LOADTEST_FIXTURES: ""            # comma-separated names; "" = every PDF in the directory
+  LOADTEST_UPLOADS_PER_USER: "1"
+  LOADTEST_UPLOAD_MIN_WAIT: "0"
+  LOADTEST_UPLOAD_MAX_WAIT: "0"
+  LOADTEST_INGEST_TIMEOUT_S: "1500"  # covers the whole queue, not one parse
+  LOADTEST_HOLD_FOR_S: "86400"     # T3; the run duration bounds the hold
+  LOADTEST_SHAPE: ""               # "" = flat -u/-r/-t; ramp (T2) | spike (T4)
+  LOADTEST_RAMP_INITIAL_USERS: "1"
+  LOADTEST_RAMP_STEP_USERS: "2"
+  LOADTEST_RAMP_STEP_SECONDS: "30"
+  LOADTEST_RAMP_MAX_USERS: "60"
+  LOADTEST_RAMP_SPAWN_RATE: "10"
+  LOADTEST_SPIKE_USERS: "50"
+  LOADTEST_SPIKE_SPAWN_SECONDS: "10"
+  LOADTEST_SPIKE_HOLD: 2m

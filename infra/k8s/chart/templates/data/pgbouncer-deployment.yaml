@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "pgbouncer") | nindent 4 }}
+spec:
+  replicas: {{ .Values.pgbouncer.replicas }}
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "pgbouncer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "pgbouncer") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9127"
+        # Reads pgbouncer-entrypoint and postgres-config.
+        checksum/config: {{ print (include (print $.Template.BasePath "/data/pgbouncer-configmap.yaml") .) (include (print $.Template.BasePath "/data/postgres-configmaps.yaml") .) | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      initContainers:
+        # Re-runs on every pod restart; not a substitute for retries at runtime.
+        - name: wait-for-postgres
+          image: {{ .Values.waitImages.postgres }}       # reuse an image that already has the client
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER"; do
+                echo "waiting for postgres:5432"; sleep 2
+              done
+          envFrom:
+            - secretRef: { name: {{ .Values.secrets.postgres }} }
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: pgbouncer
+          image: {{ .Values.pgbouncer.image }}
+          command: ["/bin/sh", "/pgbouncer-entrypoint.sh"]
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+          envFrom:
+            - configMapRef: { name: postgres-config }   # POSTGRES_DB, APP_DB, APP_DB_USER, LANGFUSE_DB, LANGFUSE_DB_USER
+            - secretRef:    { name: {{ .Values.secrets.postgres }} }   # POSTGRES_USER/PASSWORD, APP_DB_PASSWORD, LANGFUSE_DB_PASSWORD
+          env:
+            # Where Postgres is reachable from PgBouncer
+            - name: PGB_POSTGRES_HOST
+              value: postgres
+            - name: PGB_POSTGRES_PORT
+              value: "5432"
+            # PgBouncer listen
+            - name: PGB_LISTEN_ADDR
+              value: "0.0.0.0"
+            - name: PGB_LISTEN_PORT
+              value: "6432"
+          volumeMounts:
+            - name: pgbouncer-entrypoint
+              mountPath: /pgbouncer-entrypoint.sh
+              subPath: pgbouncer-entrypoint.sh
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - PGPASSWORD="$POSTGRES_PASSWORD" psql -h 127.0.0.1 -p 6432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c 'SELECT 1' >/dev/null
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 10
+          resources:
+            {{- toYaml .Values.pgbouncer.resources | nindent 12 }}
+        - name: pgbouncer-exporter
+          image: {{ .Values.exporterImages.pgbouncer }}
+          ports:
+            - name: metrics
+              containerPort: 9127
+          env:
+            # admin_users = POSTGRES_USER (see pgbouncer-entrypoint.sh); SHOW POOLS/STATS needs it.
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.postgres }}, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.postgres }}, key: POSTGRES_PASSWORD } }
+            - name: PGBOUNCER_EXPORTER_CONNECTION_STRING
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:6432/pgbouncer?sslmode=disable"
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "100m", memory: "32Mi" }
+      volumes:
+        - name: pgbouncer-entrypoint
+          configMap:
+            name: pgbouncer-entrypoint
+            defaultMode: 0755           # entrypoint script must be executable

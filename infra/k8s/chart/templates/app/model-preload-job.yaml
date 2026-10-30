@@ -1,0 +1,58 @@
+{{- if .Values.modelPreload.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-preload
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "model-preload") | nindent 4 }}
+  annotations:
+    # Re-runs on every install/upgrade: seconds on a warm cache, several GB on a fresh one.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "model-preload") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: preload
+          image: {{ include "copilot.appImage" (dict "root" $ "name" "worker") | quote }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          # Warms the model cache so the first upload doesn't block on a download inside the task.
+          # `python -m docling.cli.tools`: the `docling-tools` script's shebang points at the
+          # builder stage's venv, which the runtime image doesn't have.
+          command:
+            - python
+            - -m
+            - docling.cli.tools
+            - models
+            - download
+            - --output-dir
+            - $(DOCLING_ARTIFACTS_PATH)
+            - layout
+            - tableformer
+            - picture_classifier
+            # Scanned PDFs re-parse with EasyOCR, which can't download once artifacts_path is set.
+            - easyocr
+          envFrom:
+            - configMapRef: { name: app-config }        # incl. HF_HUB_DISABLE_XET
+            - secretRef:    { name: {{ .Values.secrets.app }} }   # HF_TOKEN
+          env:
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+          volumeMounts:
+            - name: hf-model-cache
+              mountPath: /home/appuser/.cache/huggingface
+          resources:
+            {{- toYaml .Values.modelPreload.resources | nindent 12 }}
+      volumes:
+        - name: hf-model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache
+{{- end }}

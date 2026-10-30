@@ -1,0 +1,65 @@
+suite: gpu seam
+templates:
+  - app/app-configmaps.yaml          # loaded for the checksum include; not asserted
+  - app/worker-ingestion-deployment.yaml
+  - app/tei-deployment.yaml
+  - app/tei-embedder-deployment.yaml
+  - app/api-deployment.yaml
+  - app/worker-chat-deployment.yaml
+release:
+  namespace: copilot
+tests:
+  - it: requests no GPU without an environment file
+    templates: &gpuPods
+      - app/worker-ingestion-deployment.yaml
+      - app/tei-deployment.yaml
+      - app/tei-embedder-deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+      - notExists:
+          path: spec.template.spec.nodeSelector
+      - notExists:
+          path: spec.template.spec.tolerations
+
+  - it: requests one GPU and pins to GPU nodes on kind
+    values:
+      - ../../envs/values-kind.yaml
+    templates: *gpuPods
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+          value: 1
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            nvidia.com/gpu.present: "true"
+      - notExists:
+          path: spec.template.spec.tolerations
+
+  - it: leaves the other pods unpinned on kind
+    values:
+      - ../../envs/values-kind.yaml
+    templates:
+      - app/api-deployment.yaml
+      - app/worker-chat-deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.nodeSelector
+      - notExists:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+
+  - it: adds the GPU taint toleration on EKS
+    values:
+      - ../../envs/values-eks.yaml
+    templates: *gpuPods
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["nvidia.com/gpu"]
+          value: 1
+      - equal:
+          path: spec.template.spec.tolerations
+          value:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule

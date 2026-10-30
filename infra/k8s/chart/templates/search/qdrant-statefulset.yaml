@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "qdrant") | nindent 4 }}
+spec:
+  serviceName: qdrant-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "qdrant") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "qdrant") | nindent 8 }}
+    spec:
+      # Qdrant runs as non-root; local-path volumes are created root-owned, so without this
+      # the container hits "Permission denied" on /qdrant/storage.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: qdrant
+          image: {{ .Values.qdrant.image }}
+          ports:
+            - name: http
+              containerPort: 6333
+            - name: grpc
+              containerPort: 6334
+          volumeMounts:
+            - name: data
+              mountPath: /qdrant/storage
+          # The image ships no curl/wget; httpGet probes run in the kubelet, so none is needed.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 6333 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /healthz, port: 6333 }
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.qdrant.resources | nindent 12 }}
+  # Immutable on the live object: keep the part-of label and omit storageClassName on kind.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.qdrant.persistence.size }}

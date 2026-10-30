@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: garage
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "garage") | nindent 4 }}
+spec:
+  serviceName: garage-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "garage") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "garage") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/storage/garage-configmaps.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      containers:
+        - name: garage
+          image: {{ .Values.garage.image }}
+          ports:
+            - name: s3
+              containerPort: 3900
+            - name: rpc
+              containerPort: 3901
+            - name: web
+              containerPort: 3902
+            - name: admin
+              containerPort: 3903
+          volumeMounts:
+            - name: meta
+              mountPath: /var/lib/garage/meta
+            - name: data
+              mountPath: /var/lib/garage/data
+            - name: garage-toml
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
+            - name: garage-secrets
+              mountPath: /run/secrets
+              readOnly: true
+          # tcpSocket on the S3 port: the minimal signal that Garage is accepting connections.
+          readinessProbe:
+            tcpSocket: { port: 3900 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: { port: 3900 }
+            initialDelaySeconds: 10
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.garage.resources | nindent 12 }}
+      volumes:
+        - name: garage-toml
+          configMap:
+            name: garage-toml
+        - name: garage-secrets
+          secret:
+            secretName: {{ .Values.secrets.garage }}
+            defaultMode: 0400
+            items:
+              - { key: garage_rpc_secret,     path: garage_rpc_secret }
+              - { key: garage_admin_token,    path: garage_admin_token }
+              - { key: garage_metrics_token,  path: garage_metrics_token }
+  # Immutable on the live object: keep both claims, the part-of label, and no storageClassName on kind.
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.garage.persistence.metaSize }}
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.garage.persistence.dataSize }}

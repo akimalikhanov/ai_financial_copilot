@@ -1,0 +1,164 @@
+{{- include "loadtest.requireFakeLlm" . }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadtest
+  namespace: {{ include "loadtest.namespace" . }}
+  labels:
+    {{- include "loadtest.labels" . | nindent 4 }}
+spec:
+  # A failed load test is a result, not a flake: never re-run it.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: {{ .Values.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loadtest
+    spec:
+      restartPolicy: Never
+      serviceAccountName: loadtest
+      initContainers:
+        # worker-chat and worker-ingestion bill a provider but are invisible over HTTP, so wait
+        # until no old-ReplicaSet pod is left. A prior run leaked ~6 min of real OpenAI calls here.
+        # The image is distroless: kubectl is the entrypoint, so these are its args.
+        - name: await-fake-llm-rollout
+          image: {{ .Values.kubectlImage }}
+          args:
+            - rollout
+            - status
+            - deploy/api
+            - deploy/worker-chat
+            - deploy/worker-ingestion
+            - -n
+            - {{ include "loadtest.namespace" . }}
+            - --timeout=10m
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+        # The hostPath volume arrives root-owned and fsGroup skips hostPath; the worker runs as 1001.
+        - name: chown-results
+          image: {{ .Values.busyboxImage }}
+          command: ["sh", "-c", "chown 1001:1001 /results && chmod 0775 /results"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: results
+              mountPath: /results
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        # upload mode with no fixtures would report spawn errors as a run; fail before it starts.
+        - name: assert-fixtures
+          image: {{ .Values.busyboxImage }}
+          command:
+            - sh
+            - -c
+            - |
+              if [ "$LOADTEST_MODE" != "upload" ]; then
+                echo "mode=$LOADTEST_MODE needs no fixtures, skipping"; exit 0
+              fi
+              # The directory the run reads, not /fixtures: the backlog lives in a subdirectory.
+              dir="${LOADTEST_FIXTURE_DIR:-/fixtures}"
+              count=$(find "$dir" -maxdepth 1 -name '*.pdf' 2>/dev/null | wc -l)
+              if [ "$count" -eq 0 ]; then
+                echo "REFUSING TO RUN: no PDFs in $dir." >&2
+                echo "Run: make loadtest-fixtures SOURCE=<a real filing>" >&2
+                echo "If that was already run, the host directory is not reaching the node:" >&2
+                echo "kind extraMounts apply only at cluster creation, so a cluster older" >&2
+                echo "than that entry needs: make k8s-loadtest-fixtures-push" >&2
+                echo "See docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3." >&2
+                exit 1
+              fi
+              echo "found $count fixture PDF(s) in $dir"
+              find "$dir" -maxdepth 1 -name '*.pdf' -exec ls -la {} \;
+              for want in $(echo "$LOADTEST_FIXTURES" | tr ',' ' '); do
+                if [ ! -f "$dir/$want" ]; then
+                  echo "REFUSING TO RUN: LOADTEST_FIXTURES names '$want', not in $dir." >&2
+                  exit 1
+                fi
+              done
+          envFrom:
+            - configMapRef: { name: loadtest-params }
+          volumeMounts:
+            - name: fixtures
+              mountPath: /fixtures
+              readOnly: true
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+        # Fails before any request if the api isn't serving the FakeAdapter, including an api
+        # pod still holding the real config in its cached router.
+        - name: assert-fake-llm
+          image: {{ .Values.curlImage }}
+          command:
+            - sh
+            - -c
+            - |
+              deadline=$(( $(date +%s) + 300 ))
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                models=$(curl -fsS http://api:8000/v1/models 2>/dev/null) || {
+                  echo "api not answering yet, retrying"; sleep 5; continue
+                }
+                if echo "$models" | grep -q 'Fake (was'; then
+                  echo "fake LLM adapter confirmed active"
+                  exit 0
+                fi
+                echo "api still serving the real models config, waiting for the roll"
+                sleep 5
+              done
+              echo "REFUSING TO RUN: api is not using the fake LLM adapter." >&2
+              echo "MODELS_CONFIG_PATH must point at models.loadtest.yaml, and the api" >&2
+              echo "image must be new enough for config.py to honour it." >&2
+              echo "/v1/models returned: $models" >&2
+              exit 1
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+      containers:
+        - name: locust
+          image: {{ printf "%s/copilot/worker:%s" .Values.image.registry (toString .Values.image.tag) | trimPrefix "/" | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # `python -m locust`: the console script's shebang points at the builder stage's venv.
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              python -m locust \
+                -f /mnt/loadtest/locustfile.py \
+                --host "$LOADTEST_TARGET_HOST" \
+                --headless \
+                -u "$LOADTEST_USERS" \
+                -r "$LOADTEST_SPAWN_RATE" \
+                -t "$LOADTEST_DURATION" \
+                --csv /results/run \
+                --only-summary
+              status=$?
+              for f in /results/run_stats.csv /results/run_stats_history.csv /results/run_failures.csv /results/run_exceptions.csv; do
+                if [ -f "$f" ]; then
+                  echo "===== BEGIN CSV: $f ====="
+                  cat "$f"
+                  echo "===== END CSV: $f ====="
+                fi
+              done
+              exit "$status"
+          envFrom:
+            - configMapRef: { name: loadtest-params }
+          volumeMounts:
+            - name: locustfile
+              mountPath: /mnt/loadtest
+              readOnly: true
+            - name: results
+              mountPath: /results
+            # Mounted in every mode: an unused read-only mount costs nothing.
+            - name: fixtures
+              mountPath: /fixtures
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: locustfile
+          configMap:
+            name: loadtest-locustfile
+        - name: results
+          persistentVolumeClaim:
+            claimName: loadtest-results
+        - name: fixtures
+          persistentVolumeClaim:
+            claimName: loadtest-fixtures

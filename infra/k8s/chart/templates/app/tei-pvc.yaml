@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tei-data
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "tei") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep    # survives helm uninstall; saves a model re-download
+spec:
+  # One PVC per TEI Deployment, so a bad cache on one can't take down the other.
+  accessModes: [ReadWriteOnce]
+  {{- include "copilot.storageClass" . | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.tei.persistence.size }}

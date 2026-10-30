@@ -133,7 +133,7 @@ The full walkthrough, with worked examples and every stop reason, is in
 | Eval | `src/eval/`: deterministic scorers, LLM-as-judge, retrieval metrics, run comparison, Postgres persistence |
 | Load testing | Locust (`infra/loadtest/`) |
 | CI | GitHub Actions, ruff, pyright, pytest with coverage, gitleaks, pip-audit, semgrep, hadolint, Trivy, Dependabot |
-| Deployment | Docker Compose (`infra/docker/`); Kustomize manifests for a local kind cluster (`infra/k8s/`) |
+| Deployment | Docker Compose (`infra/docker/`); a Helm chart for a local kind cluster, with EKS values (`infra/k8s/`) |
 
 ## Evaluation
 
@@ -362,7 +362,7 @@ make test-cov           # unit tests with an HTML coverage report
 ├── infra/
 │   ├── config/              models.yaml, error maps, vLLM configs
 │   ├── docker/              docker-compose.yml, Dockerfiles, Prometheus, Grafana, Fluent Bit, ES config
-│   ├── k8s/                 Kustomize base and kind overlays, load-test job
+│   ├── k8s/                 Helm chart, kind/EKS values, load-test chart
 │   ├── loadtest/            Locust load test
 │   └── scripts/             DB init, Garage and Langfuse bootstrap
 ├── tests/                   unit/ and integration/
@@ -395,10 +395,10 @@ src/services/chat/agent/
 
 ## Roadmap and known limitations
 
-- **Kubernetes.** Kustomize manifests for a local kind cluster with GPU passthrough exist in
-  `infra/k8s/`, driven by `make k8s-up`, `make k8s-deploy` and related targets, and the load
-  tests in `infra/k8s/loadtest/` run against it. Helm charts and an EKS deployment are
-  planned and not started.
+- **Kubernetes.** A Helm chart runs the stack on a local kind cluster with GPU passthrough,
+  driven by `make k8s-up`, `make k8s-deploy` and related targets (see `infra/k8s/README.md`),
+  and the load tests in `infra/k8s/loadtest/` run against it. The chart also renders for EKS
+  (`values-eks.yaml`, checked in CI), but no EKS cluster exists yet.
 - **Eval coverage.** The canary set has 13 single-company questions. There are no comparison
   or analytical fixtures, and analytical (`drivers`) answers have no correctness scorer.
 - **Grounding is a membership check.** A finding is kept if it cites a chunk the run

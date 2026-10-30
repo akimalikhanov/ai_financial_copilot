@@ -264,10 +264,9 @@ async def test_blank_latency_env_var_falls_back_to_sampling(
 ) -> None:
     """Blank is the no-fault value, not a malformed one.
 
-    infra/k8s/loadtest/patches/worker-chat-faults.yaml carries FAKE_LLM_LATENCY_MS on every
-    run and `make k8s-loadtest` writes the scenario's value into it, so every scenario except
-    T7 sets it to "". Reading that as a number would raise on the first LLM call of every
-    other load test.
+    The chart renders FAKE_LLM_LATENCY_MS only when a T7 run sets it, but a blank value set any
+    other way (an env file, `kubectl set env`) must still read as unset. Parsing it as a number
+    would raise on the first LLM call.
     """
     recorded: list[float] = []
 

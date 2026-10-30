@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei-embedder
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "tei-embedder") | nindent 4 }}
+spec:
+  replicas: {{ .Values.teiEmbedder.replicas }}
+  strategy:
+    type: Recreate               # ReadWriteOnce model cache
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "tei-embedder") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "tei-embedder" "component" "tei") | nindent 8 }}
+      annotations:
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      enableServiceLinks: false    # see tei-deployment.yaml
+      {{- include "copilot.gpuScheduling" . | nindent 6 }}
+      containers:
+        - name: tei-embedder
+          image: {{ .Values.teiEmbedder.image }}
+          args:
+            - --model-id
+            - {{ .Values.teiEmbedder.modelId }}
+            - --dtype
+            - float16
+            - --max-batch-tokens
+            - "16384"
+            - --max-batch-requests
+            - "16"
+            - --max-client-batch-size
+            - "64"
+            - --payload-limit
+            - "10000000"
+          ports:
+            - name: http
+              containerPort: 80
+          envFrom:
+            - secretRef: { name: {{ .Values.secrets.app }} }   # HF_TOKEN
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              {{- toYaml .Values.teiEmbedder.resources.requests | nindent 14 }}
+            limits:
+              {{- toYaml .Values.teiEmbedder.resources.limits | nindent 14 }}
+              {{- if .Values.gpu.enabled }}
+              nvidia.com/gpu: 1
+              {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: tei-embedder-data

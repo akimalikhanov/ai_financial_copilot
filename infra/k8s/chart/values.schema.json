@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "copilot chart values",
+  "description": "Seam objects and enable flags are strict, so a typo fails lint and install. Other components are checked as objects only.",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "component": { "type": "object" },
+    "stringMap": { "type": "object", "additionalProperties": { "type": "string" } },
+    "toggled": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "type": "string", "minLength": 1 },
+        "resources": { "type": "object" }
+      }
+    }
+  },
+  "properties": {
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "tag", "pullPolicy"],
+      "properties": {
+        "registry": { "type": "string" },
+        "tag": { "type": "string", "minLength": 1 },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "secretsChecksum": { "type": "string" },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["postgres", "redis", "garage", "app", "grafana", "clickhouse", "langfuse"],
+      "properties": {
+        "postgres": { "type": "string", "minLength": 1 },
+        "redis": { "type": "string", "minLength": 1 },
+        "garage": { "type": "string", "minLength": 1 },
+        "app": { "type": "string", "minLength": 1 },
+        "grafana": { "type": "string", "minLength": 1 },
+        "clickhouse": { "type": "string", "minLength": 1 },
+        "langfuse": { "type": "string", "minLength": 1 }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "storageClass": { "type": "string" } }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "nodeSelector": { "$ref": "#/definitions/stringMap" },
+        "tolerations": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "host": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "sysctlInit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "type": "string", "minLength": 1 }
+      }
+    },
+    "waitImages": { "$ref": "#/definitions/stringMap" },
+    "exporterImages": { "$ref": "#/definitions/stringMap" },
+    "appConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "overrides": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        }
+      }
+    },
+
+    "loadtest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fakeLlm", "toxiproxy", "faults"],
+      "properties": {
+        "fakeLlm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "toxiproxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": { "type": "string", "minLength": 1 },
+            "latencyMs": { "type": "integer", "minimum": 0 },
+            "resources": { "type": "object" },
+            "configureResources": { "type": "object" }
+          }
+        },
+        "faults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fakeLlmLatencyMs": { "type": "string", "pattern": "^[0-9]*$" },
+            "opensearchHost": { "type": "string" }
+          }
+        }
+      }
+    },
+
+    "modelPreload": { "$ref": "#/definitions/toggled" },
+    "seedSample": { "$ref": "#/definitions/toggled" },
+    "dcgmExporter": { "$ref": "#/definitions/toggled" },
+    "opensearchDashboards": { "$ref": "#/definitions/toggled" },
+
+    "postgres": { "$ref": "#/definitions/component" },
+    "pgbouncer": { "$ref": "#/definitions/component" },
+    "redisApp": { "$ref": "#/definitions/component" },
+    "redisBroker": { "$ref": "#/definitions/component" },
+    "redisLangfuse": { "$ref": "#/definitions/component" },
+    "qdrant": { "$ref": "#/definitions/component" },
+    "opensearch": { "$ref": "#/definitions/component" },
+    "elasticsearch": { "$ref": "#/definitions/component" },
+    "garage": { "$ref": "#/definitions/component" },
+    "api": { "$ref": "#/definitions/component" },
+    "frontend": { "$ref": "#/definitions/component" },
+    "workerChat": { "$ref": "#/definitions/component" },
+    "workerIngestion": { "$ref": "#/definitions/component" },
+    "tei": { "$ref": "#/definitions/component" },
+    "teiEmbedder": { "$ref": "#/definitions/component" },
+    "prometheus": { "$ref": "#/definitions/component" },
+    "kubeStateMetrics": { "$ref": "#/definitions/component" },
+    "fluentBit": { "$ref": "#/definitions/component" },
+    "grafana": { "$ref": "#/definitions/component" },
+    "clickhouse": { "$ref": "#/definitions/component" },
+    "langfuseWeb": { "$ref": "#/definitions/component" },
+    "langfuseWorker": { "$ref": "#/definitions/component" }
+  }
+}

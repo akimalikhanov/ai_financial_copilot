@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: langfuse-worker
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "langfuse-worker") | nindent 4 }}
+spec:
+  replicas: {{ .Values.langfuseWorker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "langfuse-worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "langfuse-worker") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/langfuse/langfuse-configmap.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      initContainers:
+        {{- include "copilot.waitForTcp" (dict "root" $ "name" "deps" "targets" (list "postgres:5432" "clickhouse:8123" "redis-langfuse:6379" "garage:3900")) | nindent 8 }}
+      containers:
+        - name: langfuse-worker
+          image: {{ .Values.langfuseWorker.image }}
+          envFrom:
+            - configMapRef: { name: langfuse-common }
+            - secretRef:    { name: {{ .Values.secrets.clickhouse }} }
+            - secretRef:    { name: {{ .Values.secrets.langfuse }} }
+          # No Service and no probes: it only consumes the Redis queue; nothing dials it.
+          resources:
+            {{- toYaml .Values.langfuseWorker.resources | nindent 12 }}

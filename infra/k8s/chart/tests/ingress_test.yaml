@@ -1,0 +1,42 @@
+suite: ingress seam
+templates:
+  - app/ingress.yaml
+release:
+  namespace: copilot
+tests:
+  - it: renders no Ingress without an environment file
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: uses nginx with SSE-safe settings on kind
+    values:
+      - ../../envs/values-kind.yaml
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/proxy-buffering"]
+          value: "off"
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"]
+          value: "300"
+
+  - it: uses alb with a 300s idle timeout on EKS
+    values:
+      - ../../envs/values-eks.yaml
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: alb
+      - equal:
+          path: metadata.annotations["alb.ingress.kubernetes.io/load-balancer-attributes"]
+          value: idle_timeout.timeout_seconds=300
+
+  - it: refuses an enabled Ingress without a class
+    set:
+      ingress.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "ingress.className is required"

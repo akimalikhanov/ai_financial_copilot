@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-app
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "redis-app") | nindent 4 }}
+spec:
+  serviceName: redis-app-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "redis-app") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "redis-app" "component" "redis") | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      containers:
+        - name: redis-app
+          image: {{ .Values.redisApp.image }}
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.secrets.redis }}, key: REDIS_PASSWORD }
+          # The shell expands the password at runtime. `exec` makes redis PID 1 so it gets SIGTERM.
+          # maxmemory is a backstop only (the leak is fixed by CHAT_EVENTS_TTL). allkeys-lru is safe
+          # because everything in redis-app is TTL'd or regenerable; never use it on redis-broker.
+          command:
+            - sh
+            - -c
+            - exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+              --maxmemory {{ .Values.redisApp.maxmemory }} --maxmemory-policy allkeys-lru
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 15
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 20            # laxer than readiness — avoid killing a slow-starting store
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.redisApp.resources | nindent 12 }}
+        - name: redis-exporter
+          image: {{ .Values.exporterImages.redis }}
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: "redis://localhost:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.secrets.redis }}, key: REDIS_PASSWORD }
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits:   { cpu: "100m", memory: "64Mi" }
+  # Immutable on the live object: keep the part-of label and omit storageClassName on kind.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.redisApp.persistence.size }}

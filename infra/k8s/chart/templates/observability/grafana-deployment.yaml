@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+spec:
+  replicas: 1
+  # grafana-data holds a SQLite database; two overlapping pods writing it risk corrupting it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "grafana") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/observability/grafana-configmaps.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      # No wait-for-es-bootstrap gate: es-bootstrap is a hook that runs after the release is
+      # ready, so the gate would deadlock a fresh install. Logs panels error until it finishes.
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image }}
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.grafana }}, key: GRAFANA_USER } }
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.grafana }}, key: GRAFANA_PASS } }
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_SERVER_MAX_REQUEST_SIZE
+              value: "50MB"
+            - name: GF_SERVER_MAX_QUERY_RESULT_SIZE
+              value: "50MB"
+            # datasources.yaml expands ${VAR}: these feed its PostgreSQL datasource.
+            - name: PGB_APP_DB_HOST
+              value: "pgbouncer"
+            - name: PGB_APP_DB_PORT
+              value: "6432"
+            - name: APP_DB_USER
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.app }}, key: APP_DB_USER } }
+            - name: APP_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.secrets.app }}, key: APP_DB_PASSWORD } }
+            - name: APP_DB
+              value: "app"
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana-data
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards

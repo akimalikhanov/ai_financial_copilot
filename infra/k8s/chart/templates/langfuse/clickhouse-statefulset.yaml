@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: {{ include "copilot.namespace" . }}
+  labels:
+    {{- include "copilot.labels" (dict "root" $ "name" "clickhouse") | nindent 4 }}
+spec:
+  serviceName: clickhouse-headless     # must match the headless Service name
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "copilot.selectorLabels" (dict "name" "clickhouse") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "copilot.podLabels" (dict "name" "clickhouse") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/langfuse/clickhouse-configmap.yaml") . | sha256sum }}
+        checksum/secrets: {{ .Values.secretsChecksum | quote }}
+    spec:
+      # fsGroup chowns the root-owned local-path volume to the clickhouse group.
+      securityContext:
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: {{ .Values.clickhouse.image }}
+          envFrom:
+            - secretRef: { name: {{ .Values.secrets.clickhouse }} }   # CLICKHOUSE_USER, CLICKHOUSE_PASSWORD
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: cluster-config
+              # subPath: one file into config.d/ without shadowing the image's others.
+              mountPath: /etc/clickhouse-server/config.d/langfuse-cluster.xml
+              subPath: langfuse-cluster.xml
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            initialDelaySeconds: 60
+            periodSeconds: 30            # laxer than readiness — avoid killing a slow-starting store
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: clickhouse-cluster-config
+  # Immutable on the live object: keep the part-of label and omit storageClassName on kind.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/part-of: copilot
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- include "copilot.storageClass" . | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.persistence.size }}

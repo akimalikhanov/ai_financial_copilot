@@ -1,0 +1,122 @@
+suite: load-test seam
+templates:
+  - app/app-configmaps.yaml          # loaded for the checksum include; not asserted
+  - loadtest/models-configmap.yaml   # also loaded for the fake-LLM checksum include
+  - loadtest/toxiproxy.yaml
+  - app/api-deployment.yaml
+  - app/worker-chat-deployment.yaml
+  - app/worker-ingestion-deployment.yaml
+  - app/seed-sample-job.yaml
+release:
+  namespace: copilot
+tests:
+  - it: renders no fake-LLM wiring on kind without the load-test file
+    values:
+      - ../../envs/values-kind.yaml
+    templates: &llmPods
+      - app/api-deployment.yaml
+      - app/worker-chat-deployment.yaml
+      - app/worker-ingestion-deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: FAKE_LLM_ONLY, value: "true" }
+      - notExists:
+          path: spec.template.metadata.annotations["checksum/loadtest-models"]
+
+  - it: renders no toxiproxy or fake models config on kind without the load-test file
+    values:
+      - ../../envs/values-kind.yaml
+    templates:
+      - loadtest/models-configmap.yaml
+      - loadtest/toxiproxy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: puts all three LLM-calling workloads in fake-LLM mode together
+    values: &loadtest
+      - ../../envs/values-kind.yaml
+      - ../../envs/values-loadtest.yaml
+    templates: *llmPods
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: FAKE_LLM_ONLY, value: "true" }
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: MODELS_CONFIG_PATH, value: infra/config/loadtest/models.yaml }
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content: { name: loadtest-models-config, mountPath: /app/infra/config/loadtest, readOnly: true }
+      - contains:
+          path: spec.template.spec.volumes
+          content: { name: loadtest-models-config, configMap: { name: loadtest-models-config } }
+      - exists:
+          path: spec.template.metadata.annotations["checksum/loadtest-models"]
+
+  - it: turns off the picture enricher on worker-ingestion only
+    values: *loadtest
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: PICTURE_ENRICHER_ENABLED, value: "false" }
+        template: app/worker-ingestion-deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: PICTURE_ENRICHER_ENABLED, value: "false" }
+        template: app/worker-chat-deployment.yaml
+
+  - it: renders toxiproxy and skips the seed-sample hook under load-test values
+    values: *loadtest
+    asserts:
+      - hasDocuments:
+          count: 2
+        template: loadtest/toxiproxy.yaml
+      - hasDocuments:
+          count: 0
+        template: app/seed-sample-job.yaml
+
+  - it: sends the fixed LLM latency to worker-chat only
+    values: *loadtest
+    set:
+      loadtest.faults.fakeLlmLatencyMs: "20000"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: FAKE_LLM_LATENCY_MS, value: "20000" }
+        template: app/worker-chat-deployment.yaml
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content: { name: FAKE_LLM_LATENCY_MS, value: "20000" }
+        template: app/api-deployment.yaml
+
+  - it: routes api and worker-chat through toxiproxy for T8
+    values: *loadtest
+    set:
+      loadtest.faults.opensearchHost: toxiproxy
+    templates:
+      - app/api-deployment.yaml
+      - app/worker-chat-deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content: { name: OPENSEARCH_HOST, value: toxiproxy }
+
+  - it: refuses a fault outside fake-LLM mode
+    values:
+      - ../../envs/values-kind.yaml
+    set:
+      loadtest.faults.fakeLlmLatencyMs: "20000"
+    asserts:
+      - failedTemplate:
+          errorPattern: "need loadtest.fakeLlm.enabled"
+
+  - it: refuses to route through toxiproxy when it is not deployed
+    values: *loadtest
+    set:
+      loadtest.toxiproxy.enabled: false
+      loadtest.faults.opensearchHost: toxiproxy
+    asserts:
+      - failedTemplate:
+          errorPattern: "needs loadtest.toxiproxy.enabled"

@@ -1,0 +1,28 @@
+# EKS: layered on top of chart/values.yaml. Render-only until Stage 19; PVC sizes are the base sizes.
+images:
+  registry: 000000000000.dkr.ecr.eu-central-1.amazonaws.com   # placeholder account and region
+
+persistence:
+  storageClass: gp3
+
+# GPU nodes are tainted, so the GPU pods also need the toleration.
+gpu:
+  enabled: true
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+# The node bootstrap sets vm.max_map_count.
+sysctlInit:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:             # idle timeout matches the 300s nginx read timeout, for SSE
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
