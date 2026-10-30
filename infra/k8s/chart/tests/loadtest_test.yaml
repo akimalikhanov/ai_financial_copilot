@@ -103,7 +103,10 @@ tests:
           path: spec.template.spec.containers[0].env
           content: { name: OPENSEARCH_HOST, value: toxiproxy }
 
+  # Helm stops at the first fail, and helm-unittest pins the error on that one template only.
+  # worker-chat is the first template rendered that includes the fault guard.
   - it: refuses a fault outside fake-LLM mode
+    template: app/worker-chat-deployment.yaml
     values:
       - ../../envs/values-kind.yaml
     set:
@@ -113,6 +116,7 @@ tests:
           errorPattern: "need loadtest.fakeLlm.enabled"
 
   - it: refuses to route through toxiproxy when it is not deployed
+    template: app/worker-chat-deployment.yaml
     values: *loadtest
     set:
       loadtest.toxiproxy.enabled: false

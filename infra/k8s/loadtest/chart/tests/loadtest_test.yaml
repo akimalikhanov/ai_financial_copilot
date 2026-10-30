@@ -6,7 +6,9 @@ templates:
 release:
   namespace: copilot
 tests:
+  # Helm stops at the first fail, and helm-unittest pins the error on that one template only.
   - it: refuses any namespace but copilot
+    template: storage.yaml
     release:
       namespace: other
     asserts:
