@@ -296,7 +296,9 @@ class DocumentRepository:
             {"sim": str(sim_threshold), "word": str(word_threshold)},
         )
         rows = await self.session.execute(
-            text(f"""
+            # Only the _CANDIDATE_COLUMNS constant is interpolated; input goes through bind params.
+            text(  # nosemgrep
+                f"""
                 SELECT k.key, c.*
                 FROM unnest(CAST(:keys AS text[])) AS k(key)
                 CROSS JOIN LATERAL (
@@ -313,7 +315,8 @@ class DocumentRepository:
                     ORDER BY score DESC
                     LIMIT :limit
                 ) c
-            """),  # nosemgrep
+            """
+            ),
             {"user_id": str(user_id), "keys": keys, "limit": limit},
         )
         for row in rows.mappings():
@@ -326,7 +329,9 @@ class DocumentRepository:
         """Every company among the user's ready documents, in the candidate shape, up to
         ``limit`` (None for all)."""
         rows = await self.session.execute(
-            text(f"""
+            # Only the _CANDIDATE_COLUMNS constant is interpolated; input goes through bind params.
+            text(  # nosemgrep
+                f"""
                 SELECT {_CANDIDATE_COLUMNS}
                 FROM documents
                 WHERE user_id = CAST(:user_id AS uuid)
@@ -335,7 +340,8 @@ class DocumentRepository:
                 GROUP BY company_norm
                 ORDER BY company_norm
                 LIMIT :limit
-            """),  # nosemgrep
+            """
+            ),
             {"user_id": str(user_id), "limit": limit},
         )
         return [CompanyCandidate.model_validate(dict(row)) for row in rows.mappings()]

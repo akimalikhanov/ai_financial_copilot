@@ -112,7 +112,7 @@ def compact_messages(messages: Sequence[dict[str, Any]], generation_name: str) -
         role = str(msg.get("role", ""))
         original = msg.get("content")
         if scope is not None and _content_len(original) >= min_dedup:
-            digest = hashlib.sha1(
+            digest = hashlib.sha256(
                 json.dumps(
                     [role, original, msg.get("tool_call_id"), msg.get("tool_calls")],
                     default=str,
