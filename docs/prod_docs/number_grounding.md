@@ -3,8 +3,8 @@
 How the agent path ties the numbers in an answer to the documents: what it checks, what it
 computes for the answering model, and what it measures after the answer is written. The code
 lives in `src/services/chat/agent/number_grounding.py`, `src/services/chat/agent/processor.py`
-and `src/services/chat/confidence.py`. Everything here was checked against that code as of
-2026-10-11. If the code and this doc disagree, the code wins, so fix the doc.
+and `src/services/chat/confidence.py`. If the code and this doc disagree, the code wins, so
+fix the doc.
 
 It assumes you know the findings block and the synthesis step from
 [agent_design.md](agent_design.md#15-synthesis-turning-loop-output-into-answer-context).
@@ -46,7 +46,7 @@ flowchart LR
 ```
 
 None of them blocks or rewrites anything. The first two only change the answering model's
-input, so they work as well as `gpt-4o-mini` follows the synthesis prompt. The third is a
+input, so they work as well as the answering model follows the synthesis prompt. The third is a
 metric nobody sees in the UI.
 
 The main limit: the figure check asks whether a number appears somewhere in the cited

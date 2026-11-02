@@ -1,7 +1,7 @@
 # Kubernetes
 
 The stack runs on a local kind cluster (`kind-copilot`) as one Helm release, `copilot`, in the
-`copilot` namespace. EKS (Stage 19) renders from the same chart with a different values file.
+`copilot` namespace. The EKS deployment renders from the same chart with a different values file.
 
 ```
 infra/k8s/
@@ -104,9 +104,7 @@ deploy.
 ## CI
 
 The `helm` job runs `make helm-check` (lint, schema, kubeconform, helm-unittest) on every PR
-and feeds `ci-success`. As of 2026-10-29, `ci-success` is red on master for `docker`,
-`unit-tests` and `security`, and master has no branch protection, so a red check blocks
-nothing yet. `make lint` also fails when a chart's copy of a compose file drifts.
+and feeds `ci-success`. `make lint` also fails when a chart's copy of a compose file drifts.
 
 ## Never
 

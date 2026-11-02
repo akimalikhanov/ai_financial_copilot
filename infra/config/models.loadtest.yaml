@@ -1,9 +1,9 @@
-# Load-test overlay for infra/config/models.yaml (Stage 17.5 Phase 8).
+# Load-test overlay for infra/config/models.yaml.
 #
 # Every model id the app can reference is redefined with provider: fake, so a load-test
 # deployment that sets MODELS_CONFIG_PATH to this file's mounted path never reaches a real
-# LLM provider — see src/services/llm_adapters/fake_adapter.py and
-# docs/notes/loadtest-concepts.md §6 for why (cost, determinism, and reproducibility).
+# LLM provider (src/services/llm_adapters/fake_adapter.py). That keeps load tests free,
+# deterministic and reproducible.
 #
 # Not used by any real environment: infra/config/models.yaml (no ".loadtest" suffix) is what
 # ships in the Docker image and is loaded by default. This file only takes effect if something

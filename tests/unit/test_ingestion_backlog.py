@@ -1,7 +1,8 @@
-"""Ingestion backlog items P1-3..P1-5 and P2-1..P2-4 (docs/stages/ingestion-pipeline-findings.md).
+"""Ingestion robustness fixes: Qdrant upsert, table summarizer, chunker, purge and resume.
 
-P1-1 is covered in test_picture_enricher.py::TestStageTimeout, P1-3 in test_opensearch_ingest.py,
-P2-2's embedder half in test_embedder.py.
+Related tests live elsewhere: the enrichment stage timeout in
+test_picture_enricher.py::TestStageTimeout, OpenSearch indexing in test_opensearch_ingest.py,
+and the embedder in test_embedder.py.
 """
 
 from __future__ import annotations

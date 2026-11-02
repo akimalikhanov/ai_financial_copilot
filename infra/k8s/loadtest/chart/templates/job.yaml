@@ -64,7 +64,6 @@ spec:
                 echo "If that was already run, the host directory is not reaching the node:" >&2
                 echo "kind extraMounts apply only at cluster creation, so a cluster older" >&2
                 echo "than that entry needs: make k8s-loadtest-fixtures-push" >&2
-                echo "See docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3." >&2
                 exit 1
               fi
               echo "found $count fixture PDF(s) in $dir"

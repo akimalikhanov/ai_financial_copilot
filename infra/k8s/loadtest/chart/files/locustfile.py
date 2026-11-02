@@ -1,11 +1,11 @@
-"""Locust load test for the chat and ingestion paths (Stage 17.5 Phase 8 / Stage 17 Phase 18).
+"""Locust load test for the chat and ingestion paths.
 
 Run locally against docker-compose (`make loadtest-local` / `make loadtest-local-ui`), or from
-inside a kind/EKS cluster (`make k8s-loadtest`, see docs/notes/loadtest-concepts.md §8). This is
+inside a kind/EKS cluster (`make k8s-loadtest`). This is
 the one canonical locustfile both paths use — the k8s Job ships it as a ConfigMap, kept in sync
 by `make k8s-sync-loadtest`, so edit here and never the copy under infra/k8s/loadtest/.
 
-Why this isn't a plain HttpUser hitting one endpoint (see docs/notes/loadtest-concepts.md §2-3):
+Why this isn't a plain HttpUser hitting one endpoint:
 `POST /v1/chat` only enqueues and returns in milliseconds — the actual answer streams back
 separately over SSE at `GET /v1/chat/stream`. One virtual user therefore has to model both calls
 glued together, and the metric that matters is enqueue -> first token / enqueue -> usage, not the
@@ -13,14 +13,13 @@ POST's own latency. Locust's built-in client can't read `text/event-stream` incr
 SSE leg uses a plain `httpx.Client` and reports its own timings into Locust's stats via
 `environment.events.request.fire()`.
 
-`LOADTEST_MODE=upload` drives ingestion instead (docs/notes/loadtest-readiness-audit.md §8):
+`LOADTEST_MODE=upload` drives ingestion instead:
 the same two-leg shape, POST /v1/documents/upload then the document's own SSE progress stream.
 Note the FakeAdapter caveat applies differently there — it deletes the picture enricher's LLM
-calls, so a fake ingestion run measures parse-bound time only (§8 item 1.5).
+calls, so a fake ingestion run measures parse-bound time only.
 
 Point this at a stack whose LLM calls are routed to the FakeAdapter (MODELS_CONFIG_PATH ->
-infra/config/models.loadtest.yaml) unless you mean to spend real money — see
-docs/notes/loadtest-concepts.md §6.
+infra/config/models.loadtest.yaml) unless you mean to spend real money.
 """
 
 from __future__ import annotations
@@ -39,8 +38,8 @@ from locust import HttpUser, LoadTestShape, between, events, task
 from locust.exception import StopUser
 
 # Must be a model id present in whichever models.yaml the target API is running with —
-# infra/config/models.loadtest.yaml (fake) or infra/config/models.yaml (real, do not use
-# without reading docs/notes/loadtest-concepts.md §6 first).
+# infra/config/models.loadtest.yaml (fake) or infra/config/models.yaml (real: every
+# request costs money).
 CHAT_MODEL = os.environ.get("LOADTEST_CHAT_MODEL", "gpt-4o-mini")
 
 # Log in as this account instead of registering a throwaway one. Set it when the run needs the
@@ -71,10 +70,10 @@ LOADTEST_MODE = os.environ.get("LOADTEST_MODE", "ask")
 # the hold does not end early on its own; set it below -t only to test reconnect churn.
 HOLD_FOR_S = float(os.environ.get("LOADTEST_HOLD_FOR_S", "86400"))
 
-# --- Ingestion (LOADTEST_MODE=upload), docs/notes/loadtest-readiness-audit.md §8 -------------
+# --- Ingestion (LOADTEST_MODE=upload) ---------------------------------------------------------
 
-# Directory of PDFs to upload from, taken round-robin. Phase 1's three single-document classes
-# live at /fixtures; item 2.2's 20-filing stratified sample lives at /fixtures/backlog. Which
+# Directory of PDFs to upload from, taken round-robin. The three single-document classes
+# live at /fixtures; the 20-filing stratified backlog sample lives at /fixtures/backlog. Which
 # scenario a run exercises is therefore a matter of which directory it reads, not a code change.
 FIXTURE_DIR = os.environ.get("LOADTEST_FIXTURE_DIR", "/fixtures")
 
@@ -83,26 +82,27 @@ FIXTURE_DIR = os.environ.get("LOADTEST_FIXTURE_DIR", "/fixtures")
 # The fixture classes differ by roughly 20x in service time (93-page text ~28.5s measured
 # 2026-09-14, the same filing rasterized ~4 min at the OCR path's ~2.7s/page), so a run drawing
 # from all three reports a variance that is mostly fixture mix and a mean describing no document
-# that exists. Item 2.1 pins this to one class; T12 pins it to scanned.pdf to hold the GPU on the
-# path it is measuring. Item 2.2 instead selects a whole directory via LOADTEST_FIXTURE_DIR.
+# that exists. A baseline run pins this to one class; T12 pins it to scanned.pdf to hold the GPU
+# on the path it is measuring. The backlog run instead selects a whole directory via
+# LOADTEST_FIXTURE_DIR.
 FIXTURE_NAMES = [n.strip() for n in os.environ.get("LOADTEST_FIXTURES", "").split(",") if n.strip()]
 
 # Deliberately far above the chat budget: ingestion is minutes, not seconds. It must sit above
 # every server-side bound, or the client reports a timeout for a document the worker is still
 # legitimately working on. Those bounds are DOCLING_PARSE_TIMEOUT_SECONDS=600 and the Celery
-# limits — globally 450/360, which is BELOW the parse wrapper (audit §4.7, still open); the
+# limits — globally 450/360, which is BELOW the parse wrapper; the
 # ingestion runs raise them per-Deployment via `make k8s-loadtest-ingest-limits`.
-# T13 lowers the *server's* parse timeout instead (§8 item 1.4) rather than this.
+# T13 lowers the *server's* parse timeout instead of this one.
 INGEST_TIMEOUT_S = float(os.environ.get("LOADTEST_INGEST_TIMEOUT_S", "1500"))
 
-# Think-time between uploads for one uploader. Defaults to zero — the backlog run (§8 item
-# 2.2) wants N documents queued as fast as they can be posted, and at one ingestion slot the
+# Think-time between uploads for one uploader. Defaults to zero — the backlog run
+# wants N documents queued as fast as they can be posted, and at one ingestion slot the
 # queue, not the client, is what paces the run.
 UPLOAD_MIN_WAIT_S = float(os.environ.get("LOADTEST_UPLOAD_MIN_WAIT", "0"))
 UPLOAD_MAX_WAIT_S = float(os.environ.get("LOADTEST_UPLOAD_MAX_WAIT", "0"))
 
-# Uploads per user before it stops posting (it stays spawned, holding no work). §8 item 2.2
-# is "a 20-document backlog", a fixed population — an open-ended upload loop would instead
+# Uploads per user before it stops posting (it stays spawned, holding no work). The backlog
+# run is a fixed 20-document population — an open-ended upload loop would instead
 # measure how fast the client can outrun one slot, which is not a number anyone needs.
 UPLOADS_PER_USER = int(os.environ.get("LOADTEST_UPLOADS_PER_USER", "1"))
 
@@ -227,11 +227,11 @@ def _hold_chat_stream(
     Redis stream from the given id, and the terminal `usage` event ends the generator
     (chat.py:277-279) — so the default `0-0` would replay that same `usage` and close. Past
     it, `xread` has nothing to return and the handler sits in its 15s keepalive loop, which
-    is exactly the "stream open, no work behind it" state §4.1 claims is cheap.
+    is exactly the "stream open, no work behind it" state that should be cheap.
 
     Returns (status, held_seconds, detail). Only reaching `hold_for_s` is a pass; the server
     closing early, erroring, or emitting a real event is the interesting failure — a stream
-    dropped under load is precisely the §4.1 counter-evidence this scenario exists to catch,
+    dropped under load is precisely what this scenario exists to catch,
     so every non-`held` outcome must stay distinguishable from a pass.
 
     The deadline is a socket read timeout, not a clock check inside the read loop. A check
@@ -347,7 +347,7 @@ def _read_ingestion_stream(
         immediately (documents.py:257-276). That is a real outcome, not a short read: at
         one ingestion slot a fast document can finish before the client connects.
 
-    `first_stage_s` is the client-side view of what §8 item 0.2 adds server-side as
+    `first_stage_s` is the client-side view of what the server records as
     INGESTION_QUEUE_WAIT — the gap from upload to the worker's first `stage` event is
     queue wait plus startup. Reported separately from total because at one slot those are
     the two halves that move independently: service time is a property of the document,
@@ -503,11 +503,10 @@ _FIXTURE_CYCLE = itertools.cycle(FIXTURES) if FIXTURES else None
 
 
 class RampShape(LoadTestShape):
-    """T2 (docs/notes/loadtest-concepts.md §4/§7 step 5): ramp 1->60 askers, +2 every 30s,
+    """T2: ramp 1->60 askers, +2 every 30s,
     to find the knee — the concurrency where p95 queue wait stops being flat and starts
     climbing the ρ/(1-ρ) hyperbola. Only active when LOADTEST_SHAPE=ramp; the steady-state
-    scenarios (T1, T1b, T3, T5, T6) don't set that and use plain -u/-r/-t instead, per the
-    doc's step 4 ("steady scenarios don't need one").
+    scenarios (T1, T1b, T3, T5, T6) don't set that and use plain -u/-r/-t instead.
 
     A LoadTestShape's tick() overrides -u/-r/-t entirely for the run, and Locust
     auto-registers *every* non-abstract LoadTestShape subclass it finds in the locustfile —
@@ -543,7 +542,7 @@ class RampShape(LoadTestShape):
 
 
 class SpikeShape(LoadTestShape):
-    """T4 (docs/notes/loadtest-readiness-audit.md:688, concepts §7 step 6): jump 0->50 users
+    """T4: jump 0->50 users
     in 10s, then hold at that plateau. Only active when LOADTEST_SHAPE=spike.
 
     A shape rather than plain `-u 50 -r 5` because -t starts counting when spawning starts,
@@ -611,8 +610,7 @@ class _AuthenticatedUser(HttpUser):
 
 class ChatUser(_AuthenticatedUser):
     """Asks questions on one conversation for the life of the run — approximating one real
-    user's session shape (measured mean think-time ~219s, see
-    docs/notes/capacity-planning-concepts.md §1). The profile for every throughput scenario."""
+    user's session shape (measured mean think-time ~219s). The profile for every throughput scenario."""
 
     abstract = LOADTEST_MODE != "ask"
 
@@ -692,9 +690,8 @@ class ChatUser(_AuthenticatedUser):
 
 
 class SseHoldUser(_AuthenticatedUser):
-    """T3 (docs/notes/loadtest-readiness-audit.md:671, concepts §7 step 2): open one SSE
-    stream per user and hold it, asking no further questions — to test §4.1's "SSE streams
-    are cheap" claim against `pg_stat_activity`'s `idle in transaction` count and pgbouncer
+    """T3: open one SSE stream per user and hold it, asking no further questions — to test
+    that idle SSE streams are cheap, against `pg_stat_activity`'s `idle in transaction` count and pgbouncer
     `cl_waiting`.
 
     Each user asks exactly ONE question at startup, because a stream needs a real
@@ -763,10 +760,10 @@ class SseHoldUser(_AuthenticatedUser):
 
 
 class UploadUser(_AuthenticatedUser):
-    """T11-T13 (docs/notes/loadtest-readiness-audit.md §8): upload a PDF and follow it to a
+    """T11-T13: upload a PDF and follow it to a
     terminal ingestion status.
 
-    Same two-leg shape as ChatUser and for the same reason (concepts §2-3): POST
+    Same two-leg shape as ChatUser and for the same reason: POST
     /v1/documents/upload stores to S3 and enqueues, returning in well under a second, while
     the work itself runs in the ingestion worker and reports over SSE. The POST's latency is
     S3 upload time and says nothing about ingestion, so the numbers that matter —
@@ -774,7 +771,7 @@ class UploadUser(_AuthenticatedUser):
 
     Each user uploads UPLOADS_PER_USER documents and then idles. With one ingestion slot,
     concurrency here is a property of the *queue*, not of the client: -u 20 with the default
-    one-upload-each is §8 item 2.2's 20-document backlog, posted near-simultaneously and
+    one-upload-each is a 20-document backlog, posted near-simultaneously and
     drained serially by the worker.
     """
 
@@ -790,7 +787,7 @@ class UploadUser(_AuthenticatedUser):
             # which no document was ever ingested.
             raise RuntimeError(
                 f"no PDFs in LOADTEST_FIXTURE_DIR={FIXTURE_DIR!r}; "
-                "see docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3"
+                "run make loadtest-fixtures SOURCE=<a real filing>"
             )
 
     @task

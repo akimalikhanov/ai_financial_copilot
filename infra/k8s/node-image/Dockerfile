@@ -6,8 +6,8 @@
 # toolkit/K8s version drift.
 FROM kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
 
-# Toolkit version pinned independently of the host's — the #1 GPU failure mode per
-# docs/notes/gpu-in-kubernetes.md §5 is toolkit/driver skew between host and node.
+# Toolkit version pinned independently of the host's: toolkit/driver skew between host and
+# node is the most common way GPU passthrough breaks.
 ARG TOOLKIT_VERSION=1.18.1-1
 
 # nvidia-container-toolkit's transitive deps (libnvidia-container-tools, libnvidia-container1)

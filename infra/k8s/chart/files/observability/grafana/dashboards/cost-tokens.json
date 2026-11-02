@@ -206,7 +206,7 @@
       "id": 11,
       "title": "Capacity & Service-Time Drift (PostgreSQL)",
       "type": "row",
-      "description": "Service time is the denominator of every capacity number (see docs/notes/capacity-model.md). It nearly doubled in one quarter on an unchanged model, so replica counts and the admission threshold derived from it have a shelf life. Both panels sum latency_ms across the request tree — LLM time only, so a lower bound: retrieval, reranking and embedding are never llm_requests rows.",
+      "description": "Service time is the denominator of every capacity number. It nearly doubled in one quarter on an unchanged model, so replica counts and the admission threshold derived from it have a shelf life. Both panels sum latency_ms across the request tree — LLM time only, so a lower bound: retrieval, reranking and embedding are never llm_requests rows.",
       "gridPos": { "x": 0, "y": 36, "w": 24, "h": 1 }
     },
     {

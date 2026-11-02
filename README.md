@@ -75,7 +75,8 @@ the text.
 The agent package is `src/services/chat/agent/`. The chat worker and the offline eval both
 call its one entry point, `run_agent()`.
 
-**Two tools.** The tool model (`AGENT_TOOL_MODEL`, `gpt-5-mini` in `.env.example`) can call
+**Two tools.** The tool model (`AGENT_TOOL_MODEL`: `gpt-5-mini` by default, `gpt-5.6-luna` on
+Kubernetes) can call
 `search_documents` and `report_findings`. A search carries a semantic `query` for the
 embedder and reranker, and separate `keywords` for BM25. A report records a claim, the
 excerpt labels that support it, and for numeric answers the figures with metric, unit,
@@ -203,8 +204,8 @@ the comparison finds a regression. The Grafana "Eval / Canary" dashboard reads t
 
 ## CI/CD
 
-`.github/workflows/ci.yml` runs on every pull request and on pushes to `master`. Seven jobs
-run in parallel, and a `ci-success` job that needs all seven gates the merge.
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `master`. Eight jobs
+run in parallel, and a `ci-success` job that needs all eight gates the merge.
 
 | Job | Runs |
 |---|---|
@@ -214,6 +215,7 @@ run in parallel, and a `ci-success` job that needs all seven gates the merge.
 | `integration-tests` | starts Postgres, pgBouncer, both Redis instances, Qdrant and OpenSearch, then `make test-integration` |
 | `security` | gitleaks, pip-audit, semgrep (`p/python`, `p/secrets`) |
 | `docker` | `docker compose config`, hadolint on the three Dockerfiles, Trivy config scan. No image builds |
+| `helm` | `make helm-check`: helm lint against the values schema, kubeconform and helm-unittest for every environment. No cluster needed |
 | `frontend-typecheck` | `npm ci` and `tsc --noEmit` in `src/ui` |
 
 The canary eval is not part of PR checks. It makes paid LLM calls against a seeded
@@ -340,7 +342,7 @@ make test-cov           # unit tests with an HTML coverage report
 │   ├── main.py              FastAPI app factory
 │   ├── celery_app.py        Celery configuration and queue routing
 │   ├── workers/             chat and ingestion worker entry points
-│   ├── api/routers/         auth, chat, conversations, documents, feedback, models
+│   ├── api/routers/         auth, chat, conversations, documents, feedback, models, samples
 │   ├── services/
 │   │   ├── chat/            chat task, SSE events, citation parser, confidence badge
 │   │   │   └── agent/       the agent loop (below)
@@ -416,8 +418,8 @@ src/services/chat/agent/
 - **The Responses API is new and only partly wired.** On Chat Completions, gpt-5.4-mini and
   newer reject tool calls with any `reasoning_effort` except `none`, and the GPT-6 models
   reject function calling outright. The Responses adapter fixes both and keeps the model's
-  reasoning between agent turns. Only `gpt-5.6-luna` uses it so far, and
-  `AGENT_TOOL_MODEL` still defaults to `gpt-5-mini` in `.env.example`, and no answering
+  reasoning between agent turns. Only `gpt-5.6-luna` uses it so far. The Kubernetes stack
+  runs luna as the tool model, but the default is still `gpt-5-mini`, and no answering
   model has been switched to it. Luna's prices in
   `models.yaml` come from third-party listings and still need checking against OpenAI's
   pricing page.

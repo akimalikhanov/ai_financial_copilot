@@ -207,7 +207,7 @@ def _encode_batch(batch: list[_Candidate]) -> list[_Encoded]:
 def _build_message(batch: list[_Encoded], detail: str) -> ChatMessage:
     """One user message holding the whole batch: a text part naming each picture, then the
     crops in the same order. The model sees only pixels and this text, so the label has to be
-    written in explicitly (see docs/notes/llm-image-inputs.md)."""
+    written in explicitly."""
     lines = [f"[PICTURE {i}] {c.candidate.label}" for i, c in enumerate(batch, start=1)]
     return ChatMessage(
         role=Role.user,

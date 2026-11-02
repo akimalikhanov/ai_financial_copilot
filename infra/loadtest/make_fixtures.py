@@ -1,4 +1,4 @@
-"""Build the ingestion load-test fixture set (docs/notes/loadtest-readiness-audit.md §8, 1.2-1.3).
+"""Build the ingestion load-test fixture set.
 
 Three classes, each exercising a different path through docling_parser.parse():
 
@@ -40,7 +40,7 @@ DEFAULT_OUT = Path("infra/k8s/loadtest/fixtures")
 
 # Codepoint offset between the glyph drawn and the character the ToUnicode CMap claims it is.
 # Any nonzero value reproduces the bug; 3 matches the shift measured on the filing that
-# prompted Phase 8 ("financial" extracted as "ILQDQFLDO").
+# prompted the OCR fallback ("financial" extracted as "ILQDQFLDO").
 _TOUNICODE_SHIFT = 3
 
 # Enough prose per page that a few pages clear text_quality's _MIN_SAMPLE_CHARS (2,000) floor.

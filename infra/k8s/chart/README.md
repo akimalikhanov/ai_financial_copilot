@@ -16,7 +16,7 @@ make helm-check                  # the CI gate: lint + schema, kubeconform, helm
 
 ## Environments
 
-`envs/values-kind.yaml` runs today. `envs/values-eks.yaml` is render-only until Stage 19; its
+`envs/values-kind.yaml` runs today. `envs/values-eks.yaml` is render-only until the EKS deployment; its
 ECR account and region are placeholders. The two differ only in these seams:
 
 - image registry
@@ -32,7 +32,7 @@ Anything else in `make helm-diff-envs` means environment logic leaked into a tem
 `envs/values-smoke.yaml` layers on kind for install rehearsals on a throwaway cluster with no
 GPU: everything that needs the GPU, or waits on something that does, is scaled to zero.
 
-Still out of `values-eks.yaml`, for Stage 19 to decide: `langfuseWeb.nextauthUrl`, OpenSearch's
+Still out of `values-eks.yaml`, for the EKS deployment to decide: `langfuseWeb.nextauthUrl`, OpenSearch's
 `DISABLE_SECURITY_PLUGIN`, and the RDS / S3 / IRSA seams.
 
 ## Files
@@ -47,7 +47,8 @@ settings go there.
 ## How the chart behaves
 
 - Every object carries `app.kubernetes.io/name` (from `copilot.labels`). Selectors and pod
-  template labels kept their Stage 17 values, because they are immutable on a live object.
+  template labels kept their original values from before the chart, because they are
+  immutable on a live object.
 - ConfigMaps and Secrets have fixed names. Pods roll on a change through `checksum/config` and
   `checksum/secrets` annotations instead. The chart never renders a Secret: it references
   `<name>-secret`, which `make k8s-secrets-apply` creates.
@@ -95,18 +96,15 @@ models-file edit via `checksum/loadtest-models`.
   names) that would break `helm upgrade` if changed. A suite renders only the templates it lists,
   so a template whose `checksum/config` includes a ConfigMap template needs that one listed too.
 - kubeconform validates against the Kubernetes 1.36.1 schemas (`KUBECONFORM_K8S` in the Makefile).
-- The `helm` CI job feeds `ci-success`. As of 2026-10-29, `ci-success` is red on master for
-  `docker`, `unit-tests` and `security`, and master has no branch protection, so a red check
-  blocks nothing yet.
+- The `helm` CI job feeds `ci-success`.
 - trivy's config scan skips `infra/k8s`, which covers this chart.
 
-## Cutover
+## Adopting a live stack
 
-On 2026-10-29 Helm adopted the live Kustomize-built stack with `--take-ownership
+Helm took over the kind stack, which Kustomize had built, with `--take-ownership
 --force-conflicts`, after a fresh-install rehearsal on a throwaway cluster with
-`values-smoke.yaml`. Every PVC kept its UID, and every PV is `Retain` since. The Kustomize tree
-was deleted the same day; `git log -- infra/k8s/base` has it. Lessons for the next adoption
-(Stage 19):
+`values-smoke.yaml`. Every PVC kept its UID, and every PV is `Retain`. The old Kustomize tree is
+in `git log -- infra/k8s/base`. What to know before adopting live objects again:
 
 - **Drop the old field manager after adopting.** Where Helm applied the value that was already
   live, the field stayed co-owned with `kubectl-client-side-apply`, so the first upgrade that
@@ -126,12 +124,4 @@ was deleted the same day; `git log -- infra/k8s/base` has it. Lessons for the ne
   matched the chart.
 - **The rollback drill works.** `helm rollback copilot 1 -n copilot --wait` returned the images
   to revision 1's tag without re-running the hooks.
-
-Left over on kind-copilot from Kustomize, to delete by hand: the hashed `*-<10 chars>`
-ConfigMaps and Secrets with no `app.kubernetes.io/managed-by` label; the `prometheus`,
-`fluent-bit` and `kube-state-metrics` ClusterRoles and ClusterRoleBindings (replaced by
-`copilot-*`); and the kubectl-created load-test objects (ServiceAccount `loadtest`, Role and
-RoleBinding `loadtest-rollout-reader`, the `loadtest-*` ConfigMaps, PVCs and PVs), which `helm
-install loadtest` can't adopt. The load-test hostPath data on the node stays, because the PVs
-are `Retain`. Leave `Namespace/copilot` alone: Helm doesn't manage it, so no Helm command can
-delete it.
+- **Helm doesn't manage `Namespace/copilot`**, so no Helm command can delete it.

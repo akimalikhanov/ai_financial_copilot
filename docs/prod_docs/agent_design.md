@@ -2,14 +2,13 @@
 
 How the agentic RAG loop answers a document question, from the moment the router sends a
 request its way to the moment the answer is persisted. The code lives in
-`src/services/chat/agent/`. Everything here was checked against that code as of
-2026-10-08. If the code and this doc disagree, the code wins, so fix the doc.
+`src/services/chat/agent/`. If the code and this doc disagree, the code wins, so fix the
+doc.
 
 Read sections 1 to 6 in order the first time. They build the vocabulary everything else
 uses. Sections 7 onward are reference material you can jump into when you need them.
 
-For a critical review of this design (weak spots, failure modes and a prioritized list of
-changes), see [agent-design-audit.md](agent-design-audit.md). How numbers are checked and
+How numbers are checked and
 how changes between periods are computed is in [number_grounding.md](number_grounding.md).
 
 ## Contents
@@ -152,7 +151,8 @@ Two things to note:
 - **The same answering prompt serves every branch.** `v5_agent_synthesis` knows how to
   handle a `[FINDINGS]` block, a carried block with no excerpts, and no context at all.
 
-The tool model is `AGENT_TOOL_MODEL` (default `gpt-4o-mini`).
+The tool model is `AGENT_TOOL_MODEL`: `gpt-5-mini` by default, `gpt-5.6-luna` on
+Kubernetes.
 `loop.py::tool_model_chain` resolves it together with its `fallback_model` from
 `infra/config/models.yaml`, keeping only models with `tool_calling: true`, and refuses to
 start the loop if the tool model itself lacks it. `tasks.py` and the eval pipeline both call
@@ -239,14 +239,17 @@ Because both go through the same function, the eval measures what production ser
 
 ```python
 # src/services/chat/agent/__init__.py
-async def run_agent(state, llm, session, redis_app, request_id, reranker, session_factory):
+async def run_agent(
+    state, llm, session, redis_app, request_id, reranker, session_factory, *, fallbacks=()
+):
     evidence, findings, meta = await run_loop(
-        state, llm, session, redis_app, request_id, reranker, session_factory
+        state, llm, session, redis_app, request_id, reranker, session_factory, fallbacks=fallbacks
     )
     requested_currency = getattr(state.router_output, "requested_currency", None)
     return await run_synthesis(
         evidence, findings, meta, requested_currency,
-        max_chunks_per_entity=get_agent_settings().max_chunks_per_entity,
+        fallback_max_chunks=get_agent_fallback_max_chunks(),
+        mentions=state.scope_result.mentions() if state.scope_result else None,
     )
 ```
 
@@ -539,7 +542,7 @@ calls something `input_costs` on turn 1 and `input_cost_inflation` on turn 3 cre
 keys for one idea, and the first one never closes. Copying a two-character token from the
 adjacent text is a much easier instruction to follow. Matching is exact (after lowercasing
 and whitespace collapsing). A near-duplicate sub-question mints a second id. That costs one
-extra plan item, capped by `AGENT_MAX_PLAN_ITEMS` (default 6).
+extra plan item, capped by `AGENT_MAX_PLAN_ITEMS` (default 8).
 
 ### "Addressed" and "open"
 
@@ -641,8 +644,7 @@ Why a tool result and not a user message of its own:
 call and dropped on the next cost only its own tokens. Responses reuses an earlier
 request's prompt only as a whole. A status that was sent but not stored made every call
 after call 1 read only call 0's prefix from cache, and rewrite the rest at the cache-write
-price, which is higher than plain input. A probe (`experiments/responses_cache_probe.py`)
-ran a 4-call loop on gpt-5.6-luna with the status in different places:
+price, which is higher than plain input. A probe ran a 4-call loop on gpt-5.6-luna with the status in different places:
 
 | Status | Cache hit, call 1 | Cache hit, calls 2 and 3 |
 |---|---|---|
@@ -1159,7 +1161,7 @@ class Turn(BaseModel):            # src/schemas/chat.py, frozen
   with this run's S1…Sn, and a copied label could resolve to a different chunk and pass
   grounding.
 - **No field for a findings block.** `Turn` can't carry one, so a carried block can't
-  reach any model through history (Contract F1). The router and the answering model get the
+  reach any model through history. The router and the answering model get the
   block only through their own explicit channels.
 
 #### Budgets
@@ -2427,20 +2429,20 @@ and test overrides apply immediately). Validated by Pydantic.
 
 | Env var | Default | Bound | What it controls |
 |---|---|---|---|
-| `AGENT_TOOL_MODEL` | `gpt-4o-mini` | must have `tool_calling: true` | Model that runs the loop |
+| `AGENT_TOOL_MODEL` | `gpt-5-mini` (`gpt-5.6-luna` on Kubernetes) | must have `tool_calling: true` | Model that runs the loop |
 | `AGENT_MAX_ITERATIONS` | 5 | 1–20 | Turn cap, extraction/comparison |
 | `AGENT_MAX_ITERATIONS_ANALYTICAL` | 7 | 1–20 | Turn cap, analytical |
 | `AGENT_COST_BUDGET_USD` | 0.10 | > 0 | Spend cap for the run, across all models |
 | `AGENT_MAX_CONCURRENT_SEARCHES` | 3 | 1–16 | Parallel searches at once |
-| `AGENT_MAX_CHUNKS_PER_ENTITY` | 5 | ≥ 1 | Excerpts rendered per search result; synthesis fallback size |
+| `AGENT_MAX_CHUNKS_PER_ENTITY` | 5 | ≥ 1 | Excerpts rendered per search result |
 | `AGENT_MAX_EMPTY_ROUNDS` | 1 | ≥ 0 | Consecutive no-progress turns tolerated, both modes |
 | `AGENT_DEADLINE_SECONDS` | 180 | > 0 | Whole run |
 | `AGENT_TURN_TIMEOUT_CAP_SECONDS` | 120 | > 0 | Ceiling on one tool-model call; the call gets less when the run has less left |
 | `AGENT_DEADLINE_RESERVE_SECONDS` | 15 | ≥ 0, < `AGENT_DEADLINE_SECONDS` | Run time no tool-model call is given, so its own timeout fires before the deadline |
 | `AGENT_SEARCH_TIMEOUT_SECONDS` | 60 | > 0 | One search (retrieve + rerank) |
-| `AGENT_MAX_PLAN_ITEMS` | 6 | ≥ 1 | Max analytical aspects |
+| `AGENT_MAX_PLAN_ITEMS` | 8 | ≥ 1 | Max analytical aspects |
 
-History and display settings, read through getters in `src/utils/config.py`:
+History, synthesis and display settings, read through getters in `src/utils/config.py`:
 
 | Env var | Default | What it controls |
 |---|---|---|
@@ -2449,6 +2451,9 @@ History and display settings, read through getters in `src/utils/config.py`:
 | `AGENT_HISTORY_BUDGET_TOKENS`, `AGENT_HISTORY_MAX_ANSWER_TOKENS`, `AGENT_HISTORY_STEP` | 4000, 800, 1 | Tool model's prior-turn history |
 | `ANSWER_HISTORY_BUDGET_TOKENS`, `ANSWER_HISTORY_MAX_ANSWER_TOKENS`, `ANSWER_HISTORY_STEP` | 12000, 0 (whole), 5 | Answering model's prior-turn history |
 | `AGENT_SHOWN_HEADING_CHARS` | 40 | Heading length in "Already shown above" |
+| `AGENT_FALLBACK_MAX_CHUNKS` | 25 | Excerpts synthesis serves when the findings cite none, round-robin across searches |
+| `AGENT_TRACE_CHUNK_CHARS` | 200 | Chunk text kept per search hit on an agent turn's trace span |
+| `AGENT_ACTIVITY_MAX_SOURCES` | 2 | Documents listed on one search row of the agent timeline |
 
 Related settings outside the agent package:
 
@@ -2457,7 +2462,7 @@ Related settings outside the agent package:
 | `CURRENCY_NORMALIZER_ENABLED` | true | FX conversion at synthesis |
 | `FOLLOWUP_MAX_INHERIT_HOPS` | 3 | How many follow-ups may reuse one findings block |
 | `CHAT_TAIL_MAX_MESSAGES` | 70 | Messages loaded as every model's history source; holds a 30-turn session |
-| `VECTOR_SEARCH_TOP_K`, `KEYWORD_SEARCH_TOP_K` | 10 each | Retrieval breadth per search, before fusion and rerank |
+| `VECTOR_SEARCH_TOP_K`, `KEYWORD_SEARCH_TOP_K` | 50 each | Retrieval breadth per search, before fusion and rerank |
 | `INJECTION_SCAN_CHUNKS` | true | Injection scan on every excerpt before it is rendered |
 | `INJECTION_SCAN_USER_INPUT` | true | Injection scan on the current message and, in `prior_turns`, on every prior question |
 | `CHAT_MAX_ATTEMPTS` | 2 | Celery redeliveries of one chat task before it is failed |
@@ -2485,7 +2490,7 @@ field isn't sent. For `gpt-5.6-luna` both come from env vars,
 
 Query: *"Why did Acme Corp's operating margin decline in FY2023?"*. The router returns
 `route="retrieval"`, `query_shape="analytical"`, one entity. Defaults apply: 7 turns,
-5 excerpts per search, 6 plan items. This is the conversation's first question, so there
+5 excerpts per search, 8 plan items. This is the conversation's first question, so there
 are no prior turns.
 
 ### Setup
@@ -2768,8 +2773,8 @@ is rendered once per run. The USD budget and the iteration cap bound the run ins
 label or closed a key, never because it admitted a chunk the model wasn't shown.
 
 **One history function for every model.** All three models' conversation history comes
-from `prior_turns`, so the injection scan, the blocked-turn rule and Contract F1 can't be
-skipped by one consumer. Each model only chooses its own budget.
+from `prior_turns`, so the injection scan, the blocked-turn rule and the rule that a
+findings block never reaches a model through history can't be skipped by one consumer. Each model only chooses its own budget.
 
 **Admit everything, render a few.** The record keeps provenance for every chunk. The model
 reads at most five per search.

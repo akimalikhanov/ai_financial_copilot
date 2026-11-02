@@ -27,10 +27,8 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    concurrency = os.getenv("CELERY_CHAT_WORKER_CONCURRENCY")
-    argv = ["worker", "-Q", "chat", "--pool=prefork"]
-    if concurrency:
-        argv.extend(["--concurrency", concurrency])
+    concurrency = os.getenv("CELERY_CHAT_WORKER_CONCURRENCY") or "4"
+    argv = ["worker", "-Q", "chat", "--pool=prefork", "--concurrency", concurrency]
 
     start_worker_metrics(port=9100, queues=("chat",))
     celery_app.worker_main(argv=argv)

@@ -25,7 +25,7 @@ storage:
     size: 2Gi
 
 # The loadtest-params ConfigMap, read by the Job as env. Strings only.
-# Scenario settings: docs/notes/loadtest-concepts.md §8.
+# Scenario settings: see the LOADTEST_* block in the Makefile.
 params:
   LOADTEST_TARGET_HOST: http://api:8000
   LOADTEST_USERS: "20"

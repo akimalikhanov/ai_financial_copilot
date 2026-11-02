@@ -1,4 +1,4 @@
-"""Unit tests for citation ownership consolidation (docs/stages/agentic_state_refactor_v2.md step 4).
+"""Unit tests for citation ownership: one owner for the chunk<->label mapping.
 
 `RAGContext` is the sole owner of its chunk<->label mapping; `_map_refs` reads it instead of
 callers reconstructing a `chunk_id_to_ref` dict by hand.

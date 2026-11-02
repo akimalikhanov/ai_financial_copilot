@@ -62,10 +62,10 @@ test-cov:
 
 # Load test against the docker-compose stack (mode A/B, see CLAUDE.md), headless with a
 # text summary on stdout. USERS/SPAWN_RATE/DURATION are overridable: `make loadtest-local
-# USERS=40 DURATION=30m`. Not a CI gate — see docs/notes/loadtest-concepts.md.
+# USERS=40 DURATION=30m`. Not a CI gate.
 #
 # Point the api/worker-chat env at infra/config/models.loadtest.yaml first (MODELS_CONFIG_PATH)
-# unless you mean to spend real LLM money — see docs/notes/loadtest-concepts.md §6.
+# unless you mean to spend real LLM money.
 LOADTEST_HOST := http://localhost:$(or $(API_PORT),8000)
 USERS ?= 5
 SPAWN_RATE ?= 1
@@ -89,7 +89,7 @@ docker-rebuild:
 	cd infra/docker && docker compose --env-file ../../.env up -d --build
 	docker image prune -f
 
-# Local registry (docs/notes/gpu-on-local-k8s-review.md §9) replacing `kind load`, which
+# Local registry replacing `kind load`, which
 # re-imports the whole image on every rebuild. SHA tags make IfNotPresent correct by
 # construction — but only if the tag actually changes on every rebuild. `git rev-parse HEAD`
 # doesn't: uncommitted edits rebuild under the *same* tag, so kind's node-local containerd
@@ -233,7 +233,7 @@ helm-deploy: k8s-build-push k8s-secrets-apply
 print-secrets-checksum:
 	@echo $(SECRETS_CHECKSUM)
 
-# Runs the Locust load test from inside the cluster (docs/notes/loadtest-concepts.md §7):
+# Runs the Locust load test from inside the cluster:
 # copilot in fake-LLM mode, then the `loadtest` release holding one run. `k8s-loadtest-clean`
 # reverts. Knobs and scenario examples are with the LOADTEST_* defaults further down.
 #
@@ -415,8 +415,8 @@ k8s-check-dashboards:
 k8s-preload-models:
 	$(MAKE) k8s-deploy HELM_TIMEOUT=60m
 
-# Builds the three ingestion fixture classes into the hostPath the fixtures PVC is backed by
-# (docs/notes/loadtest-readiness-audit.md §8 items 1.2-1.3). SOURCE must be a real filing:
+# Builds the three ingestion fixture classes into the hostPath the fixtures PVC is backed by.
+# SOURCE must be a real filing:
 # T11 measures service time, and a synthetic PDF parses in seconds where a real one takes
 # minutes. The generated PDFs are gitignored and reproducible from this command.
 #   make loadtest-fixtures SOURCE="data/corpus/pdfs/Microsoft Corporation.pdf"
@@ -591,8 +591,8 @@ LOADTEST_SHAPE ?=
 # not a shape. "upload" needs fixtures on the host first: `make loadtest-fixtures SOURCE=...`.
 LOADTEST_MODE ?= ask
 LOADTEST_HOLD_FOR_S ?= 86400
-# Ingestion track (docs/notes/loadtest-readiness-audit.md §8). One upload per user makes
-# LOADTEST_USERS the backlog depth: -u 20 is item 2.2's 20-document queue.
+# Ingestion track. One upload per user makes LOADTEST_USERS the backlog depth: -u 20 is a
+# 20-document queue.
 LOADTEST_UPLOADS_PER_USER ?= 1
 LOADTEST_INGEST_TIMEOUT_S ?= 1500
 # Which fixture class(es) a run uploads, comma-separated. Empty draws from all of them, which
@@ -601,11 +601,11 @@ LOADTEST_INGEST_TIMEOUT_S ?= 1500
 #   make k8s-loadtest LOADTEST_MODE=upload LOADTEST_FIXTURES=normal.pdf ...
 LOADTEST_FIXTURES ?=
 # Which directory a run uploads from. /fixtures holds the three single-document classes;
-# /fixtures/backlog holds item 2.2's 20-filing stratified sample (`make loadtest-backlog`).
+# /fixtures/backlog holds a 20-filing stratified sample (`make loadtest-backlog`).
 LOADTEST_FIXTURE_DIR ?= /fixtures
 # Think-time between one user's questions. This — not user count — is what actually drives
 # utilisation: a user spends most of its cycle waiting, so halving these doubles arrival rate
-# at the same user count (docs/notes/capacity-planning-concepts.md §1).
+# at the same user count.
 LOADTEST_MIN_WAIT ?= 180
 LOADTEST_MAX_WAIT ?= 300
 LOADTEST_RAMP_INITIAL_USERS ?= 1
@@ -629,11 +629,11 @@ LOADTEST_CHAT_PASSWORD ?=
 # T7 needs it above 300s, its pass bar.
 LOADTEST_SSE_TIMEOUT_S ?= 180
 
-# --- T7-T9 fault injection (docs/notes/loadtest-readiness-audit.md §5) ----------------------
+# --- T7-T9 fault injection --------------------------------------------------------------------
 # Both default to "no fault", so every other scenario is unaffected by their presence.
 #
-# T7 (slow LLM): a fixed FakeAdapter latency instead of its sampled profile, which is the
-# knob the concepts note (§6) prefers over standing up toxiproxy for the LLM leg.
+# T7 (slow LLM): a fixed FakeAdapter latency instead of its sampled profile, which is
+# simpler than standing up toxiproxy for the LLM leg.
 #   make k8s-loadtest LOADTEST_MODE=ask LOADTEST_SHAPE= LOADTEST_FAKE_LLM_LATENCY_MS=20000 \
 #     LOADTEST_USERS=20 LOADTEST_SPAWN_RATE=2 LOADTEST_DURATION=20m
 LOADTEST_FAKE_LLM_LATENCY_MS ?=

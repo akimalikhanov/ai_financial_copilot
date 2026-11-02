@@ -1,8 +1,7 @@
-"""A zero-cost, zero-network LLMAdapter for load testing (Stage 17.5 Phase 8).
+"""A zero-cost, zero-network LLMAdapter for load testing.
 
 Wired in via `provider: fake` in a models.yaml config (see infra/config/models.loadtest.yaml),
-never reachable from the real infra/config/models.yaml. See docs/notes/loadtest-concepts.md §6
-for why: a load test needs realistic LLM *latency* (to exercise queueing/capacity behaviour) but
+never reachable from the real infra/config/models.yaml. Why: a load test needs realistic LLM *latency* (to exercise queueing/capacity behaviour) but
 zero real spend and deterministic tool-calling shape (to keep results reproducible run to run).
 
 The adapter instance is a process-wide singleton (cached inside LLMRouter), shared across
@@ -33,8 +32,8 @@ from src.services.llm_adapters.base_adapter import (
     ToolCallRef,
 )
 
-# Defaults centered on the measured per-turn LLM latency (mean ~9.3s), see
-# docs/notes/capacity-planning-concepts.md §1 "Service time is not a constant". Used for
+# Defaults centered on the measured per-turn LLM latency (mean ~9.3s), spread wide because
+# real service time varies a lot from call to call. Used for
 # complete_with_tools (agent turns) and _stream (final answers) — the heavy calls.
 _DEFAULT_LATENCY_MIN_S = 2.0
 _DEFAULT_LATENCY_MODE_S = 6.0
