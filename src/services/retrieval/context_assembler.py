@@ -97,16 +97,17 @@ def assemble_rag_context(
 
         # Scan the body only — prompt_text includes a header line "[Sn | doc | p.X]"
         # that adds benign tokens and dilutes instructional_density scores.
+        # The header is put back in front of the sanitized body so excerpts keep their pages.
         # Skipped when INJECTION_SCAN_CHUNKS=false; chunk is treated as clean.
         if get_injection_scan_chunks_enabled():
-            body = (
-                payload.prompt_text.split("\n", 1)[1]
-                if "\n" in payload.prompt_text
-                else payload.prompt_text
-            )
+            header, sep, body = payload.prompt_text.partition("\n")
+            if not sep:
+                header, body = "", payload.prompt_text
             signal = scan_retrieved_chunk(body)
+            text = header + sep + signal.sanitized_text
         else:
             signal = InjectionSignal(score=0, severity="clean", sanitized_text=payload.prompt_text)
+            text = payload.prompt_text
 
         if signal.severity == "block":
             guardrails.dropped.append(
@@ -130,7 +131,7 @@ def assemble_rag_context(
 
         ref_id = f"S{ref_counter}"
         ref_counter += 1
-        prompt_text = signal.sanitized_text.replace(REF_PLACEHOLDER, ref_id)
+        prompt_text = text.replace(REF_PLACEHOLDER, ref_id)
 
         citation = Citation(
             ref_id=ref_id,

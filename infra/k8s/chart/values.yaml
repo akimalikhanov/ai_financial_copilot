@@ -140,7 +140,7 @@ frontend:
     limits: { cpu: 500m, memory: 256Mi }
 
 workerChat:
-  replicas: 6              # x CELERY_CHAT_WORKER_CONCURRENCY slots; see docs/notes/capacity-model.md
+  replicas: 6              # x CELERY_CHAT_WORKER_CONCURRENCY = concurrent chat requests
   resources:
     requests: { cpu: 250m, memory: 1536Mi }
     limits: { cpu: 2000m, memory: 3Gi }

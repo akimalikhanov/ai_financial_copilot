@@ -44,7 +44,7 @@ if __name__ == "__main__":
     configure_worker_logging()
     nodename = f"ingestion@{socket.gethostname()}.{os.getpid()}"
     pool = os.getenv("CELERY_WORKER_POOL", "prefork")
-    concurrency = os.getenv("CELERY_WORKER_CONCURRENCY")
+    concurrency = os.getenv("CELERY_WORKER_CONCURRENCY") or "1"
 
     argv = build_worker_argv(nodename, pool, concurrency)
 

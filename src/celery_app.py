@@ -27,8 +27,8 @@ celery_app = Celery(
 
 # App-wide default, sized for chat. ingest_document overrides both on its own decorator —
 # a large parse outlives these by an order of magnitude (see src/services/ingestion/tasks.py).
-_task_soft_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS")
-_task_limit = _get_int_env("CELERY_TASK_TIME_LIMIT_SECONDS")
+_task_soft_limit = _get_int_env("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS") or 360
+_task_limit = _get_int_env("CELERY_TASK_TIME_LIMIT_SECONDS") or 450
 
 celery_app.conf.update(
     task_serializer="json",
@@ -40,7 +40,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_track_started=True,
     broker_transport_options={
-        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT_SECONDS", "7200"))
+        "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT_SECONDS", "3600"))
     },
     task_soft_time_limit=_task_soft_limit,
     task_time_limit=_task_limit,

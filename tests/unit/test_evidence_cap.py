@@ -1,9 +1,9 @@
-"""P2 regression test (docs/stages/agentic_state_refactor_v2.md step 6).
+"""Regression test for the per-search excerpt cap.
 
 Mid-loop, the model must see at most `max_chunks_per_entity` rendered excerpts per
 search — that cap moved from a post-loop registry mutation to a render-time
 projection at transcript entry. `EvidenceLedger` must still hold the *full* admitted
-set regardless (provenance intact for P1-5's any-lookup-top-N accounting).
+set regardless, so provenance stays intact for every chunk a search returned.
 """
 
 from __future__ import annotations

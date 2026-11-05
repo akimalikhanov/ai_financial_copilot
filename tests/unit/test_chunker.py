@@ -1,7 +1,7 @@
 """Unit tests for CustomHybridChunker's merge-policy logic.
 
 Uses a stub tokenizer (word-count based) instead of a real HF AutoTokenizer to
-keep these tests fast/offline — see docs/stages/stage_16a_tests.md section 6.
+keep these tests fast and offline.
 `HybridChunker.chunk` (the base-class docling chunking pass) is monkeypatched to
 yield hand-built DocChunks directly, so only the merge-loop logic in
 CustomHybridChunker.chunk is under test, not real Docling document parsing.
@@ -228,9 +228,8 @@ def _picture_doc_chunk(text: str, ref: str, heading: str = "Section") -> DocChun
 
 
 class TestPictureDescriptionSubstitution:
-    """Phase 2: the chunker substitutes descriptions into `<!-- image -->` placeholders
-    without destroying surrounding prose. See docs/stages/ingestion-optimization-implementation.md
-    Phase 2."""
+    """The chunker substitutes descriptions into `<!-- image -->` placeholders without
+    destroying surrounding prose."""
 
     def test_prose_plus_picture_keeps_the_prose(self, monkeypatch) -> None:
         chunker = _make_chunker(min_tokens=5, max_merge_multiplier=10.0)

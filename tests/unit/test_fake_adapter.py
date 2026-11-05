@@ -1,5 +1,5 @@
-"""FakeAdapter is a real LLMAdapter shipped for the Stage 17.5 Phase 8 load test, not a test
-mock — see src/services/llm_adapters/fake_adapter.py and docs/notes/loadtest-concepts.md §6.
+"""FakeAdapter is a real LLMAdapter shipped for load tests, not a test mock — see
+src/services/llm_adapters/fake_adapter.py.
 These tests prove it's safe to deploy: it must never make a real call, must never crash the
 callers that parse structured output, and must not leak state across concurrent requests
 despite being a process-wide singleton (see llm_router.py::_build_adapter / get_router).

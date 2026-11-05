@@ -3,9 +3,8 @@
 How a chat question gets narrowed to the right documents before the agent runs: which
 companies the question names, which of the user's documents belong to them, and what
 happens when the system can't tell. The code lives in `src/services/router/`, with the
-clarification card spread across the chat worker, the chat API and the UI. Everything here
-was checked against that code as of 2026-10-07. If the code and this doc disagree, the code
-wins, so fix the doc.
+clarification card spread across the chat worker, the chat API and the UI. If the code and
+this doc disagree, the code wins, so fix the doc.
 
 Read sections 1 to 4 first. They set up the vocabulary. Sections 5 to 9 walk through the
 three steps and the card in pipeline order, and section 13 follows one question through all

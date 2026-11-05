@@ -4,7 +4,7 @@ infra/loadtest/locustfile.py is not importable as `src.*` — it is a standalone
 to the k8s Job as a ConfigMap — so it is loaded here by path.
 
 Why these tests exist rather than trusting a manual run: T3's whole purpose is to catch the
-API dropping idle SSE streams under load (docs/notes/loadtest-readiness-audit.md §4.1). A
+API dropping idle SSE streams under load. A
 `_hold_chat_stream` that reported a dropped stream as a successful hold would turn that
 finding into a silent pass, which is worse than having no scenario at all — so the hold and
 drop outcomes are pinned here in both directions. One earlier bug was of that family: the

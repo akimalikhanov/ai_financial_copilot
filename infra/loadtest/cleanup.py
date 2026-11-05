@@ -1,4 +1,4 @@
-"""Delete the residue a load test leaves behind (docs/notes/loadtest-readiness-audit.md §8).
+"""Delete the residue a load test leaves behind.
 
 Every run auto-registers a throwaway user per simulated client (locustfile.py's
 `loadtest-{uuid4}@example.com`), and nothing ever collects them. After the chat track's T1-T4

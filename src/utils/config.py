@@ -98,7 +98,7 @@ def load_models_config(config_path: str | Path | None = None) -> dict[str, Any]:
         config_path: Path to models.yaml. If None, checks the MODELS_CONFIG_PATH env var, then
             falls back to infra/config/models.yaml relative to project root. The env var is the
             hook a load-test deployment uses to swap in infra/config/models.loadtest.yaml
-            without touching any call site — see docs/notes/loadtest-concepts.md §6.
+            without touching any call site.
 
             A relative value is resolved against the project root, so one setting
             ("infra/config/models.loadtest.yaml") works both on the host and inside a
@@ -201,8 +201,8 @@ def get_rate_limit_window_ms() -> int:
 
 
 def get_rate_limit_max_requests() -> int:
-    """Max requests per window (RATE_LIMIT_MAX_REQUESTS, default 30)."""
-    return int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "30"))
+    """Max requests per window (RATE_LIMIT_MAX_REQUESTS, default 100)."""
+    return int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "100"))
 
 
 def get_rate_limit_retry_after_sec() -> int:
@@ -331,8 +331,8 @@ def get_chat_queue_max_depth() -> int:
     admit far more than the worker pool can serve. Sized as
     `slots x (longest promised wait / service time)` = 24 x (60s / 40.5s) ~= 36.
 
-    The depth is only meaningful against that 40.5s service time (measured 2026-09-07, see
-    docs/notes/capacity-model.md). If service time doubles, the same depth silently becomes a
+    The depth is only meaningful against that 40.5s service time (measured 2026-09-07). If
+    service time doubles, the same depth silently becomes a
     two-minute buffer instead of a one-minute one — re-derive it whenever service time is
     re-measured.
     """
@@ -537,8 +537,8 @@ def _parse_bool(val: str | None, default: bool) -> bool:
 
 # --- Docling ---
 def get_docling_do_ocr() -> bool:
-    """DOCLING_DO_OCR (default: true)."""
-    return _parse_bool(os.getenv("DOCLING_DO_OCR"), True)
+    """DOCLING_DO_OCR (default: false)."""
+    return _parse_bool(os.getenv("DOCLING_DO_OCR"), False)
 
 
 def get_docling_do_table_structure() -> bool:
@@ -547,13 +547,13 @@ def get_docling_do_table_structure() -> bool:
 
 
 def get_docling_do_picture_description() -> bool:
-    """DOCLING_DO_PICTURE_DESCRIPTION (default: true)."""
-    return _parse_bool(os.getenv("DOCLING_DO_PICTURE_DESCRIPTION"), True)
+    """DOCLING_DO_PICTURE_DESCRIPTION (default: false)."""
+    return _parse_bool(os.getenv("DOCLING_DO_PICTURE_DESCRIPTION"), False)
 
 
 def get_docling_generate_picture_images() -> bool:
-    """DOCLING_GENERATE_PICTURE_IMAGES (default: false)."""
-    return _parse_bool(os.getenv("DOCLING_GENERATE_PICTURE_IMAGES"), False)
+    """DOCLING_GENERATE_PICTURE_IMAGES (default: true)."""
+    return _parse_bool(os.getenv("DOCLING_GENERATE_PICTURE_IMAGES"), True)
 
 
 def get_docling_do_picture_classification() -> bool:
@@ -577,8 +577,8 @@ def get_docling_generate_page_images() -> bool:
 
 
 def get_docling_picture_vlm_model() -> str:
-    """DOCLING_PICTURE_VLM_MODEL — HuggingFace repo_id for picture description (default: SmolVLM-256M)."""
-    return os.getenv("DOCLING_PICTURE_VLM_MODEL", "HuggingFaceTB/SmolVLM-256M-Instruct")
+    """DOCLING_PICTURE_VLM_MODEL — HuggingFace repo_id for picture description (default: SmolVLM-500M)."""
+    return os.getenv("DOCLING_PICTURE_VLM_MODEL", "HuggingFaceTB/SmolVLM-500M-Instruct")
 
 
 def get_docling_picture_vlm_prompt() -> str:
@@ -831,13 +831,13 @@ def get_docling_ocr_use_gpu() -> bool:
 
 
 def get_docling_images_scale() -> float:
-    """DOCLING_IMAGES_SCALE (default: 2.0). Resolution multiplier for generated page/picture
+    """DOCLING_IMAGES_SCALE (default: 1.5). Resolution multiplier for generated page/picture
     images."""
-    val = os.getenv("DOCLING_IMAGES_SCALE", "2.0")
+    val = os.getenv("DOCLING_IMAGES_SCALE", "1.5")
     try:
         return float(val)
     except ValueError:
-        return 2.0
+        return 1.5
 
 
 def get_docling_artifacts_path() -> Path | None:
@@ -852,17 +852,17 @@ def get_docling_artifacts_path() -> Path | None:
 
 
 def get_chunking_tokenizer_model() -> str:
-    """CHUNKING_TOKENIZER_MODEL (default: nomic-ai/nomic-embed-text-v1.5)."""
-    return os.getenv("CHUNKING_TOKENIZER_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+    """CHUNKING_TOKENIZER_MODEL (default: BAAI/bge-m3, the embedding model)."""
+    return os.getenv("CHUNKING_TOKENIZER_MODEL", "BAAI/bge-m3")
 
 
 def get_chunking_max_tokens() -> int:
-    """CHUNKING_MAX_TOKENS (default: 1000)."""
-    val = os.getenv("CHUNKING_MAX_TOKENS", "1000")
+    """CHUNKING_MAX_TOKENS (default: 900)."""
+    val = os.getenv("CHUNKING_MAX_TOKENS", "900")
     try:
         return int(val)
     except ValueError:
-        return 1000
+        return 900
 
 
 def get_chunking_min_tokens() -> int:
@@ -875,22 +875,22 @@ def get_chunking_min_tokens() -> int:
 
 
 def get_chunking_max_merge_multiplier() -> float:
-    """CHUNKING_MAX_MERGE_MULTIPLIER (default: 2.0)."""
-    val = os.getenv("CHUNKING_MAX_MERGE_MULTIPLIER", "2.0")
+    """CHUNKING_MAX_MERGE_MULTIPLIER (default: 3.0)."""
+    val = os.getenv("CHUNKING_MAX_MERGE_MULTIPLIER", "3.0")
     try:
         return float(val)
     except ValueError:
-        return 2.0
+        return 3.0
 
 
 def get_embedding_provider() -> str:
-    """EMBEDDING_PROVIDER (default: local). Supported: 'tei', 'openai', 'local'."""
-    return os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+    """EMBEDDING_PROVIDER (default: tei). Supported: 'tei', 'openai', 'local'."""
+    return os.getenv("EMBEDDING_PROVIDER", "tei").strip().lower()
 
 
 def get_embedding_model() -> str:
-    """EMBEDDING_MODEL or EMBED_MODEL_ID (default: all-MiniLM-L6-v2)."""
-    return os.getenv("EMBEDDING_MODEL") or os.getenv("EMBED_MODEL_ID") or "all-MiniLM-L6-v2"
+    """EMBEDDING_MODEL or EMBED_MODEL_ID (default: BAAI/bge-m3)."""
+    return os.getenv("EMBEDDING_MODEL") or os.getenv("EMBED_MODEL_ID") or "BAAI/bge-m3"
 
 
 def get_embedder_base_url() -> str:
@@ -1002,8 +1002,8 @@ def get_entity_disambiguator_prompt_version() -> str:
 
 
 def get_table_summarizer_enabled() -> bool:
-    """Whether table summarization is enabled (TABLE_SUMMARIZER_ENABLED, default: true)."""
-    return os.getenv("TABLE_SUMMARIZER_ENABLED", "true").strip().lower() not in {
+    """Whether table summarization is enabled (TABLE_SUMMARIZER_ENABLED, default: false)."""
+    return os.getenv("TABLE_SUMMARIZER_ENABLED", "false").strip().lower() not in {
         "0",
         "false",
         "no",
@@ -1012,8 +1012,8 @@ def get_table_summarizer_enabled() -> bool:
 
 
 def get_table_summarizer_model() -> str:
-    """Model ID for table chunk summarization (TABLE_SUMMARIZER_MODEL, default: gpt-4o-mini). Must exist in models.yaml."""
-    return os.getenv("TABLE_SUMMARIZER_MODEL", "gpt-4o-mini")
+    """Model ID for table chunk summarization (TABLE_SUMMARIZER_MODEL, default: qwen3-8b). Must exist in models.yaml."""
+    return os.getenv("TABLE_SUMMARIZER_MODEL", "qwen3-8b")
 
 
 def get_table_summarizer_enable_thinking() -> bool:
@@ -1168,39 +1168,39 @@ def get_rag_vector_weight() -> float:
 
 
 def get_vector_search_top_k() -> int:
-    """VECTOR_SEARCH_TOP_K (default: 10)."""
-    return int(os.getenv("VECTOR_SEARCH_TOP_K", "10"))
+    """VECTOR_SEARCH_TOP_K (default: 50)."""
+    return int(os.getenv("VECTOR_SEARCH_TOP_K", "50"))
 
 
 def get_keyword_search_top_k() -> int:
-    """KEYWORD_SEARCH_TOP_K (default: 10)."""
-    return int(os.getenv("KEYWORD_SEARCH_TOP_K", "10"))
+    """KEYWORD_SEARCH_TOP_K (default: 50)."""
+    return int(os.getenv("KEYWORD_SEARCH_TOP_K", "50"))
 
 
 def get_fuse_rrf_k() -> int:
-    """FUSE_RRF_K (default: 60)."""
-    return int(os.getenv("FUSE_RRF_K", "60"))
+    """FUSE_RRF_K (default: 20)."""
+    return int(os.getenv("FUSE_RRF_K", "20"))
 
 
 def get_fuse_rrf_final_top_k() -> int:
-    """FUSE_RRF_FINAL_TOP_K (default: 15)."""
-    return int(os.getenv("FUSE_RRF_FINAL_TOP_K", "15"))
+    """FUSE_RRF_FINAL_TOP_K (default: 50)."""
+    return int(os.getenv("FUSE_RRF_FINAL_TOP_K", "50"))
 
 
 def get_fuse_rrf_vector_weight() -> float:
-    """FUSE_RRF_VECTOR_WEIGHT (default: 0.6)."""
-    return float(os.getenv("FUSE_RRF_VECTOR_WEIGHT", "0.6"))
+    """FUSE_RRF_VECTOR_WEIGHT (default: 0.4)."""
+    return float(os.getenv("FUSE_RRF_VECTOR_WEIGHT", "0.4"))
 
 
 def get_fuse_rrf_keyword_weight() -> float:
-    """FUSE_RRF_KEYWORD_WEIGHT (default: 0.4)."""
-    return float(os.getenv("FUSE_RRF_KEYWORD_WEIGHT", "0.4"))
+    """FUSE_RRF_KEYWORD_WEIGHT (default: 0.6)."""
+    return float(os.getenv("FUSE_RRF_KEYWORD_WEIGHT", "0.6"))
 
 
 # --- Reranker ---
 def get_reranker_enabled() -> bool:
-    """RERANKER_ENABLED (default: False)."""
-    return os.getenv("RERANKER_ENABLED", "false").lower() in ("true", "1", "yes")
+    """RERANKER_ENABLED (default: True)."""
+    return os.getenv("RERANKER_ENABLED", "true").lower() in ("true", "1", "yes")
 
 
 def get_reranker_base_url() -> str:
@@ -1219,13 +1219,13 @@ def get_reranker_timeout_seconds() -> float:
 
 
 def get_reranker_top_k() -> int:
-    """RERANKER_TOP_K (default: 10). Number of chunks to return after reranking."""
-    return int(os.getenv("RERANKER_TOP_K", "10"))
+    """RERANKER_TOP_K (default: 8). Number of chunks to return after reranking."""
+    return int(os.getenv("RERANKER_TOP_K", "8"))
 
 
 def get_reranker_max_input() -> int:
-    """RERANKER_MAX_INPUT (default: 30). Max chunks to send to reranker per query."""
-    return int(os.getenv("RERANKER_MAX_INPUT", "30"))
+    """RERANKER_MAX_INPUT (default: 50). Max chunks to send to reranker per query."""
+    return int(os.getenv("RERANKER_MAX_INPUT", "50"))
 
 
 def get_injection_scan_user_input_enabled() -> bool:

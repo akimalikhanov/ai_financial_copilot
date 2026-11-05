@@ -11,8 +11,7 @@ The hook runs as the `assemble` stage's postprocess, after `page.assembled` is p
 can make per page the decision Docling can only make globally: keep an image only on the pages
 that actually hold a picture. Measured on a 1043-page filing: 15.7 GB peak stock, 7.3 GB here.
 
-See docs/stages/ingestion-pipeline-findings.md §2 Option A for the measurements and the full
-safety argument. All of this reads Docling private attributes and is pinned to docling 2.111.0.
+All of this reads Docling private attributes and is pinned to docling 2.111.0.
 """
 
 from __future__ import annotations

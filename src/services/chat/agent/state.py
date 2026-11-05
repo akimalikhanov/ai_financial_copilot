@@ -1,7 +1,7 @@
 """Agent state: settings and the run state the loop mutates.
 
-Two kinds of state: `transcript` is the model's view (lossy, compactable); `evidence` + the
-record fields below are the durable, never-truncated record. `AgentRunState` is neither
+Two kinds of state: `transcript` is the model's view (append-only, never rewritten);
+`evidence` + the record fields below are the durable record that resolves its labels. `AgentRunState` is neither
 alone — it is transcript + record + loop control.
 """
 
@@ -128,7 +128,7 @@ def get_agent_settings() -> AgentSettings:
     env overrides (incl. in tests) always take effect."""
     max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "5"))
     return AgentSettings(
-        tool_model=os.getenv("AGENT_TOOL_MODEL", "gpt-4o-mini"),
+        tool_model=os.getenv("AGENT_TOOL_MODEL", "gpt-5-mini"),
         max_iterations=max_iterations,
         cost_budget_usd=float(os.getenv("AGENT_COST_BUDGET_USD", "0.10")),
         max_concurrent_searches=int(os.getenv("AGENT_MAX_CONCURRENT_SEARCHES", "3")),
@@ -139,7 +139,7 @@ def get_agent_settings() -> AgentSettings:
         deadline_reserve_seconds=float(os.getenv("AGENT_DEADLINE_RESERVE_SECONDS", "15")),
         search_timeout_seconds=float(os.getenv("AGENT_SEARCH_TIMEOUT_SECONDS", "60")),
         max_iterations_analytical=int(os.getenv("AGENT_MAX_ITERATIONS_ANALYTICAL", "7")),
-        max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "6")),
+        max_plan_items=int(os.getenv("AGENT_MAX_PLAN_ITEMS", "8")),
     )
 
 

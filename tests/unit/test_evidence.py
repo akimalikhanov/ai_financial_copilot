@@ -1,4 +1,4 @@
-"""Unit tests for EvidenceLedger (docs/stages/agentic_state_refactor_v2.md step 6)."""
+"""Unit tests for EvidenceLedger."""
 
 from __future__ import annotations
 

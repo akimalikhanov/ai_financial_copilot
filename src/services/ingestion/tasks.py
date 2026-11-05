@@ -101,8 +101,8 @@ def _get_int_env(name: str) -> int | None:
 # sized for chat (360/450). A 1000-page parse alone outlives that, so the global limits made
 # every inner stage timeout unreachable: Celery reaped the child first and every large-document
 # failure surfaced as a generic SoftTimeLimitExceeded instead of the stage that actually blew.
-# Must stay strictly above the sum of the stage budgets — see docs/stages/
-# ingestion-pipeline-findings.md P1-2 for the ladder.
+# Must stay strictly above the sum of the stage budgets, or a stage's own timeout can never
+# fire before Celery's.
 _task_soft_time_limit = _get_int_env("INGEST_TASK_SOFT_TIME_LIMIT_SECONDS") or 2400
 # Held back from the enrichment budget for everything after it (~60s on a 1043-page filing).
 _POST_ENRICH_RESERVE_SECONDS = 300
