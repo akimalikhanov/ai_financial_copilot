@@ -32,8 +32,8 @@ Anything else in `make helm-diff-envs` means environment logic leaked into a tem
 `envs/values-smoke.yaml` layers on kind for install rehearsals on a throwaway cluster with no
 GPU: everything that needs the GPU, or waits on something that does, is scaled to zero.
 
-Still out of `values-eks.yaml`, for the EKS deployment to decide: `langfuseWeb.nextauthUrl`, OpenSearch's
-`DISABLE_SECURITY_PLUGIN`, and the RDS / S3 / IRSA seams.
+What the EKS deployment still has to decide is in
+[architecture.md](../../../docs/prod_docs/architecture.md#6-moving-to-eks).
 
 ## Files
 
@@ -101,27 +101,5 @@ models-file edit via `checksum/loadtest-models`.
 
 ## Adopting a live stack
 
-Helm took over the kind stack, which Kustomize had built, with `--take-ownership
---force-conflicts`, after a fresh-install rehearsal on a throwaway cluster with
-`values-smoke.yaml`. Every PVC kept its UID, and every PV is `Retain`. The old Kustomize tree is
-in `git log -- infra/k8s/base`. What to know before adopting live objects again:
-
-- **Drop the old field manager after adopting.** Where Helm applied the value that was already
-  live, the field stayed co-owned with `kubectl-client-side-apply`, so the first upgrade that
-  changed it (the image tag) failed with a conflict. Removing that manager's `managedFields`
-  entries, and its `last-applied-configuration` annotation, from the 62 adopted objects made
-  Helm the sole owner. That is a metadata patch; no pod restarted.
-- **Check what the live state equals with the server, as Helm.** `helm get manifest copilot -n
-  copilot | kubectl diff --server-side --field-manager=helm --force-conflicts -f -` shows only
-  Helm's own `meta.helm.sh/*` annotations, which the manifest leaves out. A plain `kubectl diff`
-  compares against the old `last-applied-configuration` instead.
-- **`--wait` also waits for every PVC to bind.** With a `WaitForFirstConsumer` storage class
-  (kind's `standard`, EKS `gp3`), a standalone PVC binds only once a pod uses it. On the smoke
-  cluster `tei-data`, `tei-embedder-data` and `hf-model-cache` have no pod, so the install
-  times out unless a throwaway pod mounts them first. A real install has their pods.
-- **Adoption never deletes a field the chart leaves out.** Grafana's gate and OpenSearch
-  Dashboards' old curl image were removed through Kustomize first, so the live objects already
-  matched the chart.
-- **The rollback drill works.** `helm rollback copilot 1 -n copilot --wait` returned the images
-  to revision 1's tag without re-running the hooks.
-- **Helm doesn't manage `Namespace/copilot`**, so no Helm command can delete it.
+Helm took over the kind stack from Kustomize. What to know before adopting live objects again
+is in [architecture.md](../../../docs/prod_docs/architecture.md#lessons-from-adopting-a-live-stack).

@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from src.schemas.retrieval import ChunkPromptPayload, RetrievedChunk
+from src.services.chat.agent.evidence import EvidenceLedger
 from src.services.retrieval import context_assembler
 from src.services.retrieval.context_assembler import assemble_rag_context, wrap_excerpt
 from src.services.security.injection_detector import InjectionSignal
@@ -184,6 +185,25 @@ class TestRealInjectionDetectorWiring:
         ctx, guardrails = assemble_rag_context([chunk], {chunk.chunk_id: payload})
         assert ctx.chunk_count == 0
         assert len(guardrails.dropped) == 1
+
+
+class TestHeaderPreserved:
+    _TEXT = "[__REF__ | Doc | p.12 | MD&A]\n[SECTION] Results\nRevenue grew 15%."
+
+    def test_scanned_excerpt_keeps_header(self) -> None:
+        chunk = _chunk()
+        ctx, _ = assemble_rag_context(
+            [chunk], {chunk.chunk_id: _payload(chunk, self._TEXT)}, ref_start=3
+        )
+        assert ctx.items[0].prompt_text == self._TEXT.replace("__REF__", "S3")
+
+    def test_reassembly_from_ledger_keeps_every_line(self) -> None:
+        chunk = _chunk()
+        ledger = EvidenceLedger()
+        ledger.admit([chunk])
+        ledger.assign_labels([chunk], {chunk.chunk_id: _payload(chunk, self._TEXT)})
+        ctx, _ = assemble_rag_context([chunk], ledger.payloads_for([chunk.chunk_id]))
+        assert ctx.items[0].prompt_text == self._TEXT.replace("__REF__", "S1")
 
 
 def test_wrap_excerpt_neutralises_a_forged_run_status() -> None:

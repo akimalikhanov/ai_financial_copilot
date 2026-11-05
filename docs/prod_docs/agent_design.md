@@ -5,17 +5,20 @@ request its way to the moment the answer is persisted. The code lives in
 `src/services/chat/agent/`. If the code and this doc disagree, the code wins, so fix the
 doc.
 
-Read sections 1 to 6 in order the first time. They build the vocabulary everything else
-uses. Sections 7 onward are reference material you can jump into when you need them.
+Sections 1 and 2 are a primer for a reader who knows classic RAG, where one retrieval puts
+the top k chunks in the prompt and one model answers. Section 3 says where to go next. The
+rest is reference material to read when you need it.
 
-How numbers are checked and
-how changes between periods are computed is in [number_grounding.md](number_grounding.md).
+Three other docs cover what sits around the agent. [chat_pipeline.md](chat_pipeline.md)
+covers the request before and after it, [scope_resolution.md](scope_resolution.md) how
+company names become document IDs, and [number_grounding.md](number_grounding.md) how
+numbers are checked and how changes between periods are computed.
 
 ## Contents
 
 1. [The short version](#1-the-short-version)
-2. [Where the agent sits in the chat pipeline](#2-where-the-agent-sits-in-the-chat-pipeline)
-3. [Three models, three jobs](#3-three-models-three-jobs)
+2. [What changes from classic RAG](#2-what-changes-from-classic-rag)
+3. [Where to go next](#3-where-to-go-next)
 4. [The package](#4-the-package)
 5. [Two query shapes](#5-two-query-shapes)
 6. [State: the view and the record](#6-state-the-view-and-the-record)
@@ -43,168 +46,196 @@ how changes between periods are computed is in [number_grounding.md](number_grou
 
 ## 1. The short version
 
-A small, cheap "tool model" runs in a loop. On each turn it can call two tools:
-
-- `search_documents` runs hybrid retrieval over the user's documents and returns excerpts
-  labelled `S1`, `S2`, and so on.
-- `report_findings` records a conclusion, the excerpt labels that back it and, for a
-  numeric answer, the figures it states.
-
-Reporting does not end the run. The loop keeps a **plan**, a list of things that need an
-answer. For a comparison that list is the companies in scope. For an analytical question
-the model opens items itself by attaching a `sub_question` to its searches. The loop stops
-on its own when every plan item has a grounded finding, or when it hits a budget.
-
-After the loop, a synthesis step picks only the excerpts the findings actually cite,
-renders a structured findings block on top of them, and hands both to a separate, stronger
-answering model. That model writes the prose the user sees, with `[S1]`-style citations.
+In classic RAG, one retrieval fills the prompt and one model writes the answer. Here, for a
+question the router sends to `retrieval`, a loop replaces that single retrieval. A small,
+cheap tool model searches the user's documents several times and records what it finds.
+Then the model the user picked in the UI writes the answer from those findings and the
+excerpts they cite.
 
 ```mermaid
 flowchart LR
-    Q["User question"] --> R["Query router"]
-    R -->|"route = retrieval"| L["Agent loop<br/>tool model searches and reports"]
-    L --> S["Synthesis<br/>select cited excerpts,<br/>render findings block"]
-    S --> A["Answering model<br/>streams the answer"]
-    A --> U["UI: answer, citations,<br/>evidence panel"]
+    Q["User question"] --> R["Query router<br/>route, query shape, scope"]
+    R -->|"route = retrieval"| TM
+    subgraph LOOP["Agent loop"]
+        direction TB
+        TM["Tool model<br/>writes searches and reports"]
+        PY["Loop code<br/>runs searches, checks citations,<br/>tracks the plan, stops the run"]
+        TM <-->|"tool calls / tool results"| PY
+    end
+    PY --> S["Synthesis<br/>keep cited excerpts,<br/>render findings block"]
+    S --> A["Answering model<br/>streams the answer<br/>with [S1] citations"]
 ```
 
-Three ideas carry most of the design. Keep them in mind as you read:
+The tool model can call two tools:
 
-1. **The loop decides when to stop, not the model.** No tool call ends the run.
-2. **What the model sees is separate from what the system knows.** The transcript is text
-   for the tool model to read; the ledgers hold the same facts keyed by id, for code to
-   check and for the answering model, which never sees the transcript.
-3. **Nothing reaches the answer without a citation that resolves to a real chunk.** The
-   only exception is an explicit "the documents don't say" negative.
+- `search_documents` runs hybrid retrieval over one company's documents (dense plus BM25,
+  fused and reranked, as described in [chat_pipeline.md](chat_pipeline.md#4-retrieval))
+  and returns excerpts labelled `S1`, `S2`, and so on. The model writes both the semantic
+  `query` and the BM25 `keywords`.
+- `report_findings` records a conclusion, the excerpt labels that back it and, for a
+  numeric answer, the figures it states.
+
+Three roles share the run:
+
+| Role | What it is | What it does | What it never does |
+|---|---|---|---|
+| Tool model | `AGENT_TOOL_MODEL`, `gpt-5-mini` by default and `gpt-5.6-luna` on Kubernetes | Picks what to search, reads excerpts, reports findings with S-labels | Talk to the user. Its prompts say "Your only output is tool calls." |
+| The loop | Plain Python in `loop.py` | Runs searches in parallel, checks that citations resolve, tracks the plan, decides when to stop | Ask a model whether a citation is real or whether the run is done |
+| Answering model | Whatever model the user picked | Writes the prose answer with `[S1]`-style citations | See the tool model's transcript. It reads only the findings block and the cited excerpts |
+
+Every request the router sends to `retrieval` runs the agent, as long as it has a corpus
+owner whose documents it can search. There is no separate classic RAG path. Besides the
+route, the router hands the agent a `query_shape`, which picks one of two modes
+([section 5](#5-two-query-shapes)), a `requested_currency` for FX conversion at synthesis,
+and the resolved scope: every document the run may search, and each company's documents
+([scope_resolution.md](scope_resolution.md#how-the-agent-uses-the-result)). The other
+branches, `direct_answer`, `out_of_scope` and the clarification card, are in
+[chat_pipeline.md](chat_pipeline.md#35-branch).
 
 ---
 
-## 2. Where the agent sits in the chat pipeline
+## 2. What changes from classic RAG
 
-A chat request is a Celery task, `process_chat` in `src/services/chat/tasks.py`. The
-pipeline stages before the agent are: load and validate the request, build conversation
-context, scan the user message for prompt injection, then route the query.
+Eight places where the agent does something classic RAG doesn't, roughly from most to least
+confusing. Each one starts with the failure it prevents.
 
-The router (`src/services/router/`) returns a `RouterOutput` with three fields the agent
-cares about:
+### Why there's a loop at all
 
-| Field | Values | Used for |
-|---|---|---|
-| `route` | `direct_answer`, `retrieval`, `out_of_scope` | Whether the agent runs at all |
-| `query_shape` | `extraction`, `comparison`, `analytical`, or `None` | Which prompt, tools and budgets the agent uses |
-| `requested_currency` | e.g. `"EUR"` or `None` | FX conversion target at synthesis |
+One retrieval for "Compare Acme and Globex revenue" ranks chunks from both companies'
+filings in one list, and the top k can all come from one company. The answer then compares
+one company with nothing. A "why did the margin fall" question has the same problem in
+another form. The causes sit in different parts of the filing, under different wording, and
+one query finds one of them. And a model reading 50 excerpts at once has to find the right
+figures and work out the changes between periods itself, which is where answers went wrong.
 
-It also returns a `DocumentScopeResult` from scope resolution, which
-[scope_resolution.md](scope_resolution.md) covers in full. The agent reads three fields:
+The loop splits the job. The tool model searches one company or one sub-question at a time,
+with `entity` restricting each search to that company's documents. It reads the results and
+reports what they say, over up to five turns (seven for analytical questions). Code then
+converts currencies, ranks, checks figures against their excerpts and computes the changes
+between periods. The answering model gets a short structured block and only the excerpts
+it cites. See [section 5](#5-two-query-shapes) and [section 9](#9-executing-a-search).
 
-- `doc_ids`, every document the run may search. For a retrieval question it is always an
-  explicit list. `[]` means "match nothing": both retrievers return no results without
-  querying Qdrant or OpenSearch. `None` ("no filter") survives only as the retrievers'
-  contract for callers that build a scope themselves.
-- `per_entity_doc_ids`, each covered company's documents, keyed by the company name stored
-  on its documents (not the router's spelling). A question that names no company covers
-  every company in the UI scope. An entity that matched nothing stays in the map under the
-  router's name with an empty list, and is listed in `unresolved_entities`.
-- `entity_manifest`, each covered company's documents with their fiscal years, and
-  `mentioned_as`: the question's names for the company when they differ from its own. "PFH"
-  lands there when the user picked Alcoa Corporation for it on a clarification card. "RWE"
-  for RWE AG doesn't, because the two normalize to the same name.
-  `DocumentScopeResult.mentions()` turns it into the map the agent and synthesis read.
+### Who decides when to stop
 
-When every named entity fails to match, `source` is `"unresolved"`; `"all"` means the
-question named no entity and the UI scope was all documents. When the router call fails
-(model missing, timeout, unparseable output), `route_query` still resolves scope on the
-fallback route, with no entities, so a UI selection or filter still applies.
+An earlier design gave the model a "finalize" tool, and a gate rejected weak finalize calls.
+Rejection needed retry budgets and forced restatements, and a restatement could silently
+drop a finding the model had already established.
 
-Scope resolution can also end the request before the agent runs. A company name that is
-ambiguous, matches nothing, or sits outside the UI selection gets a clarification card,
-and so does a question covering more than `SCOPE_MAX_COMPANIES` companies (default 5). With
-clarification off (eval, API clients sending `allow_clarification: false`), a too-broad
-question gets a fixed "narrow the scope" reply and the other cases go ahead: an ambiguous
-name runs on its most likely company, and the rest are planned as not found.
+Now no tool ends the run, and reporting doesn't either. The loop keeps a plan, a set of keys
+that each need an answer. For a comparison the keys are the companies in scope, seeded
+before the first turn. For an analytical question the model opens keys itself by attaching
+a `sub_question` to a search, and the loop gives each one a short id (`A1`, `A2`), since
+small models are bad at repeating their own free-text names exactly. Plain code stops the
+run as `covered` once every key has a grounded finding, or earlier on a budget. See
+[section 7](#7-the-plan-how-the-loop-knows-when-it-is-done) and
+[Termination checks](#termination-checks-in-order).
 
-```mermaid
-flowchart TD
-    START["process_chat task"] --> PRE["load request, build context,<br/>scan user input for injection"]
-    PRE -->|"blocked"| REFUSE["refusal message, done"]
-    PRE --> ROUTE["route_query()<br/>router LLM + scope resolution"]
-    ROUTE -->|"unclear company or too many<br/>companies, clarification allowed"| CARD["clarification card, done"]
-    ROUTE -->|"too many companies,<br/>clarification off"| TB["'narrow the scope' message, done"]
-    ROUTE -->|"out_of_scope"| OOS["redirect message, done"]
-    ROUTE -->|"retrieval AND user_id is set"| AGENT["run_agent()<br/>(this document)"]
-    ROUTE -->|"anything else"| CARRY{"a findings block from an<br/>earlier turn is still valid?"}
-    CARRY -->|"yes"| CTX1["context = carried findings block,<br/>no excerpts"]
-    CARRY -->|"no"| CTX2["context = '(No document context - general question.)'"]
-    AGENT --> CTX3["context = findings block + cited excerpts"]
-    CTX1 --> SYN["answering model, prompt v5_agent_synthesis"]
-    CTX2 --> SYN
-    CTX3 --> SYN
-    SYN --> PERSIST["parse citations, persist message,<br/>emit SSE events"]
-```
+### Two ledgers next to one transcript
 
-Two things to note:
+The loop makes decisions that need structure. Which document and page is `S7`? Has this
+chunk been shown already? Does this figure appear in the excerpt it cites? Getting those
+answers by parsing the model's transcript would break on the first odd phrasing.
 
-- **There is no separate "classic RAG" path.** Every retrieval-routed request from a
-  logged-in user goes through the agent. The one exception is a request whose
-  `LLMRequest.user_id` is `NULL`. The agent can't search without a user id, so that
-  request falls to the no-retrieval branch.
-- **The same answering prompt serves every branch.** `v5_agent_synthesis` knows how to
-  handle a `[FINDINGS]` block, a carried block with no excerpts, and no context at all.
+So the run keeps the same facts twice. The `Transcript` is the text the tool model reads,
+and it is append-only. The `EvidenceLedger` maps each retrieved chunk's UUID to its S-label
+and cached text, and the `FindingsLedger` maps each plan key to its finding. Facts go from
+the ledgers into the transcript by rendering (excerpts, a status line). Model output goes
+the other way by parsing and checking each tool call. The answering model never sees the
+transcript, only what synthesis builds from the ledgers.
+[Section 6](#6-state-the-view-and-the-record) explains this split, and the rest of the doc
+assumes it.
 
-The tool model is `AGENT_TOOL_MODEL`: `gpt-5-mini` by default, `gpt-5.6-luna` on
-Kubernetes.
-`loop.py::tool_model_chain` resolves it together with its `fallback_model` from
-`infra/config/models.yaml`, keeping only models with `tool_calling: true`, and refuses to
-start the loop if the tool model itself lacks it. `tasks.py` and the eval pipeline both call
-it, then pass the fallbacks to `run_agent(..., fallbacks=...)`.
+### Labels change between the loop and the answer
+
+A run can show the tool model twenty excerpts while its findings cite three, say `S3`, `S7`
+and `S12`. Handing all twenty to the answering model would let it cite text no finding was
+based on.
+
+When a report cites `S7`, the loop resolves it to a chunk UUID straight away. A label that
+matches nothing is dropped, and a positive claim with no citation left isn't recorded.
+After the loop, synthesis keeps only the cited chunks and labels them again, `S1` to `Sk`
+by score. So the `S7` in a loop trace and the `[S2]` in the answer can be the same chunk,
+and the UI shows the answer's labels. If the findings cite nothing, synthesis serves a
+fallback pool of shown excerpts instead. See
+[section 15](#15-synthesis-turning-loop-output-into-answer-context) and
+[section 16](#16-citations-end-to-end).
+
+### Reports are judged before the same turn's searches
+
+The model writes all of a turn's tool calls at once, before it has seen that turn's search
+results. A report written next to a search can't be about that search.
+
+So the loop applies a turn's reports first, against what earlier turns left, and a report
+can cite only labels from earlier turns. Every plan item therefore takes at least two
+turns, search and then report. A typical turn reports on what is settled and searches for
+the rest. The same rule is why the final turn offers only the report tool, and why the run
+doesn't stop as `covered` on a turn that also showed new excerpts. The model hasn't read
+them yet. See [Rules the turn follows](#rules-the-turn-follows).
+
+### Ten stop reasons, and which mean a partial answer
+
+A run cut off by its budget that served its findings as complete would read as a full
+answer, with one company missing and nothing said about it.
+
+Only `covered` means the plan was finished. Every other reason serves what was recorded,
+marks the findings block degraded, and adds one line per open key: "Not searched", "Not
+resolved", or "Could not be checked" when the search backend was down. The answering model
+states those as limitations.
+
+| Group | Reasons |
+|---|---|
+| Finished | `covered` |
+| The model stopped | `natural` (no tool calls), `truncated` (hit its token cap) |
+| No progress | `convergence` (consecutive turns with nothing new) |
+| Limits | `iteration_cap`, `budget_cap` (USD), `deadline` (whole run), `timeout` (one model call) |
+| Infrastructure | `search_unavailable`, `llm_error` |
+
+A run whose plan stayed empty counts as finished whatever the reason. After
+`search_unavailable` the answer says search is down, not that the documents lack the
+information. See [section 14](#14-why-a-run-stops).
+
+### Follow-ups reuse the findings
+
+"Show that in EUR" after a comparison asks for nothing new. Searching again would cost a
+full run and could come back with different numbers.
+
+A finished run saves its findings block on the assistant message. On the next question,
+`tasks.py` passes the block to the router, which can route the follow-up to
+`direct_answer`. The block then becomes the answering model's whole context, with no
+excerpts and no `[Sn]` citations. The block is dropped, and the follow-up searches again,
+after `FOLLOWUP_MAX_INHERIT_HOPS` carries (default 3) or when the document scope changes.
+This path runs through `tasks.py`, the router and the synthesis prompt. See
+[Follow-up questions without re-searching](#follow-up-questions-without-re-searching).
+
+### The status line lives in the last tool result
+
+Each turn the model needs to know which keys are still open. Sent as a user message of its
+own, that status starts a new turn on the provider's side, and on the Responses API
+`gpt-5-mini` then drops the reasoning the loop carries between calls. Sent and not stored,
+it made later calls miss the prompt cache, down to a 0.51 hit rate by the fourth call.
+
+So the loop appends a `<run_status>` block to the last tool result and keeps it in the
+transcript, and each request starts with the previous one word for word. You don't need
+this to follow the loop. It matters when you change the transcript or the prompts. See
+[What the model sees about coverage](#what-the-model-sees-about-coverage-render_status) and
+[Reasoning items on the Responses API](#reasoning-items-on-the-responses-api).
 
 ---
 
-## 3. Three models, three jobs
+## 3. Where to go next
 
-It helps to think of the run as three roles.
+Sections 4 to 25 are reference. Read [section 6](#6-state-the-view-and-the-record) next
+whatever you're doing, then pick by task:
 
-```mermaid
-flowchart TD
-    subgraph Researcher["Tool model (cheap)"]
-        direction TB
-        T1["decides what to search,<br/>writes both search queries"]
-        T2["reads excerpts"]
-        T3["reports findings with S-labels"]
-    end
-    subgraph Supervisor["The loop (plain Python)"]
-        direction TB
-        L1["runs searches in parallel"]
-        L2["checks citations resolve"]
-        L3["tracks the plan, decides when to stop"]
-        L4["records evidence and findings"]
-    end
-    subgraph Writer["Answering model (user's choice)"]
-        direction TB
-        W1["reads findings + cited excerpts"]
-        W2["writes the prose answer"]
-        W3["cites [S1] etc."]
-    end
-    Researcher <-->|"tool calls / tool results"| Supervisor
-    Supervisor -->|"synthesis context"| Writer
-```
-
-- The **tool model** never talks to the user. Its prompts
-  (`prompts/system_v4_agent.yaml`, `prompts/system_v6_agent_analytical.yaml`) say "Your only
-  output is tool calls."
-- The **loop** is deterministic code. It owns every decision that matters for correctness:
-  whether a citation is real, whether a plan item is done, when to stop.
-- The **answering model** is whatever model the user picked in the UI. It never sees the
-  agent's transcript. It sees only the synthesis context.
-
-On the Responses API the tool model's reasoning carries from turn to turn within a run, and
-the reasoning summaries end up on each turn's trace span and `llm_requests` row
-([section 11](#reasoning-items-on-the-responses-api)). On Chat Completions each call
-reasons from scratch.
-
-No other model sits between the tool model and retrieval. Each `search_documents` call
-carries a `query` for semantic search and `keywords` for BM25, and the loop passes both to
-retrieval as written. See [section 9](#9-executing-a-search).
+| Task | Sections |
+|---|---|
+| Follow one run end to end | [20](#20-worked-example-an-analytical-question) (analytical, turn by turn), [21](#21-worked-example-a-comparison-question) (comparison) |
+| Change how the loop searches, reports or stops | [5](#5-two-query-shapes), [7](#7-the-plan-how-the-loop-knows-when-it-is-done), [8](#8-anatomy-of-one-turn), [12](#12-handling-a-report-call), [14](#14-why-a-run-stops) |
+| Debug a wrong or partial answer | [22](#22-failure-modes-and-how-they-surface) first, then [14](#14-why-a-run-stops), [15](#15-synthesis-turning-loop-output-into-answer-context), [16](#16-citations-end-to-end), and [18](#18-observability) for the trace fields |
+| Change what the answering model sees | [15](#15-synthesis-turning-loop-output-into-answer-context), [17](#17-after-the-agent-answering-persisting-follow-ups), [number_grounding.md](number_grounding.md) |
+| Change history, caching or the Responses API path | [11](#11-transcript-history-and-the-append-only-run), [19](#19-configuration) |
+| Find the file, function or test for something | [4](#4-the-package), [25](#25-quick-reference) |
+| Understand why something is built this way | [23](#23-design-decisions-and-the-reasons-behind-them) |
 
 ---
 
@@ -1417,7 +1448,7 @@ growing prefix once per turn.
 blocks because there is nothing before this question.
 
 ```text
-system  query_router_v4                                             ~12k chars
+system  query_router_v5                                             ~14k chars
 user    User query: analyze the main factors influencing the revenue changes of Alcoa form year to year
 ```
 
@@ -1514,7 +1545,7 @@ Four LLM calls this time (the title is generated only for a conversation's first
 one user message, in this order:
 
 ```text
-system  query_router_v4                                             ~12k chars
+system  query_router_v5                                             ~14k chars
 user    Data already retrieved in this conversation (available without new retrieval):
         1. [high confidence] Average realized primary aluminum price increased to $3,457/mt in
         2022 from $2,879/mt in 2021 and average realized alumina price increased to $384/mt …
@@ -2442,6 +2473,11 @@ and test overrides apply immediately). Validated by Pydantic.
 | `AGENT_SEARCH_TIMEOUT_SECONDS` | 60 | > 0 | One search (retrieve + rerank) |
 | `AGENT_MAX_PLAN_ITEMS` | 8 | ≥ 1 | Max analytical aspects |
 
+`loop.py::tool_model_chain` resolves `AGENT_TOOL_MODEL` together with its `fallback_model`
+chain from `infra/config/models.yaml`, keeping only models with `tool_calling: true`, and
+refuses to start the loop if the tool model itself lacks it. `tasks.py` and the eval pipeline
+both call it, then pass the fallbacks to `run_agent(..., fallbacks=...)`.
+
 History, synthesis and display settings, read through getters in `src/utils/config.py`:
 
 | Env var | Default | What it controls |
@@ -2461,13 +2497,15 @@ Related settings outside the agent package:
 |---|---|---|
 | `CURRENCY_NORMALIZER_ENABLED` | true | FX conversion at synthesis |
 | `FOLLOWUP_MAX_INHERIT_HOPS` | 3 | How many follow-ups may reuse one findings block |
-| `CHAT_TAIL_MAX_MESSAGES` | 70 | Messages loaded as every model's history source; holds a 30-turn session |
-| `VECTOR_SEARCH_TOP_K`, `KEYWORD_SEARCH_TOP_K` | 50 each | Retrieval breadth per search, before fusion and rerank |
-| `INJECTION_SCAN_CHUNKS` | true | Injection scan on every excerpt before it is rendered |
-| `INJECTION_SCAN_USER_INPUT` | true | Injection scan on the current message and, in `prior_turns`, on every prior question |
-| `CHAT_MAX_ATTEMPTS` | 2 | Celery redeliveries of one chat task before it is failed |
 | `LLM_PROMPT_CACHE_KEY_ENABLED` | true | Sends `prompt_cache_key` to OpenAI: `agent:`, `synthesis:` and `router:` plus the prompt version ([cache key](#cache-key)) |
 | `LLM_REASONING_SUMMARY_MAX_CHARS` | 4000 | Cap on a reasoning summary stored on the turn span and the `llm_requests` row |
+
+Settings the agent shares with the rest of the chat pipeline live in
+[chat_pipeline.md](chat_pipeline.md): retrieval breadth and the reranker
+([values in use](chat_pipeline.md#47-values-in-use)), the injection scans
+([scan user input](chat_pipeline.md#33-scan-user-input)), the history tail
+`CHAT_TAIL_MAX_MESSAGES` ([build conversation context](chat_pipeline.md#32-build-conversation-context))
+and `CHAT_MAX_ATTEMPTS` ([redelivery](chat_pipeline.md#62-redelivery)).
 
 Per-model settings in `infra/config/models.yaml`: `capabilities.reasoning: true` marks a
 reasoning model. The adapter then sends `reasoning_effort`, `verbosity` and
@@ -2824,7 +2862,7 @@ a misrouted question lands in the same schema either way.
 
 | Question | Where to look |
 |---|---|
-| Does this request use the agent? | `tasks.py`, `route == "retrieval" and llm_request.user_id is not None`, and no clarification card or too-broad exit |
+| Does this request use the agent? | `tasks.py`, `route == "retrieval" and state.corpus_owner_id is not None`, and no clarification card or too-broad exit |
 | Which documents and companies are in scope? | [scope_resolution.md](scope_resolution.md), `router/scope_resolver.py::resolve_scope` |
 | Which prompt, tools and per-shape behaviour? | `state.py::shape_config` |
 | What a finding looks like | `src/schemas/agent_findings.py` |

@@ -104,7 +104,7 @@ jobs:
             --compare-to-latest-db \
             --persist-db \
             --model "${{ inputs.model }}" \
-            --prompt-version v3_agent_synthesis \
+            --prompt-version v5_agent_synthesis \
             --run-kind "${{ inputs.run_kind }}" \
             ${{ inputs.limit != '' && format('--limit {0}', inputs.limit) || '' }} \
             ${{ inputs.reasoning_effort != '' && format('--reasoning-effort {0}', inputs.reasoning_effort) || '' }} \

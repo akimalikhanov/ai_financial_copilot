@@ -120,6 +120,127 @@ excerpts, and computed change lines), and hands it to the answering model the us
 The full walkthrough, with worked examples and every stop reason, is in
 [agent_design.md](docs/prod_docs/agent_design.md).
 
+## Data layer
+
+| Store | Holds | Written by | Read by |
+|---|---|---|---|
+| Postgres `app` | Users, sessions, conversations, messages, documents, chunk text and metadata, `llm_requests`, feedback, canary runs | API, both workers, eval | API, workers, Grafana |
+| Qdrant `documents` | One bge-m3 vector per chunk, keyed by chunk ID, with `user_id`, `document_id`, pages and chunk type for filtering | Ingestion worker | Dense retriever |
+| OpenSearch `chunks` | A BM25 index of each chunk's `enriched_text`, keyed by chunk ID | Ingestion worker | Keyword retriever |
+| Garage (S3) | Buckets `pdfs` (uploads), `docling` (`docling.json`, reused when a retry skips the parse), `rendered` (`document.md`), `chunks` (`chunks.jsonl` backup), `pictures` (picture crops) | API (PDFs), ingestion worker | Ingestion worker, the PDF viewer |
+| redis-app | Chat event streams (`chat:events:<request_id>`), ingestion event streams, the conversation-history cache (`chat:tail:v2:<conversation_id>`), ingestion leases, chat rate limits | API, workers | API (SSE), workers |
+| redis-broker | Celery `chat` and `ingestion` queues | API | Workers, the API's admission check |
+| Postgres `langfuse`, ClickHouse | Langfuse metadata and traces | Langfuse | Langfuse |
+
+The retrievers return chunk IDs and scores. Hydration then reads each chunk's text, pages
+and headings from Postgres, so Postgres is the source of truth for what a model sees.
+
+```mermaid
+erDiagram
+    users ||--o{ sessions : has
+    users ||--o{ conversations : owns
+    users ||--o{ documents : uploads
+    conversations ||--o{ messages : contains
+    messages ||--o{ message_feedback : "rated in"
+    documents ||--o{ chunks : "split into"
+    conversations ||--o{ llm_requests : logs
+    llm_requests |o--o{ llm_requests : "parent of agent sub-calls"
+    llm_requests }o--o| messages : "user and assistant message"
+    canary_runs ||--o{ canary_run_results : contains
+```
+
+Every table also has a `user_id` to `users` except `chunks` and the canary tables. JSON
+columns worth knowing: `messages.metadata` holds the citation spans, references,
+`finish_reason`, the findings block a follow-up reuses, and `degraded_retrieval`.
+`messages.agent_findings` holds the agent's structured findings, and
+`conversations.metadata.entity_bindings` the user's answers to clarification cards.
+
+**Deletes.** Deleting a document (`DELETE /v1/documents/{id}`) removes its Qdrant points and
+OpenSearch entries first (if either fails, the request returns 503 and nothing is deleted),
+then its S3 objects, then its chunks and the row (`src/services/ingestion/purge.py`).
+Deleting a conversation only sets `deleted_at`. There's no endpoint to delete a user. A
+`DELETE` on `users` cascades to all of their rows but leaves their vectors, BM25 entries and
+S3 objects behind.
+
+**Schema changes.** There's no migration tool. The schema is
+`infra/scripts/db_init/01_create_app_tables.sh`, and Postgres runs it only on an empty
+volume. The script is idempotent (`IF NOT EXISTS` throughout), so add a column as
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` and re-run the script on an existing database.
+Renames, type changes and drops need hand-written SQL. Run `make k8s-sync-initdb` so the
+chart's copy matches.
+
+```bash
+docker exec postgres bash /docker-entrypoint-initdb.d/01_create_app_tables.sh
+kubectl -n copilot exec postgres-0 -- bash /docker-entrypoint-initdb.d/01_create_app_tables.sh
+```
+
+**The application database is `app`, not `postgres`.** The `postgres` database exists but
+holds no app tables, so a query against it returns zero rows instead of an error. Use
+`docker exec -it postgres psql -U postgres -d app`.
+
+## LLM layer
+
+```mermaid
+flowchart LR
+    CS["Call site<br/>(router, agent, answer)"] -->|"model ID"| LR["LLMRouter<br/>llm_router.py"]
+    LR -->|"reads"| MY[("models.yaml")]
+    LR --> RL["RoutedLLM<br/>default params, tracing"]
+    RL --> AD["Adapter"] --> PV["Provider"]
+```
+
+A call site asks `LLMRouter.get(model_id)` for a `RoutedLLM`. The router builds the adapter
+on first use from that model's entry in `infra/config/models.yaml`, and the `RoutedLLM`
+merges the model's default parameters into each call and records a Langfuse generation.
+
+**Adapters** (`src/services/llm_adapters/`): OpenAI Chat Completions (`openai_adapter.py`),
+the OpenAI Responses API (`openai_responses_adapter.py`, picked per model by `api: responses`),
+Gemini (`gemini_adapter.py`), vLLM through the Chat Completions adapter with a local base URL,
+and `fake_adapter.py` for load tests. `MODELS_CONFIG_PATH=infra/config/models.loadtest.yaml`
+swaps in fake models, and `FAKE_LLM_ONLY=true` makes the router refuse any real provider.
+
+**Adding a model.** Add an entry to `models.yaml` with `id`, `label`, `provider`,
+`model_name` (`model_path` and `server` for vLLM), `pricing` per 1k tokens (`input`,
+`output`, `cached_input`, `cache_write_input`), `capabilities` (`streaming`, `tool_calling`,
+`allowed_tools`, `vision`, `reasoning`), `params_override`, and optionally `fallback_model`
+and `api`. Values can use `${VAR:-default}`. Every entry shows in the UI's model picker. A
+model needs `tool_calling: true` to serve as `AGENT_TOOL_MODEL`, and `reasoning: true` makes
+the adapter send `reasoning_effort` and `max_completion_tokens` instead of `temperature`.
+
+**Errors.** Each adapter maps provider exceptions (`src/services/llm_runtime/exception_mapper.py`)
+into `LLMTransientError` subclasses (rate limit, timeout, 5xx, connection) or
+`LLMPermanentError` subclasses (auth, bad request, context length, content filter, quota).
+`infra/config/error_maps.yaml` holds the message the user sees for each status code.
+
+**Retries, timeouts and fallbacks.** Each layer retries on its own, so the counts multiply:
+
+| Layer | Behaviour | Settings |
+|---|---|---|
+| SDK client | Retries a failed request; bounds each read and connect | `LLM_MAX_RETRIES` (1), `LLM_TIMEOUT_SECONDS` (120), `LLM_CONNECT_TIMEOUT_SECONDS` (5) |
+| Query router | Re-asks once if the output doesn't parse, then falls back to the `retrieval` route | `ROUTER_TIMEOUT` (10 s per call) |
+| Agent | Bounds each tool-model call by the turn cap and the time left in the run. A provider error moves the turn to the tool model's `fallback_model` | `AGENT_TURN_TIMEOUT_CAP_SECONDS`, `AGENT_DEADLINE_SECONDS` |
+| Answering model | `FallbackStream` switches to `fallback_model` only if the first model fails before streaming any text | `fallback_model` |
+| Celery | Redelivers a chat task whose worker died, up to a cap | `CHAT_MAX_ATTEMPTS` (2) |
+
+**Cost.** Every call on the chat path writes an `llm_requests` row (agent turns, the router
+and the disambiguator as child rows of the request) and increments the Prometheus token and
+cost counters. Cost comes from the model's `models.yaml` pricing (`src/utils/llm_utils.py`).
+
+**Prompts.** Prompts are `prompts/{name}_{version}.yaml`, loaded by
+`src/services/prompts/prompt_loader.py` and rendered with Jinja2.
+
+| Call | Model setting | Prompt | Version picked by |
+|---|---|---|---|
+| Query router | `QUERY_ROUTER_MODEL` (`gpt-4o-mini`) | `query_router_v5` | `QUERY_ROUTER_PROMPT_VERSION` |
+| Entity disambiguator | `ENTITY_DISAMBIGUATOR_MODEL` (`gpt-4o-mini`) | `entity_disambiguator_v1` | `ENTITY_DISAMBIGUATOR_PROMPT_VERSION` |
+| Tool model, extraction and comparison | `AGENT_TOOL_MODEL` | `system_v4_agent` | `shape_config()` in `agent/state.py` |
+| Tool model, analytical | `AGENT_TOOL_MODEL` | `system_v6_agent_analytical` | `shape_config()` |
+| Answering model, every route | The user's pick in the UI | `system_v5_agent_synthesis` + `user_v1` | `SYNTHESIS_PROMPT_VERSION` in `chat/tasks.py` |
+| Table summaries | `TABLE_SUMMARIZER_MODEL` (`qwen3-8b`) | `table_summarizer_v1` | `table_summarizer.py` |
+| Picture descriptions | `PICTURE_ENRICHER_MODEL`, `PICTURE_ENRICHER_CHEAP_MODEL` | `picture_enricher_chart_v1`, `picture_enricher_caption_v1` | `picture_enricher.py` |
+| Eval judge | `EVAL_JUDGE_MODEL` (`gpt-4o-mini`) | `src/eval/prompts/judge_system.yaml`, `driver_recall_judge_v1.yaml` | `src/eval/` |
+
+`system_v3_bracket` is kept as an eval option (`run_agent --prompt-version`).
+
 ## Tech stack
 
 | Area | Components |
@@ -187,15 +308,49 @@ calls, compares against the committed `src/eval/fixtures/runs/canary_baseline.js
 the run to the `canary_runs` and `canary_run_results` tables (`--persist-db`), and fails if
 the comparison finds a regression. The Grafana "Eval / Canary" dashboard reads those tables.
 
+**Regenerating the canary baseline.** Do it when a change is meant to move the scores (a new
+prompt, model or fixture question); otherwise the next canary run reports the change as a
+regression. Run the fixture without `--compare`, with the same `--model` and flags the
+workflow will use, and write over the baseline. Or take `canary_latest.json` from the
+`canary-run` artifact of a workflow run you accept. Check the per-question results before
+committing, since every later run is judged against this file.
+
+```bash
+.venv/bin/python -m src.eval.run_agent \
+    --test-set src/eval/fixtures/canary_eval.json \
+    --user-id <uuid> \
+    --model gpt-4o-mini \
+    --output src/eval/fixtures/runs/canary_baseline.json
+```
+
 ## Observability
 
 | Signal | Where | What it shows |
 |---|---|---|
 | LLM traces | Langfuse (`localhost:3003`) | One trace per chat request: `route_query` with `resolve_scope` and its candidate and disambiguator spans, then `agent_loop` with an `agent_turn_N` span per turn (status line in, tool calls and results out, state after, and the reasoning summary when the model returned one), each search's retrieval spans, and every LLM generation with tokens and cost. Scores: `agent_plan_coverage`, `agent_uncited_claim_rate`, `uncited_fact_share`, `ungrounded_claims`, and user feedback |
 | Metrics | Prometheus (`localhost:9090`) | Scrapes `api:8000/metrics`, `worker-chat:9100` and `worker-ingestion:9101`. Agent iterations, tool-call counts and latency, tool-model latency by turn kind, LLM tokens, reasoning tokens, cache reads and writes, cost, calls by wire API, replayed reasoning size, reasoning context mode, resends with a feature removed, answers cut short, dropped citation refs. Metric definitions are in `src/observability/metrics.py` |
-| Dashboards | Grafana (`localhost:3004`) | Six provisioned dashboards: API Overview, Agentic RAG, Cost & Tokens, Worker Health, Logs Explorer, Eval / Canary. Data sources: Prometheus, the app Postgres database, Elasticsearch |
+| Dashboards | Grafana (`localhost:3004`) | Six provisioned dashboards (seven on Kubernetes), listed below. Data sources: Prometheus, the app Postgres database, Elasticsearch |
 | Logs | Fluent Bit → Elasticsearch (`copilot-logs` index) | App containers write JSON to stdout; Docker's fluentd log driver ships it to Fluent Bit, which parses and forwards it |
 | Request records | Postgres `llm_requests` | One row per LLM call, including every tool-model turn and disambiguator call, with tokens (cache reads and writes included), cost, latency, status, `scope_outcome`, `llm_api` and, on Responses tool-model calls, `reasoning_summary` |
+
+| Dashboard | Question it answers |
+|---|---|
+| API Overview | Is the API keeping up? Request rate, latency, errors, open SSE streams, chat queue depth against the admission threshold, pgBouncer waits |
+| Agentic RAG | Where does a chat request spend its time, and how did the agent behave? Stage and retrieval latency, time to first token, iterations, tool calls, stop reasons, router decisions, guardrail blocks, thumbs-down rate |
+| Cost & Tokens | What are we spending, on which model, for whom? Spend rate, daily cost from `llm_requests`, cache reads and writes, reasoning tokens, top users, answers cut short |
+| Worker Health | Are the Celery workers keeping up, and is ingestion memory bounded? Throughput, failures, queue depth, ingestion stage latency, memory kept per document, worker recycles, retry storms |
+| Logs Explorer | What happened in one request? Log search by `request_id`, `trace_id`, level or endpoint, with Langfuse links |
+| Eval / Canary | Did the last canary run regress? Correctness, judge scores, hallucination rate, retrieval metrics, cost per run |
+| Resources (Kubernetes only) | Is anything short of memory, CPU or GPU? OOM kills, restarts, memory against limits, throttling, node conditions, GPU use, firing alerts |
+
+**Alerts.** Only the Kubernetes stack has alert rules: 14 in
+`infra/k8s/chart/files/observability/alert-rules.yml`, covering OOM kills, memory near the
+limit, CPU throttling, restarts, node pressure, ingestion workers recycling too often,
+documents reaped after a lost lease, agent runs cut off by the deadline, and scrape targets
+down. There's no Alertmanager, so a firing rule shows as an `ALERTS` series in Prometheus and
+on the Resources dashboard and notifies nobody. The Compose Prometheus loads no rules.
+[architecture.md](docs/prod_docs/architecture.md#5-observability-in-the-cluster) lists them
+by group.
 
 **Correlating logs with traces.** The Langfuse trace ID is the request UUID in hex
 (`UUID(request_id).hex`). The chat worker stamps the same value as `trace_id` on every log line
@@ -391,7 +546,12 @@ src/services/chat/agent/
 
 | Document | Covers |
 |---|---|
-| [agent_design.md](docs/prod_docs/agent_design.md) | The agent loop end to end: query shapes, the plan, one turn in detail, the three state stores, stop reasons, synthesis, citations, follow-ups, observability, configuration, worked examples, failure modes |
+| [architecture.md](docs/prod_docs/architecture.md) | The Kubernetes deployment: every workload with its sizes, the kind cluster (GPU passthrough, local registry, storage), the Helm chart (values layering, config and secrets, hooks, rollouts), observability and alerts, the planned EKS move and its open decisions, and how local Compose differs |
+| [infra/k8s/README.md](infra/k8s/README.md) | Operating the kind cluster: first setup, secrets, deploy and rollback, load tests, what never to run |
+| [infra/k8s/chart/README.md](infra/k8s/chart/README.md) | Changing the Helm chart: environment seams, shared files, how the chart behaves, checks |
+| [chat_pipeline.md](docs/prod_docs/chat_pipeline.md) | A chat request outside the agent loop: enqueue, the worker's stages, hybrid retrieval (RRF, reranking, fail-open, the confidence badge), the SSE event set and reconnects, timeouts, redelivery guards and dead-worker detection |
+| [ingestion.md](docs/prod_docs/ingestion.md) | How an uploaded PDF becomes searchable: the stages and what each writes, keeping a 1,000-page filing inside the worker's memory, retries, leases and recovery, progress events |
+| [agent_design.md](docs/prod_docs/agent_design.md) | The agent loop end to end, opening with a primer for readers who know classic RAG: query shapes, the plan, one turn in detail, the three state stores, stop reasons, synthesis, citations, follow-ups, observability, configuration, worked examples, failure modes |
 | [scope_resolution.md](docs/prod_docs/scope_resolution.md) | How a question's company names become document IDs: the UI scope, pg_trgm candidates, the disambiguator, the company limit, clarification cards and per-conversation bindings |
 | [number_grounding.md](docs/prod_docs/number_grounding.md) | The figure check against cited excerpts, change lines, the uncited-fact metric, and which numeric errors each mechanism catches and misses |
 

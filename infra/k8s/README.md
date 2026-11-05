@@ -2,6 +2,9 @@
 
 The stack runs on a local kind cluster (`kind-copilot`) as one Helm release, `copilot`, in the
 `copilot` namespace. The EKS deployment renders from the same chart with a different values file.
+How the cluster is built and why (GPU passthrough, the local registry, storage, the EKS move)
+is in [docs/prod_docs/architecture.md](../../docs/prod_docs/architecture.md). This file is the
+commands.
 
 ```
 infra/k8s/
@@ -40,18 +43,10 @@ models; later deploys find them cached. The app is then on <http://localhost>.
 
 ## Environments
 
-| | `values-kind.yaml` | `values-eks.yaml` (render-only) |
-|---|---|---|
-| images | `localhost:5001` | ECR (placeholder account) |
-| storage | kind `standard`, small PVCs | `gp3`, full sizes |
-| GPU | time-sliced, no taint | taint toleration |
-| ingress | `nginx` | `alb` + annotations |
-| sysctl initContainer | on | off (node bootstrap sets it) |
-| dcgm-exporter, opensearch-dashboards | on | off |
-
-`make helm-diff-envs` shows the full difference; anything outside these rows is a bug.
-`values-loadtest.yaml` and `values-smoke.yaml` layer on top of kind (see below and
-[chart/README.md](chart/README.md)).
+`envs/values-kind.yaml` runs here, and `envs/values-eks.yaml` renders for EKS. The seams
+between them are listed in [chart/README.md](chart/README.md#environments), and
+`make helm-diff-envs` shows the full difference. `values-loadtest.yaml` and
+`values-smoke.yaml` layer on top of kind.
 
 ## Secrets
 
@@ -101,19 +96,16 @@ their defaults in the Makefile. The T9/T13/ingest-limit targets change chart obj
 purpose (`kubectl scale`, `kubectl set env`); run their `-restore` target before the next
 deploy.
 
-## CI
-
-The `helm` job runs `make helm-check` (lint, schema, kubeconform, helm-unittest) on every PR
-and feeds `ci-success`. `make lint` also fails when a chart's copy of a compose file drifts.
-
 ## Never
 
 - **`helm uninstall copilot`** without reading what it deletes: every Deployment, StatefulSet,
   Service, ConfigMap and RBAC object, so the whole stack goes down. The data survives: the five
   `keep` PVCs and the StatefulSets' PVCs stay, and so do the Secrets, which the release doesn't
   own.
-- **`kubectl delete namespace copilot`.** It deletes every PVC and Secret. The PVs are `Retain`,
-  so the data stays on the node, but getting it back means rebinding each PV by hand.
+- **`kubectl delete namespace copilot`.** It deletes every PVC and Secret. kind's `standard`
+  class creates PVs with the reclaim policy `Delete`, so on a fresh cluster the data goes too.
+  A PV patched to `Retain` keeps its data on the node, but getting it back means rebinding the
+  PV by hand.
 - **`--reuse-values`.** It carries the last release's values forward, a load test's fake-LLM
   switch included, and ignores new defaults in the chart's `values.yaml`. The make targets pass
   the values files on every deploy.

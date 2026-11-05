@@ -394,7 +394,7 @@ k8s-check-es-bootstrap:
 	@diff -q infra/docker/elasticsearch/index-template.json $(CHART)/files/search/es-bootstrap/index-template.json
 
 # Source of truth: infra/docker/grafana/dashboards/. Not synced: resources.json exists only in
-# the chart, and the chart's worker-health.json adds GPU panels (dcgm-exporter) compose lacks.
+# the chart, and the chart's worker-health.json points saturation at resources.json.
 K8S_SHARED_DASHBOARDS := api-overview agentic-rag cost-tokens logs-explorer eval-canary
 .PHONY: k8s-sync-dashboards
 k8s-sync-dashboards:

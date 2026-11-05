@@ -348,7 +348,7 @@ def test_renderer_with_default_loader():
 def test_system_prompt_with_real_templates():
     """Test that get_system_prompt works with real templates."""
     # This uses the actual prompts directory
-    system_prompt = get_system_prompt(version="v3_agent_synthesis")
+    system_prompt = get_system_prompt(version="v5_agent_synthesis")
 
     # Should contain the Financial Document Analyst prompt
     assert "Financial Document Analyst" in system_prompt

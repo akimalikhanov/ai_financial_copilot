@@ -1,4 +1,4 @@
-# EKS: layered on top of chart/values.yaml. Render-only until Stage 19; PVC sizes are the base sizes.
+# EKS: layered on top of chart/values.yaml. Render-only until the EKS deployment; PVC sizes are the base sizes.
 images:
   registry: 000000000000.dkr.ecr.eu-central-1.amazonaws.com   # placeholder account and region
 

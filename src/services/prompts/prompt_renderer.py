@@ -145,7 +145,7 @@ def get_system_prompt(version: str) -> str:
     Get the system prompt by loading the system template.
 
     Args:
-        version: System template version, e.g. "v3_agent_synthesis".
+        version: System template version, e.g. "v5_agent_synthesis".
 
     Returns:
         System prompt string.
